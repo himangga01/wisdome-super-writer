@@ -4,6 +4,49 @@
 근거가 연결된 글을 만든 뒤 WordPress와 Google Blogger에 발행하는 Django/Celery 서비스입니다.
 스캔 PDF와 복합 레이아웃 PDF는 로컬 PaddleOCR 3.7.0 `PP-StructureV3`로 처리합니다.
 
+> **개발 상태:** 핵심 MVP 파이프라인과 관리자 콘솔이 구현된 개발 버전입니다. 실제 운영 전에는
+> 출처별 수집기 고도화, PaddleOCR 모델 checksum 확정, 자동발행 안전 게이트 및 Phase 7 테스트를
+> 완료해야 합니다. 세부 진행 상태는
+> [`specs/001-automated-content-publishing/tasks.md`](specs/001-automated-content-publishing/tasks.md)를
+> 기준으로 확인합니다.
+
+## 지원 범위
+
+| 구분 | 현재 범위 |
+|---|---|
+| 사용자 | Django staff 권한을 가진 관리자 전용 |
+| 주제 | 대한민국 부동산 청약정보, 한국·글로벌 반도체 뉴스/속보 |
+| 입력 | HTML, 구조화 데이터, PDF, 이미지, HWP/HWPX, spreadsheet, 첨부파일 |
+| 문서 인식 | native PDF 우선, 스캔·복합 문서는 PaddleOCR `PP-StructureV3` |
+| 결과물 | 출처 링크, 주장-근거 연결, 시각 자료와 품질 검사를 포함한 글 개정본 |
+| 발행 채널 | WordPress 대표 원문 → Google Blogger 보조 배포 |
+| 실행 방식 | 관리자 수동 실행 또는 `Asia/Seoul` 기준 cron 일정 |
+
+핵심 기능은 다음과 같습니다.
+
+- 승인된 주제별 출처 레지스트리를 기준으로 최신 자료 수집
+- 원문과 첨부파일의 text, 표, 이미지, 페이지 캡처 및 locator 보존
+- 주장마다 근거 snapshot과 원문 URL을 연결하고 게시 전 품질 gate 적용
+- 채널별 미리보기, target별 관리자 승인, 멱등 발행 및 실패 재조정
+- 일정 중복 방지, `queue_one`, 전역 kill switch, 감사 로그와 보존 정책
+
+## 처리 흐름
+
+```mermaid
+flowchart LR
+    A[관리자 주제·기간 선택] --> B[승인 출처 수집]
+    B --> C[첨부·PDF 추출]
+    C --> D{OCR 필요?}
+    D -- 예 --> E[PaddleOCR 전용 worker]
+    D -- 아니오 --> F[일반 추출 worker]
+    E --> G[근거 정규화·검토]
+    F --> G
+    G --> H[출처 기반 초안·품질 gate]
+    H --> I[채널별 미리보기·승인]
+    I --> J[WordPress 대표 원문]
+    J --> K[Blogger 보조 배포]
+```
+
 ## 구성
 
 - Django 5.2: 관리자 콘솔, same-origin Admin API, session/CSRF, 재인증
@@ -50,6 +93,21 @@ docker compose up -d web worker ocr-worker beat
 
 소스 레지스트리와 추출 프로필 import는 불변 draft만 생성합니다. 관리자 검토·재인증·승인 전에는
 자동 수집이나 자동 발행에 사용할 수 없습니다.
+
+## 관리자 사용 순서
+
+1. `/admin/`에서 관리자 계정을 확인하고 `/console/`에 로그인합니다.
+2. 출처 레지스트리와 추출 프로필의 material, checksum, 검증 보고서를 검토한 뒤 승인합니다.
+3. **실행** 화면에서 주제와 수집 시간창을 지정해 collection run을 만듭니다.
+4. run 상세에서 원문, 첨부파일, OCR locator와 저신뢰 근거를 검토합니다.
+5. 생성된 article의 주장·출처·품질 검사를 확인하고 필요한 경우 새 revision을 만듭니다.
+6. **발행** 화면에서 WordPress/Blogger target을 선택하고 채널별 최종 render를 승인합니다.
+7. WordPress 공개 URL 확인 후 Blogger 후속 발행 상태를 확인합니다.
+8. 반복 작업은 **운영** 화면에서 cron 일정과 중복 정책을 설정합니다.
+
+API는 `/api/v1/` 아래에 있으며 관리자 session과 CSRF 보호를 사용합니다. 전체 계약은
+[`admin-api.openapi.yaml`](specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml)에
+정의되어 있습니다.
 
 ## PaddleOCR 모델 준비
 
@@ -150,6 +208,56 @@ token을 외부 비밀 저장소에 기록한 뒤 `vault://...` 같은 참조 �
 Beat는 한 인스턴스만 실행하고 60초마다
 `apps.scheduling.tasks.dispatch_due_schedules_task`를 호출합니다. 일정 중복 방지는 PostgreSQL
 잠금과 dispatch 멱등키가 담당합니다.
+
+## 프로젝트 구조
+
+```text
+.
+├── config/                         # 출처, 편집 정책, 추출 profile, 보존 정책
+├── deploy/containers/              # web 및 PaddleOCR worker 이미지
+├── specs/001-automated-content-publishing/
+│   ├── spec.md                     # 기능 요구사항
+│   ├── plan.md                     # 기술 설계
+│   ├── tasks.md                    # 구현 진행 상태
+│   └── contracts/                  # Admin API와 adapter 계약
+├── src/
+│   ├── adapters/                   # source, extractor, publisher, storage adapter
+│   ├── apps/                       # Django domain apps
+│   └── wisdome_writer/             # settings, API, Celery, 공통 infrastructure
+├── compose.yaml
+└── pyproject.toml
+```
+
+주요 Django 앱:
+
+| 앱 | 역할 |
+|---|---|
+| `topics` | 주제 정책, 출처 정의와 불변 registry snapshot |
+| `collection` | collection run, source version, 실행 단계 |
+| `evidence` | 문서 추출, PaddleOCR routing, locator와 검토 결정 |
+| `editorial` | article revision, 주장-근거 연결, 품질 검사와 정정 |
+| `publishing` | target, 승인, WordPress/Blogger 발행과 reconcile |
+| `scheduling` | cron 일정, 중복 정책, kill switch |
+| `audit` | append-only 감사 이벤트와 hold-aware 보존 |
+
+## 개발 확인 명령
+
+호스트에서 실행할 때는 Python 3.12 가상환경을 사용합니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python src/manage.py check
+python src/manage.py makemigrations --check --dry-run
+```
+
+테스트 구현은 현재 Spec Kit Phase 7 후속 작업입니다. 테스트 파일이 준비된 뒤에는 다음 명령을
+기준으로 실행합니다.
+
+```powershell
+pytest
+```
 
 ## 비밀·운영 원칙
 
