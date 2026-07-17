@@ -1,0 +1,3845 @@
+openapi: 3.1.0
+info:
+  title: Wisdome Super Writer Admin API
+  version: 0.4.0
+  license:
+    name: Proprietary project contract
+    identifier: LicenseRef-Proprietary
+  description: >-
+    Same-origin administrator API. Browser sessions are established by Django's
+    login view. Every same-origin API request, including safe reads, requires both the session cookie
+    and CSRF header; the OAuth callback explicitly overrides this rule. No public registration or
+    anonymous write operation exists.
+servers:
+  - url: /api/v1
+security:
+  - sessionCookie: []
+    csrfHeader: []
+tags:
+  - name: Topics
+    description: Topic policies and automatic-publication eligibility.
+  - name: Sources
+    description: Versioned source registry and read-only connection checks.
+  - name: Runs
+    description: Collection pipeline execution, evidence, stop and retry controls.
+  - name: Evidence
+    description: Evidence provenance, publishability and append-only administrator review decisions.
+  - name: Articles
+    description: Immutable revisions, previews, evidence and approval decisions.
+  - name: Schedules
+    description: Topic schedules, overlap rules and validation state.
+  - name: Publishing
+    description: Publication targets and idempotent channel dispatch.
+  - name: Operations
+    description: High-risk operational controls such as the global kill switch.
+
+paths:
+  /auth/reauth:
+    post:
+      tags: [Operations]
+      summary: Reauthenticate the current administrator for one scoped high-risk mutation
+      operationId: reauthenticateAdmin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReauthenticationRequest' }
+      responses:
+        '201':
+          description: Session-bound proof valid for at most five minutes and consumed atomically once
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReauthenticationProof' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '429': { $ref: '#/components/responses/Problem' }
+
+  /topics:
+    get:
+      tags: [Topics]
+      summary: List supported topics
+      operationId: listTopics
+      responses:
+        '200':
+          description: Supported topics and their active policy versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Topic' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+
+  /sources:
+    get:
+      tags: [Sources]
+      summary: List source definitions
+      operationId: listSources
+      parameters:
+        - $ref: '#/components/parameters/TopicQuery'
+        - name: enabled
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Approved and draft source definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SourceDefinition' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Sources]
+      summary: Create a draft source definition
+      operationId: createSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceDefinitionCreateRequest' }
+      responses:
+        '200':
+          description: Existing source and draft snapshot for an identical request-key replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceDefinition' }
+        '201':
+          description: Source definition created in draft state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceDefinition' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /sources/{sourceId}:
+    parameters:
+      - $ref: '#/components/parameters/SourceId'
+    get:
+      tags: [Sources]
+      summary: Get a source definition
+      operationId: getSource
+      responses:
+        '200':
+          description: Source definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceDefinition' }
+        '404': { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Sources]
+      summary: Update a source definition
+      operationId: updateSource
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/SourceDefinitionPatch' }
+      responses:
+        '200':
+          description: Updated draft; separate registry approval atomically creates a new topic registry version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceDefinition' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /sources/{sourceId}/check:
+    parameters:
+      - $ref: '#/components/parameters/SourceId'
+    post:
+      tags: [Sources]
+      summary: Check source access and parsing
+      operationId: checkSource
+      responses:
+        '202':
+          description: Non-publishing source access and parser check accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /source-registries:
+    get:
+      tags: [Sources]
+      summary: List draft, approved and retired source-registry snapshots
+      operationId: listSourceRegistries
+      parameters:
+        - $ref: '#/components/parameters/TopicQuery'
+      responses:
+        '200':
+          description: Immutable registry versions and draft projections
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SourceRegistrySnapshot' }
+        '403': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Sources]
+      summary: Create an idempotent draft registry by carrying forward a complete base membership
+      operationId: createSourceRegistryDraft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceRegistryDraftRequest' }
+      responses:
+        '200':
+          description: Existing idempotent draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistrySnapshot' }
+        '201':
+          description: New draft with complete carried-forward membership
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistrySnapshot' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /source-registries/{registryId}:
+    parameters:
+      - $ref: '#/components/parameters/RegistryId'
+    get:
+      tags: [Sources]
+      summary: Get an exact registry manifest and membership set
+      operationId: getSourceRegistry
+      responses:
+        '200':
+          description: Registry snapshot detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistrySnapshot' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /source-registries/{registryId}/memberships/{sourceId}:
+    parameters:
+      - $ref: '#/components/parameters/RegistryId'
+      - $ref: '#/components/parameters/SourceId'
+    put:
+      tags: [Sources]
+      summary: CAS-update one draft membership and recompute the complete immutable manifest candidate
+      operationId: updateSourceRegistryMembership
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceRegistryMembershipRequest' }
+      responses:
+        '200':
+          description: Updated draft with complete membership
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistrySnapshot' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /source-registries/{registryId}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/RegistryId'
+    post:
+      tags: [Sources]
+      summary: Append a re-authenticated approve or retire decision for an exact registry manifest
+      operationId: decideSourceRegistry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceRegistryDecisionRequest' }
+      responses:
+        '200':
+          description: Existing idempotent decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistryDecision' }
+        '201':
+          description: New append-only registry decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceRegistryDecision' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /extraction-profiles:
+    get:
+      tags: [Evidence]
+      summary: List immutable extraction profile snapshots awaiting approval or active/retired
+      operationId: listExtractionProfiles
+      parameters:
+        - name: approvalState
+          in: query
+          schema: { type: string, enum: [draft, approved, retired] }
+        - name: engine
+          in: query
+          schema: { $ref: '#/components/schemas/ExtractionEngine' }
+      responses:
+        '200':
+          description: Profile material, local-model manifest and calibration report metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ExtractionProfileSnapshot' }
+        '403': { $ref: '#/components/responses/Problem' }
+
+  /extraction-profiles/{profileId}:
+    parameters:
+      - $ref: '#/components/parameters/ProfileId'
+    get:
+      tags: [Evidence]
+      summary: Get an immutable extraction profile and verification material
+      operationId: getExtractionProfile
+      responses:
+        '200':
+          description: Exact profile snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtractionProfileSnapshot' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /extraction-profiles/{profileId}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/ProfileId'
+    post:
+      tags: [Evidence]
+      summary: Append a re-authenticated approve or retire decision
+      operationId: decideExtractionProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExtractionProfileDecisionRequest' }
+      responses:
+        '200':
+          description: Existing idempotent decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtractionProfileDecision' }
+        '201':
+          description: New append-only decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtractionProfileDecision' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /extraction-profiles/{profileId}/report:
+    parameters:
+      - $ref: '#/components/parameters/ProfileId'
+    get:
+      tags: [Evidence]
+      summary: Read the hash-verified non-sensitive golden/calibration report before a decision
+      operationId: getExtractionProfileReport
+      responses:
+        '200':
+          description: Normalized samples, metrics, thresholds and pass/fail bound to the profile material hash
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/VerificationReport'
+                  - type: object
+                    properties:
+                      subjectType: { const: extraction_profile }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /runs:
+    get:
+      tags: [Runs]
+      summary: List collection runs
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/TopicQuery'
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/RunState' }
+        - $ref: '#/components/parameters/Cursor'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Collection runs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunPage' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Runs]
+      summary: Start an idempotent collection run
+      operationId: createRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRunRequest' }
+      responses:
+        '202':
+          description: Idempotent run accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionRun' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [Runs]
+      summary: Get run details and attempts
+      operationId: getRun
+      responses:
+        '200':
+          description: Run, step attempts, counters and redacted failure details
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionRunDetail' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /runs/{runId}/stop:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Runs]
+      summary: Request a safe run stop
+      operationId: stopRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3, maxLength: 500 }
+      responses:
+        '202':
+          description: Stop requested; already-started external calls are reconciled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionRun' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /runs/{runId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Runs]
+      summary: Retry a safe run step
+      operationId: retryRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fromStep, requestKey, reauthProofId, reason]
+              properties:
+                fromStep:
+                  type: string
+                  enum: [collect, extract, validate, draft, publish, reconcile]
+                targetIds:
+                  type: array
+                  items: { type: string, format: uuid }
+                requestKey: { type: string, minLength: 8, maxLength: 200 }
+                reauthProofId: { type: string, format: uuid }
+                reason: { type: string, minLength: 3, maxLength: 500 }
+      responses:
+        '202':
+          description: Safe retry accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /runs/{runId}/evidence:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [Evidence]
+      summary: List run evidence and exclusions
+      description: >-
+        Resolves evidence through the requested CollectionRun's RunSourceItem rows. Each item keeps
+        immutable originCollectionRunId/originRunSourceItemId/originSourceSnapshotId provenance even
+        when the same SourceItem content is rediscovered by a later run.
+      operationId: listRunEvidence
+      parameters:
+        - name: publishable
+          in: query
+          schema: { type: boolean }
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/EvidenceKind' }
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Evidence and exclusion reasons
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidencePage' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+
+  /evidence/{evidenceId}:
+    parameters:
+      - $ref: '#/components/parameters/EvidenceId'
+    get:
+      tags: [Evidence]
+      summary: Get current evidence provenance and review subject
+      operationId: getEvidence
+      responses:
+        '200':
+          description: Current subject version/hash, latest decision and publishability projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidenceAsset' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /document-extractions/{documentExtractionId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentExtractionId'
+    get:
+      tags: [Evidence]
+      summary: Get the server-computed document completion aggregate
+      operationId: getDocumentExtraction
+      responses:
+        '200':
+          description: Parent page coverage, selected evidence manifest and completion state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentExtractionSummary' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /evidence/{evidenceId}/review-decisions:
+    parameters:
+      - $ref: '#/components/parameters/EvidenceId'
+    post:
+      tags: [Evidence]
+      summary: Append an administrator decision for the current evidence subject
+      description: >-
+        Locks the EvidenceAsset, creates or loads its immutable EvidenceAuditSnapshot, locks that
+        durable subject, compares subject version/hash and expectedLatestDecisionId, then
+        loads the complete low-confidence reason manifest, verifies its canonical hash and rejects
+        approval if any reason is unavailable. It then writes the immutable decision, latest
+        projection and outbox event in one transaction.
+        (evidenceAuditSnapshotId, requestKey) is idempotent; the path evidence ID is only the live
+        lookup key before raw retention purge.
+      operationId: createEvidenceReviewDecision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvidenceReviewDecisionRequest' }
+      responses:
+        '200':
+          description: Existing decision returned for an identical idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidenceReviewDecision' }
+        '201':
+          description: Immutable decision recorded and evidence projection recalculated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidenceReviewDecision' }
+        '409':
+          description: >-
+            Subject version/hash or expected latest decision is stale, or the request key was reused
+            with a different payload. Same key and same payload returns the existing decision. Read
+            GET /evidence/{evidenceId} before retrying a stale comparison.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /articles:
+    get:
+      tags: [Articles]
+      summary: List draft and published articles
+      operationId: listArticles
+      parameters:
+        - $ref: '#/components/parameters/TopicQuery'
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/ArticleState' }
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Draft and published articles
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticlePage' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Articles]
+      summary: Get an article with evidence and checks
+      operationId: getArticle
+      responses:
+        '200':
+          description: Current revision, claims, evidence, checks and publications
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleDetail' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/revisions:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    post:
+      tags: [Articles]
+      summary: Create an immutable article revision
+      operationId: createArticleRevision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRevisionRequest' }
+      responses:
+        '200':
+          description: Existing revision returned for an identical request-key replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleRevision' }
+        '201':
+          description: New immutable drafting revision created; claim/evidence and all blocking quality checks are queued again
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArticleRevision' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/preview:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Articles]
+      summary: Render a channel-specific preview
+      operationId: previewArticle
+      parameters:
+        - name: targetId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Sanitized channel render and limit violations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelPreview' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    post:
+      tags: [Articles]
+      summary: Record an article approval decision
+      operationId: decideArticleApproval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalRequest' }
+      responses:
+        '200':
+          description: Existing idempotent approval decision for the same request key and payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        '201':
+          description: New append-only approval decision recorded against an exact target command and revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/publication-intents:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    post:
+      tags: [Publishing]
+      summary: Create or supersede an append-only publication intent
+      operationId: createPublicationIntent
+      description: >-
+        Locks the article/correction subject, compares expectedLatestIntentId, and atomically inserts
+        the immutable intent plus latest projection. Same requestKey and payload returns the existing
+        intent; a stale CAS or changed payload returns 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicationIntentRequest' }
+      responses:
+        '200':
+          description: Existing idempotent intent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationIntent' }
+        '201':
+          description: New immutable intent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationIntent' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/publish:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    post:
+      tags: [Publishing]
+      summary: Dispatch approved publication jobs
+      operationId: publishArticle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishRequest' }
+      responses:
+        '202':
+          description: Per-target idempotent publication jobs accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/corrections:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Articles]
+      summary: List correction and retraction history
+      operationId: listArticleCorrections
+      responses:
+        '200':
+          description: Correction and retraction history
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CorrectionCase' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+
+  /schedules:
+    get:
+      tags: [Schedules]
+      summary: List schedules
+      operationId: listSchedules
+      responses:
+        '200':
+          description: Schedules
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Schedule' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Schedules]
+      summary: Create a topic schedule
+      operationId: createSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleInput' }
+      responses:
+        '201':
+          description: Schedule created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /schedules/{scheduleId}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    patch:
+      tags: [Schedules]
+      summary: Update a topic schedule
+      operationId: updateSchedule
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/ScheduleInput' }
+      responses:
+        '200':
+          description: Updated schedule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /targets:
+    get:
+      tags: [Publishing]
+      summary: List publication targets and capabilities
+      operationId: listPublicationTargets
+      responses:
+        '200':
+          description: Connected and blocked publication targets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PublicationTarget' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Publishing]
+      summary: Create a publication target using secret-store references
+      operationId: createPublicationTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicationTargetInput' }
+      responses:
+        '201':
+          description: Target created in pending state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationTarget' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    patch:
+      tags: [Publishing]
+      summary: Update target metadata or secret-store references
+      operationId: updatePublicationTarget
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/PublicationTargetPatch' }
+      responses:
+        '200':
+          description: Target updated; validation becomes stale when connection fields change
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationTarget' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/preflight:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    post:
+      tags: [Publishing]
+      summary: Run a read-only target connection preflight
+      operationId: preflightPublicationTarget
+      responses:
+        '202':
+          description: Read-only route, identity and declared-capability check accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '4XX': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/canary:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    post:
+      tags: [Publishing]
+      summary: Run a destructive write canary on a confirmed test-environment target
+      operationId: canaryPublicationTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CanaryRequest' }
+      responses:
+        '202':
+          description: Create-update-media-publish-withdraw-cleanup canary accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/auto-publish-validations:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    get:
+      tags: [Publishing]
+      summary: List immutable automatic-publication validation candidates for a target
+      operationId: listAutoPublishValidations
+      responses:
+        '200':
+          description: Validation candidates and their current decision/staleness projection
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AutoPublishValidation' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Publishing]
+      summary: Register an immutable automatic-publication validation candidate and test report
+      operationId: createAutoPublishValidation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutoPublishValidationCreateRequest' }
+      responses:
+        '200':
+          description: Existing candidate for an identical request-key/material replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishValidation' }
+        '201':
+          description: New immutable draft validation candidate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishValidation' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/auto-publish-validations/{validationId}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+      - $ref: '#/components/parameters/ValidationId'
+    post:
+      tags: [Publishing]
+      summary: Append a re-authenticated pass or revoke decision for a validation candidate
+      operationId: decideAutoPublishValidation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutoPublishValidationDecisionRequest' }
+      responses:
+        '200':
+          description: Existing idempotent decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishValidationDecision' }
+        '201':
+          description: New append-only validation decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishValidationDecision' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/auto-publish-validations/{validationId}/report:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+      - $ref: '#/components/parameters/ValidationId'
+    get:
+      tags: [Publishing]
+      summary: Read the hash-verified non-sensitive canary and regression report before a decision
+      operationId: getAutoPublishValidationReport
+      responses:
+        '200':
+          description: Normalized samples, metrics, thresholds and pass/fail bound to the validation material hash
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/VerificationReport'
+                  - type: object
+                    properties:
+                      subjectType: { const: auto_publish_validation }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/auto-publish:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    put:
+      tags: [Publishing]
+      summary: Enable or disable automatic publication after preflight, test canary and manual pilot
+      operationId: setTargetAutoPublish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutoPublishActivationRequest' }
+      responses:
+        '200':
+          description: Existing idempotent activation decision and recalculated target projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishActivationResult' }
+        '201':
+          description: New append-only activation decision and recalculated target projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutoPublishActivationResult' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/oauth/start:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    post:
+      tags: [Publishing]
+      summary: Start Google OAuth for a Blogger target
+      operationId: startTargetOAuth
+      responses:
+        '200':
+          description: Short-lived authorization URL with signed state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorizationUrl, expiresAt]
+                properties:
+                  authorizationUrl: { type: string, format: uri }
+                  expiresAt: { type: string, format: date-time }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /publishing/oauth/google/callback:
+    get:
+      tags: [Publishing]
+      summary: Complete Blogger OAuth using signed state
+      operationId: completeTargetOAuth
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema: { type: string }
+        - name: error
+          in: query
+          required: false
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OAuth result recorded and a safe completion page returned
+        '302':
+          description: OAuth result recorded and browser redirected to the target page
+        '400': { $ref: '#/components/responses/Problem' }
+
+  /targets/{targetId}/connection:
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    delete:
+      tags: [Publishing]
+      summary: Revoke or detach target credentials and disable publication
+      operationId: disconnectPublicationTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedTargetSnapshotId, expectedTargetConfigHash, requestKey, reauthProofId, reason]
+              properties:
+                expectedTargetSnapshotId: { type: string, format: uuid }
+                expectedTargetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+                requestKey: { type: string, minLength: 8, maxLength: 200 }
+                reauthProofId: { type: string, format: uuid }
+                reason: { type: string, minLength: 3, maxLength: 500 }
+      responses:
+        '202':
+          description: Target disabled immediately; local deletion and remote revocation accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedJob' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /operations/kill-switch:
+    put:
+      tags: [Operations]
+      summary: Enable or disable the global kill switch
+      operationId: setKillSwitch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled, expectedControlVersion, requestKey, reauthProofId, reason]
+              properties:
+                enabled: { type: boolean }
+                expectedControlVersion: { type: integer, minimum: 1 }
+                requestKey: { type: string, minLength: 8, maxLength: 200 }
+                reauthProofId: { type: [string, 'null'], format: uuid }
+                reason: { type: string, minLength: 3, maxLength: 500 }
+              allOf:
+                - if:
+                    required: [enabled]
+                    properties:
+                      enabled: { const: false }
+                  then:
+                    properties:
+                      reauthProofId: { type: string, format: uuid }
+                  else:
+                    properties:
+                      reauthProofId: { type: 'null' }
+      responses:
+        '200':
+          description: Global dispatch/publish state changed; in-flight calls reconcile
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [decisionId, enabled, version, changedAt]
+                properties:
+                  decisionId: { type: string, format: uuid }
+                  enabled: { type: boolean }
+                  version: { type: integer, minimum: 1 }
+                  changedAt: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /retention/previews:
+    post:
+      tags: [Operations]
+      summary: Create an immutable retention impact and hold preview
+      operationId: previewRetentionBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetentionPreviewRequest' }
+      responses:
+        '200':
+          description: Existing idempotent preview
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatch' }
+        '201':
+          description: New previewed retention batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatch' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /audit-events:
+    get:
+      tags: [Operations]
+      summary: Read the redacted append-only audit timeline
+      operationId: listAuditEvents
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - name: correlationId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: entityType
+          in: query
+          schema: { type: string }
+        - name: entityId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: >-
+            Descending keyset page. The signed opaque cursor binds canonical filters, initial upper
+            watermark, last occurredAt/ID tuple and limit; from is inclusive and to is exclusive.
+            Metadata is deny-by-default redacted and contains no body or secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditEventPage' }
+        '403': { $ref: '#/components/responses/Problem' }
+
+  /retention/batches/{retentionBatchId}:
+    parameters:
+      - $ref: '#/components/parameters/RetentionBatchId'
+    get:
+      tags: [Operations]
+      summary: Get retention batch phase, counts, holds and resumable failure state
+      operationId: getRetentionBatch
+      responses:
+        '200':
+          description: Retention batch status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatch' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /retention/batches/{retentionBatchId}/execute:
+    parameters:
+      - $ref: '#/components/parameters/RetentionBatchId'
+    post:
+      tags: [Operations]
+      summary: Authorize and execute an immutable retention batch
+      operationId: executeRetentionBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetentionExecuteRequest' }
+      responses:
+        '200':
+          description: Existing idempotent authorization or current batch state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatch' }
+        '202':
+          description: Re-authenticated execution accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatch' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /retention/batches/{retentionBatchId}/items:
+    parameters:
+      - $ref: '#/components/parameters/RetentionBatchId'
+    get:
+      tags: [Operations]
+      summary: Page through the immutable impact items and hold reasons before execution
+      operationId: listRetentionBatchItems
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Verifiable item page whose full-set hash equals the batch impact and hold manifests
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionBatchItemPage' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sessionid
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRFToken
+
+  parameters:
+    TopicQuery:
+      name: topic
+      in: query
+      schema: { $ref: '#/components/schemas/TopicCode' }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    SourceId:
+      name: sourceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RegistryId:
+      name: registryId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    EvidenceId:
+      name: evidenceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DocumentExtractionId:
+      name: documentExtractionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProfileId:
+      name: profileId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ArticleId:
+      name: articleId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ScheduleId:
+      name: scheduleId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TargetId:
+      name: targetId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ValidationId:
+      name: validationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RetentionBatchId:
+      name: retentionBatchId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Problem:
+      description: RFC 9457-style error with no secret or full source body
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    ReauthenticationRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, actionScopes]
+      properties:
+        currentPassword: { type: string, minLength: 1, writeOnly: true }
+        mfaCode: { type: [string, 'null'], writeOnly: true }
+        actionScopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect]
+    ReauthenticationProof:
+      type: object
+      additionalProperties: false
+      required: [id, actionScopes, issuedAt, expiresAt]
+      properties:
+        id: { type: string, format: uuid }
+        actionScopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string }
+        issuedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+    TopicCode:
+      type: string
+      enum: [housing_subscription, semiconductor_news]
+    Topic:
+      type: object
+      required: [code, name, policyVersion]
+      properties:
+        code: { $ref: '#/components/schemas/TopicCode' }
+        name: { type: string }
+        policyVersion: { type: integer, minimum: 1 }
+        autoPublishEligible: { type: boolean }
+
+    SourceRateLimitPolicy:
+      type: object
+      additionalProperties: false
+      required: [maxConcurrency, requestsPerMinute, burst]
+      properties:
+        maxConcurrency: { type: integer, minimum: 1, maximum: 50 }
+        requestsPerMinute: { type: integer, minimum: 1, maximum: 10000 }
+        burst: { type: integer, minimum: 1, maximum: 1000 }
+    SourceDefinitionInput:
+      type: object
+      required: [topic, name, publisher, authorityTier, independenceGroupId, ownerName, editorialControlName, baseUrl, accessMethod, adapterKey, externalConfig, secretRef, allowedMimeTypes, defaultRightsStatus, termsUrl, robotsUrl, licenseUrl, pollIntervalSeconds, rateLimitPolicy, enabled]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        name: { type: string, maxLength: 200 }
+        publisher: { type: string, maxLength: 200 }
+        authorityTier:
+          type: string
+          enum: [primary_official, primary_corporate, trusted_secondary, discovery_only]
+        independenceGroupId: { type: string, minLength: 1, maxLength: 200 }
+        ownerName: { type: string, minLength: 1, maxLength: 200 }
+        editorialControlName: { type: string, minLength: 1, maxLength: 200 }
+        baseUrl: { type: string, format: uri }
+        accessMethod:
+          type: string
+          enum: [public_api, open_data_api, rss_atom, public_html, public_file]
+        adapterKey: { type: string, pattern: '^[a-z0-9_.-]+$' }
+        externalConfig:
+          type: object
+          additionalProperties: true
+          description: >-
+            Non-secret adapter parameters validated against the registered adapterKey schema.
+            Authorization headers, cookies, tokens, passwords and secret-looking keys/values are
+            rejected; secretRef is the only credential pointer.
+        secretRef: { type: [string, 'null'], maxLength: 300 }
+        allowedMimeTypes:
+          type: array
+          items: { type: string }
+        defaultRightsStatus: { $ref: '#/components/schemas/RightsStatus' }
+        termsUrl: { type: [string, 'null'], format: uri }
+        robotsUrl: { type: [string, 'null'], format: uri }
+        licenseUrl: { type: [string, 'null'], format: uri }
+        pollIntervalSeconds: { type: integer, minimum: 60 }
+        rateLimitPolicy: { $ref: '#/components/schemas/SourceRateLimitPolicy' }
+        enabled: { type: boolean }
+    SourceDefinitionCreateRequest:
+      allOf:
+        - $ref: '#/components/schemas/SourceDefinitionInput'
+        - type: object
+          required: [requestKey]
+          properties:
+            requestKey: { type: string, minLength: 8, maxLength: 200 }
+      unevaluatedProperties: false
+    SourceDefinitionPatch:
+      type: object
+      additionalProperties: false
+      required: [expectedLatestDraftSnapshotId, requestKey]
+      description: topic is immutable after SourceDefinition creation and is intentionally absent.
+      properties:
+        expectedLatestDraftSnapshotId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        name: { type: string, maxLength: 200 }
+        publisher: { type: string, maxLength: 200 }
+        authorityTier:
+          type: string
+          enum: [primary_official, primary_corporate, trusted_secondary, discovery_only]
+        independenceGroupId: { type: string, minLength: 1, maxLength: 200 }
+        ownerName: { type: string, minLength: 1, maxLength: 200 }
+        editorialControlName: { type: string, minLength: 1, maxLength: 200 }
+        baseUrl: { type: string, format: uri }
+        accessMethod:
+          type: string
+          enum: [public_api, open_data_api, rss_atom, public_html, public_file]
+        adapterKey: { type: string, pattern: '^[a-z0-9_.-]+$' }
+        externalConfig:
+          type: object
+          additionalProperties: true
+          description: Same non-secret, adapter-schema-validated rules as create.
+        secretRef: { type: [string, 'null'], maxLength: 300 }
+        allowedMimeTypes:
+          type: array
+          items: { type: string }
+        defaultRightsStatus: { $ref: '#/components/schemas/RightsStatus' }
+        termsUrl: { type: [string, 'null'], format: uri }
+        robotsUrl: { type: [string, 'null'], format: uri }
+        licenseUrl: { type: [string, 'null'], format: uri }
+        pollIntervalSeconds: { type: integer, minimum: 60 }
+        rateLimitPolicy: { $ref: '#/components/schemas/SourceRateLimitPolicy' }
+        enabled: { type: boolean }
+    SourceDefinition:
+      allOf:
+        - $ref: '#/components/schemas/SourceDefinitionInput'
+        - type: object
+          required: [id, latestApprovedSnapshotVersion, latestDraftSnapshotId, latestDraftSnapshotVersion, latestDraftConfigHash, status, lastHealth]
+          properties:
+            id: { type: string, format: uuid }
+            latestApprovedSnapshotVersion: { type: [integer, 'null'], minimum: 1 }
+            latestDraftSnapshotId: { type: [string, 'null'], format: uuid }
+            latestDraftSnapshotVersion: { type: [integer, 'null'], minimum: 1 }
+            latestDraftConfigHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+            status: { type: string, enum: [draft, approved, retired] }
+            lastHealth: { type: [object, 'null'], additionalProperties: true }
+      unevaluatedProperties: false
+
+    SourceRegistryDraftRequest:
+      type: object
+      additionalProperties: false
+      required: [topic, baseRegistryId, expectedLatestRegistryVersion, expectedLatestRegistryManifestHash, requestKey]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        baseRegistryId: { type: [string, 'null'], format: uuid }
+        expectedLatestRegistryVersion: { type: [integer, 'null'], minimum: 1 }
+        expectedLatestRegistryManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+    SourceRegistryMembership:
+      type: object
+      additionalProperties: false
+      required: [sourceId, sourceDefinitionSnapshotId, sourceDefinitionSnapshotVersion, sourceDefinitionSnapshotStatus, sourceDefinitionConfigHash, enabled, displayOrder]
+      properties:
+        sourceId: { type: string, format: uuid }
+        sourceDefinitionSnapshotId: { type: string, format: uuid }
+        sourceDefinitionSnapshotVersion: { type: integer, minimum: 1 }
+        sourceDefinitionSnapshotStatus: { type: string, enum: [draft, approved, retired] }
+        sourceDefinitionConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        enabled: { type: boolean }
+        displayOrder: { type: integer, minimum: 0 }
+    SourceRegistrySnapshot:
+      type: object
+      additionalProperties: false
+      required: [id, topic, version, rowVersion, status, baseApprovedRegistryId, baseApprovedVersion, baseApprovedManifestHash, manifestHash, latestDecisionId, memberships, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        version: { type: integer, minimum: 1 }
+        rowVersion: { type: integer, minimum: 1 }
+        status: { type: string, enum: [draft, approved, retired] }
+        baseApprovedRegistryId: { type: [string, 'null'], format: uuid }
+        baseApprovedVersion: { type: [integer, 'null'], minimum: 1 }
+        baseApprovedManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        manifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        latestDecisionId: { type: [string, 'null'], format: uuid }
+        memberships:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/SourceRegistryMembership' }
+        createdAt: { type: string, format: date-time }
+    SourceRegistryMembershipRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRowVersion, expectedManifestHash, sourceDefinitionSnapshotId, enabled, displayOrder, requestKey]
+      properties:
+        expectedRowVersion: { type: integer, minimum: 1 }
+        expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceDefinitionSnapshotId: { type: string, format: uuid }
+        enabled: { type: boolean }
+        displayOrder: { type: integer, minimum: 0 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+    SourceRegistryDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, expectedRowVersion, expectedManifestHash, expectedCurrentHeadRegistryId, expectedCurrentHeadVersion, expectedCurrentHeadManifestHash, expectedLatestDecisionId, requestKey, reauthProofId, reason]
+      properties:
+        decision: { type: string, enum: [approved, retired] }
+        expectedRowVersion: { type: integer, minimum: 1 }
+        expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedCurrentHeadRegistryId: { type: [string, 'null'], format: uuid }
+        expectedCurrentHeadVersion: { type: [integer, 'null'], minimum: 1 }
+        expectedCurrentHeadManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        expectedLatestDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    SourceRegistryDecision:
+      type: object
+      additionalProperties: false
+      required: [id, registryId, version, decision, expectedRowVersion, expectedManifestHash, expectedCurrentHeadRegistryId, expectedCurrentHeadVersion, expectedCurrentHeadManifestHash, supersedesDecisionId, requestKey, decisionHash, decidedBy, decidedAt, reason]
+      properties:
+        id: { type: string, format: uuid }
+        registryId: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        decision: { type: string, enum: [approved, retired] }
+        expectedRowVersion: { type: integer, minimum: 1 }
+        expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedCurrentHeadRegistryId: { type: [string, 'null'], format: uuid }
+        expectedCurrentHeadVersion: { type: [integer, 'null'], minimum: 1 }
+        expectedCurrentHeadManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        supersedesDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decidedBy: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+
+    CreateRunRequest:
+      type: object
+      description: >-
+        For validated_auto, targetIds and validation/activation ref targetId sets must be identical;
+        each target appears exactly once and all refs must bind the same target snapshot and the
+        activation's exact validation set. The server enforces these relational invariants.
+      additionalProperties: false
+      required: [topic, targetIds, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, requestKey]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        windowStart: { type: [string, 'null'], format: date-time }
+        windowEnd: { type: [string, 'null'], format: date-time }
+        targetIds:
+          type: array
+          description: Must include the WordPress primary target when Blogger is selected.
+          items: { type: string, format: uuid }
+          uniqueItems: true
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          description: In validated_auto mode, exactly one current validation per targetId is required.
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          description: In validated_auto mode, exactly one current enabled activation per targetId is required.
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+      allOf:
+        - if:
+            required: [approvalMode]
+            properties:
+              approvalMode: { const: validated_auto }
+          then:
+            properties:
+              autoPublishValidationRefs: { minItems: 1 }
+              autoPublishActivationRefs: { minItems: 1 }
+          else:
+            properties:
+              autoPublishValidationRefs: { maxItems: 0 }
+              autoPublishActivationRefs: { maxItems: 0 }
+    RunState:
+      type: string
+      enum: [queued, collecting, extracting, validating, drafting, awaiting_approval, publishing, stopping, stopped, completed, failed]
+    TargetSnapshotRef:
+      type: object
+      additionalProperties: false
+      required: [targetId, targetSnapshotId, targetConfigHash]
+      properties:
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+    TargetCommand:
+      type: object
+      additionalProperties: false
+      required: [targetId, targetSnapshotId, targetConfigHash, resolvedAction, canonicalDependencyTargetId]
+      properties:
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        resolvedAction: { type: string, enum: [create, update, unpublish, mark_withdrawn] }
+        canonicalDependencyTargetId:
+          type: [string, 'null']
+          format: uuid
+          description: Required for Blogger create, update and mark_withdrawn; null for the primary target and unpublish.
+    AutoPublishValidationRef:
+      type: object
+      additionalProperties: false
+      required: [validationId, targetId, targetSnapshotId, materialHash]
+      properties:
+        validationId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        materialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    AutoPublishActivationRef:
+      type: object
+      additionalProperties: false
+      required: [activationId, targetId, targetSnapshotId, version, activationHash]
+      properties:
+        activationId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        activationHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    CollectionRun:
+      type: object
+      description: >-
+        Server-computed immutable run snapshot. In validated_auto mode, requested target,
+        target-snapshot, validation and activation target sets are equal and one-to-one.
+      required: [id, displayId, topic, trigger, sourceRegistrySnapshotId, registryVersion, registryManifestHash, policyVersion, requestedTargetIds, requestedTargetSnapshots, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, scheduleSnapshotHash, autoValidationSnapshotHash, requestFingerprint, state, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        displayId: { type: string }
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        trigger: { type: string, enum: [manual, schedule, source_change, retry] }
+        sourceRegistrySnapshotId: { type: string, format: uuid }
+        registryVersion: { type: integer, minimum: 1 }
+        registryManifestHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        policyVersion: { type: integer, minimum: 1 }
+        requestedTargetIds:
+          type: array
+          items: { type: string, format: uuid }
+          uniqueItems: true
+        requestedTargetSnapshots:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TargetSnapshotRef' }
+        targetSnapshotManifestHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        autoActivationManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        scheduleSnapshotHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        autoValidationSnapshotHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        requestFingerprint:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        state: { $ref: '#/components/schemas/RunState' }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        counters: { type: object, additionalProperties: { type: integer } }
+        stopRequestedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+      allOf:
+        - if:
+            required: [approvalMode]
+            properties:
+              approvalMode: { const: validated_auto }
+          then:
+            properties:
+              autoValidationSnapshotHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+              autoPublishValidationRefs: { minItems: 1 }
+              autoPublishActivationRefs: { minItems: 1 }
+              autoActivationManifestHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+          else:
+            properties:
+              autoValidationSnapshotHash: { type: 'null' }
+              autoPublishValidationRefs: { maxItems: 0 }
+              autoPublishActivationRefs: { maxItems: 0 }
+              autoActivationManifestHash: { type: 'null' }
+        - if:
+            required: [trigger]
+            properties:
+              trigger: { const: schedule }
+          then:
+            properties:
+              scheduleSnapshotHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+    RunStep:
+      type: object
+      required: [name, attempt, state]
+      properties:
+        name: { type: string }
+        attempt: { type: integer, minimum: 1 }
+        state: { type: string }
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        errorCode: { type: [string, 'null'] }
+        retryAt: { type: [string, 'null'], format: date-time }
+    CollectionRunDetail:
+      allOf:
+        - $ref: '#/components/schemas/CollectionRun'
+        - type: object
+          properties:
+            steps:
+              type: array
+              items: { $ref: '#/components/schemas/RunStep' }
+            errorSummary: { type: [object, 'null'], additionalProperties: true }
+    RunPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CollectionRun' }
+        nextCursor: { type: [string, 'null'] }
+
+    RightsStatus:
+      type: string
+      enum: [allowed, attribution_required, internal_analysis_only, unknown, prohibited]
+    EvidenceKind:
+      type: string
+      enum: [text, table, pdf, image, chart, spreadsheet, screenshot, attachment]
+    ExtractionEngine:
+      type: string
+      enum: [native_pdf, paddleocr_ppstructurev3, html_parser, structured_parser, spreadsheet_parser, hwpx_parser, legacy_hwp_converter, browser_capture, media_parser, manual_entry]
+    ExtractionProfileSnapshot:
+      type: object
+      additionalProperties: false
+      required: [id, profileKey, profileVersion, engine, extractorVersion, packageVersion, runtimeVersion, pipelineName, implementationManifestHash, approvalState, decisionVersion, latestDecisionId, config, configHash, validationMode, calibrationProfileKey, calibrationProfileVersion, calibrationManifestObjectKey, calibrationManifestObjectVersion, calibrationProfileHash, modelManifest, modelManifestHash, profileMaterialHash, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        profileKey: { type: string, minLength: 1 }
+        profileVersion: { type: string, minLength: 1 }
+        engine: { $ref: '#/components/schemas/ExtractionEngine' }
+        extractorVersion: { type: string, minLength: 1 }
+        packageVersion: { type: [string, 'null'] }
+        runtimeVersion: { type: [string, 'null'] }
+        pipelineName: { type: [string, 'null'] }
+        implementationManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        approvalState: { type: string, enum: [draft, approved, retired] }
+        decisionVersion: { type: integer, minimum: 0 }
+        latestDecisionId: { type: [string, 'null'], format: uuid }
+        config: { type: object, additionalProperties: true }
+        configHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        validationMode:
+          oneOf:
+            - $ref: '#/components/schemas/GenericValidationMode'
+            - type: 'null'
+        calibrationProfileKey: { type: [string, 'null'] }
+        calibrationProfileVersion: { type: [string, 'null'] }
+        calibrationManifestObjectKey: { type: [string, 'null'] }
+        calibrationManifestObjectVersion: { type: [string, 'null'] }
+        calibrationProfileHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        modelManifest: { type: [object, 'null'], additionalProperties: true }
+        modelManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        profileMaterialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        createdAt: { type: string, format: date-time }
+      allOf:
+        - if:
+            required: [engine]
+            properties:
+              engine: { const: paddleocr_ppstructurev3 }
+          then:
+            properties:
+              packageVersion: { const: '3.7.0' }
+              runtimeVersion: { type: string, pattern: '^3\.[0-9]+\.[0-9]+(?:[+.-][A-Za-z0-9.]+)?$' }
+              pipelineName: { const: PPStructureV3 }
+              modelManifest: { type: object }
+              modelManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ExtractionProfileDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, expectedMaterialHash, expectedLatestDecisionId, requestKey, reauthProofId, reason]
+      properties:
+        decision: { type: string, enum: [approved, retired] }
+        expectedMaterialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedLatestDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    ExtractionProfileDecision:
+      type: object
+      additionalProperties: false
+      required: [id, profileSnapshotId, version, decision, expectedMaterialHash, supersedesDecisionId, requestKey, decisionHash, decidedBy, decidedAt, reason]
+      properties:
+        id: { type: string, format: uuid }
+        profileSnapshotId: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        decision: { type: string, enum: [approved, retired] }
+        expectedMaterialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        supersedesDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decidedBy: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    VerificationSampleResult:
+      type: object
+      additionalProperties: false
+      required: [sampleId, inputClass, sampleHash, expectedOutcomeHash, observedOutcomeHash, result, sensitiveDataExcluded]
+      properties:
+        sampleId: { type: string, minLength: 1, maxLength: 200 }
+        inputClass: { type: string, minLength: 1, maxLength: 100 }
+        sampleHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedOutcomeHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        observedOutcomeHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        result: { type: string, enum: [passed, failed] }
+        sensitiveDataExcluded: { type: boolean, const: true }
+        detailRedacted: { type: [string, 'null'], maxLength: 1000 }
+    VerificationMetric:
+      type: object
+      additionalProperties: false
+      required: [metricKey, value, unit, sampleCount]
+      properties:
+        metricKey: { type: string, pattern: '^[a-z][a-z0-9_.-]{1,99}$' }
+        value: { type: number }
+        unit: { type: string, minLength: 1, maxLength: 50 }
+        sampleCount: { type: integer, minimum: 1 }
+    VerificationThresholdResult:
+      type: object
+      additionalProperties: false
+      required: [metricKey, comparator, threshold, observed, result]
+      properties:
+        metricKey: { type: string, pattern: '^[a-z][a-z0-9_.-]{1,99}$' }
+        comparator: { type: string, enum: [gte, lte, eq] }
+        threshold: { type: number }
+        observed: { type: number }
+        result: { type: string, enum: [passed, failed] }
+    VerificationStageResult:
+      type: object
+      additionalProperties: false
+      required: [code, result]
+      properties:
+        code: { type: string, pattern: '^[a-z][a-z0-9_.-]{1,99}$' }
+        result: { type: string, enum: [passed, failed, skipped] }
+        detailRedacted: { type: [string, 'null'], maxLength: 1000 }
+    VerificationReport:
+      type: object
+      additionalProperties: false
+      required: [subjectType, subjectId, subjectMaterialHash, reportObjectKey, reportObjectVersion, reportHash, sampleManifestHash, samples, metrics, thresholds, stageResults, overallResult, generatedAt, verifiedAt]
+      properties:
+        subjectType: { type: string, enum: [extraction_profile, auto_publish_validation] }
+        subjectId: { type: string, format: uuid }
+        subjectMaterialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        reportObjectKey: { type: string, minLength: 1 }
+        reportObjectVersion: { type: string, minLength: 1 }
+        reportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sampleManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        samples:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/VerificationSampleResult' }
+        metrics:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/VerificationMetric' }
+        thresholds:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/VerificationThresholdResult' }
+        stageResults:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/VerificationStageResult' }
+        overallResult: { type: string, enum: [passed, failed] }
+        generatedAt: { type: string, format: date-time }
+        verifiedAt: { type: string, format: date-time }
+    DocumentInputKind:
+      type: string
+      enum: [pdf, standalone_image]
+    GenericValidationMode:
+      type: string
+      enum: [deterministic, calibrated, manual]
+    EvidenceDerivationType:
+      type: string
+      enum: [raw, document_derived, other_derived, visualization_derived]
+    DocumentEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, pageIndex, blockId, blockType, readingOrder]
+      properties:
+        locatorType: { type: string, const: document_block }
+        pageIndex:
+          type: integer
+          minimum: 0
+          description: Server verifies membership in child processed pages and parent expected pages.
+        blockId: { type: string, minLength: 1 }
+        blockType:
+          type: string
+          enum: [title, text, list, table, chart, formula, image, header, footer, other]
+        polygon:
+          type: [array, 'null']
+          minItems: 4
+          items:
+            type: array
+            prefixItems:
+              - { type: number }
+              - { type: number }
+            minItems: 2
+            maxItems: 2
+        bbox:
+          type: [array, 'null']
+          prefixItems:
+            - { type: number }
+            - { type: number }
+            - { type: number }
+            - { type: number }
+          minItems: 4
+          maxItems: 4
+        readingOrder: { type: integer, minimum: 0 }
+        cell: { type: [object, 'null'], additionalProperties: true }
+      anyOf:
+        - required: [polygon]
+          properties:
+            polygon: { type: array }
+        - required: [bbox]
+          properties:
+            bbox: { type: array }
+    SpreadsheetEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, sheetName, cellRange]
+      properties:
+        locatorType: { type: string, const: spreadsheet_cell }
+        sheetName: { type: string, minLength: 1 }
+        cellRange: { type: string, minLength: 1 }
+        tableName: { type: [string, 'null'] }
+    HtmlEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType]
+      properties:
+        locatorType: { type: string, const: html_dom }
+        cssSelector: { type: [string, 'null'] }
+        xpath: { type: [string, 'null'] }
+      anyOf:
+        - required: [cssSelector]
+          properties:
+            cssSelector: { type: string, minLength: 1 }
+        - required: [xpath]
+          properties:
+            xpath: { type: string, minLength: 1 }
+    StructuredEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, pathType, path]
+      properties:
+        locatorType: { type: string, const: structured_path }
+        pathType: { type: string, enum: [json_pointer, xpath, csv_row, record_key] }
+        path: { type: string, minLength: 1 }
+    MediaEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, startMs, endMs]
+      properties:
+        locatorType: { type: string, const: media_time }
+        startMs: { type: integer, minimum: 0 }
+        endMs: { type: integer, minimum: 0 }
+    ImageRegionEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType]
+      properties:
+        locatorType: { type: string, const: image_region }
+        polygon:
+          type: [array, 'null']
+          minItems: 4
+          items:
+            type: array
+            prefixItems:
+              - { type: number }
+              - { type: number }
+            minItems: 2
+            maxItems: 2
+        bbox:
+          type: [array, 'null']
+          prefixItems:
+            - { type: number }
+            - { type: number }
+            - { type: number }
+            - { type: number }
+          minItems: 4
+          maxItems: 4
+      anyOf:
+        - required: [polygon]
+          properties:
+            polygon: { type: array }
+        - required: [bbox]
+          properties:
+            bbox: { type: array }
+    ManualEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, note]
+      properties:
+        locatorType: { type: string, const: manual }
+        note: { type: string, minLength: 1, maxLength: 500 }
+    HwpxEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, sectionPath, paragraphId, tableId, rowIndex, columnIndex]
+      properties:
+        locatorType: { type: string, const: hwpx_path }
+        sectionPath: { type: string, minLength: 1 }
+        paragraphId: { type: [string, 'null'] }
+        tableId: { type: [string, 'null'] }
+        rowIndex: { type: [integer, 'null'], minimum: 0 }
+        columnIndex: { type: [integer, 'null'], minimum: 0 }
+        embeddedObjectId: { type: [string, 'null'] }
+      oneOf:
+        - properties:
+            paragraphId: { type: string, minLength: 1 }
+            tableId: { type: 'null' }
+            rowIndex: { type: 'null' }
+            columnIndex: { type: 'null' }
+        - properties:
+            tableId: { type: string, minLength: 1 }
+            rowIndex: { type: integer, minimum: 0 }
+            columnIndex: { type: integer, minimum: 0 }
+    HwpConversionLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, inputChecksum, outputPdfChecksum, converterManifestHash, sandboxReportHash]
+      properties:
+        locatorType: { type: string, const: hwp_conversion }
+        inputChecksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+        outputPdfChecksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+        converterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sandboxReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    VisualizationEvidenceLocator:
+      type: object
+      additionalProperties: false
+      required: [locatorType, visualizationRenderId, inputManifestHash, transformSpecHash]
+      properties:
+        locatorType: { type: string, const: visualization }
+        visualizationRenderId: { type: string, format: uuid }
+        inputManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        transformSpecHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    OtherEvidenceLocator:
+      oneOf:
+        - $ref: '#/components/schemas/SpreadsheetEvidenceLocator'
+        - $ref: '#/components/schemas/HtmlEvidenceLocator'
+        - $ref: '#/components/schemas/StructuredEvidenceLocator'
+        - $ref: '#/components/schemas/MediaEvidenceLocator'
+        - $ref: '#/components/schemas/ImageRegionEvidenceLocator'
+        - $ref: '#/components/schemas/HwpxEvidenceLocator'
+        - $ref: '#/components/schemas/HwpConversionLocator'
+        - $ref: '#/components/schemas/ManualEvidenceLocator'
+      discriminator:
+        propertyName: locatorType
+        mapping:
+          spreadsheet_cell: '#/components/schemas/SpreadsheetEvidenceLocator'
+          html_dom: '#/components/schemas/HtmlEvidenceLocator'
+          structured_path: '#/components/schemas/StructuredEvidenceLocator'
+          media_time: '#/components/schemas/MediaEvidenceLocator'
+          image_region: '#/components/schemas/ImageRegionEvidenceLocator'
+          hwpx_path: '#/components/schemas/HwpxEvidenceLocator'
+          hwp_conversion: '#/components/schemas/HwpConversionLocator'
+          manual: '#/components/schemas/ManualEvidenceLocator'
+    DocumentExtractionProvenance:
+      type: object
+      additionalProperties: false
+      description: >-
+        Child-run provenance. collectionRunId/runSourceItemId/sourceSnapshotId must equal the
+        persisted DocumentExtraction lineage and the enclosing evidence origin lineage; the server
+        rejects any mismatch before serialization.
+      required:
+        - documentExtractionId
+        - collectionRunId
+        - runSourceItemId
+        - sourceSnapshotId
+        - extractionRunId
+        - inputKind
+        - inputMimeType
+        - inputChecksum
+        - inputFrameCount
+        - profileSnapshotId
+        - profileMaterialHash
+        - engine
+        - fingerprintSchemaVersion
+        - extractionFingerprint
+        - profileKey
+        - profileVersion
+        - packageVersion
+        - runtimeVersion
+        - configHash
+        - resultChecksum
+        - lowConfidenceReasonsHash
+        - inputPageCount
+        - pageSetHash
+        - requestedPageIndices
+        - processedPageIndices
+        - runComplete
+        - runState
+      properties:
+        documentExtractionId: { type: string, format: uuid }
+        collectionRunId: { type: string, format: uuid }
+        runSourceItemId: { type: string, format: uuid }
+        sourceSnapshotId: { type: string, format: uuid }
+        extractionRunId: { type: string, format: uuid }
+        retryOfRunId: { type: [string, 'null'], format: uuid }
+        inputKind: { $ref: '#/components/schemas/DocumentInputKind' }
+        inputMimeType:
+          type: string
+          enum: [application/pdf, image/png, image/jpeg, image/tiff]
+        inputChecksum:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        inputFrameCount: { type: [integer, 'null'], minimum: 1 }
+        profileSnapshotId: { type: string, format: uuid }
+        profileMaterialHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        engine:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionEngine'
+            - type: string
+              enum: [native_pdf, paddleocr_ppstructurev3]
+        fingerprintSchemaVersion: { type: string, const: v1 }
+        extractionFingerprint:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        profileKey: { type: string, minLength: 1 }
+        profileVersion: { type: string, minLength: 1 }
+        packageVersion: { type: string, minLength: 1 }
+        runtimeVersion: { type: string, minLength: 1 }
+        pipelineName: { type: [string, 'null'] }
+        modelManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        configHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        resultChecksum:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        lowConfidenceReasonsHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        languageProfile: { type: [string, 'null'] }
+        inputPageCount: { type: integer, minimum: 1 }
+        pageSetHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: >-
+            Hash of the canonical requested page set. The server verifies requested and processed
+            sets are identical before serializing succeeded/low_confidence provenance.
+        requestedPageIndices:
+          type: array
+          minItems: 1
+          items: { type: integer, minimum: 0 }
+          uniqueItems: true
+        processedPageIndices:
+          type: array
+          minItems: 1
+          items: { type: integer, minimum: 0 }
+          uniqueItems: true
+        runComplete: { type: boolean, const: true }
+        runState:
+          type: string
+          enum: [succeeded, low_confidence]
+      allOf:
+        - if:
+            required: [inputKind]
+            properties:
+              inputKind: { const: standalone_image }
+          then:
+            properties:
+              engine: { const: paddleocr_ppstructurev3 }
+              inputMimeType: { enum: [image/png, image/jpeg, image/tiff] }
+              inputFrameCount: { const: 1 }
+              inputPageCount: { const: 1 }
+              requestedPageIndices: { const: [0] }
+              processedPageIndices: { const: [0] }
+        - if:
+            required: [inputKind]
+            properties:
+              inputKind: { const: pdf }
+          then:
+            properties:
+              inputMimeType: { const: application/pdf }
+              inputFrameCount: { type: 'null' }
+        - if:
+            required: [runState]
+            properties:
+              runState: { const: low_confidence }
+          then:
+            properties:
+              lowConfidenceReasonsHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+          else:
+            properties:
+              lowConfidenceReasonsHash: { type: 'null' }
+        - if:
+            properties:
+              engine: { const: paddleocr_ppstructurev3 }
+          then:
+            required: [pipelineName, modelManifestHash, languageProfile]
+            properties:
+              packageVersion: { const: 3.7.0 }
+              runtimeVersion:
+                type: string
+                pattern: '^3\.[0-9]+\.[0-9]+(?:[+.-][A-Za-z0-9.]+)?$'
+              pipelineName: { const: PPStructureV3 }
+              modelManifestHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+              languageProfile:
+                type: string
+                enum: [korean_PP-OCRv5_mobile_rec, en_PP-OCRv5_mobile_rec]
+    DocumentExtractionSummary:
+      type: object
+      additionalProperties: false
+      description: >-
+        Server-computed parent aggregate. Child EvidenceAsset responses reference this resource by
+        documentExtractionId and never duplicate mutable completion fields. The server derives page
+        sets and both manifests from persisted child runs/assets; clients cannot submit them.
+        expectedPageIndices is always exactly 0..inputPageCount-1, and documentComplete=true is
+        emitted only when coveredPageIndices is exactly that set and every selected asset is present
+        in the selected evidence manifest with required reviews approved.
+      required: [documentExtractionId, collectionRunId, runSourceItemId, sourceItemId, sourceSnapshotId, inputKind, inputMimeType, inputChecksum, inputFrameCount, inputPageCount, expectedPageIndices, coveredPageIndices, state, coverageManifestHash, selectedEvidenceManifestHash, documentComplete]
+      properties:
+        documentExtractionId: { type: string, format: uuid }
+        collectionRunId: { type: string, format: uuid }
+        runSourceItemId: { type: string, format: uuid }
+        sourceItemId: { type: string, format: uuid }
+        sourceSnapshotId: { type: string, format: uuid }
+        inputKind: { $ref: '#/components/schemas/DocumentInputKind' }
+        inputMimeType:
+          type: string
+          enum: [application/pdf, image/png, image/jpeg, image/tiff]
+        inputChecksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+        inputFrameCount: { type: [integer, 'null'], minimum: 1 }
+        inputPageCount: { type: integer, minimum: 1 }
+        expectedPageIndices:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: integer, minimum: 0 }
+        coveredPageIndices:
+          type: array
+          items: { type: integer, minimum: 0 }
+          uniqueItems: true
+        state: { type: string, enum: [queued, running, succeeded, low_confidence, failed] }
+        coverageManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        selectedEvidenceManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        documentComplete: { type: boolean }
+      allOf:
+        - if:
+            required: [documentComplete]
+            properties:
+              documentComplete: { const: true }
+          then:
+            properties:
+              state: { const: succeeded }
+              coverageManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+              selectedEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+          else:
+            properties:
+              coverageManifestHash: { type: 'null' }
+              selectedEvidenceManifestHash: { type: 'null' }
+        - if:
+            required: [inputKind]
+            properties:
+              inputKind: { const: standalone_image }
+          then:
+            properties:
+              inputMimeType: { enum: [image/png, image/jpeg, image/tiff] }
+              inputFrameCount: { const: 1 }
+              inputPageCount: { const: 1 }
+              expectedPageIndices: { const: [0] }
+              coveredPageIndices: { enum: [[0], []] }
+        - if:
+            required: [inputKind]
+            properties:
+              inputKind: { const: pdf }
+          then:
+            properties:
+              inputMimeType: { const: application/pdf }
+              inputFrameCount: { type: 'null' }
+    GenericExtractionProvenance:
+      type: object
+      additionalProperties: false
+      description: >-
+        Attempt provenance. collectionRunId/runSourceItemId/sourceSnapshotId must equal the
+        persisted GenericExtractionAttempt and enclosing evidence origin lineage.
+      required: [collectionRunId, runSourceItemId, sourceSnapshotId, attemptId, inputChecksum, profileSnapshotId, profileMaterialHash, fingerprintSchemaVersion, extractionFingerprint, attemptState, engine, extractorVersion, configHash, validationMode, resultChecksum, lowConfidenceReasonsHash, calibrationProfileKey, calibrationProfileVersion, calibrationProfileHash]
+      properties:
+        collectionRunId: { type: string, format: uuid }
+        runSourceItemId: { type: string, format: uuid }
+        sourceSnapshotId: { type: string, format: uuid }
+        attemptId: { type: string, format: uuid }
+        inputChecksum:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        profileSnapshotId: { type: string, format: uuid }
+        profileMaterialHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        fingerprintSchemaVersion: { type: string, const: v1 }
+        extractionFingerprint:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        attemptState:
+          type: string
+          enum: [succeeded, low_confidence]
+        engine:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionEngine'
+            - type: string
+              enum: [html_parser, structured_parser, spreadsheet_parser, hwpx_parser, legacy_hwp_converter, browser_capture, media_parser, manual_entry]
+        extractorVersion: { type: string, minLength: 1 }
+        configHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        validationMode: { $ref: '#/components/schemas/GenericValidationMode' }
+        resultChecksum:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        lowConfidenceReasonsHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        calibrationProfileKey: { type: [string, 'null'] }
+        calibrationProfileVersion: { type: [string, 'null'] }
+        calibrationProfileHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+      allOf:
+        - if:
+            required: [attemptState]
+            properties:
+              attemptState: { const: low_confidence }
+          then:
+            properties:
+              validationMode: { const: calibrated }
+              lowConfidenceReasonsHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+          else:
+            properties:
+              lowConfidenceReasonsHash: { type: 'null' }
+        - if:
+            required: [validationMode]
+            properties:
+              validationMode: { const: calibrated }
+          then:
+            properties:
+              calibrationProfileKey: { type: string, minLength: 1 }
+              calibrationProfileVersion: { type: string, minLength: 1 }
+              calibrationProfileHash:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+          else:
+            properties:
+              calibrationProfileKey: { type: 'null' }
+              calibrationProfileVersion: { type: 'null' }
+              calibrationProfileHash: { type: 'null' }
+        - if:
+            required: [engine]
+            properties:
+              engine: { const: manual_entry }
+          then:
+            properties:
+              validationMode: { const: manual }
+              attemptState: { const: succeeded }
+        - if:
+            required: [validationMode]
+            properties:
+              validationMode: { const: manual }
+          then:
+            properties:
+              engine: { const: manual_entry }
+    GenericLowConfidenceReason:
+      allOf:
+        - $ref: '#/components/schemas/LowConfidenceReason'
+        - type: object
+          properties:
+            scope: { const: generic_result }
+            observedConfidence: { type: number, minimum: 0, maximum: 1 }
+            threshold: { type: number, minimum: 0, maximum: 1 }
+            calibrationProfileHash:
+              type: string
+              pattern: '^[a-f0-9]{64}$'
+    VisualizationProvenance:
+      type: object
+      additionalProperties: false
+      required: [renderId, articleRevisionId, inputManifestHash, transformSpecHash, rendererName, rendererVersion, configHash, outputChecksum, rightsManifestHash]
+      properties:
+        renderId: { type: string, format: uuid }
+        articleRevisionId: { type: string, format: uuid }
+        inputManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        transformSpecHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        rendererName: { type: string, minLength: 1 }
+        rendererVersion: { type: string, minLength: 1 }
+        configHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        outputChecksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+        rightsManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    EvidenceReviewDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [subjectSchemaVersion, subjectHash, expectedLatestDecisionId, requestKey, decision, reason]
+      properties:
+        subjectSchemaVersion: { type: string, const: v1 }
+        subjectHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: Must equal the current evidence reviewSubjectHash or the API returns 409.
+        expectedLatestDecisionId:
+          type: [string, 'null']
+          format: uuid
+          description: Compare-and-swap value; null means no current-subject decision is expected.
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        decision: { type: string, enum: [approved, rejected] }
+        reason: { type: string, minLength: 3, maxLength: 1000 }
+    EvidenceReviewDecision:
+      type: object
+      additionalProperties: false
+      required: [id, evidenceAuditSnapshotId, evidenceId, decisionProvenanceType, subjectSchemaVersion, subjectHash, extractionRunId, genericExtractionAttemptId, supersedesDecisionId, requestKey, decision, reason, reviewerAdminId, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        evidenceAuditSnapshotId: { type: string, format: uuid }
+        evidenceId:
+          type: [string, 'null']
+          format: uuid
+          description: Null after the 90-day raw-evidence purge; the audit snapshot remains authoritative.
+        decisionProvenanceType: { type: string, enum: [raw, document, generic] }
+        subjectSchemaVersion: { type: string, const: v1 }
+        subjectHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        extractionRunId: { type: [string, 'null'], format: uuid }
+        genericExtractionAttemptId: { type: [string, 'null'], format: uuid }
+        supersedesDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        decision: { type: string, enum: [approved, rejected] }
+        reason: { type: string, minLength: 3, maxLength: 1000 }
+        reviewerAdminId: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+      oneOf:
+        - properties:
+            decisionProvenanceType: { const: raw }
+            extractionRunId: { type: 'null' }
+            genericExtractionAttemptId: { type: 'null' }
+        - properties:
+            decisionProvenanceType: { const: document }
+            extractionRunId: { type: string, format: uuid }
+            genericExtractionAttemptId: { type: 'null' }
+        - properties:
+            decisionProvenanceType: { const: generic }
+            extractionRunId: { type: 'null' }
+            genericExtractionAttemptId: { type: string, format: uuid }
+    EvidenceReviewDecisionSummary:
+      type: object
+      additionalProperties: false
+      description: >-
+        Embedded current-subject projection. Evidence/subject/provenance identifiers are omitted so
+        they cannot conflict with the enclosing EvidenceAsset; GET/POST decision responses expose
+        the full append-only record.
+      required: [id, decision, reason, reviewerAdminId, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        decision: { type: string, enum: [approved, rejected] }
+        reason: { type: string, minLength: 3, maxLength: 1000 }
+        reviewerAdminId: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+    LowConfidenceReason:
+      type: object
+      additionalProperties: false
+      required: [impact, code, scope, fieldOrBlockRef, message, observedConfidence, threshold, calibrationProfileHash]
+      properties:
+        impact: { type: string, enum: [high, standard] }
+        code: { type: string, pattern: '^[a-z0-9_.-]+$' }
+        scope:
+          type: string
+          enum: [document_block, field, table, chart, formula, generic_result]
+        fieldOrBlockRef: { type: [string, 'null'] }
+        message: { type: string, minLength: 1, maxLength: 500 }
+        observedConfidence: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        threshold: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        calibrationProfileHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+    EvidenceAsset:
+      type: object
+      additionalProperties: false
+      description: >-
+        Detailed server read model. Origin IDs are derived from originRunSourceItemId and cannot be
+        client authored; derived extraction lineage must be identical to that origin join.
+      required: [id, sourceItemId, originCollectionRunId, originRunSourceItemId, originSourceSnapshotId, sourceChecksum, derivationType, kind, contentHash, sourceTitle, sourceUrl, rightsStatus, lowConfidenceReasons, reviewSubjectSchemaVersion, reviewSubjectHash, latestManualReviewDecision, manualReviewRequired, publishable, reviewState]
+      properties:
+        id: { type: string, format: uuid }
+        sourceItemId: { type: [string, 'null'], format: uuid }
+        originCollectionRunId: { type: [string, 'null'], format: uuid }
+        originRunSourceItemId: { type: [string, 'null'], format: uuid }
+        originSourceSnapshotId: { type: [string, 'null'], format: uuid }
+        sourceChecksum:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        derivationType: { $ref: '#/components/schemas/EvidenceDerivationType' }
+        kind: { $ref: '#/components/schemas/EvidenceKind' }
+        contentHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        sourceTitle: { type: [string, 'null'] }
+        sourceUrl: { type: [string, 'null'], format: uri }
+        publisher: { type: string }
+        publishedAt: { type: [string, 'null'], format: date-time }
+        locator:
+          oneOf:
+            - $ref: '#/components/schemas/DocumentEvidenceLocator'
+            - $ref: '#/components/schemas/OtherEvidenceLocator'
+            - $ref: '#/components/schemas/VisualizationEvidenceLocator'
+            - type: 'null'
+        excerpt: { type: [string, 'null'], maxLength: 2000 }
+        extraction:
+          description: Required for derived evidence; raw source assets may be null.
+          oneOf:
+            - $ref: '#/components/schemas/DocumentExtractionProvenance'
+            - $ref: '#/components/schemas/GenericExtractionProvenance'
+            - $ref: '#/components/schemas/VisualizationProvenance'
+            - type: 'null'
+        rightsStatus: { $ref: '#/components/schemas/RightsStatus' }
+        rightsBasisUrl: { type: [string, 'null'], format: uri }
+        attribution: { type: [string, 'null'] }
+        altText: { type: [string, 'null'] }
+        confidence: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        confidenceDetail: { type: [object, 'null'], additionalProperties: true }
+        lowConfidenceReasons:
+          type: array
+          description: >-
+            The complete non-sensitive immutable reason manifest, ordered with high-impact reasons
+            first and deterministic tie-breaks. Its Unicode-NFC RFC-8785-JCS SHA-256 must equal the
+            provenance lowConfidenceReasonsHash; approval is forbidden if the full array cannot be
+            loaded and verified.
+          items: { $ref: '#/components/schemas/LowConfidenceReason' }
+        reviewSubjectSchemaVersion: { type: string, const: v1 }
+        reviewSubjectHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: >-
+            SHA-256 of Unicode-NFC and RFC-8785-JCS canonical JSON v1 over immutable
+            source/evidence/child-extraction fields only.
+            Document completion, coverage, rights, review, publication projections, decisions and
+            timestamps are excluded so an approval cannot invalidate itself.
+        latestManualReviewDecision:
+          description: >-
+            Current-subject decision only; historical or stale decisions remain in the audit log.
+            The compact projection omits repeated evidence/subject/provenance IDs. The server checks
+            the underlying full decision row: matching EvidenceAuditSnapshot and subject version/hash;
+            before purge its nullable evidenceId also matches the enclosing asset; document
+            extractionRunId equals extraction.extractionRunId with generic ID null, generic evidence
+            uses the inverse, and raw evidence has both null. These are transactional invariants.
+          oneOf:
+            - $ref: '#/components/schemas/EvidenceReviewDecisionSummary'
+            - type: 'null'
+        reviewState: { type: string, enum: [pending, passed, rejected, manual_required] }
+        manualReviewRequired:
+          type: boolean
+          description: Must be true for low-confidence or conflicting high-impact values until explicit administrator review; cross-evidence cannot clear it automatically.
+        publishable:
+          type: boolean
+          description: >-
+            Server projection only. For document-derived evidence, true requires loading the parent
+            DocumentExtractionSummary, verifying documentComplete=true and confirming this evidence
+            ID/checksum/locator is present in selectedEvidenceManifestHash with every selected
+            low-confidence child approved. Clients cannot set this value.
+        exclusionReason: { type: [string, 'null'] }
+      allOf:
+        - if:
+            required: [derivationType]
+            properties:
+              derivationType: { enum: [raw, document_derived, other_derived] }
+          then:
+            properties:
+              sourceItemId: { type: string, format: uuid }
+              originCollectionRunId: { type: string, format: uuid }
+              originRunSourceItemId: { type: string, format: uuid }
+              originSourceSnapshotId: { type: string, format: uuid }
+              sourceChecksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+              sourceTitle: { type: string }
+              sourceUrl: { type: string, format: uri }
+        - if:
+            required: [derivationType]
+            properties:
+              derivationType: { const: raw }
+          then:
+            properties:
+              extraction: { type: 'null' }
+              lowConfidenceReasons: { maxItems: 0 }
+        - if:
+            required: [derivationType]
+            properties:
+              derivationType: { const: document_derived }
+          then:
+            required: [extraction, locator, confidence]
+            properties:
+              extraction: { $ref: '#/components/schemas/DocumentExtractionProvenance' }
+              locator: { $ref: '#/components/schemas/DocumentEvidenceLocator' }
+              confidence: { type: number, minimum: 0, maximum: 1 }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: document_derived }
+              extraction:
+                type: object
+                required: [inputKind]
+                properties:
+                  inputKind: { const: standalone_image }
+          then:
+            properties:
+              locator:
+                allOf:
+                  - $ref: '#/components/schemas/DocumentEvidenceLocator'
+                  - properties:
+                      pageIndex: { const: 0 }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: document_derived }
+              extraction:
+                type: object
+                required: [runState]
+                properties:
+                  runState: { const: succeeded }
+          then:
+            properties:
+              lowConfidenceReasons: { maxItems: 0 }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: document_derived }
+              extraction:
+                type: object
+                required: [runState]
+                properties:
+                  runState: { const: low_confidence }
+          then:
+            properties:
+              lowConfidenceReasons: { minItems: 1 }
+        - if:
+            required: [derivationType]
+            properties:
+              derivationType: { const: other_derived }
+          then:
+            required: [extraction, locator]
+            properties:
+              extraction: { $ref: '#/components/schemas/GenericExtractionProvenance' }
+              locator: { $ref: '#/components/schemas/OtherEvidenceLocator' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [attemptState]
+                properties:
+                  attemptState: { const: succeeded }
+          then:
+            properties:
+              lowConfidenceReasons: { maxItems: 0 }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [attemptState]
+                properties:
+                  attemptState: { const: low_confidence }
+          then:
+            properties:
+              lowConfidenceReasons:
+                minItems: 1
+                items: { $ref: '#/components/schemas/GenericLowConfidenceReason' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [validationMode]
+                properties:
+                  validationMode: { const: calibrated }
+          then:
+            required: [confidence]
+            properties:
+              confidence: { type: number, minimum: 0, maximum: 1 }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [validationMode]
+                properties:
+                  validationMode: { enum: [deterministic, manual] }
+          then:
+            properties:
+              confidence: { type: 'null' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: html_parser }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/HtmlEvidenceLocator' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: structured_parser }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/StructuredEvidenceLocator' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: spreadsheet_parser }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/SpreadsheetEvidenceLocator' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: hwpx_parser }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/HwpxEvidenceLocator' }
+              confidence: { type: 'null' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: legacy_hwp_converter }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/HwpConversionLocator' }
+              confidence: { type: 'null' }
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: browser_capture }
+          then:
+            properties:
+              locator:
+                oneOf:
+                  - $ref: '#/components/schemas/HtmlEvidenceLocator'
+                  - $ref: '#/components/schemas/ImageRegionEvidenceLocator'
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: media_parser }
+          then:
+            properties:
+              locator:
+                oneOf:
+                  - $ref: '#/components/schemas/MediaEvidenceLocator'
+                  - $ref: '#/components/schemas/ImageRegionEvidenceLocator'
+        - if:
+            required: [derivationType, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              extraction:
+                type: object
+                required: [engine]
+                properties:
+                  engine: { const: manual_entry }
+          then:
+            properties:
+              locator: { $ref: '#/components/schemas/ManualEvidenceLocator' }
+        - if:
+            required: [derivationType]
+            properties:
+              derivationType: { const: visualization_derived }
+          then:
+            required: [extraction, locator]
+            properties:
+              sourceItemId: { type: 'null' }
+              originCollectionRunId: { type: 'null' }
+              originRunSourceItemId: { type: 'null' }
+              originSourceSnapshotId: { type: 'null' }
+              sourceChecksum: { type: 'null' }
+              sourceTitle: { type: 'null' }
+              sourceUrl: { type: 'null' }
+              locator: { $ref: '#/components/schemas/VisualizationEvidenceLocator' }
+              extraction: { $ref: '#/components/schemas/VisualizationProvenance' }
+              confidence: { type: 'null' }
+              lowConfidenceReasons: { maxItems: 0 }
+        - if:
+            required: [derivationType, extraction, latestManualReviewDecision]
+            properties:
+              derivationType: { const: document_derived }
+              latestManualReviewDecision: { type: 'null' }
+              extraction:
+                type: object
+                required: [runState]
+                properties:
+                  runState: { const: low_confidence }
+          then:
+            properties:
+              manualReviewRequired: { const: true }
+              publishable: { const: false }
+              reviewState: { const: manual_required }
+              lowConfidenceReasons: { minItems: 1 }
+        - if:
+            required: [derivationType, extraction, latestManualReviewDecision]
+            properties:
+              derivationType: { const: other_derived }
+              latestManualReviewDecision: { type: 'null' }
+              extraction:
+                type: object
+                required: [attemptState]
+                properties:
+                  attemptState: { const: low_confidence }
+          then:
+            properties:
+              manualReviewRequired: { const: true }
+              publishable: { const: false }
+              reviewState: { const: manual_required }
+              lowConfidenceReasons: { minItems: 1 }
+        - if:
+            required: [manualReviewRequired]
+            properties:
+              manualReviewRequired: { const: true }
+          then:
+            properties:
+              publishable: { const: false }
+              reviewState: { const: manual_required }
+              latestManualReviewDecision: { type: 'null' }
+        - if:
+            required: [latestManualReviewDecision]
+            properties:
+              latestManualReviewDecision:
+                type: object
+                required: [decision]
+                properties:
+                  decision: { const: approved }
+          then:
+            properties:
+              manualReviewRequired: { const: false }
+              reviewState: { const: passed }
+        - if:
+            required: [latestManualReviewDecision]
+            properties:
+              latestManualReviewDecision:
+                type: object
+                required: [decision]
+                properties:
+                  decision: { const: rejected }
+          then:
+            properties:
+              manualReviewRequired: { const: false }
+              publishable: { const: false }
+              reviewState: { const: rejected }
+        - if:
+            required: [publishable]
+            properties:
+              publishable: { const: true }
+          then:
+            required: [rightsBasisUrl]
+            properties:
+              manualReviewRequired: { const: false }
+              reviewState: { const: passed }
+              rightsStatus:
+                type: string
+                enum: [allowed, attribution_required]
+              rightsBasisUrl: { type: string, format: uri, minLength: 1 }
+        - if:
+            required: [publishable, rightsStatus]
+            properties:
+              publishable: { const: true }
+              rightsStatus: { const: attribution_required }
+          then:
+            required: [attribution]
+            properties:
+              attribution: { type: string, minLength: 1 }
+        - if:
+            required: [publishable, kind]
+            properties:
+              publishable: { const: true }
+              kind: { enum: [image, chart, screenshot] }
+          then:
+            required: [altText]
+            properties:
+              altText: { type: string, minLength: 1 }
+        - if:
+            required: [derivationType, publishable]
+            properties:
+              derivationType: { const: document_derived }
+              publishable: { const: true }
+          then:
+            required: [extraction]
+            properties:
+              manualReviewRequired: { const: false }
+              reviewState: { const: passed }
+              extraction:
+                allOf:
+                  - $ref: '#/components/schemas/DocumentExtractionProvenance'
+                  - properties:
+                      runComplete: { const: true }
+                      runState: { enum: [succeeded, low_confidence] }
+        - if:
+            required: [derivationType, publishable, extraction]
+            properties:
+              derivationType: { const: document_derived }
+              publishable: { const: true }
+              extraction:
+                type: object
+                required: [runState]
+                properties:
+                  runState: { const: low_confidence }
+          then:
+            required: [latestManualReviewDecision]
+            properties:
+              latestManualReviewDecision:
+                allOf:
+                  - $ref: '#/components/schemas/EvidenceReviewDecisionSummary'
+                  - properties:
+                      decision: { const: approved }
+        - if:
+            required: [derivationType, publishable, extraction]
+            properties:
+              derivationType: { const: other_derived }
+              publishable: { const: true }
+              extraction:
+                type: object
+                required: [attemptState]
+                properties:
+                  attemptState: { const: low_confidence }
+          then:
+            required: [latestManualReviewDecision]
+            properties:
+              latestManualReviewDecision:
+                allOf:
+                  - $ref: '#/components/schemas/EvidenceReviewDecisionSummary'
+                  - properties:
+                      decision: { const: approved }
+    EvidenceListItem:
+      type: object
+      additionalProperties: false
+      required: [id, sourceItemId, originCollectionRunId, originRunSourceItemId, originSourceSnapshotId, derivationType, kind, sourceTitle, sourceUrl, rightsStatus, lowConfidenceReasonSummaries, lowConfidenceReasonCount, lowConfidenceReasonsTruncated, manualReviewRequired, publishable, reviewState]
+      properties:
+        id: { type: string, format: uuid }
+        sourceItemId: { type: [string, 'null'], format: uuid }
+        originCollectionRunId: { type: [string, 'null'], format: uuid }
+        originRunSourceItemId: { type: [string, 'null'], format: uuid }
+        originSourceSnapshotId: { type: [string, 'null'], format: uuid }
+        derivationType: { $ref: '#/components/schemas/EvidenceDerivationType' }
+        kind: { $ref: '#/components/schemas/EvidenceKind' }
+        sourceTitle: { type: [string, 'null'] }
+        sourceUrl: { type: [string, 'null'], format: uri }
+        rightsStatus: { $ref: '#/components/schemas/RightsStatus' }
+        lowConfidenceReasonSummaries:
+          type: array
+          maxItems: 20
+          description: High-impact-first bounded preview of the complete manifest.
+          items: { $ref: '#/components/schemas/LowConfidenceReason' }
+        lowConfidenceReasonCount: { type: integer, minimum: 0 }
+        lowConfidenceReasonsTruncated: { type: boolean }
+        manualReviewRequired: { type: boolean }
+        publishable: { type: boolean }
+        reviewState: { type: string, enum: [pending, passed, rejected, manual_required] }
+        exclusionReason: { type: [string, 'null'] }
+      description: >-
+        List projection only. Summaries are the first 20 entries of the complete deterministic
+        high-impact-first manifest; count equals the full count and truncated is true iff count is
+        greater than the returned length. Approval must use GET /evidence/{evidenceId} and verify the
+        complete manifest hash.
+    EvidencePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceListItem' }
+        nextCursor: { type: [string, 'null'] }
+
+    ArticleState:
+      type: string
+      enum: [drafting, review_ready, approved, publishing, published, blocked, correction_pending, stopped, failed]
+    ArticleRevision:
+      type: object
+      required: [revisionNo, title, summary, bodyBlocks, contentHash, provenanceKind, generationAttemptId, inputEvidenceManifestHash, generationPipelineManifestHash, claimGraphState, qualityGateManifestHash, qualityReportHash, createdAt]
+      properties:
+        revisionNo: { type: integer, minimum: 1 }
+        title: { type: string }
+        summary: { type: string }
+        bodyBlocks:
+          type: array
+          items:
+            type: object
+            required: [id, type, content]
+            properties:
+              id: { type: string }
+              type: { type: string, enum: [facts, background, analysis, forecast, caution, sources, correction] }
+              content: { type: string }
+        contentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        provenanceKind: { type: string, enum: [automated, admin_edit] }
+        generationAttemptId: { type: [string, 'null'], format: uuid }
+        inputEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        generationPipelineManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        claimGraphState: { type: string, enum: [queued, running, passed, blocked] }
+        qualityGateManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        qualityReportHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        correctionNote: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+      allOf:
+        - if:
+            required: [provenanceKind]
+            properties:
+              provenanceKind: { const: automated }
+          then:
+            properties:
+              generationAttemptId: { type: string, format: uuid }
+              generationPipelineManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+          else:
+            properties:
+              generationAttemptId: { type: 'null' }
+              generationPipelineManifestHash: { type: 'null' }
+    ArticleSummary:
+      type: object
+      required: [id, topic, articleType, articleIdentityKey, localDigestDate, digestPolicyVersion, state, title, currentRevisionNo, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        articleType:
+          type: string
+          enum: [housing_notice, housing_correction, semiconductor_daily_digest, semiconductor_breaking, correction]
+        articleIdentityKey: { type: string, minLength: 1 }
+        localDigestDate: { type: [string, 'null'], format: date }
+        digestPolicyVersion: { type: [integer, 'null'], minimum: 1 }
+        state: { $ref: '#/components/schemas/ArticleState' }
+        title: { type: string }
+        currentRevisionNo: { type: integer, minimum: 1 }
+        updatedAt: { type: string, format: date-time }
+    Claim:
+      type: object
+      required: [id, statement, type, riskLevel, verificationState, evidenceIds]
+      properties:
+        id: { type: string, format: uuid }
+        statement: { type: string }
+        type: { type: string, enum: [fact, company_claim, analysis, forecast, disclaimer] }
+        riskLevel: { type: string, enum: [normal, high] }
+        verificationState: { type: string, enum: [pending, verified, conflicted, rejected] }
+        evidenceIds:
+          type: array
+          items: { type: string, format: uuid }
+    QualityCheck:
+      type: object
+      required: [code, result, blocking]
+      properties:
+        code: { type: string }
+        result: { type: string, enum: [passed, failed, manual_required] }
+        score: { type: [number, 'null'] }
+        blocking: { type: boolean }
+        details: { type: object, additionalProperties: true }
+    ArticleEventCluster:
+      type: object
+      additionalProperties: false
+      required: [eventClusterId, role, displayOrder, inclusionReason, clusterSnapshotHash]
+      properties:
+        eventClusterId: { type: string, format: uuid }
+        role: { type: string, enum: [lead, supporting, held] }
+        displayOrder: { type: integer, minimum: 0 }
+        inclusionReason: { type: string }
+        clusterSnapshotHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ChannelBinding:
+      oneOf:
+        - type: object
+          required: [channel, channelRole]
+          properties:
+            channel: { type: string, const: wordpress }
+            channelRole: { type: string, const: primary_canonical }
+        - type: object
+          required: [channel, channelRole]
+          properties:
+            channel: { type: string, const: blogger }
+            channelRole: { type: string, const: secondary_distribution }
+    PublicationState:
+      type: string
+      enum: [pending, scheduled, in_progress, published, updating, withdrawing, withdrawn, marking_withdrawn, marked_withdrawn, reconciling, retryable_failed, permanent_failed, manual_required]
+    RemotePublicationState:
+      type: string
+      enum: [draft, scheduled, published, withdrawn, deleted, unknown]
+    Publication:
+      allOf:
+        - $ref: '#/components/schemas/ChannelBinding'
+        - type: object
+          required: [targetId, state, remoteState]
+          properties:
+            targetId: { type: string, format: uuid }
+            state: { $ref: '#/components/schemas/PublicationState' }
+            remoteState: { $ref: '#/components/schemas/RemotePublicationState' }
+            remotePostId: { type: [string, 'null'] }
+            remoteUrl: { type: [string, 'null'], format: uri }
+            canonicalSourceUrl: { type: [string, 'null'], format: uri }
+            scheduledFor: { type: [string, 'null'], format: date-time }
+            canonicalReadyAt: { type: [string, 'null'], format: date-time }
+            publishedAt: { type: [string, 'null'], format: date-time }
+            publishedRevisionNo: { type: [integer, 'null'] }
+            errorCode: { type: [string, 'null'] }
+    ArticleDetail:
+      allOf:
+        - $ref: '#/components/schemas/ArticleSummary'
+        - type: object
+          required: [revision, clusterMemberships, claims, evidence, qualityChecks, publications]
+          properties:
+            revision: { $ref: '#/components/schemas/ArticleRevision' }
+            clusterMemberships:
+              type: array
+              items: { $ref: '#/components/schemas/ArticleEventCluster' }
+            claims:
+              type: array
+              items: { $ref: '#/components/schemas/Claim' }
+            evidence:
+              type: array
+              items: { $ref: '#/components/schemas/EvidenceAsset' }
+            qualityChecks:
+              type: array
+              items: { $ref: '#/components/schemas/QualityCheck' }
+            publications:
+              type: array
+              items: { $ref: '#/components/schemas/Publication' }
+    ArticlePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ArticleSummary' }
+        nextCursor: { type: [string, 'null'] }
+    CreateRevisionRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Creates an admin_edit revision in drafting state. Claims, evidence links, visualizations,
+        checks, renders, intents and approvals are regenerated for the new revision; preview and
+        publication remain blocked until claimGraphState and every blocking check pass.
+      required: [baseRevisionNo, requestKey, title, summary, bodyBlocks, editReason]
+      properties:
+        baseRevisionNo: { type: integer, minimum: 1 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        title: { type: string, minLength: 1 }
+        summary: { type: string, minLength: 1 }
+        bodyBlocks: { $ref: '#/components/schemas/ArticleRevision/properties/bodyBlocks' }
+        editReason: { type: string, minLength: 3, maxLength: 500 }
+    ChannelPreview:
+      type: object
+      required: [renderId, targetId, targetSnapshotId, targetConfigHash, channelRole, renderStage, canonicalLinkState, title, sanitizedHtml, sourceLinks, includedClaimIds, canonicalSourceUrl, violations, templateHash, renderHash, sourceManifestHash]
+      properties:
+        renderId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        channelRole: { type: string, enum: [primary_canonical, secondary_distribution] }
+        renderStage: { type: string, enum: [preview, final] }
+        canonicalLinkState: { type: string, enum: [not_applicable, pending, resolved] }
+        title: { type: string }
+        sanitizedHtml: { type: string }
+        sourceLinks:
+          type: array
+          items: { type: string, format: uri }
+        includedClaimIds:
+          type: array
+          items: { type: string, format: uuid }
+        canonicalSourceUrl: { type: [string, 'null'], format: uri }
+        violations:
+          type: array
+          items: { type: string }
+        templateHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        renderHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+      allOf:
+        - oneOf:
+            - properties:
+                channelRole: { const: primary_canonical }
+                canonicalLinkState: { const: not_applicable }
+                canonicalSourceUrl: { type: 'null' }
+            - properties:
+                channelRole: { const: secondary_distribution }
+                renderStage: { const: preview }
+                canonicalLinkState: { const: pending }
+                canonicalSourceUrl: { type: 'null' }
+            - properties:
+                channelRole: { const: secondary_distribution }
+                renderStage: { const: final }
+                canonicalLinkState: { const: resolved }
+                canonicalSourceUrl: { type: string, format: uri }
+    PublicationIntentRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        targetCommands must have a one-to-one ID and snapshot/hash match with targetSnapshots. In
+        validated_auto mode, target, validation and activation ref sets are also identical and each
+        activation binds the exact supplied validation material.
+      required: [revisionNo, expectedRevisionContentHash, correctionCaseId, targetSnapshots, targetCommands, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, expectedLatestIntentId, requestKey]
+      properties:
+        revisionNo: { type: integer, minimum: 1 }
+        expectedRevisionContentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        correctionCaseId: { type: [string, 'null'], format: uuid }
+        targetSnapshots:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TargetSnapshotRef' }
+        targetCommands:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TargetCommand' }
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        expectedLatestIntentId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+      allOf:
+        - if:
+            required: [approvalMode]
+            properties:
+              approvalMode: { const: validated_auto }
+          then:
+            properties:
+              autoPublishValidationRefs: { minItems: 1 }
+              autoPublishActivationRefs: { minItems: 1 }
+          else:
+            properties:
+              autoPublishValidationRefs: { maxItems: 0 }
+              autoPublishActivationRefs: { maxItems: 0 }
+    PublicationIntent:
+      type: object
+      additionalProperties: false
+      required: [id, articleId, revisionNo, revisionContentHash, generationAttemptId, inputEvidenceManifestHash, generationPipelineManifestHash, qualityGateManifestHash, qualityReportHash, correctionCaseId, targetSnapshots, targetCommands, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, supersedesIntentId, intentHash, requestKey, state, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        articleId: { type: string, format: uuid }
+        revisionNo: { type: integer, minimum: 1 }
+        revisionContentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        generationAttemptId: { type: [string, 'null'], format: uuid }
+        inputEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        generationPipelineManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        qualityGateManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        qualityReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        correctionCaseId: { type: [string, 'null'], format: uuid }
+        targetSnapshots:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TargetSnapshotRef' }
+        targetCommands:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TargetCommand' }
+        targetSnapshotManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        autoActivationManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        supersedesIntentId: { type: [string, 'null'], format: uuid }
+        intentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        state: { type: string, enum: [draft, awaiting_approval, approved, stale, dispatched, cancelled] }
+        createdAt: { type: string, format: date-time }
+    ContentApprovalSubject:
+      type: object
+      additionalProperties: false
+      required: [kind, action, renderId, targetId, targetSnapshotId, targetConfigHash, templateHash, sourceManifestHash]
+      properties:
+        kind: { type: string, const: content_preview }
+        action: { type: string, enum: [create, update, mark_withdrawn] }
+        renderId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        templateHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    UnpublishApprovalSubject:
+      type: object
+      additionalProperties: false
+      required: [kind, action, targetId, targetSnapshotId, targetConfigHash, remotePostId, observedRemoteState, reason, affectedTargetIds, correctionEvidenceManifestHash]
+      properties:
+        kind: { type: string, const: unpublish_command }
+        action: { type: string, const: unpublish }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        remotePostId: { type: string, minLength: 1 }
+        observedRemoteState: { type: string, enum: [published, marked_withdrawn, draft] }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        affectedTargetIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        correctionEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [revisionNo, publicationIntentId, expectedLatestApprovalId, requestKey, reauthProofId, actionSubject, decision]
+      properties:
+        revisionNo: { type: integer, minimum: 1 }
+        publicationIntentId: { type: string, format: uuid }
+        expectedLatestApprovalId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: [string, 'null'], format: uuid }
+        actionSubject:
+          oneOf:
+            - $ref: '#/components/schemas/ContentApprovalSubject'
+            - $ref: '#/components/schemas/UnpublishApprovalSubject'
+        decision: { type: string, enum: [approved, rejected, revoked] }
+        reason: { type: [string, 'null'], maxLength: 500 }
+      allOf:
+        - if:
+            required: [actionSubject]
+            properties:
+              actionSubject:
+                type: object
+                required: [kind]
+                properties:
+                  kind: { const: unpublish_command }
+          then:
+            properties:
+              reauthProofId: { type: string, format: uuid }
+          else:
+            properties:
+              reauthProofId: { type: 'null' }
+    Approval:
+      type: object
+      required: [id, revisionNo, publicationIntentId, approvalSubjectHash, supersedesApprovalId, requestKey, reauthProofId, actionSubject, mode, decision, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        revisionNo: { type: integer }
+        publicationIntentId: { type: string, format: uuid }
+        approvalSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        supersedesApprovalId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: [string, 'null'], format: uuid }
+        actionSubject:
+          oneOf:
+            - $ref: '#/components/schemas/ContentApprovalSubject'
+            - $ref: '#/components/schemas/UnpublishApprovalSubject'
+        mode: { type: string, enum: [manual, validated_auto] }
+        decision: { type: string, enum: [approved, rejected, revoked] }
+        decidedAt: { type: string, format: date-time }
+    PublishRequest:
+      type: object
+      description: >-
+        Initial requests containing a Blogger target must also contain the
+        primary WordPress target unless that exact revision already has a
+        successful WordPress publication. WordPress is always dispatched first.
+      required: [revisionNo, publicationIntentId, targetIds, expectedTargetSnapshots, requestKey]
+      properties:
+        revisionNo: { type: integer, minimum: 1 }
+        publicationIntentId: { type: string, format: uuid }
+        targetIds:
+          type: array
+          minItems: 1
+          description: Must include the WordPress primary target when Blogger is selected.
+          items: { type: string, format: uuid }
+        expectedTargetSnapshots:
+          type: array
+          description: >-
+            Must match the immutable target snapshots bound to the current PublicationIntent,
+            target command, action-specific approval and render when applicable. Any
+            current target config mismatch returns 409 before an external write.
+          items: { $ref: '#/components/schemas/TargetSnapshotRef' }
+        publishAt:
+          type: [string, 'null']
+          format: date-time
+          description: Normalized to UTC; the internal scheduler publishes WordPress first and waits for public verification before Blogger.
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+
+    ScheduleInput:
+      type: object
+      description: >-
+        A schedule containing Blogger must also contain the primary WordPress target. In
+        validated_auto mode, targetIds and validation/activation ref targetId sets are identical,
+        unique and bound to the same target snapshots; the server rejects relational mismatches.
+      required: [topic, cronExpression, timezone, targetIds, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, overlapPolicy]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        cronExpression: { type: string, pattern: '^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$' }
+        timezone: { type: string, default: Asia/Seoul }
+        windowMinutes: { type: integer, minimum: 1, maximum: 10080 }
+        targetIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        overlapPolicy: { type: string, enum: [skip, queue_one] }
+        enabled: { type: boolean }
+      allOf:
+        - if:
+            required: [approvalMode]
+            properties:
+              approvalMode: { const: validated_auto }
+          then:
+            properties:
+              autoPublishValidationRefs: { minItems: 1 }
+              autoPublishActivationRefs: { minItems: 1 }
+          else:
+            properties:
+              autoPublishValidationRefs: { maxItems: 0 }
+              autoPublishActivationRefs: { maxItems: 0 }
+    Schedule:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleInput'
+        - type: object
+          required: [id, version, autoValidationManifestHash, autoActivationManifestHash]
+          properties:
+            id: { type: string, format: uuid }
+            version: { type: integer, minimum: 1 }
+            autoValidationManifestHash:
+              type: [string, 'null']
+              pattern: '^[a-f0-9]{64}$'
+            autoActivationManifestHash:
+              type: [string, 'null']
+              pattern: '^[a-f0-9]{64}$'
+            nextRunAt: { type: [string, 'null'], format: date-time }
+            lastDispatchedAt: { type: [string, 'null'], format: date-time }
+            validatedPolicyVersion: { type: [integer, 'null'] }
+
+    PublicationTargetInput:
+      allOf:
+        - $ref: '#/components/schemas/ChannelBinding'
+        - type: object
+          required: [environment, displayName, baseUrl]
+          properties:
+            environment: { type: string, enum: [test, production] }
+            displayName: { type: string, minLength: 1, maxLength: 200 }
+            baseUrl: { type: string, format: uri }
+            remoteBlogId: { type: [string, 'null'] }
+            canaryTargetId: { type: [string, 'null'], format: uuid, description: Same-channel test target required for production automatic publication. }
+            usernameRef: { type: [string, 'null'], description: Secret-store reference for the WordPress username. }
+            credentialRef: { type: [string, 'null'], description: Secret-store reference; never the credential value. }
+    PublicationTargetPatch:
+      type: object
+      description: Channel, channelRole, environment, baseUrl and remoteBlogId are immutable destination identity; create a new target to change them.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        displayName: { type: string, minLength: 1, maxLength: 200 }
+        canaryTargetId: { type: [string, 'null'], format: uuid }
+        usernameRef: { type: [string, 'null'] }
+        credentialRef: { type: [string, 'null'] }
+    TargetValidationState:
+      type: string
+      enum: [not_run, passed, failed, stale]
+    CanaryRequest:
+      type: object
+      required: [confirmIsolatedTestTarget, policyVersion, reason]
+      properties:
+        confirmIsolatedTestTarget: { type: boolean, const: true }
+        policyVersion: { type: string, minLength: 1 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    AutoPublishValidationRequest:
+      type: object
+      required: [topic, targetSnapshotId, targetConfigHash, sourceRegistrySnapshotId, registryManifestHash, sourceAdapterManifestHash, extractionProfileManifestHash, generationPipelineManifestHash, topicPolicyVersion, editorialPolicyHash, qualityGateManifestHash, renderContractVersion, channelContractVersion, publisherAdapterManifestHash, testReportObjectKey, testReportObjectVersion, testReportHash, requestKey]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        targetSnapshotId: { type: string, format: uuid }
+        targetConfigHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceRegistrySnapshotId: { type: string, format: uuid }
+        registryManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceAdapterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        extractionProfileManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        generationPipelineManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        topicPolicyVersion: { type: integer, minimum: 1 }
+        editorialPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        qualityGateManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        renderContractVersion: { type: string, minLength: 1 }
+        channelContractVersion: { type: string, minLength: 1 }
+        publisherAdapterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        testReportObjectKey: { type: string, minLength: 1 }
+        testReportObjectVersion: { type: string, minLength: 1 }
+        testReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+    AutoPublishValidationCreateRequest:
+      allOf:
+        - $ref: '#/components/schemas/AutoPublishValidationRequest'
+      unevaluatedProperties: false
+    AutoPublishValidation:
+      allOf:
+        - $ref: '#/components/schemas/AutoPublishValidationRequest'
+        - type: object
+          required: [id, materialHash, status, latestDecisionId, decisionVersion, createdAt]
+          properties:
+            id: { type: string, format: uuid }
+            materialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+            status: { type: string, enum: [draft, passed, revoked, stale] }
+            latestDecisionId: { type: [string, 'null'], format: uuid }
+            decisionVersion: { type: integer, minimum: 0 }
+            createdAt: { type: string, format: date-time }
+      unevaluatedProperties: false
+    AutoPublishValidationDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, expectedLatestDecisionId, requestKey, reauthProofId, reason]
+      properties:
+        decision: { type: string, enum: [passed, revoked] }
+        expectedLatestDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    AutoPublishValidationDecision:
+      type: object
+      additionalProperties: false
+      required: [id, validationId, version, decision, supersedesDecisionId, requestKey, decisionHash, decidedBy, decidedAt, reason]
+      properties:
+        id: { type: string, format: uuid }
+        validationId: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        decision: { type: string, enum: [passed, revoked] }
+        supersedesDecisionId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decidedBy: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    AutoPublishActivationRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled, validationRefs, expectedLatestActivationId, requestKey, reauthProofId, reason]
+      properties:
+        enabled: { type: boolean }
+        validationRefs:
+          type: array
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        expectedLatestActivationId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+      allOf:
+        - if:
+            required: [enabled]
+            properties:
+              enabled: { const: true }
+          then:
+            properties:
+              validationRefs: { minItems: 1 }
+          else:
+            properties:
+              validationRefs: { maxItems: 0 }
+    AutoPublishActivation:
+      type: object
+      additionalProperties: false
+      required: [id, targetId, targetSnapshotId, targetOperationalConfigHash, validationRefs, validationManifestHash, version, decision, supersedesActivationId, requestKey, activationHash, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        targetSnapshotId: { type: string, format: uuid }
+        targetOperationalConfigHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        validationRefs:
+          type: array
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        validationManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        version: { type: integer, minimum: 1 }
+        decision: { type: string, enum: [enabled, revoked] }
+        supersedesActivationId: { type: [string, 'null'], format: uuid }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        activationHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decidedAt: { type: string, format: date-time }
+    AutoPublishActivationResult:
+      type: object
+      additionalProperties: false
+      required: [activation, target]
+      properties:
+        activation: { $ref: '#/components/schemas/AutoPublishActivation' }
+        target: { $ref: '#/components/schemas/PublicationTarget' }
+    PublicationTarget:
+      allOf:
+        - $ref: '#/components/schemas/ChannelBinding'
+        - type: object
+          required: [id, currentSnapshotId, currentSnapshotVersion, currentConfigHash, publisherContractVersion, publisherAdapterManifestHash, environment, displayName, baseUrl, connectionState, preflightState, canaryState, pilotState, capabilities, autoPublishEnabled, autoPublishActivationId, autoPublishActivationVersion]
+          properties:
+            id: { type: string, format: uuid }
+            currentSnapshotId: { type: string, format: uuid }
+            currentSnapshotVersion: { type: integer, minimum: 1 }
+            currentConfigHash:
+              type: string
+              pattern: '^[a-f0-9]{64}$'
+              description: Operational target configuration hash; the automatic-publication toggle is intentionally excluded.
+            publisherContractVersion: { type: string, minLength: 1 }
+            publisherAdapterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+            environment: { type: string, enum: [test, production] }
+            displayName: { type: string }
+            baseUrl: { type: string, format: uri }
+            remoteBlogId: { type: [string, 'null'] }
+            canaryTargetId: { type: [string, 'null'], format: uuid }
+            connectionState: { type: string, enum: [pending, verified, expired, revoked, blocked] }
+            preflightState: { $ref: '#/components/schemas/TargetValidationState' }
+            canaryState: { $ref: '#/components/schemas/TargetValidationState' }
+            pilotState: { $ref: '#/components/schemas/TargetValidationState' }
+            canaryPolicyVersion: { type: [string, 'null'] }
+            capabilities:
+              type: object
+              description: Camel-case serialization of create, update, unpublish, mark_withdrawn, draft, schedule and media_upload.
+              required: [create, update, unpublish, markWithdrawn, draft, schedule, mediaUpload]
+              properties:
+                create: { type: boolean }
+                update: { type: boolean }
+                unpublish: { type: boolean }
+                markWithdrawn: { type: boolean }
+                draft: { type: boolean }
+                schedule: { type: boolean }
+                mediaUpload: { type: boolean }
+            autoPublishEnabled:
+              type: boolean
+              description: True only while the latest enabled activation matches this operational snapshot and all bound validations remain current and passed.
+            autoPublishActivationId: { type: [string, 'null'], format: uuid }
+            autoPublishActivationVersion: { type: [integer, 'null'], minimum: 1 }
+            lastPreflightAt: { type: [string, 'null'], format: date-time }
+            lastCanaryAt: { type: [string, 'null'], format: date-time }
+            lastPilotAt: { type: [string, 'null'], format: date-time }
+
+    CorrectionCase:
+      type: object
+      required: [id, kind, state, sourceIdentityHash, observedSourceVersionHash, changeKind, correctionSubjectHash, supersedesCaseId, detectedAt, diffSummary]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [correction, retraction, source_unavailable] }
+        state: { type: string, enum: [detected, verifying, verified, applying, completed, rejected, failed] }
+        sourceIdentityHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        observedSourceVersionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        changeKind: { type: string, enum: [corrected, retracted, unavailable, restored] }
+        correctionSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        supersedesCaseId: { type: [string, 'null'], format: uuid }
+        detectedAt: { type: string, format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        diffSummary: { type: object, additionalProperties: true }
+
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required: [id, occurredAt, correlationId, actorType, actorId, action, entityType, entityId, beforeHash, afterHash, reasonCode, metadataSchemaVersion, redactionPolicyVersion, redactionPolicyHash, metadataRedacted]
+      properties:
+        id: { type: string, format: uuid }
+        occurredAt: { type: string, format: date-time }
+        correlationId: { type: string, format: uuid }
+        actorType: { type: string, enum: [admin, system, worker] }
+        actorId: { type: [string, 'null'], format: uuid }
+        action: { type: string }
+        entityType: { type: string }
+        entityId: { type: string, format: uuid }
+        beforeHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        afterHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        reasonCode: { type: [string, 'null'] }
+        metadataSchemaVersion: { type: string, minLength: 1 }
+        redactionPolicyVersion: { type: string, minLength: 1 }
+        redactionPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        metadataRedacted:
+          type: object
+          maxProperties: 50
+          description: Versioned per-action allowlist output; maximum 8 KiB and depth four are enforced by the server before insert and serialization.
+          additionalProperties: true
+    AuditEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEvent' }
+        nextCursor: { type: [string, 'null'] }
+
+    RetentionPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, cutoffAt, requestKey, reason]
+      properties:
+        scope: { type: string, enum: [raw_evidence, unpublished_drafts, wordpress_media, public_delivery_assets, audit_expiry] }
+        cutoffAt: { type: string, format: date-time }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    RetentionExecuteRequest:
+      type: object
+      additionalProperties: false
+      description: requestKey is the authorization idempotency key, distinct from the preview request key.
+      required: [expectedVersion, previewHash, requestKey, reauthProofId, reason]
+      properties:
+        expectedVersion: { type: integer, minimum: 1 }
+        previewHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    RetentionBatch:
+      type: object
+      additionalProperties: false
+      required: [id, scope, cutoffAt, previewReason, authorizationReason, previewHash, impactManifestObjectKey, impactManifestObjectVersion, impactManifestHash, holdManifestObjectKey, holdManifestObjectVersion, holdManifestHash, expectedItemCount, expectedByteCount, state, phase, version, processedCount, skippedHoldCount, failedCount, failureCursor, errorCode, errorDetailRedacted, remediation, requestedBy, authorizedBy, authorizationRequestKey, createdAt, authorizedAt, completedAt]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string, enum: [raw_evidence, unpublished_drafts, wordpress_media, public_delivery_assets, audit_expiry] }
+        cutoffAt: { type: string, format: date-time }
+        previewReason: { type: string, minLength: 3, maxLength: 500 }
+        authorizationReason: { type: [string, 'null'], maxLength: 500 }
+        previewHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        impactManifestObjectKey: { type: string, minLength: 1 }
+        impactManifestObjectVersion: { type: string, minLength: 1 }
+        impactManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        holdManifestObjectKey: { type: string, minLength: 1 }
+        holdManifestObjectVersion: { type: string, minLength: 1 }
+        holdManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedItemCount: { type: integer, minimum: 0 }
+        expectedByteCount: { type: integer, minimum: 0 }
+        state: { type: string, enum: [previewed, authorized, running, completed, failed, cancelled] }
+        phase: { type: string, enum: [not_started, snapshotting, nulling, deleting, tombstoning, done] }
+        version: { type: integer, minimum: 1 }
+        processedCount: { type: integer, minimum: 0 }
+        skippedHoldCount: { type: integer, minimum: 0 }
+        failedCount: { type: integer, minimum: 0 }
+        failureCursor: { type: [string, 'null'] }
+        errorCode: { type: [string, 'null'] }
+        errorDetailRedacted: { type: [string, 'null'] }
+        remediation: { type: [string, 'null'] }
+        requestedBy: { type: string, format: uuid }
+        authorizedBy: { type: [string, 'null'], format: uuid }
+        authorizationRequestKey: { type: [string, 'null'], minLength: 8, maxLength: 200 }
+        createdAt: { type: string, format: date-time }
+        authorizedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+    RetentionBatchItem:
+      type: object
+      additionalProperties: false
+      required: [entityType, entityId, objectVersion, preconditionHash, holdReason, state, resultHash, errorCode, errorDetailRedacted, remediation]
+      properties:
+        entityType: { type: string }
+        entityId: { type: string, format: uuid }
+        objectVersion: { type: [string, 'null'] }
+        preconditionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        holdReason: { type: [string, 'null'] }
+        state: { type: string, enum: [pending, snapshotted, unlinked, deleted, tombstoned, skipped, failed] }
+        resultHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        errorCode: { type: [string, 'null'] }
+        errorDetailRedacted: { type: [string, 'null'] }
+        remediation: { type: [string, 'null'] }
+    RetentionBatchItemPage:
+      type: object
+      additionalProperties: false
+      required: [batchId, impactManifestHash, holdManifestHash, items, nextCursor]
+      properties:
+        batchId: { type: string, format: uuid }
+        impactManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        holdManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RetentionBatchItem' }
+        nextCursor: { type: [string, 'null'] }
+
+    AcceptedJob:
+      type: object
+      required: [jobId, correlationId, acceptedAt]
+      properties:
+        jobId: { type: string, format: uuid }
+        correlationId: { type: string, format: uuid }
+        acceptedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      required: [type, title, status, correlationId]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        code: { type: string }
+        correlationId: { type: string, format: uuid }
+        remediation: { type: [string, 'null'] }

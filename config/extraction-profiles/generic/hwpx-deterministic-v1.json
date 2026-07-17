@@ -1,0 +1,8 @@
+{
+  "profile_key": "hwpx-deterministic-v1", "profile_version": "1.0.0",
+  "engine": "hwpx_parser", "extractor_version": "1.0.0", "package_version": "defusedxml",
+  "runtime_version": "Python-3.12", "pipeline_name": null, "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/hwpx.py"],
+  "config": {"max_entries": 10000, "max_uncompressed_bytes": 524288000, "max_compression_ratio": 200, "external_links": false, "active_content": false}
+}
+

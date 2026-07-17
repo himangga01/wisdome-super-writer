@@ -1,0 +1,95 @@
+{% extends "admin_console/base.html" %}
+{% block title %}발행 · Wisdome{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><p class="eyebrow">PUBLISHING</p><h1>WordPress · Blogger 발행</h1></div>
+</div>
+
+<section class="panel">
+  <h2>발행 대상 연결</h2>
+  <p class="muted">비밀 값은 입력하지 않고 비밀 저장소 참조만 등록합니다. 운영 대상은 읽기 preflight, test canary와 관리자 승인 파일럿을 모두 거친 뒤 자동발행할 수 있습니다.</p>
+  <form id="target-form" class="form-row">
+    <label>채널
+      <select name="channel" id="channel">
+        <option value="wordpress">WordPress · 대표 원문</option>
+        <option value="blogger">Google Blogger · 보조 배포</option>
+      </select>
+    </label>
+    <label>환경
+      <select name="environment"><option value="test">테스트</option><option value="production">운영</option></select>
+    </label>
+    <label>표시 이름<input name="displayName" required maxlength="200"></label>
+    <label>HTTPS 기준 URL<input name="baseUrl" type="url" required placeholder="https://blog.example.com"></label>
+    <label>Blogger blog ID<input name="remoteBlogId" id="remote-blog-id"></label>
+    <label>WordPress 사용자 참조<input name="usernameRef" placeholder="env://WP_USERNAME"></label>
+    <label>자격 증명 참조<input name="credentialRef" required placeholder="env://PUBLISHER_CREDENTIAL"></label>
+    <button type="submit">대상 만들기</button>
+  </form>
+  <p id="target-message" class="muted" role="status"></p>
+</section>
+
+<section class="panel">
+  <div class="page-head"><div><h2>연결 상태</h2><p class="muted">현재 snapshot과 자동발행 activation 기준 상태입니다.</p></div><button id="refresh-targets" type="button">새로고침</button></div>
+  <div id="target-list" class="list"><p class="muted">불러오는 중…</p></div>
+</section>
+
+<section class="panel">
+  <h2>최근 채널 상태</h2>
+  <p class="muted">글별 세부 화면에서 승인된 미리보기와 target snapshot을 확인한 뒤 발행합니다.</p>
+  <div class="list" id="publication-list"><p class="muted">글을 선택하면 채널별 상태가 표시됩니다.</p></div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const api = '/api/v1';
+  const headers = {'Content-Type': 'application/json', 'X-CSRFToken': window.csrfToken};
+  const list = document.getElementById('target-list');
+  const message = document.getElementById('target-message');
+  const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+
+  async function loadTargets() {
+    list.innerHTML = '<p class="muted">불러오는 중…</p>';
+    const response = await fetch(`${api}/targets`, {headers: {'X-CSRFToken': window.csrfToken}});
+    const rows = await response.json();
+    if (!response.ok) { list.textContent = rows.detail || '대상을 불러오지 못했습니다.'; return; }
+    if (!rows.length) { list.innerHTML = '<p class="muted">아직 연결된 발행 대상이 없습니다.</p>'; return; }
+    list.innerHTML = rows.map(row => `
+      <article class="list-item">
+        <div>
+          <strong>${escapeHtml(row.displayName)}</strong>
+          <div class="muted">${escapeHtml(row.channel)} · ${escapeHtml(row.environment)} · snapshot ${row.currentSnapshotVersion}</div>
+          <div><span class="badge">연결 ${escapeHtml(row.connectionState)}</span> <span class="badge">preflight ${escapeHtml(row.preflightState)}</span> <span class="badge">canary ${escapeHtml(row.canaryState)}</span> <span class="badge">자동 ${row.autoPublishEnabled ? 'ON' : 'OFF'}</span></div>
+        </div>
+        <div><a href="/console/publishing/targets/${row.id}/">검증·설정</a></div>
+      </article>`).join('');
+  }
+
+  document.getElementById('channel').addEventListener('change', event => {
+    document.getElementById('remote-blog-id').required = event.target.value === 'blogger';
+  });
+  document.getElementById('refresh-targets').addEventListener('click', loadTargets);
+  document.getElementById('target-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const channel = form.get('channel');
+    const payload = {
+      channel,
+      channelRole: channel === 'wordpress' ? 'primary_canonical' : 'secondary_distribution',
+      environment: form.get('environment'),
+      displayName: form.get('displayName'),
+      baseUrl: form.get('baseUrl'),
+      remoteBlogId: form.get('remoteBlogId') || null,
+      usernameRef: form.get('usernameRef') || null,
+      credentialRef: form.get('credentialRef') || null
+    };
+    const response = await fetch(`${api}/targets`, {method: 'POST', headers, body: JSON.stringify(payload)});
+    const result = await response.json();
+    message.textContent = response.ok ? '발행 대상을 만들었습니다. preflight를 실행하세요.' : (result.detail || '생성 실패');
+    if (response.ok) { event.target.reset(); await loadTargets(); }
+  });
+  loadTargets();
+})();
+</script>
+{% endblock %}
+

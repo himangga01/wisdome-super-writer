@@ -1,0 +1,239 @@
+# 발행 어댑터 계약
+
+## 목적
+
+채널별 API 차이를 숨기면서 생성, 수정, 철회, 상태 조정과 멱등 처리를 동일한 방식으로
+검증한다. 이 계약을 충족하고 공식·승인된 연동 근거가 있는 채널만 자동발행 대상으로
+활성화할 수 있다.
+
+## 기능 선언
+
+어댑터는 읽기 전용 preflight에서 선언 capability를 반환하고, 쓰기 canary 결과로 이를
+검증한다.
+
+```json
+{
+  "create": true,
+  "update": true,
+  "unpublish": false,
+  "mark_withdrawn": true,
+  "draft": true,
+  "schedule": false,
+  "media_upload": false,
+  "max_title_chars": 0,
+  "max_body_bytes": 0,
+  "max_media_count": 0,
+  "supported_media_types": []
+}
+```
+
+숫자 `0`은 제한이 없다는 의미가 아니라 공식 값이 확인되지 않았음을 뜻한다. 이 경우
+보수적 내부 제한을 두고 샌드박스/테스트 계정 검증 없이는 자동발행을 활성화하지 않는다.
+
+## 입력 DTO
+
+### RenderedArticle
+
+| 필드 | 필수 | 설명 |
+|---|---|---|
+| `article_id` | 예 | 내부 글 UUID |
+| `revision_no` | 예 | 불변 개정 번호 |
+| `channel_role` | 예 | `primary_canonical` 또는 `secondary_distribution` |
+| `render_stage` | 예 | `preview` 또는 `final` |
+| `title` | 예 | 채널 제한 검증을 마친 제목 |
+| `body_html` | 예 | 정화된 채널별 HTML |
+| `labels` | 아니오 | 채널 태그/라벨 |
+| `source_links` | 예 | 독자에게 표시할 출처 목록 |
+| `included_claim_ids` | 예 | 해당 채널 본문에 포함한 검증 주장 ID |
+| `canonical_source_url` | 조건부 | Blogger final 렌더에는 공개 확인된 WordPress URL 필수 |
+| `canonical_link_state` | 예 | `not_applicable`, `pending` 또는 `resolved` |
+| `template_hash` | 예 | 원문 링크·원격 media 자리표시자를 포함한 승인 템플릿 SHA-256 |
+| `media` | 아니오 | 권리·alt 검증을 마친 게시 자산 |
+| `correction_history` | 아니오 | 독자 표시 정정/철회 이력 |
+| `content_hash` | 예 | 렌더 결과 SHA-256 |
+| `source_manifest_hash` | 예 | 렌더에 사용한 사실·출처 목록 SHA-256 |
+
+각 `media`는 `asset_id`, `delivery_kind: wordpress_remote/public_delivery`, `delivery_id`,
+`delivery_url`, `mime_type`, `checksum`, `alt_text`, `caption`, `attribution`, `rights_status`를
+가진다. Blogger의 `delivery_id/url`은 장기 `PublicDeliveryAsset`만 허용하며 90일 원근거
+object key를 직접 노출하지 않는다.
+
+### PublishCommand
+
+| 필드 | 설명 |
+|---|---|
+| `publication_attempt_id` | 이미 생성된 단일 외부 동작 UUID; 모든 이벤트의 라우팅 기준 |
+| `action` | current intent의 해당 target command에 고정된 `create/update/unpublish/mark_withdrawn` |
+| `target_command_hash` | target snapshot, resolved action과 canonical dependency의 지문 |
+| `idempotency_key` | 내부 전역 고유 키 |
+| `remote_lookup_key` | 채널별 결정적 원격 조회 키 |
+| `target_id` | 발행 대상 UUID |
+| `publication_intent_id` | 현재 append-only dispatch intent UUID |
+| `approval_id`, `approval_subject_hash` | 해당 target command의 current action-specific 승인 |
+| `target_snapshot_id`, `target_config_hash` | current PublicationIntent·render·Approval에 고정된 immutable target snapshot |
+| `publisher_contract_version`, `publisher_adapter_manifest_hash` | 승인 당시와 실행 배포의 공식 API mapping 구현 지문 |
+| `auto_publish_activation_id`, `auto_publish_activation_hash` | validated_auto에서 intent가 고정한 enable 결정; manual은 null |
+| `remote_post_id` | update/unpublish/mark_withdrawn에는 필수 |
+| `rendered_article` | create/update/mark_withdrawn에는 필수 |
+| `publish_at` | 내부 스케줄러가 UTC로 정규화한 예정 시각 |
+| `requested_at` | UTC 시각 |
+| `correlation_id` | CollectionRun 또는 CorrectionCase ID |
+
+## 출력 DTO
+
+```json
+{
+  "status": "succeeded",
+  "remote_post_id": "external-id",
+  "remote_url": "https://example.invalid/post",
+  "remote_state": "published",
+  "remote_revision": "optional-etag-or-version",
+  "scheduled_for": null,
+  "published_at": "2026-07-17T00:00:00Z",
+  "request_id": "provider-request-id",
+  "reconcile_required": false
+}
+```
+
+`status`는 `succeeded`, `retryable_failed`, `permanent_failed`, `unknown_outcome` 중 하나다.
+`remote_state`는 `draft`, `scheduled`, `published`, `withdrawn`, `deleted`, `unknown` 중
+하나이며 `scheduled_for`와 `published_at`은 해당 상태에 맞게 nullable이다.
+본문/토큰/개인정보를 오류 객체에 넣지 않는다.
+
+## 필수 동작
+
+0. 외부 호출 전에 PublicationAttempt가 current PublicationIntent의 정확한 target command를
+   가리키며 resolved action/command hash, publisher contract/adapter manifest와 target snapshot
+   ID/hash가 action-specific Approval,
+   적용 가능한 render, current target snapshot과 모두 같은지 트랜잭션으로
+   확인한다. 하나라도 다르면 `target_snapshot_stale`로 외부 쓰기 0건이며 재검증·재승인이
+   필요하다. target ID와 snapshot ref의 target ID도 같아야 하며 현재 배포 adapter manifest가
+   다르면 manual/auto 모두 재-render·재승인 전 외부 호출은 0건이다. 기존 CollectionRun은
+   최초 의도 감사값일 뿐 외부 dispatch의 current snapshot gate가 아니다. target 변경 또는
+   CorrectionCase는 새 superseding PublicationIntent와 새 render/Approval을 만든다.
+   `approval_mode=validated_auto`이면 intent의 AutoPublishActivation ID/version/hash가 target의
+   latest enabled activation과 정확히 같고 그 operational config hash 및 AutoPublishValidation
+   ID/material/status도 intent refs와 같은지 호출 직전에 확인한다. revoke/재활성화가 있거나
+   validation이 stale/revoked면 과거 intent는 stale이며 새 activation을 참조하는 superseding
+   intent 없이 재사용할 수 없다. manual intent는 auto flag와 무관하지만 verified
+   connection/current snapshot 및 명시적 관리자 승인은 여전히 필수다.
+1. `preflight_connection()`은 대상 블로그 소유권, API 경로, 인증 사용자 capability와
+   토큰 만료를 읽기 전용으로 확인한다. 이는 실제 쓰기 성공을 보장하지 않는다.
+   `run_canary()`는 `environment=test`로 확인된 격리 target에서 생성→수정→미디어→공개
+   확인→철회/삭제와 정리를 실행한다. 운영 target은 동일 채널의 현재 canary를 참조하고
+   자체 preflight와 관리자 승인 첫 실제 게시·공개 확인(pilot)을 모두 통과해야
+   자동발행을 활성화할 수 있다.
+2. `render(stage)`는 canonical body block을 채널 허용 HTML로 변환하고 제한 위반 목록을
+   반환한다. 근거·정정 이력은 렌더 단계에서 제거할 수 없다.
+   WordPress preview/final은 `canonical_link_state=not_applicable`이며 final은 승인 media
+   바인딩 후 외부 게시 전에 생성한다. Blogger preview는 원문 링크 자리와
+   `canonical_link_state=pending`을 표시할 수 있다. Blogger final은 WordPress Publication의
+   실제 공개 상태와 비인증 GET 200이 확인된 `remote_url`을 결합하고
+   `canonical_link_state=resolved`로 만든다. preview와 final의
+   `template_hash`는 같아야 하며 승인된 대표 URL·asset ID의 원격 media URL 바인딩 외
+   본문 변경은 재승인을 요구한다. 주 채널과
+   같은 승인 개정의 `source_manifest_hash`를 유지하고, Blogger의 `included_claim_ids`는
+   WordPress 집합의 부분집합이어야 하며 포함한 주장의 의미·출처는 같아야 한다.
+3. `prepare_media()`는 WordPress `(target, asset_checksum, presentation_hash)` 매핑을 잠그고
+   alt/caption/attribution까지 같은 기존 원격 media만 재사용한다. 새 업로드는 checksum과
+   표시 지문 기반 slug 및 description marker를 사용하고 응답
+   유실 시 이를 조회해 정확히 한 건만 조정한다. 승인 템플릿의 해당 asset ID 자리만
+   원격 media ID/URL로 치환하고
+   필요 시 `featured_media`를 지정한다. 외부 호출 전에 revision별 PublicationMedia를
+   `prepared`로 저장하고 asset lease generation을 고정한다. `prepared/active` binding과
+   scheduled/in-progress publish/update/withdraw/reconcile attempt, 공개 `published`와 공개 상태의
+   `marked_withdrawn`을 모두 보호 참조로 계산한다. 완전 `withdrawn/deleted` 또는 원격 본문에서
+   참조 제거가 hash/시각과 함께 확인된 binding만 `removed`로 제외한다.
+   재사용은 asset 행을 잠그고 `orphaned/pending_delete`를 취소한 뒤 lease generation을 올린다.
+   cleanup도 같은 행 잠금과 expected generation CAS에서 보호 refs, in-flight attempts, 열린
+   정정/권리 hold와 최신 원격 본문 확인을 다시 계산한다. 하나라도 바뀌면 삭제를 취소한다.
+   grace 뒤에는 외부 bytes만 삭제하고 ID/URL/checksum/presentation/deleted 시각·사유·reconcile
+   hash mapping tombstone은 발행 감사 만료까지 유지한다.
+   Blogger는 `(asset_checksum, presentation_hash)`의 immutable PublicDeliveryAsset을 만들거나
+   재사용하고 장기 공개 HTTPS URL만 final 렌더에 결합한다. 공개/marked-withdrawn 글 참조가
+   남으면 90일 evidence purge 뒤에도 URL을 유지한다. 모든 원격 본문에서 제거/철회가 확인되고
+   ref=0, 열린 정정·권리 hold 없음, 30일 grace 경과를 같은 lock/CAS에서 재확인한 뒤에만
+   전달 bytes를 삭제한다. 재참조와 delete가 경합하면 lease generation이 바뀌어 stale delete가
+   반드시 무효화된다.
+4. `execute(command)`는 외부 쓰기 한 번을 수행한다. WordPress create는 Publication UUID
+   기반 slug, Blogger create는 UUID 기반 전용 label+HTML comment marker를 사용한다.
+5. `reconcile()`은 응답 유실 등 `unknown_outcome`에서 `remote_lookup_key`로 원격 결과를
+   찾는다. 정확히 한 건이고 marker·대상 blog가 일치할 때만 성공으로 확정하며 0건 또는
+   복수건이면 `manual_required`로 격리한다. 확정 전 create/upload를 반복하지 않는다.
+6. `fetch_remote_state()`는 원격 게시물이 관리자나 외부 정책으로 바뀌었는지 확인한다.
+7. 정정은 항상 기존 `remote_post_id`를 수정하며 새 글을 만들지 않는다.
+8. 철회 API가 없으면 capability에 `unpublish=false`, `mark_withdrawn=true`를 선언하고 기존
+   본문 상단에 철회 안내·시각·출처를 넣는 update를 수행한다.
+9. 예약 요청은 내부 상태를 `scheduled`로 두고 `publish_at`에 WordPress를 `publish`로
+   생성·수정한다. WordPress REST 상태와 비인증 공개 URL 200 응답이 확인된 뒤에만
+   Blogger를 공개한다. WordPress 실패·비공개·지연이면 Blogger도 보류한다. 플랫폼의
+   `future`/`publishDate`는 canary 검증에만 사용하고 두 채널 운영 예약에는 사용하지 않는다.
+   canary에서는 UTC `publish_at`을 WordPress `date_gmt`와 Blogger RFC 3339
+   `publishDate`로 변환하고 왕복 응답 시각을 비교한다.
+10. 정정 또는 `mark_withdrawn`은 WordPress 기존 글과 최신 공개 URL을 먼저 확인한 다음
+   Blogger 기존 글을 수정한다. WordPress permalink가 달라졌다면 Blogger의
+   `canonical_source_url`과 독자 표시 원문 링크를 같은 시도에서 함께 갱신한다.
+11. 완전 `unpublish`는 WordPress가 `withdrawn/deleted/draft` terminal state에 도달한 뒤
+   Blogger `revert/delete`를 실행한다. 이 분기에는 공개 URL 200이나
+   `canonical_source_url`이 필요하지 않으며 이전 URL은 감사용으로만 보존한다.
+
+## 오류 분류
+
+| 분류 | 예 | 처리 |
+|---|---|---|
+| 인증 갱신 가능 | 만료 access token | 한 번 갱신 후 동일 멱등 키 재시도 |
+| 속도 제한/일시 장애 | 429, 5xx, timeout | Retry-After 우선, 지수 백오프+지터, 최대 횟수 제한 |
+| 영구 요청 오류 | 권한 부족, 형식/용량 위반 | 즉시 영구 실패, 관리자 조치 안내 |
+| 결과 불명 | 외부 성공 뒤 연결 종료 | `unknown_outcome`→reconcile; create 즉시 반복 금지 |
+| 정책 차단 | 공식 쓰기 수단 부재/폐기 | target을 `blocked`, 자동발행 비활성화 |
+
+## 채널 구현 게이트
+
+- WordPress 어댑터는 Core REST API의 posts/media route와 HTTPS Application Password를
+  사용한다. Application Password에는 세부 scope가 없으므로 전용 사용자 역할이
+  `read`, `edit_posts`, `edit_published_posts`, `publish_posts`, `delete_posts`,
+  `delete_published_posts`, `upload_files` 등 필요한 capability만 갖고 사이트·사용자·
+  플러그인 관리 권한은 갖지 않아야 한다. preflight와 쓰기 canary를 분리해
+  대상 자체 도메인, permalink, draft/update/trash/media와 공개 확인을 검증한다.
+- Google Blogger 어댑터는 공식 OAuth와 Blogger API의 posts 리소스가 제공하는 실제
+  기능만 선언한다. 별도 바이너리 미디어 업로드는 `false`로 두고 권리가 확인된 공개
+  HTTPS 자산 URL만 본문에 포함한다.
+- 로그인 세션을 Playwright/Selenium으로 조작해 편집기를 자동 클릭하는 방식은 이
+  계약의 합법적 전송 수단으로 인정하지 않는다.
+
+## 계약 테스트
+
+- 동일 create 명령 100회 전달 시 원격 글은 하나다.
+- create 성공 직후 응답 유실에서 WordPress slug 또는 Blogger label+marker로 reconcile이
+  원격 글을 정확히 한 건 찾아낸다.
+- WordPress 미디어 업로드 응답 유실에서 원격 media를 조정하고 같은 checksum을 다시
+  업로드하지 않는다. 표시 지문이 다른 자산은 분리되고, 다른 `published` 또는
+  `marked_withdrawn` 공개 글의 PublicationMedia 참조가 남은 자산은 고아 삭제되지 않는다.
+- 한 채널 실패가 다른 Publication 상태를 되돌리지 않는다.
+- WordPress가 실제 공개되고 공개 URL이 200을 반환하기 전 Blogger create가 실행되지
+  않으며, Blogger final 렌더의 원문 링크가 해당 URL과 일치한다.
+- Blogger preview는 pending 링크를 표시하고 final은 같은 `template_hash`에서 URL만
+  결합한다. 그 외 차이가 있으면 이전 승인을 사용할 수 없다.
+- WordPress final은 공개 전에 생성되고 `canonical_link_state=not_applicable`이며 Blogger
+  final만 WordPress 공개 확인 뒤 생성된다.
+- WordPress와 Blogger 렌더의 `source_manifest_hash`가 다르면 발행이 차단된다.
+- Blogger의 `included_claim_ids`에 WordPress 원문에 없는 주장이 있거나 포함 주장의
+  출처 의미가 달라지면 발행이 차단된다.
+- update가 동일 remote post를 변경하고 정정 이력을 유지한다.
+- 철회 capability별로 unpublish 또는 mark_withdrawn이 선택된다.
+- 완전 unpublish는 WordPress terminal state 뒤 공개 URL 없이 Blogger revert/delete를
+  실행하고, mark_withdrawn은 공개 URL을 유지해 두 채널 본문을 갱신한다.
+- 토큰·본문이 구조화 로그와 AuditEvent 오류 세부에 나타나지 않는다.
+- 운영 target의 preflight, 동일 채널 test target의 현재 정책 canary와 관리자 승인
+  파일럿 중 하나라도 통과하지 않으면 자동발행을 켤 수 없다.
+- target snapshot mismatch에서 외부 요청 0건; credential/capability 변경 후 재승인까지 차단
+- validated_auto run/intent 생성 뒤 auto flag off 또는 validation stale 시 외부 요청 0건
+- auto off→on 뒤 과거 activation을 참조한 예약 intent는 되살아나지 않고 새 activation·intent 없이는 외부 요청 0건
+- WordPress unpublish와 Blogger mark_withdrawn처럼 target별 action이 달라도 각 command/승인이 intent hash에 고정됨
+- unpublish는 render 없이 remote post/state·사유·정정 근거 hash 승인으로 실행되고 content action은 preview render 없이는 차단
+- 게시 91일 뒤 원 EvidenceAsset을 purge해도 공개 Blogger 본문의 모든 PublicDeliveryAsset URL이 200이고, 참조 0+30일 전에는 삭제되지 않음
+- pending delete worker가 lock을 기다리는 동안 같은 자산을 새 scheduled publication이 prepare하면 lease CAS가 실패해 bytes 삭제 0건
+- media/delivery delete 성공 직후 응답 유실을 재전달해도 physical delete는 한 번이고 mapping tombstone·result hash는 동일
+- base URL/remote blog ID 변경 PATCH 거절; 새 target의 기존 remote post ID 재사용 0건
+- WordPress Application Password와 Blogger OAuth token 폐기 후 target이 각각
+  `revoked` 또는 `expired`로 전환되고 쓰기가 거부된다.

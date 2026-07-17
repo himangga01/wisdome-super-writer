@@ -1,0 +1,8 @@
+{
+  "profile_key": "media-deterministic-v1", "profile_version": "1.0.0",
+  "engine": "media_parser", "extractor_version": "1.0.0", "package_version": "Pillow",
+  "runtime_version": "Python-3.12", "pipeline_name": null, "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/media.py"],
+  "config": {"metadata_only": true, "max_frames": 1, "network_access": false}
+}
+

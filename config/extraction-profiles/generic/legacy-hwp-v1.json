@@ -1,0 +1,13 @@
+{
+  "profile_key": "legacy-hwp-v1", "profile_version": "1.0.0",
+  "engine": "legacy_hwp_converter", "extractor_version": "legacy-hwp-v1", "package_version": "deployment-pinned",
+  "runtime_version": "sandbox-v1", "pipeline_name": "hwp-to-pdf", "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/legacy_hwp.py"],
+  "config": {
+    "sandbox_command": ["/usr/local/bin/wisdome-hwp-sandbox", "--network=none", "--input", "{input}", "--output", "{output}", "--report", "{report}"],
+    "converter_manifest_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "timeout_seconds": 180, "max_output_bytes": 314572800, "network_access": false,
+    "read_only_input": true, "disposable_filesystem": true
+  }
+}
+

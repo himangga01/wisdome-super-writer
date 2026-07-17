@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "timezone": "Asia/Seoul",
+  "rawEvidenceDays": 90,
+  "draftArticleDays": 90,
+  "publishedSnapshotDays": 365,
+  "auditEventDays": 365,
+  "deliveryAssetGraceDays": 30,
+  "previewRequired": true,
+  "legalHoldWins": true
+}

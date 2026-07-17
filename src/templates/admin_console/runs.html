@@ -1,0 +1,16 @@
+{% extends "admin_console/base.html" %}
+{% load static %}
+{% block title %}수집 실행 · Wisdome{% endblock %}
+{% block content %}
+<div class="page-head"><div><p class="eyebrow">COLLECTION</p><h1>수집 실행</h1></div></div>
+<section class="panel">
+  <form id="run-form" class="form-row">
+    <label>주제<select name="topic"><option value="housing_subscription">대한민국 부동산 청약정보</option><option value="semiconductor_news">한국·글로벌 반도체 뉴스</option></select></label>
+    <label>시간창(시간)<input name="hours" type="number" min="1" max="720" value="24"></label>
+    <button type="submit">지금 수집</button>
+  </form>
+  <p id="run-message" class="muted"></p>
+</section>
+<section class="panel"><h2>최근 실행</h2><div id="run-list" class="list"></div></section>
+{% endblock %}
+{% block scripts %}<script src="{% static 'admin_console/runs.js' %}"></script>{% endblock %}

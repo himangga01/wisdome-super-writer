@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wisdome-super-writer"
+version = "0.1.0"
+description = "Administrator-only evidence-driven content collection and publishing service"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "Django>=5.2,<5.3",
+  "celery[redis]>=5.6,<5.7",
+  "psycopg[binary]>=3.2,<4",
+  "dj-database-url>=2.3,<3",
+  "python-dotenv>=1.1,<2",
+  "boto3>=1.38,<2",
+  "httpx>=0.28,<1",
+  "croniter>=6,<7",
+  "defusedxml>=0.7,<1",
+  "lxml>=5.4,<7",
+  "selectolax>=0.3.28,<1",
+  "PyMuPDF>=1.25,<2",
+  "pypdf>=5.5,<7",
+  "pdfplumber>=0.11,<1",
+  "openpyxl>=3.1,<4",
+  "Pillow>=11,<13",
+  "bleach>=6.2,<7",
+  "playwright>=1.52,<2",
+]
+
+[project.optional-dependencies]
+ocr = [
+  "paddleocr[doc-parser]==3.7.0",
+  "paddlepaddle==3.2.2",
+]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-django>=4.11,<5",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "wisdome_writer.settings"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "DJ"]

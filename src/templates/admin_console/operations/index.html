@@ -1,0 +1,12 @@
+{% extends "admin_console/base.html" %}
+{% load static %}
+{% block title %}일정·운영 · Wisdome{% endblock %}
+{% block content %}
+<div class="page-head"><div><p class="eyebrow">OPERATIONS</p><h1>일정과 운영 제어</h1></div></div>
+<section class="panel danger-zone">
+  <h2>전체 Kill Switch</h2><p>켜져 있으면 새 수집 dispatch와 외부 발행 호출이 차단됩니다.</p>
+  <div id="kill-state"></div><button id="kill-toggle">상태 전환</button>
+</section>
+<section class="panel"><h2>일정</h2><div id="schedule-list" class="list"></div></section>
+{% endblock %}
+{% block scripts %}<script src="{% static 'admin_console/operations.js' %}"></script>{% endblock %}

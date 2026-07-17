@@ -1,0 +1,2 @@
+"""Official publisher API adapters."""
+

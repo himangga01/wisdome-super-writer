@@ -1,0 +1,9 @@
+{% extends "admin_console/base.html" %}
+{% load static %}
+{% block title %}초안 · Wisdome{% endblock %}
+{% block content %}
+<div class="page-head"><div><p class="eyebrow">EDITORIAL</p><h1>출처 연결 초안</h1></div></div>
+<section class="panel"><div id="article-list" class="list"></div></section>
+<section id="article-detail" class="panel hidden"></section>
+{% endblock %}
+{% block scripts %}<script src="{% static 'admin_console/articles.js' %}"></script>{% endblock %}

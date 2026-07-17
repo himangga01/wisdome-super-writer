@@ -1,0 +1,8 @@
+{
+  "profile_key": "browser-capture-deterministic-v1", "profile_version": "1.0.0",
+  "engine": "browser_capture", "extractor_version": "1.0.0", "package_version": "playwright",
+  "runtime_version": "Chromium-pinned", "pipeline_name": null, "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/browser_capture.py"],
+  "config": {"viewport_width": 1440, "viewport_height": 1200, "network_access": false, "local_input_only": true}
+}
+

@@ -1,0 +1,93 @@
+{
+  "topicCode": "semiconductor_news",
+  "title": "한국 및 글로벌 반도체 뉴스",
+  "policyVersion": 1,
+  "freshnessMinutes": 720,
+  "policy": {
+    "breakingCategories": ["government_control", "factory_disruption", "major_ma", "material_earnings", "technology_production"],
+    "breakingVerification": "one_primary_or_two_independent",
+    "articleTypes": ["semiconductor_daily_digest", "semiconductor_breaking"]
+  },
+  "sources": [
+    {
+      "key": "motie",
+      "displayName": "산업통상자원부",
+      "ownerName": "대한민국 산업통상자원부",
+      "baseUrl": "https://www.motie.go.kr/",
+      "authorityTier": "primary_official",
+      "accessMethod": "public_html",
+      "independenceGroup": "kr-motie",
+      "adapter": "public_html",
+      "entrypoints": ["https://www.motie.go.kr/motie/ne/presse/press2/bbs/bbsList.do?bbs_cd_n=81"],
+      "allowedContentTypes": ["text/html", "application/pdf", "application/haansofthwp", "application/hwp+zip"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 30,
+      "rateLimitPerMinute": 5,
+      "enabled": true
+    },
+    {
+      "key": "krx_kind",
+      "displayName": "KRX KIND",
+      "ownerName": "한국거래소",
+      "baseUrl": "https://kind.krx.co.kr/",
+      "authorityTier": "primary_official",
+      "accessMethod": "public_html",
+      "independenceGroup": "krx",
+      "adapter": "public_html",
+      "entrypoints": ["https://kind.krx.co.kr/disclosure/todaydisclosure.do"],
+      "allowedContentTypes": ["text/html", "application/pdf"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 30,
+      "rateLimitPerMinute": 5,
+      "enabled": true
+    },
+    {
+      "key": "samsung_global_newsroom",
+      "displayName": "Samsung Global Newsroom",
+      "ownerName": "Samsung Electronics",
+      "baseUrl": "https://news.samsung.com/global/",
+      "authorityTier": "primary_corporate",
+      "accessMethod": "rss_atom",
+      "independenceGroup": "samsung-electronics",
+      "adapter": "rss",
+      "entrypoints": ["https://news.samsung.com/global/feed"],
+      "allowedContentTypes": ["application/rss+xml", "application/xml", "text/xml", "text/html"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 30,
+      "rateLimitPerMinute": 10,
+      "enabled": true
+    },
+    {
+      "key": "skhynix_newsroom",
+      "displayName": "SK hynix Newsroom",
+      "ownerName": "SK hynix",
+      "baseUrl": "https://news.skhynix.com/",
+      "authorityTier": "primary_corporate",
+      "accessMethod": "rss_atom",
+      "independenceGroup": "sk-hynix",
+      "adapter": "rss",
+      "entrypoints": ["https://news.skhynix.com/feed/"],
+      "allowedContentTypes": ["application/rss+xml", "application/xml", "text/xml", "text/html"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 30,
+      "rateLimitPerMinute": 10,
+      "enabled": true
+    },
+    {
+      "key": "semiconductor_industry_association",
+      "displayName": "Semiconductor Industry Association",
+      "ownerName": "SIA",
+      "baseUrl": "https://www.semiconductors.org/",
+      "authorityTier": "trusted_secondary",
+      "accessMethod": "public_html",
+      "independenceGroup": "sia",
+      "adapter": "public_html",
+      "entrypoints": ["https://www.semiconductors.org/news-events/latest-news/"],
+      "allowedContentTypes": ["text/html", "application/pdf"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 60,
+      "rateLimitPerMinute": 5,
+      "enabled": true
+    }
+  ]
+}

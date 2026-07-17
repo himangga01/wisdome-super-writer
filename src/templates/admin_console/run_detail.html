@@ -1,0 +1,19 @@
+{% extends "admin_console/base.html" %}
+{% load static %}
+{% block title %}근거 검토 · Wisdome{% endblock %}
+{% block content %}
+<style>.list-item{color:inherit;text-decoration:none}.button-link{background:#2563eb;color:#fff;text-decoration:none;font-weight:800;padding:10px 16px;border-radius:9px}.section-head,.evidence-meta,.review-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.evidence-card{border:1px solid #e2e8f0;border-radius:12px;padding:18px}.evidence-card p{white-space:pre-wrap;max-height:220px;overflow:auto}.evidence-meta{justify-content:flex-start;color:#64748b;font-size:13px}.review-actions{justify-content:flex-end;margin-top:14px}.secondary{background:#475569}</style>
+<div class="page-head">
+  <div><p class="eyebrow">EVIDENCE REVIEW</p><h1 id="run-title">수집 실행 근거</h1></div>
+  <a class="button-link" href="/console/runs/">실행 목록</a>
+</div>
+<section class="panel" id="run-summary"><p class="muted">실행 정보를 불러오는 중입니다.</p></section>
+<section class="panel">
+  <div class="section-head"><h2>수집 근거</h2><span id="evidence-count" class="badge">0</span></div>
+  <div id="evidence-list" class="list"></div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>window.runId = "{{ run_id }}";</script>
+<script src="{% static 'admin_console/run_detail.js' %}"></script>
+{% endblock %}

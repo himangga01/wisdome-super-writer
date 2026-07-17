@@ -1,0 +1,61 @@
+{
+  "topicCode": "housing_subscription",
+  "title": "대한민국 부동산 청약정보",
+  "policyVersion": 1,
+  "freshnessMinutes": 1440,
+  "policy": {
+    "requiredAuthority": "primary_official",
+    "highImpactFields": ["application_start", "application_end", "supply_count", "price", "eligibility"],
+    "articleTypes": ["housing_notice", "housing_correction"]
+  },
+  "sources": [
+    {
+      "key": "applyhome",
+      "displayName": "청약Home",
+      "ownerName": "한국부동산원",
+      "baseUrl": "https://www.applyhome.co.kr/",
+      "authorityTier": "primary_official",
+      "accessMethod": "public_html",
+      "independenceGroup": "korea-real-estate-board",
+      "adapter": "housing_applyhome",
+      "entrypoints": ["https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancListView.do"],
+      "allowedContentTypes": ["text/html", "application/pdf", "application/haansofthwp", "application/hwp+zip"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 60,
+      "rateLimitPerMinute": 5,
+      "enabled": true
+    },
+    {
+      "key": "lh_apply",
+      "displayName": "LH청약플러스",
+      "ownerName": "한국토지주택공사",
+      "baseUrl": "https://apply.lh.or.kr/",
+      "authorityTier": "primary_official",
+      "accessMethod": "public_html",
+      "independenceGroup": "lh",
+      "adapter": "housing_lh",
+      "entrypoints": ["https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do"],
+      "allowedContentTypes": ["text/html", "application/pdf", "application/haansofthwp", "application/hwp+zip"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 60,
+      "rateLimitPerMinute": 5,
+      "enabled": true
+    },
+    {
+      "key": "data_go_kr_housing",
+      "displayName": "공공데이터포털 주택청약 공고",
+      "ownerName": "공공데이터포털",
+      "baseUrl": "https://www.data.go.kr/",
+      "authorityTier": "primary_official",
+      "accessMethod": "open_data_api",
+      "independenceGroup": "public-data-portal",
+      "adapter": "open_data_json",
+      "entrypoints": [],
+      "allowedContentTypes": ["application/json", "application/xml"],
+      "rightsStatus": "attribution_required",
+      "pollMinutes": 120,
+      "rateLimitPerMinute": 10,
+      "enabled": false
+    }
+  ]
+}

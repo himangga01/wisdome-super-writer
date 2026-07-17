@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "language": "ko-KR",
+  "requiredSections": ["핵심 요약", "확인된 사실", "배경", "산업적 의미", "주의할 해석", "출처"],
+  "breakingRequires": "one_primary_or_two_independent",
+  "companyStatementsAreClaims": true,
+  "forbiddenClaims": ["주가 상승 확실", "투자 추천", "업계 관계자에 따르면"]
+}

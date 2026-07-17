@@ -1,0 +1,8 @@
+{
+  "profile_key": "structured-deterministic-v1", "profile_version": "1.0.0",
+  "engine": "structured_parser", "extractor_version": "1.0.0", "package_version": "stdlib+defusedxml",
+  "runtime_version": "Python-3.12", "pipeline_name": null, "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/structured.py"],
+  "config": {"max_file_bytes": 52428800, "max_records": 100000, "resolve_external_entities": false}
+}
+

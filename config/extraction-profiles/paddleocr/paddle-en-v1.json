@@ -1,0 +1,28 @@
+{
+  "profile_key": "paddle-en-v1",
+  "profile_version": "1.0.0",
+  "engine": "paddleocr_ppstructurev3",
+  "extractor_version": "1.0.0",
+  "package_version": "3.7.0",
+  "runtime_version": "3.2.2",
+  "pipeline_name": "PPStructureV3",
+  "validation_mode": null,
+  "implementation_files": ["src/adapters/extractors/paddleocr/adapter.py"],
+  "model_manifest_file": "${PADDLEOCR_MODEL_MANIFEST_ROOT}/paddle-en-v1.models.json",
+  "config": {
+    "pipeline_name": "PPStructureV3",
+    "runtime_version": "3.2.2",
+    "network_access": false,
+    "device": "cpu",
+    "render_dpi": 200,
+    "text_recognition_model": "en_PP-OCRv5_mobile_rec",
+    "use_doc_orientation_classify": true,
+    "use_doc_unwarping": true,
+    "use_textline_orientation": true,
+    "enable_table_recognition": true,
+    "enable_formula_recognition": true,
+    "enable_chart_recognition": true,
+    "enable_seal_recognition": false,
+    "confidence_thresholds": {"default": 0.78, "table": 0.82, "formula": 0.85, "chart": 0.82}
+  }
+}

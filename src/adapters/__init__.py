@@ -1,0 +1,2 @@
+"""Replaceable external-system adapters."""
+

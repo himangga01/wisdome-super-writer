@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v1",
+  "profiles": [
+    {"file": "generic/native-pdf-v1.json"},
+    {"file": "paddleocr/paddle-ko-v1.json"},
+    {"file": "paddleocr/paddle-en-v1.json"},
+    {"file": "generic/html-deterministic-v1.json"},
+    {"file": "generic/structured-deterministic-v1.json"},
+    {"file": "generic/spreadsheet-deterministic-v1.json"},
+    {"file": "generic/hwpx-deterministic-v1.json"},
+    {"file": "generic/legacy-hwp-v1.json"},
+    {"file": "generic/browser-capture-deterministic-v1.json"},
+    {"file": "generic/media-deterministic-v1.json"},
+    {"file": "generic/manual-entry-v1.json"}
+  ]
+}
+

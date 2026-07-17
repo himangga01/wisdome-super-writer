@@ -1,0 +1,8 @@
+{
+  "profile_key": "manual-entry-v1", "profile_version": "1.0.0",
+  "engine": "manual_entry", "extractor_version": "1.0.0", "package_version": null,
+  "runtime_version": "Django-5.2", "pipeline_name": null, "validation_mode": "manual",
+  "implementation_files": ["src/apps/evidence/services.py"],
+  "config": {"admin_only": true, "confidence": null, "max_note_length": 500}
+}
+

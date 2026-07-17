@@ -1,0 +1,14 @@
+{% extends "admin_console/base.html" %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">ADMIN ONLY</p>
+  <h1>출처에서 게시까지 한 흐름으로 관리하세요.</h1>
+  <p>청약 공고와 반도체 뉴스를 수집하고, PaddleOCR 근거를 확인한 뒤 WordPress와 Blogger에 발행합니다.</p>
+</section>
+<section class="grid cards">
+  <a class="card" href="/console/runs/"><strong>새 수집 실행</strong><span>주제와 시간창을 선택합니다.</span></a>
+  <a class="card" href="/console/articles/"><strong>초안 검토</strong><span>주장별 출처와 품질 상태를 확인합니다.</span></a>
+  <a class="card" href="/console/publishing/"><strong>발행 관리</strong><span>WordPress를 먼저 발행하고 Blogger로 배포합니다.</span></a>
+  <a class="card" href="/console/operations/"><strong>일정·중지</strong><span>반복 일정과 전체 kill switch를 관리합니다.</span></a>
+</section>
+{% endblock %}

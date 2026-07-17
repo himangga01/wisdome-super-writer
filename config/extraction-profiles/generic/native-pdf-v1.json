@@ -1,0 +1,18 @@
+{
+  "profile_key": "native-pdf-v1",
+  "profile_version": "1.0.0",
+  "engine": "native_pdf",
+  "extractor_version": "1.0.0",
+  "package_version": "PyMuPDF",
+  "runtime_version": "Python-3.12",
+  "pipeline_name": null,
+  "validation_mode": null,
+  "implementation_files": ["src/adapters/extractors/native_pdf/adapter.py"],
+  "config": {
+    "max_file_bytes": 209715200,
+    "max_pages": 1000,
+    "minimum_text_chars": 40,
+    "maximum_replacement_ratio": 0.02
+  }
+}
+
