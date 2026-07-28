@@ -12,7 +12,11 @@ from adapters.publishers.wordpress import WordPressPublisher
 from adapters.storage import S3ObjectStorage
 from wisdome_writer.domain.errors import Conflict
 from wisdome_writer.domain.hashing import sha256_hex
-from wisdome_writer.infrastructure.outbox import enqueue_event
+from wisdome_writer.infrastructure.outbox import (
+    CURRENT_EVENT_ID,
+    PermanentEventError,
+    enqueue_event,
+)
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle
 from .models import (
@@ -32,6 +36,7 @@ from .services import (
     _snapshot_locked,
     begin_attempt,
     begin_reconcile,
+    finalize_reconcile_delivery_failure,
     persist_publish_result,
     publisher_error_result,
     publisher_for_target,
@@ -91,12 +96,10 @@ def run_target_preflight_task(
 
 
 @shared_task(
-    bind=True,
     name="apps.publishing.tasks.revoke_target_credentials",
-    max_retries=4,
     acks_late=True,
 )
-def revoke_target_credentials(self, decision_id: str):
+def revoke_target_credentials(decision_id: str):
     with transaction.atomic():
         decision = TargetDisconnectDecision.objects.select_for_update().select_related("target").get(
             id=decision_id
@@ -123,7 +126,7 @@ def revoke_target_credentials(self, decision_id: str):
             )
             decision.save(update_fields=["state", "remote_result_hash"])
         if exc.category in {"retryable", "unknown_outcome"}:
-            raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries + 1))
+            raise
         return {"decisionId": decision_id, "state": decision.state}
     finally:
         adapter.close()
@@ -141,13 +144,11 @@ def revoke_target_credentials(self, decision_id: str):
 
 
 @shared_task(
-    bind=True,
     name="apps.publishing.tasks.execute_publication_attempt",
-    max_retries=6,
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def execute_publication_attempt(self, attempt_id: str):
+def execute_publication_attempt(attempt_id: str):
     try:
         attempt, command = begin_attempt(attempt_id)
     except Conflict as exc:
@@ -185,44 +186,68 @@ def execute_publication_attempt(self, attempt_id: str):
         if persisted.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
             _enqueue_reconcile_locked(persisted)
     if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
-        if persisted.attempt_no >= self.max_retries + 1:
-            return {"attemptId": attempt_id, "state": persisted.state, "code": persisted.error_code}
-        PublicationAttempt.objects.filter(id=attempt_id).update(attempt_no=persisted.attempt_no + 1)
-        raise self.retry(
-            exc=error or RuntimeError(persisted.error_code),
-            countdown=_retry_countdown(
-                persisted.attempt_no,
-                error.retry_after_seconds if error else None,
-            ),
+        if persisted.attempt_no >= 5:
+            with transaction.atomic():
+                persisted = PublicationAttempt.objects.select_for_update().select_related(
+                    "publication"
+                ).get(id=attempt_id)
+                persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
+                persisted.error_code = (
+                    persisted.error_code
+                    or "publication_attempts_exhausted"
+                )
+                persisted.save(update_fields=("state", "error_code"))
+                persisted.publication.state = Publication.State.MANUAL_REQUIRED
+                persisted.publication.last_error_code = persisted.error_code
+                persisted.publication.save(
+                    update_fields=(
+                        "state",
+                        "last_error_code",
+                        "updated_at",
+                    )
+                )
+            return {
+                "attemptId": attempt_id,
+                "state": persisted.state,
+                "code": persisted.error_code,
+            }
+        PublicationAttempt.objects.filter(id=attempt_id).update(
+            attempt_no=persisted.attempt_no + 1
         )
+        raise error or RuntimeError(persisted.error_code)
     return {"attemptId": attempt_id, "state": persisted.state, "remotePostId": persisted.publication.remote_post_id}
 
 
 @shared_task(
-    bind=True,
     name="apps.publishing.tasks.reconcile_publication_attempt",
-    max_retries=4,
     acks_late=True,
 )
 def reconcile_publication_attempt(
-    self,
     attempt_id: str,
     reconcile_attempt_no: int | None = None,
 ):
+    source_event_id = CURRENT_EVENT_ID.get()
+    if source_event_id is None:
+        raise PermanentEventError("reconcile_event_context_missing")
     try:
-        attempt, command = begin_reconcile(
+        attempt, generation, command = begin_reconcile(
             attempt_id,
             expected_reconcile_attempt_no=reconcile_attempt_no,
+            source_event_id=source_event_id,
         )
     except Conflict as exc:
         return {"attemptId": attempt_id, "state": "ignored", "code": exc.code}
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
-    if command is None:
+    if command is None or generation is None:
         return {
             "attemptId": attempt_id,
             "state": attempt.state,
-            "reconcileAttemptNo": attempt.reconcile_attempt_no,
+            "reconcileAttemptNo": (
+                generation.generation
+                if generation is not None
+                else attempt.reconcile_attempt_no
+            ),
             "duplicate": True,
         }
     adapter = publisher_for_target(attempt.publication.target)
@@ -241,35 +266,53 @@ def reconcile_publication_attempt(
         retry_after = exc.retry_after_seconds
     finally:
         adapter.close()
-    with transaction.atomic():
-        persisted = persist_publish_result(attempt_id, result)
-        if persisted.state in {
-            PublicationAttempt.State.RETRYABLE_FAILED,
-            PublicationAttempt.State.UNKNOWN_OUTCOME,
-        }:
-            if persisted.reconcile_attempt_no >= 5:
-                persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
-                persisted.error_code = (
-                    persisted.error_code or "reconcile_attempts_exhausted"
-                )
-                persisted.save(update_fields=("state", "error_code"))
-                persisted.publication.state = Publication.State.MANUAL_REQUIRED
-                persisted.publication.last_error_code = persisted.error_code
-                persisted.publication.save(
-                    update_fields=("state", "last_error_code", "updated_at")
-                )
-            else:
-                persisted.next_retry_at = timezone.now() + timedelta(
-                    seconds=_retry_countdown(
-                        persisted.reconcile_attempt_no,
-                        retry_after,
+    try:
+        with transaction.atomic():
+            persisted = persist_publish_result(
+                attempt_id,
+                result,
+                expected_reconcile_generation=generation.generation,
+                expected_reconcile_event_id=source_event_id,
+            )
+            if persisted.state in {
+                PublicationAttempt.State.RETRYABLE_FAILED,
+                PublicationAttempt.State.UNKNOWN_OUTCOME,
+            }:
+                if generation.generation >= 5:
+                    persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
+                    persisted.error_code = (
+                        persisted.error_code
+                        or "reconcile_attempts_exhausted"
                     )
-                )
-                persisted.save(update_fields=("next_retry_at",))
-                _enqueue_reconcile_locked(
-                    persisted,
-                    available_at=persisted.next_retry_at,
-                )
+                    persisted.save(update_fields=("state", "error_code"))
+                    persisted.publication.state = Publication.State.MANUAL_REQUIRED
+                    persisted.publication.last_error_code = persisted.error_code
+                    persisted.publication.save(
+                        update_fields=(
+                            "state",
+                            "last_error_code",
+                            "updated_at",
+                        )
+                    )
+                else:
+                    persisted.next_retry_at = timezone.now() + timedelta(
+                        seconds=_retry_countdown(
+                            generation.generation,
+                            retry_after,
+                        )
+                    )
+                    persisted.save(update_fields=("next_retry_at",))
+                    _enqueue_reconcile_locked(
+                        persisted,
+                        available_at=persisted.next_retry_at,
+                    )
+    except Conflict as exc:
+        return {
+            "attemptId": attempt_id,
+            "state": "stale_fenced",
+            "code": exc.code,
+            "reconcileAttemptNo": generation.generation,
+        }
     return {
         "attemptId": attempt_id,
         "state": persisted.state,
@@ -278,12 +321,34 @@ def reconcile_publication_attempt(
 
 
 @shared_task(
-    bind=True,
+    name="apps.publishing.tasks.finalize_publication_reconcile_failure"
+)
+def finalize_publication_reconcile_failure(
+    attempt_id: str,
+    error_code: str,
+):
+    source_event_id = CURRENT_EVENT_ID.get()
+    if source_event_id is None:
+        raise PermanentEventError("reconcile_event_context_missing")
+    attempt = finalize_reconcile_delivery_failure(
+        attempt_id,
+        source_event_id=source_event_id,
+        error_code=error_code,
+    )
+    if attempt is None:
+        return {"attemptId": attempt_id, "state": "missing"}
+    return {
+        "attemptId": str(attempt.id),
+        "state": attempt.state,
+        "reconcileAttemptNo": attempt.reconcile_attempt_no,
+    }
+
+
+@shared_task(
     name="apps.publishing.tasks.run_target_canary",
-    max_retries=1,
     acks_late=True,
 )
-def run_target_canary(self, canary_run_id: str):
+def run_target_canary(canary_run_id: str):
     with transaction.atomic():
         run = TargetCanaryRun.objects.select_for_update().select_related("target").get(id=canary_run_id)
         if run.state == TargetCanaryRun.State.PASSED:
@@ -431,12 +496,10 @@ def run_target_canary(self, canary_run_id: str):
 
 
 @shared_task(
-    bind=True,
     name="apps.publishing.tasks.delete_public_delivery_asset",
-    max_retries=5,
     acks_late=True,
 )
-def delete_public_delivery_asset(self, asset_id: str, expected_lease_generation: int):
+def delete_public_delivery_asset(asset_id: str, expected_lease_generation: int):
     with transaction.atomic():
         asset = PublicDeliveryAsset.objects.select_for_update().get(id=asset_id)
         if asset.state == PublicDeliveryAsset.State.DELETED:
@@ -455,10 +518,7 @@ def delete_public_delivery_asset(self, asset_id: str, expected_lease_generation:
             return {"assetId": asset_id, "state": "protected"}
         object_key = asset.delivery_object_key
         object_version = asset.delivery_object_version
-    try:
-        S3ObjectStorage().delete(key=object_key, version_id=object_version or None)
-    except Exception as exc:
-        raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries + 1))
+    S3ObjectStorage().delete(key=object_key, version_id=object_version or None)
     with transaction.atomic():
         asset = PublicDeliveryAsset.objects.select_for_update().get(id=asset_id)
         if asset.lease_generation != expected_lease_generation:

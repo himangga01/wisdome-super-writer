@@ -200,7 +200,11 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 - consumer의 DB/receipt 인프라 오류는 1/2/4초의 독립 bounded retry 뒤에도 DB가
   불능이면 ACK하지 않고 broker에 requeue한다. hard timeout과 worker loss도 requeue하며,
   receipt lease는 hard limit보다 10분 길다. 정산은 만료 시각만으로 거부하지 않고
-  token+generation의 현재 소유권으로 fence한다.
+  token+generation의 현재 소유권으로 fence한다. claim 이후 handler 실행, payload 누락
+  종결, domain 실패 종결, 성공 정산 중 어느 지점에서든 `DatabaseError`가 발생하면 같은
+  token+generation으로 receipt claim을 해제하고 domain attempt를 소비하지 않는다. claim
+  해제 자체도 DB 오류로 실패하면 인프라 재시도가 소유권을 전달받아 살아 있는 40분
+  lease를 즉시 재점유한다.
 - `run.requested`, publication/canary/disconnect 이벤트에는 queue 선택용 `topic_code` 또는
   `channel`을 넣지 않는다. dispatcher가 payload의 엔터티 ID로 DB 기준 topic/channel을
   다시 조회하며, 엔터티가 없거나 채널을 확정할 수 없으면 안전하게 DLQ 처리한다.
@@ -239,20 +243,59 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   reconcile 이벤트로 최대 5회 이어지며, 한도를 넘으면 `manual_required`가 된다.
   `publication.reconcile_requested@2`의 exact payload는 `publication_attempt_id`,
   `reconcile_attempt_no`이고, 이 번호는 execute/admin `attempt_no`와 분리된 영속
-  counter다. v1은 기존 outbox 호환용으로만 소비한다.
+  counter다. 각 1~5 세대는 append-only `PublicationReconcileGeneration` 행과 정확히 한
+  source outbox event에 결합된다. 완료된 동일 이벤트는 adapter를 다시 호출하지 않고,
+  시작된 동일 이벤트는 같은 세대를 재개한다. v1은 기존 outbox event를 최초 소비할 때
+  연속된 다음 세대에 한 번만 결합해 이후 replay에서도 같은 세대를 사용한다.
+- 새 reconcile 세대와 event를 할당하는 transaction은 attempt와 publication projection도
+  함께 `reconciling`으로 고정한다. 따라서 execute 재전달이나 관리자 retry가 열린 세대와
+  경합해 외부 write 경로를 다시 열 수 없다.
+- reconcile 결과 저장은 source event와 generation을 함께 검증한다. 현재 세대보다 늦게
+  도착한 과거 결과는 publication/attempt 결과를 덮어쓰지 못한다. 결과와 세대 완료,
+  필요 시 다음 v2 event와 다음 세대 시작은 각각 하나의 DB transaction에서 원자적으로
+  기록하며 6번째 세대는 생성하지 않는다.
+- v1/v2 reconcile 전달이 영구 실패하거나 route 예산을 소진하면 terminal callback이 그
+  source event의 세대를 완료하고 attempt/publication을 `manual_required`로 종결한다.
+  후속 생성 및 upgrade backfill도 source outbox 또는 해당 consumer receipt의
+  `dead_letter`를 감지해 같은 종결을 수행하며, 이후 replay는 no-op이다.
 - generic attempt 생성과 `evidence.other_extract_requested` 생성은 같은 트랜잭션이다.
   일시 추출 오류는 `queued`로 되돌리고 finalizer를 깨우지 않는다. 영구 오류 또는
   consumer 재시도 소진 시에만 `failed`와 단 하나의 terminal finalizer 이벤트를 같은
   트랜잭션에 기록한다.
+- 문서 입력은 `document-input-v1` schema, `run_source_item_id`, `input_kind`,
+  `input_checksum`의 안정 SHA-256인 `input_fingerprint`로 식별한다. 동일 입력의
+  활성 canonical DocumentExtraction과 route outbox는 각각 하나만 존재하며, 이미 성공한
+  legacy HWP 변환 결과의 PDF 승격 경로도 같은 identity를 사용한다. upgrade 시 과거 중복
+  행은 삭제하거나 합성 hash를 부여하지 않고 audit용 null fingerprint로 보존하며,
+  `document_complete+succeeded`, `succeeded`, `low_confidence`, 실패/종료 순으로 canonical
+  행을 선택한다. 성공/저신뢰 legacy HWP 행에 연결된 EvidenceAsset이 없으면 checksum과
+  객체 위치가 유효한 단 하나의 파생 자산만 복구한다. 없거나 여러 개이거나 불변 객체
+  material이 불완전하면 attempt를 `failed`로 바꾸고 terminal finalizer를 기록한다.
 - target preflight는 짧은 DB fence snapshot, transaction 밖 외부 호출, fence를 다시
   확인하는 결과·audit·완료 이벤트 transaction의 세 단계로 수행한다.
 - run evidence parent는 외부 download/storage I/O 밖의 짧은 row-lock transaction에서
   `RunStep.fanout_completed_at`, counters, `evidence.finalize_requested`를 함께 기록한다.
   finalizer는 marker 전에는 run을 전진시키지 않으므로 0 child, 빠른 child, 중간 실패도
   fan-out 완료 wake-up 뒤에만 재평가된다.
+- marker 도입 migration은 `extract/running`, 시작 시각 있음, marker 없음,
+  `CollectionRun=extracting`인 행만 검사한다. 기존 counters에 evidence와
+  extractionFailures가 모두 있으면 과거 parent 완료 증거로 인정해 marker와 stable
+  finalizer를 기록하고, 증거가 없으면 marker를 추정하지 않고 stable re-fanout event를
+  기록한다. 이미 전진했거나 terminal인 run은 변경하지 않는다. 이 복구는 migration의
+  historical model과 대상 DB alias만 사용하고, immutable outbox material/hash 생성도
+  migration 안에 고정해 미래 runtime 코드 변경에 영향받지 않는다.
+- parent evidence 처리에서 `ExtractorError`, `httpx.HTTPError`, `OSError`만 분류된
+  partial failure로 집계한다. `DatabaseError`, soft time limit과 programming exception은
+  marker를 기록하지 않고 다시 던져 route receipt 재시도 대상이 된다. parent route의
+  세 번 전달이 모두 소진되면 terminal callback이 아직 extracting인 run/step만
+  `failed` 또는 stop 요청 시 둘 다 `stopped`로 일관되게 종결한다.
 - 영구 오류 또는 retry 소진 terminal handler는 원 consumed envelope의 event context
   안에서 실행한다. 따라서 terminal finalizer outbox는 원 correlation ID와
   `causation_id=current event_id`를 유지하며 receipt terminal 전이와 원자적이다.
+- routed leaf task는 Celery `self.retry`/`autoretry` 예산을 갖지 않는다. receipt route가
+  유일한 전달 재시도 권한이며 `run.requested=4`, `run.evidence_requested=3`,
+  `publication.preflight_requested=4`, target canary=2, 그 밖의 route=5로 모두 5회
+  이하이다.
 
 ## English — T005 Versioned Internal Event Addendum
 
@@ -323,3 +366,43 @@ the pre-created `GenerationAttempt` contract.
 6. Permanent/exhausted terminal handlers run inside the original consumed event context,
    preserving correlation and setting the terminal wake-up causation to the consumed
    event ID in the same receipt-terminal transaction.
+
+### Third re-review durability addendum
+
+1. Any post-claim `DatabaseError` from handler execution, missing-payload termination,
+   domain-failure settlement, or success settlement releases the matching receipt
+   token/generation and restores the consumed domain-attempt count. If that release
+   cannot reach the database, the infrastructure retry carries ownership and may
+   immediately reclaim the still-live lease.
+2. Every reconciliation generation from one through five is an append-only row bound
+   one-to-one to its source outbox event. Completed replay is a no-op, started replay
+   resumes the same generation, and a legacy v1 event is assigned once to the next
+   contiguous generation.
+3. Result persistence fences on both source event and generation. A late older result
+   cannot overwrite current publication state. Result completion and any next v2
+   generation/event allocation are atomic; generation six is forbidden. Allocating a
+   generation also projects attempt and publication to reconciling in that transaction,
+   so execute redelivery or admin retry cannot reopen the external-write path. Terminal
+   v1/v2 delivery callbacks, source-event DLQ, and receipt DLQ complete the bound
+   generation and manualize the attempt; replay is a no-op.
+4. `DocumentExtraction.input_fingerprint` is the stable SHA-256 of schema
+   `document-input-v1`, run-source-item identity, input kind, and input checksum. It
+   provides one active canonical document and one route event for normal and legacy-HWP
+   promotion paths. Upgrade canonicalization prioritizes complete success, success,
+   low-confidence, and then failed/finished rows; historical duplicates remain
+   audit-only with a null fingerprint instead of receiving synthetic hashes. A terminal
+   legacy-HWP success recovers exactly one valid derived asset when the link is missing,
+   and fails closed with a terminal finalizer for missing, ambiguous, or incomplete
+   immutable material.
+5. The marker upgrade only inspects in-flight extracting step-one rows. Existing evidence
+   and extraction-failure counters prove parent completion and cause marker plus finalizer
+   recovery; absence of proof causes stable re-fan-out without synthesizing the marker.
+   The migration uses historical models, its target database alias, and migration-local
+   immutable outbox material/hash construction rather than current runtime helpers.
+6. Only extractor, HTTP-client, and operating-system I/O errors become partial evidence
+   failures. Database, soft-time-limit, and programming errors escape without a marker.
+   Exhausting the parent route terminates only a still-extracting run/step, projecting
+   both to stopped when stop was requested and both to their failure states otherwise.
+7. Routed leaf tasks have no Celery retry loop. Receipt routes are the sole delivery
+   retry authority, with budgets of four for collection run, three for evidence parent,
+   four for preflight, two for canary, and five for all remaining routes.

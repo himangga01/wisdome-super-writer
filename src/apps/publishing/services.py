@@ -34,6 +34,7 @@ from .models import (
     Publication,
     PublicationAction,
     PublicationAttempt,
+    PublicationReconcileGeneration,
     PublicationIntent,
     PublicationMedia,
     PublicationTarget,
@@ -1520,20 +1521,162 @@ def _command_for_attempt(attempt: PublicationAttempt, render: ArticleChannelRend
     )
 
 
+def _project_reconciling_locked(
+    attempt: PublicationAttempt,
+    *,
+    update_counter: bool = False,
+) -> None:
+    terminal_states = {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }
+    if attempt.state in terminal_states:
+        return
+    attempt.state = PublicationAttempt.State.RECONCILING
+    attempt_fields = ["state"]
+    if update_counter:
+        attempt_fields.append("reconcile_attempt_no")
+    attempt.save(update_fields=attempt_fields)
+    publication = attempt.publication
+    publication.state = Publication.State.RECONCILING
+    publication.save(update_fields=("state", "updated_at"))
+
+
+def _manualize_reconcile_attempt_locked(
+    attempt: PublicationAttempt,
+    *,
+    error_code: str,
+    now=None,
+) -> str:
+    now = now or timezone.now()
+    preserved_terminal_states = {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }
+    if attempt.state in preserved_terminal_states:
+        return attempt.state
+    attempt.state = PublicationAttempt.State.MANUAL_REQUIRED
+    attempt.error_code = error_code[:100]
+    attempt.finished_at = now
+    attempt.save(
+        update_fields=(
+            "state",
+            "error_code",
+            "finished_at",
+        )
+    )
+    attempt.publication.state = Publication.State.MANUAL_REQUIRED
+    attempt.publication.last_error_code = attempt.error_code
+    attempt.publication.save(
+        update_fields=(
+            "state",
+            "last_error_code",
+            "updated_at",
+        )
+    )
+    return attempt.state
+
+
+def _terminalize_reconcile_generation_locked(
+    attempt: PublicationAttempt,
+    generation: PublicationReconcileGeneration,
+    *,
+    error_code: str,
+) -> None:
+    if generation.state == PublicationReconcileGeneration.State.COMPLETED:
+        return
+    now = timezone.now()
+    result_state = _manualize_reconcile_attempt_locked(
+        attempt,
+        error_code=error_code,
+        now=now,
+    )
+    generation.state = PublicationReconcileGeneration.State.COMPLETED
+    generation.result_identity = sha256_hex(
+        {
+            "kind": "reconcile_delivery_terminal",
+            "publication_attempt_id": str(attempt.id),
+            "generation": generation.generation,
+            "source_event_id": str(generation.source_event_id),
+            "result_state": result_state,
+            "error_code": error_code[:100],
+        }
+    )
+    generation.result_state = result_state
+    generation.completed_at = now
+    generation.save(
+        update_fields=(
+            "state",
+            "result_identity",
+            "result_state",
+            "completed_at",
+        )
+    )
+
+
+def _reconcile_generation_delivery_dead_lettered(
+    generation: PublicationReconcileGeneration,
+) -> bool:
+    source_event = generation.source_event
+    return (
+        source_event.status == "dead_letter"
+        or source_event.consumer_receipts.filter(
+            consumer_name="publication-reconcile",
+            state="dead_letter",
+        ).exists()
+    )
+
+
 def _enqueue_reconcile_locked(
     attempt: PublicationAttempt,
     *,
     available_at=None,
-) -> None:
-    from wisdome_writer.infrastructure.models import OutboxMessage
-
+) -> PublicationReconcileGeneration | None:
+    if attempt.reconcile_attempt_no:
+        current = (
+            PublicationReconcileGeneration.objects.select_related(
+                "source_event"
+            ).filter(
+                publication_attempt=attempt,
+                generation=attempt.reconcile_attempt_no,
+            )
+            .order_by("generation")
+            .first()
+        )
+        if (
+            current is not None
+            and current.state == PublicationReconcileGeneration.State.STARTED
+        ):
+            if _reconcile_generation_delivery_dead_lettered(current):
+                _terminalize_reconcile_generation_locked(
+                    attempt,
+                    current,
+                    error_code=(
+                        current.source_event.last_error_code
+                        or "reconcile_delivery_dead_letter"
+                    ),
+                )
+            else:
+                _project_reconciling_locked(attempt)
+            return current
+    if attempt.state in {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }:
+        return None
     reconcile_attempt_no = attempt.reconcile_attempt_no + 1
+    if reconcile_attempt_no > 5:
+        return None
     dedupe_key = (
         f"publication.reconcile_requested:{attempt.id}:{reconcile_attempt_no}"
     )
-    if OutboxMessage.objects.filter(message_key=dedupe_key).exists():
-        return
-    _enqueue_event(
+    event = _enqueue_event(
         "publication.reconcile_requested",
         {
             "publication_attempt_id": str(attempt.id),
@@ -1546,6 +1689,21 @@ def _enqueue_reconcile_locked(
         job_id=attempt.id,
         available_at=available_at,
     )
+    generation, created = PublicationReconcileGeneration.objects.get_or_create(
+        publication_attempt=attempt,
+        generation=reconcile_attempt_no,
+        defaults={
+            "source_event": event,
+            "state": PublicationReconcileGeneration.State.STARTED,
+            "not_before": event.not_before,
+            "started_at": event.occurred_at,
+        },
+    )
+    if not created and generation.source_event_id != event.id:
+        raise Conflict("reconcile generation is bound to a different event")
+    attempt.reconcile_attempt_no = reconcile_attempt_no
+    _project_reconciling_locked(attempt, update_counter=True)
+    return generation
 
 
 @transaction.atomic
@@ -1611,11 +1769,76 @@ def begin_attempt(
     return attempt, _command_for_attempt(attempt, render)
 
 
+def _publish_result_identity(result) -> str:
+    return sha256_hex(
+        {
+            "status": result.status,
+            "remote_post_id": result.remote_post_id,
+            "remote_url": result.remote_url,
+            "remote_state": result.remote_state,
+            "remote_revision": result.remote_revision,
+            "scheduled_for": (
+                result.scheduled_for.isoformat()
+                if result.scheduled_for
+                else None
+            ),
+            "published_at": (
+                result.published_at.isoformat()
+                if result.published_at
+                else None
+            ),
+            "request_id": result.request_id,
+            "reconcile_required": result.reconcile_required,
+            "http_status": result.http_status,
+            "error_code": result.error_code,
+            "error_detail_redacted": result.error_detail_redacted,
+        }
+    )
+
+
 @transaction.atomic
-def persist_publish_result(attempt_id: str, result) -> PublicationAttempt:
+def persist_publish_result(
+    attempt_id: str,
+    result,
+    *,
+    expected_reconcile_generation: int | None = None,
+    expected_reconcile_event_id: uuid.UUID | str | None = None,
+) -> PublicationAttempt:
     attempt = PublicationAttempt.objects.select_for_update().select_related(
         "publication__target", "publication_intent"
     ).get(id=attempt_id)
+    reconcile_generation = None
+    if (
+        expected_reconcile_generation is None
+    ) != (
+        expected_reconcile_event_id is None
+    ):
+        raise Conflict("reconcile result fence is incomplete")
+    if expected_reconcile_generation is not None:
+        try:
+            expected_event_uuid = uuid.UUID(
+                str(expected_reconcile_event_id)
+            )
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise Conflict("reconcile result event fence is invalid") from exc
+        reconcile_generation = (
+            PublicationReconcileGeneration.objects.select_for_update()
+            .filter(
+                publication_attempt=attempt,
+                generation=expected_reconcile_generation,
+                source_event_id=expected_event_uuid,
+            )
+            .first()
+        )
+        if (
+            reconcile_generation is None
+            or reconcile_generation.state
+            != PublicationReconcileGeneration.State.STARTED
+            or attempt.reconcile_attempt_no
+            != expected_reconcile_generation
+            or attempt.state != PublicationAttempt.State.RECONCILING
+        ):
+            raise Conflict("stale reconcile result was fenced")
     publication = attempt.publication
     now = timezone.now()
     attempt.http_status = result.http_status
@@ -1682,6 +1905,23 @@ def persist_publish_result(attempt_id: str, result) -> PublicationAttempt:
         publication.last_error_code = result.error_code or "publisher_permanent"
     attempt.save()
     publication.save()
+    if reconcile_generation is not None:
+        reconcile_generation.state = (
+            PublicationReconcileGeneration.State.COMPLETED
+        )
+        reconcile_generation.result_identity = _publish_result_identity(
+            result
+        )
+        reconcile_generation.result_state = attempt.state
+        reconcile_generation.completed_at = now
+        reconcile_generation.save(
+            update_fields=(
+                "state",
+                "result_identity",
+                "result_state",
+                "completed_at",
+            )
+        )
     _audit("publication_attempt.finished", attempt, None, sha256_hex({"state": attempt.state, "remote": result.remote_post_id}))
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         _release_dependents_on_commit(attempt)
@@ -1745,33 +1985,211 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
 def begin_reconcile(
     attempt_id: str,
     expected_reconcile_attempt_no: int | None = None,
-) -> tuple[PublicationAttempt, PublishCommand | None]:
+    *,
+    source_event_id: uuid.UUID | str | None = None,
+) -> tuple[
+    PublicationAttempt,
+    PublicationReconcileGeneration | None,
+    PublishCommand | None,
+]:
+    from wisdome_writer.infrastructure.models import OutboxMessage
+    from wisdome_writer.infrastructure.outbox import CURRENT_EVENT_ID
+
+    source_event_id = source_event_id or CURRENT_EVENT_ID.get()
+    if source_event_id is None:
+        raise Conflict("reconcile source event context is required")
+    try:
+        source_event_uuid = uuid.UUID(str(source_event_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise Conflict("reconcile source event context is invalid") from exc
     attempt = PublicationAttempt.objects.select_for_update().select_related(
         "publication__target", "publication_intent", "approval__article_channel_render"
     ).get(id=attempt_id)
+    source_event = OutboxMessage.objects.select_for_update().filter(
+        id=source_event_uuid,
+        topic="publication.reconcile_requested",
+        aggregate_id=attempt.id,
+    ).first()
+    if source_event is None:
+        raise Conflict("reconcile source event does not match the attempt")
+    payload = source_event.payload if isinstance(source_event.payload, dict) else {}
+    if payload.get("publication_attempt_id") != str(attempt.id):
+        raise Conflict("reconcile source event payload does not match the attempt")
+
+    generation = (
+        PublicationReconcileGeneration.objects.select_for_update()
+        .filter(source_event=source_event)
+        .first()
+    )
+    if generation is not None:
+        if generation.publication_attempt_id != attempt.id:
+            raise Conflict("reconcile source event is bound to another attempt")
+        if (
+            expected_reconcile_attempt_no is not None
+            and generation.generation != expected_reconcile_attempt_no
+        ):
+            raise Conflict("reconcile source event generation does not match")
+    else:
+        if attempt.state in {
+            PublicationAttempt.State.SUCCEEDED,
+            PublicationAttempt.State.PERMANENT_FAILED,
+            PublicationAttempt.State.MANUAL_REQUIRED,
+            PublicationAttempt.State.STALE,
+        }:
+            return attempt, None, None
+        if source_event.event_version == 1:
+            generation_no = attempt.reconcile_attempt_no + 1
+        elif source_event.event_version == 2:
+            payload_generation = payload.get("reconcile_attempt_no")
+            if (
+                type(payload_generation) is not int
+                or payload_generation != expected_reconcile_attempt_no
+            ):
+                raise Conflict("reconcile v2 payload generation does not match")
+            generation_no = payload_generation
+        else:
+            raise Conflict("unsupported reconcile event version")
+        if generation_no < 1 or generation_no > 5:
+            raise Conflict("reconcile attempt budget is exhausted")
+        if generation_no != attempt.reconcile_attempt_no + 1:
+            raise Conflict("reconcile generation is not contiguous")
+        generation = PublicationReconcileGeneration.objects.create(
+            publication_attempt=attempt,
+            generation=generation_no,
+            source_event=source_event,
+            state=PublicationReconcileGeneration.State.STARTED,
+            not_before=source_event.not_before,
+            started_at=timezone.now(),
+        )
+        attempt.reconcile_attempt_no = generation_no
+        attempt.save(update_fields=("reconcile_attempt_no",))
+
+    if (
+        generation.state == PublicationReconcileGeneration.State.COMPLETED
+        or generation.generation < attempt.reconcile_attempt_no
+    ):
+        return attempt, generation, None
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
-        return attempt, None
+        return attempt, generation, None
     if attempt.state not in {
         PublicationAttempt.State.UNKNOWN_OUTCOME,
         PublicationAttempt.State.RECONCILING,
         PublicationAttempt.State.RETRYABLE_FAILED,
     }:
         raise Conflict("unknown-outcome attempt만 조정할 수 있습니다.")
-    if expected_reconcile_attempt_no is None:
-        expected_reconcile_attempt_no = attempt.reconcile_attempt_no + 1
-    if expected_reconcile_attempt_no < attempt.reconcile_attempt_no:
-        return attempt, None
-    if expected_reconcile_attempt_no > attempt.reconcile_attempt_no + 1:
-        raise Conflict("reconcile attempt sequence has a gap")
-    if expected_reconcile_attempt_no == attempt.reconcile_attempt_no + 1:
-        if expected_reconcile_attempt_no > 5:
-            raise Conflict("reconcile attempt budget is exhausted")
-        attempt.reconcile_attempt_no = expected_reconcile_attempt_no
     attempt.state = PublicationAttempt.State.RECONCILING
-    attempt.save(update_fields=["state", "reconcile_attempt_no"])
+    attempt.save(update_fields=["state"])
     attempt.publication.state = Publication.State.RECONCILING
     attempt.publication.save(update_fields=["state", "updated_at"])
-    return attempt, _command_for_attempt(attempt, _final_render(attempt))
+    return (
+        attempt,
+        generation,
+        _command_for_attempt(attempt, _final_render(attempt)),
+    )
+
+
+@transaction.atomic
+def finalize_reconcile_delivery_failure(
+    attempt_id: str,
+    *,
+    source_event_id: uuid.UUID | str,
+    error_code: str,
+) -> PublicationAttempt | None:
+    from wisdome_writer.infrastructure.models import OutboxMessage
+
+    try:
+        source_event_uuid = uuid.UUID(str(source_event_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    attempt = (
+        PublicationAttempt.objects.select_for_update()
+        .select_related("publication")
+        .filter(id=attempt_id)
+        .first()
+    )
+    if attempt is None:
+        return None
+    source_event = (
+        OutboxMessage.objects.select_for_update()
+        .filter(
+            id=source_event_uuid,
+            topic="publication.reconcile_requested",
+            aggregate_id=attempt.id,
+        )
+        .first()
+    )
+    if source_event is None:
+        _manualize_reconcile_attempt_locked(
+            attempt,
+            error_code="reconcile_source_event_missing",
+        )
+        return attempt
+    payload = source_event.payload if isinstance(source_event.payload, dict) else {}
+    if payload.get("publication_attempt_id") != str(attempt.id):
+        _manualize_reconcile_attempt_locked(
+            attempt,
+            error_code="reconcile_source_event_mismatch",
+        )
+        return attempt
+
+    generation = (
+        PublicationReconcileGeneration.objects.select_for_update()
+        .filter(source_event=source_event)
+        .first()
+    )
+    if generation is None:
+        if source_event.event_version == 1:
+            generation_no = attempt.reconcile_attempt_no + 1
+        elif source_event.event_version == 2:
+            generation_no = payload.get("reconcile_attempt_no")
+        else:
+            generation_no = None
+        if (
+            type(generation_no) is not int
+            or generation_no < 1
+            or generation_no > 5
+        ):
+            _manualize_reconcile_attempt_locked(
+                attempt,
+                error_code="reconcile_generation_invalid",
+            )
+            return attempt
+        generation = (
+            PublicationReconcileGeneration.objects.select_for_update()
+            .filter(
+                publication_attempt=attempt,
+                generation=generation_no,
+            )
+            .first()
+        )
+        if (
+            generation is not None
+            and generation.source_event_id != source_event.id
+        ):
+            _manualize_reconcile_attempt_locked(
+                attempt,
+                error_code="reconcile_generation_binding_conflict",
+            )
+            return attempt
+        if generation is None:
+            generation = PublicationReconcileGeneration.objects.create(
+                publication_attempt=attempt,
+                generation=generation_no,
+                source_event=source_event,
+                state=PublicationReconcileGeneration.State.STARTED,
+                not_before=source_event.not_before,
+                started_at=source_event.occurred_at,
+            )
+        if generation_no > attempt.reconcile_attempt_no:
+            attempt.reconcile_attempt_no = generation_no
+            attempt.save(update_fields=("reconcile_attempt_no",))
+
+    _terminalize_reconcile_generation_locked(
+        attempt,
+        generation,
+        error_code=error_code or "reconcile_delivery_exhausted",
+    )
+    return attempt
 
 
 @transaction.atomic
@@ -2005,7 +2423,7 @@ def _enqueue_event(
     aggregate_id=None,
     job_id=None,
     available_at=None,
-) -> None:
+):
     from wisdome_writer.infrastructure.outbox import enqueue_event
 
     resolved_id = (
@@ -2014,7 +2432,7 @@ def _enqueue_event(
         or payload.get("canary_run_id")
         or payload.get("decision_id")
     )
-    enqueue_event(
+    return enqueue_event(
         event_type=event_type,
         event_version=event_version,
         aggregate_type=aggregate_type

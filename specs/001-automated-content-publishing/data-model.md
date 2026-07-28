@@ -348,7 +348,21 @@ CollectionRun target/mode snapshot은 자동 파이프라인의
 
 단계별 시도와 관측 정보를 보존한다. `run_id`, `step_name`, `attempt_no`, `state`,
 `worker_task_id`, `started_at`, `finished_at`, `input_count`, `output_count`, `error_code`,
-`error_detail_redacted`, `retry_at`을 가진다. `(run_id, step_name, attempt_no)`가 고유하다.
+`error_detail_redacted`, `retry_at`, `fanout_completed_at`을 가진다.
+`(run_id, step_name, attempt_no)`가 고유하다.
+
+`fanout_completed_at`은 extract parent가 모든 child attempt와 outbox를 영속 생성한 뒤에만
+설정하는 완료 projection이다. evidence finalizer는 이 값이 null인 동안 run을 다음 단계로
+전진시키지 않는다. marker 도입 시점의 복구는 `CollectionRun=extracting`,
+`RunStep(name=extract, attempt_no=1, state=running)`, 시작 시각 있음, marker 없음인 행만
+대상으로 한다. 기존 run counters에 `evidence`와 `extractionFailures`가 모두 있으면 과거
+parent 완료 증거로 marker를 복원하고 finalizer를 재발행한다. 증거가 없으면 marker를 만들지
+않고 같은 run의 fan-out을 안정 dedupe key로 다시 요청한다. 이미 전진했거나 terminal인
+run/step은 변경하지 않는다. 이 data migration은 historical model과 schema editor의 DB
+alias만 사용하며, immutable outbox material과 hash 공식도 migration 안에 고정한다. 따라서
+이후 runtime model이나 enqueue helper가 바뀌어도 과거 upgrade 의미는 변하지 않는다.
+parent route 소진 시 아직 extracting인 run과 step만 종결하고, stop 요청이 있으면 두
+projection을 모두 `stopped`, 없으면 run=`failed`, step=`failed`로 맞춘다.
 
 `RunRetryRequest`는 `id`, `collection_run_id`, `from_step`, 정렬 target IDs, `request_key`,
 `request_hash`, `reauth_proof_id`, `reason`, `requested_by`, `created_at`, `accepted_job_id`를 가진
@@ -497,6 +511,7 @@ threshold, stage 결과, overall result와 생성·검증 시각만 노출한다
 | `input_asset_id` | EvidenceAsset FK nullable | SourceItem에 딸린 특정 원본 첨부/자산 |
 | `input_object_key`, `input_object_version` | string | 실제 처리한 불변 객체 위치 |
 | `input_kind` | DocumentInputKind | PDF 또는 독립 정적 이미지 |
+| `input_fingerprint` | unique SHA-256 nullable | `document-input-v1`, run-source-item ID, 입력 종류, 입력 checksum의 canonical hash; null은 과거 중복 격리 전용 |
 | `input_mime_type` | string | sniff 후 allowlist와 일치한 실제 MIME |
 | `input_frame_count` | integer nullable | 독립 이미지의 디코더 확인 frame 수; PDF는 null |
 | `input_checksum` | SHA-256 | 입력 PDF/이미지 지문 |
@@ -526,6 +541,22 @@ threshold, stage 결과, overall result와 생성·검증 시각만 노출한다
 `run_source_item_id`가 가리키는 SourceItem은 같은 행의 `source_item_id`와 같아야 하며,
 그 join의 `collection_run_id`만 document event의 `run_id`로 허용한다. 이 계보 불일치는
 트랜잭션에서 거절한다.
+
+`input_fingerprint`는 같은 run/source 계보와 같은 실제 입력이 재전달될 때 하나의
+DocumentExtraction만 선택하는 전역 고유 identity다. 기존 행을 재사용할 때 계보, 입력 종류,
+checksum이 모두 다시 일치해야 하며 다르면 fail-closed 처리한다. 정상 PDF/이미지 경로와 이미
+성공 또는 저신뢰로 끝난 legacy HWP 변환 결과의 PDF 승격 경로가 이 identity와 동일한 route
+outbox dedupe 규칙을 공유한다. 신규 행에는 fingerprint가 필수다. upgrade 전 동일 identity의
+과거 행이 여러 개면 `document_complete+succeeded`, `succeeded`, `low_confidence`,
+실패/종료, 그 밖의 상태 순으로 canonical 행 하나를 고르고 그 안에서는 가장 이른 행을
+선택한다. 나머지 행은 삭제·병합하거나 합성 fingerprint를 부여하지 않고 null로 보존해
+감사 이력과 singleton identity를 동시에 유지한다.
+
+성공 또는 저신뢰로 이미 종결된 legacy HWP 변환은 PDF 승격 전에 연결된 EvidenceAsset을
+재사용한다. 연결이 누락된 과거 행은 같은 attempt의 유효한 객체 위치와 SHA-256 checksum을
+가진 파생 자산이 정확히 하나일 때만 결합을 복구한다. 후보가 없거나 여러 개이거나 object
+material이 불완전하면 임의 자산을 선택하지 않고 attempt를 `failed`로 종결하며 terminal
+finalizer를 같은 transaction에 기록한다.
 
 ### ExtractionRun
 
@@ -1131,7 +1162,8 @@ update, 공개 확인과 최신 `remote_url` 저장이 먼저 성공한 뒤 Blog
 `approval_id`, `approval_subject_hash`, `auto_publish_activation_id/hash` nullable,
 `idempotency_key`, `remote_lookup_key`, `request_fingerprint`, `state`, `attempt_no`, `remote_request_id`,
 `http_status`, `error_code`, `error_detail_redacted`, `started_at`, `finished_at`,
-`next_retry_at`을 가진다. `idempotency_key`가 전역 고유하다.
+`next_retry_at`, `reconcile_attempt_no`를 가진다. `idempotency_key`가 전역 고유하고
+`reconcile_attempt_no`는 `0..5`다.
 
 dispatch 트랜잭션은 current intent의 target command마다 PublicationAttempt를 먼저 생성하고 exact
 revision/action/snapshot/approval/activation을 고정한 뒤 attempt ID만 request outbox의 routing
@@ -1149,6 +1181,39 @@ WordPress `remote_lookup_key`는 Publication UUID 기반 결정적 post slug다.
 UUID 기반 전용 label과 HTML comment marker 쌍이다. 조회 결과가 정확히 한 건이고 marker와
 대상 blog가 일치할 때만 기존 생성 결과로 채택하며 0건 또는 복수건은 `manual_required`로
 격리한다.
+
+### PublicationReconcileGeneration
+
+한 PublicationAttempt의 원격 결과 조정 시도를 source outbox event와 함께 append-only로
+보존한다.
+
+| 필드 | 타입/제약 | 설명 |
+|---|---|---|
+| `id` | UUID PK | 조정 세대 식별자 |
+| `publication_attempt_id` | PublicationAttempt FK, PROTECT | 조정 대상 외부 동작 |
+| `generation` | integer `1..5` | execute/admin `attempt_no`와 분리된 조정 세대 |
+| `source_event_id` | OutboxMessage one-to-one, PROTECT | 이 세대를 시작한 정확한 reconcile event |
+| `state` | `started`, `completed` | 동일 이벤트 재개의 durable 상태 |
+| `result_identity` | SHA-256 blank 허용 | 완료 결과의 canonical material hash |
+| `result_state` | string blank 허용 | 완료 시 적용된 PublicationAttempt 상태 |
+| `not_before` | datetime | source event의 불변 예약 시각 |
+| `started_at`, `completed_at` | datetime | 시작과 완료 시각 |
+
+`(publication_attempt_id, generation)`과 `source_event_id`가 각각 고유하다. 같은 완료 event의
+재전달은 adapter를 호출하지 않고, 같은 started event의 재전달은 같은 generation을 재개한다.
+legacy v1 event는 최초 소비 시 해당 attempt의 다음 연속 세대에 한 번만 결합한다. v2 event의
+payload 세대, 행 세대, `PublicationAttempt.reconcile_attempt_no`는 정확히 일치해야 한다.
+
+결과 저장은 source event와 generation을 함께 fence한다. 더 새 세대가 시작된 뒤 도착한 과거
+결과는 현재 attempt/publication 결과를 덮어쓰지 못한다. 결과 적용과 generation 완료는 하나의
+transaction이며, retryable/unknown 결과의 다음 v2 outbox event와 다음 started generation
+할당도 하나의 transaction이다. 다섯 번째 실패는 `manual_required`로 종결하고 여섯 번째 행이나
+event를 만들지 않는다. 새 세대를 할당하는 같은 transaction에서 attempt와 publication도
+`reconciling`으로 projection하므로 execute 재전달이나 관리자 retry가 외부 write 경로를
+다시 열 수 없다. v1/v2 전달의 terminal callback은 정확한 source event에 결합된 세대를
+`completed`로 만들고 attempt/publication을 `manual_required`로 종결한다. 후속 생성과
+upgrade backfill도 source outbox 또는 해당 consumer receipt의 `dead_letter`를 감지해 같은
+종결을 적용하며 완료 세대 replay는 no-op이다.
 
 ### RemoteMedia
 
@@ -1346,6 +1411,7 @@ CorrectionCase 0..1 ── * PublicationIntent
 ArticleRevision 1 ── * QualityCheck
 ArticleRevision 1 ── * Approval * ── 1 PublicationTarget
 DraftArticle 1 ── * Publication 1 ── * PublicationAttempt
+PublicationAttempt 1 ── 0..5 PublicationReconcileGeneration 1 ── 1 OutboxMessage
 Publication 1 ── * PublicationMedia * ── 1 RemoteMedia
 Publication 1 ── * PublicationMedia * ── 1 PublicDeliveryAsset
 PublishedEvidenceSnapshot 1 ── * PublicationMedia
@@ -1373,3 +1439,27 @@ SourceItem/DraftArticle 1 ── * CorrectionCase
 PublicDeliveryAsset 삭제를 보류한다. raw 원문 purge는 snapshot 생성·해시 검증과 nullable FK
 전환을 같은 retention transaction/batch에서 완료한 경우에만 허용한다.
 관리자 삭제는 사전 영향 미리보기, 재인증, 이유 입력과 AuditEvent를 요구한다.
+
+## English — T005 Durable Recovery Model Addendum
+
+- `RunStep.fanout_completed_at` is a completion projection set only after the evidence
+  parent durably creates all child attempts and outbox events. Upgrade recovery restores
+  it only when both existing evidence counters prove completion; otherwise it emits a
+  deduplicated re-fan-out request and leaves the marker null. The data migration uses
+  historical models, the schema-editor database alias, and migration-local immutable
+  outbox material/hash construction. Exhausted parent delivery projects both run and
+  step to stopped when requested, or to their failure states otherwise.
+- `DocumentExtraction.input_fingerprint` is the unique nullable canonical SHA-256 of
+  schema `document-input-v1`, run-source-item identity, input kind, and input checksum.
+  New rows require it. Normal document processing and legacy-HWP PDF promotion share
+  this identity and one route event. Upgrade canonicalization prioritizes complete
+  success, success, low confidence, and then failed/finished rows; historical duplicates
+  remain audit-only with null fingerprints. Legacy-HWP convergence recovers exactly one
+  valid derived asset and fails closed for missing, ambiguous, or incomplete immutable
+  material.
+- `PublicationReconcileGeneration` is append-only, ranges from one through five, and is
+  bound one-to-one to the exact source outbox event. Source-event plus generation fencing
+  makes replay resumable and prevents an older result from overwriting a newer one.
+  Allocation atomically projects attempt/publication to reconciling. Terminal route
+  callbacks and source-event or receipt DLQ complete the bound generation, manualize the
+  attempt/publication, and make replay a no-op.

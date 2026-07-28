@@ -216,6 +216,13 @@ class DocumentExtraction(UUIDModel):
     input_object_key = models.CharField(max_length=1024)
     input_object_version = models.CharField(max_length=256)
     input_kind = models.CharField(max_length=24, choices=DocumentInputKind.choices)
+    input_fingerprint = models.CharField(
+        max_length=64,
+        unique=True,
+        null=True,
+        blank=True,
+        validators=[sha256_validator],
+    )
     input_mime_type = models.CharField(max_length=160)
     input_frame_count = models.PositiveIntegerField(null=True, blank=True)
     input_checksum = models.CharField(max_length=64, validators=[sha256_validator])

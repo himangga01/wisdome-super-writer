@@ -98,8 +98,20 @@ def consume_outbox_event(
     self,
     envelope: dict,
     infra_retry_count: int = 0,
+    infrastructure_lease_token: str | None = None,
+    infrastructure_lease_generation: int | None = None,
 ):
     def retry_infrastructure(exc: DatabaseError):
+        retry_lease_token = getattr(
+            exc,
+            "lease_token",
+            infrastructure_lease_token,
+        )
+        retry_lease_generation = getattr(
+            exc,
+            "lease_generation",
+            infrastructure_lease_generation,
+        )
         if infra_retry_count >= 3:
             logger.exception(
                 "outbox consumer infrastructure remained unavailable; requeueing",
@@ -108,7 +120,13 @@ def consume_outbox_event(
             raise Reject(exc, requeue=True)
         raise self.retry(
             args=(envelope,),
-            kwargs={"infra_retry_count": infra_retry_count + 1},
+            kwargs={
+                "infra_retry_count": infra_retry_count + 1,
+                "infrastructure_lease_token": (
+                    str(retry_lease_token) if retry_lease_token else None
+                ),
+                "infrastructure_lease_generation": retry_lease_generation,
+            },
             exc=exc,
             countdown=2**infra_retry_count,
         )
@@ -180,6 +198,8 @@ def consume_outbox_event(
             terminal_handler=terminal_handler if route.terminal_task_name else None,
             terminal_argument_keys=route.terminal_argument_keys,
             max_attempts=route.max_attempts,
+            infrastructure_lease_token=infrastructure_lease_token,
+            infrastructure_lease_generation=infrastructure_lease_generation,
         )
     except DatabaseError as exc:
         return retry_infrastructure(exc)

@@ -504,6 +504,55 @@ class PublicationAttempt(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(reconcile_attempt_no__lte=5),
+                name="ck_publication_reconcile_attempt_no_lte_5",
+            ),
+        ]
+
+
+class PublicationReconcileGeneration(models.Model):
+    class State(models.TextChoices):
+        STARTED = "started", "시작"
+        COMPLETED = "completed", "완료"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication_attempt = models.ForeignKey(
+        PublicationAttempt,
+        on_delete=models.PROTECT,
+        related_name="reconcile_generations",
+    )
+    generation = models.PositiveSmallIntegerField()
+    source_event = models.OneToOneField(
+        "infrastructure.OutboxMessage",
+        on_delete=models.PROTECT,
+        related_name="publication_reconcile_generation",
+    )
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.STARTED,
+    )
+    result_identity = models.CharField(max_length=64, blank=True)
+    result_state = models.CharField(max_length=24, blank=True)
+    not_before = models.DateTimeField()
+    started_at = models.DateTimeField()
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["publication_attempt_id", "generation"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("publication_attempt", "generation"),
+                name="uq_publication_reconcile_generation",
+            ),
+            models.CheckConstraint(
+                condition=Q(generation__gte=1, generation__lte=5),
+                name="ck_publication_reconcile_generation_1_5",
+            ),
+        ]
 
 
 class RemoteMedia(models.Model):

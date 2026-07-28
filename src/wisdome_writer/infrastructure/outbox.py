@@ -12,7 +12,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -96,6 +96,19 @@ class PermanentEventError(RuntimeError):
     def __init__(self, code: str, detail: str = ""):
         super().__init__(detail or code)
         self.code = code
+
+
+class ConsumerInfrastructureError(DatabaseError):
+    def __init__(
+        self,
+        cause: DatabaseError,
+        *,
+        lease_token: uuid.UUID,
+        lease_generation: int,
+    ):
+        super().__init__(str(cause))
+        self.lease_token = lease_token
+        self.lease_generation = lease_generation
 
 
 def _uuid(value: uuid.UUID | str | None, *, fallback: uuid.UUID | None = None) -> uuid.UUID:
@@ -832,6 +845,8 @@ def consume_event(
     terminal_handler: Callable[..., Any] | None = None,
     terminal_argument_keys: tuple[str, ...] = (),
     max_attempts: int = 5,
+    infrastructure_lease_token: uuid.UUID | str | None = None,
+    infrastructure_lease_generation: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(envelope, dict):
         raise ForbiddenEventPayload("received event envelope must be an object")
@@ -849,6 +864,18 @@ def consume_event(
             return {"state": "duplicate", "attempt": receipt.attempts}
         if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
             return {"state": "dead_letter", "attempt": receipt.attempts}
+        if (
+            receipt.state == OutboxConsumerReceipt.State.PROCESSING
+            and infrastructure_lease_token is not None
+            and receipt.lease_token == _uuid(infrastructure_lease_token)
+            and receipt.lease_generation == infrastructure_lease_generation
+        ):
+            receipt.state = OutboxConsumerReceipt.State.RETRY
+            receipt.attempts = max(receipt.attempts - 1, 0)
+            receipt.next_retry_at = None
+            receipt.claimed_at = None
+            receipt.claimed_until = None
+            receipt.lease_token = None
         try:
             if not isinstance(payload, dict):
                 raise ForbiddenEventPayload("received event payload must be an object")
@@ -972,87 +999,89 @@ def consume_event(
             )
         )
 
+    def consumer_infrastructure_error(
+        exc: DatabaseError,
+    ) -> ConsumerInfrastructureError:
+        try:
+            with transaction.atomic():
+                owned_receipt = _lock_owned_consumer_receipt(
+                    event_id=event_id,
+                    consumer_name=consumer_name,
+                    lease_token=lease_token,
+                    lease_generation=lease_generation,
+                )
+                if owned_receipt is not None:
+                    owned_receipt.state = OutboxConsumerReceipt.State.RETRY
+                    owned_receipt.attempts = max(
+                        owned_receipt.attempts - 1,
+                        0,
+                    )
+                    owned_receipt.last_error_code = ""
+                    owned_receipt.next_retry_at = None
+                    owned_receipt.claimed_at = None
+                    owned_receipt.claimed_until = None
+                    owned_receipt.lease_token = None
+                    owned_receipt.save(
+                        update_fields=(
+                            "state",
+                            "attempts",
+                            "last_error_code",
+                            "next_retry_at",
+                            "claimed_at",
+                            "claimed_until",
+                            "lease_token",
+                        )
+                    )
+        except DatabaseError as release_exc:
+            return ConsumerInfrastructureError(
+                release_exc,
+                lease_token=lease_token,
+                lease_generation=lease_generation,
+            )
+        return ConsumerInfrastructureError(
+            exc,
+            lease_token=lease_token,
+            lease_generation=lease_generation,
+        )
+
     try:
         args = [payload[key] for key in argument_keys]
     except KeyError as exc:
-        with transaction.atomic():
-            receipt = _lock_owned_consumer_receipt(
-                event_id=event_id,
-                consumer_name=consumer_name,
-                lease_token=lease_token,
-                lease_generation=lease_generation,
-            )
-            if receipt is None:
-                return {"state": "stale_fenced", "attempt": None}
-            receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
-            receipt.last_error_code = f"missing_payload_{exc.args[0]}"[:120]
-            receipt.dead_lettered_at = timezone.now()
-            receipt.claimed_at = None
-            receipt.claimed_until = None
-            receipt.lease_token = None
-            receipt.save(
-                update_fields=(
-                    "state",
-                    "last_error_code",
-                    "dead_lettered_at",
-                    "claimed_at",
-                    "claimed_until",
-                    "lease_token",
+        try:
+            with transaction.atomic():
+                receipt = _lock_owned_consumer_receipt(
+                    event_id=event_id,
+                    consumer_name=consumer_name,
+                    lease_token=lease_token,
+                    lease_generation=lease_generation,
                 )
-            )
-            event = OutboxMessage.objects.select_for_update().get(pk=event_id)
-            event.status = OutboxMessage.Status.DEAD_LETTER
-            event.dead_lettered_at = timezone.now()
-            event.last_error_at = timezone.now()
-            event.last_error_code = receipt.last_error_code
-            event.save(
-                update_fields=(
-                    "status",
-                    "dead_lettered_at",
-                    "last_error_at",
-                    "last_error_code",
+                if receipt is None:
+                    return {"state": "stale_fenced", "attempt": None}
+                receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
+                receipt.last_error_code = (
+                    f"missing_payload_{exc.args[0]}"[:120]
                 )
-            )
-            return {"state": "dead_letter", "attempt": receipt.attempts}
-
-    try:
-        # Domain tasks own their transaction boundaries. In particular, publisher
-        # tasks commit the pre-call fingerprint before external I/O and use
-        # reconcile on ambiguous outcomes.
-        with event_context(envelope):
-            result = handler(*args)
-    except Exception as exc:
-        with transaction.atomic():
-            event = OutboxMessage.objects.select_for_update().get(pk=event_id)
-            receipt = _lock_owned_consumer_receipt(
-                event_id=event_id,
-                consumer_name=consumer_name,
-                lease_token=lease_token,
-                lease_generation=lease_generation,
-            )
-            if receipt is None:
-                return {"state": "stale_fenced", "attempt": None}
-            terminal = bool(getattr(exc, "permanent", False)) or (
-                receipt.attempts >= consumer_attempt_limit
-            )
-            error_code = str(getattr(exc, "code", exc.__class__.__name__))[:120]
-            if terminal and terminal_handler is not None:
-                terminal_args = [event.payload[key] for key in terminal_argument_keys]
-                with event_context(envelope):
-                    terminal_handler(*terminal_args, error_code)
-            receipt.state = (
-                OutboxConsumerReceipt.State.DEAD_LETTER
-                if terminal
-                else OutboxConsumerReceipt.State.RETRY
-            )
-            receipt.last_error_code = error_code
-            if terminal:
                 receipt.dead_lettered_at = timezone.now()
-                receipt.next_retry_at = None
+                receipt.claimed_at = None
+                receipt.claimed_until = None
+                receipt.lease_token = None
+                receipt.save(
+                    update_fields=(
+                        "state",
+                        "last_error_code",
+                        "dead_lettered_at",
+                        "claimed_at",
+                        "claimed_until",
+                        "lease_token",
+                    )
+                )
+                event = OutboxMessage.objects.select_for_update().get(
+                    pk=event_id
+                )
                 event.status = OutboxMessage.Status.DEAD_LETTER
                 event.dead_lettered_at = timezone.now()
                 event.last_error_at = timezone.now()
-                event.last_error_code = error_code
+                event.last_error_code = receipt.last_error_code
                 event.save(
                     update_fields=(
                         "status",
@@ -1061,11 +1090,126 @@ def consume_event(
                         "last_error_code",
                     )
                 )
-            else:
-                retry_after = getattr(exc, "retry_after_seconds", None)
-                receipt.next_retry_at = timezone.now() + timedelta(
-                    seconds=_backoff_seconds(event_id, receipt.attempts, retry_after)
+                return {
+                    "state": "dead_letter",
+                    "attempt": receipt.attempts,
+                }
+        except DatabaseError as settlement_exc:
+            raise consumer_infrastructure_error(
+                settlement_exc
+            ) from settlement_exc
+
+    try:
+        # Domain tasks own their transaction boundaries. In particular, publisher
+        # tasks commit the pre-call fingerprint before external I/O and use
+        # reconcile on ambiguous outcomes.
+        with event_context(envelope):
+            result = handler(*args)
+    except DatabaseError as exc:
+        raise consumer_infrastructure_error(exc) from exc
+    except Exception as exc:
+        try:
+            with transaction.atomic():
+                event = OutboxMessage.objects.select_for_update().get(
+                    pk=event_id
                 )
+                receipt = _lock_owned_consumer_receipt(
+                    event_id=event_id,
+                    consumer_name=consumer_name,
+                    lease_token=lease_token,
+                    lease_generation=lease_generation,
+                )
+                if receipt is None:
+                    return {"state": "stale_fenced", "attempt": None}
+                terminal = bool(getattr(exc, "permanent", False)) or (
+                    receipt.attempts >= consumer_attempt_limit
+                )
+                error_code = str(
+                    getattr(exc, "code", exc.__class__.__name__)
+                )[:120]
+                if terminal and terminal_handler is not None:
+                    terminal_args = [
+                        event.payload[key]
+                        for key in terminal_argument_keys
+                    ]
+                    with event_context(envelope):
+                        terminal_handler(*terminal_args, error_code)
+                receipt.state = (
+                    OutboxConsumerReceipt.State.DEAD_LETTER
+                    if terminal
+                    else OutboxConsumerReceipt.State.RETRY
+                )
+                receipt.last_error_code = error_code
+                if terminal:
+                    receipt.dead_lettered_at = timezone.now()
+                    receipt.next_retry_at = None
+                    event.status = OutboxMessage.Status.DEAD_LETTER
+                    event.dead_lettered_at = timezone.now()
+                    event.last_error_at = timezone.now()
+                    event.last_error_code = error_code
+                    event.save(
+                        update_fields=(
+                            "status",
+                            "dead_lettered_at",
+                            "last_error_at",
+                            "last_error_code",
+                        )
+                    )
+                else:
+                    retry_after = getattr(
+                        exc,
+                        "retry_after_seconds",
+                        None,
+                    )
+                    receipt.next_retry_at = timezone.now() + timedelta(
+                        seconds=_backoff_seconds(
+                            event_id,
+                            receipt.attempts,
+                            retry_after,
+                        )
+                    )
+                receipt.claimed_at = None
+                receipt.claimed_until = None
+                receipt.lease_token = None
+                receipt.save(
+                    update_fields=(
+                        "state",
+                        "last_error_code",
+                        "next_retry_at",
+                        "dead_lettered_at",
+                        "claimed_at",
+                        "claimed_until",
+                        "lease_token",
+                    )
+                )
+                return {
+                    "state": receipt.state,
+                    "attempt": receipt.attempts,
+                    "retry_at": (
+                        receipt.next_retry_at.isoformat()
+                        if receipt.next_retry_at
+                        else None
+                    ),
+                }
+        except DatabaseError as settlement_exc:
+            raise consumer_infrastructure_error(
+                settlement_exc
+            ) from settlement_exc
+
+    try:
+        with transaction.atomic():
+            receipt = _lock_owned_consumer_receipt(
+                event_id=event_id,
+                consumer_name=consumer_name,
+                lease_token=lease_token,
+                lease_generation=lease_generation,
+            )
+            if receipt is None:
+                return {"state": "stale_fenced", "attempt": None}
+            receipt.state = OutboxConsumerReceipt.State.SUCCEEDED
+            receipt.last_error_code = ""
+            receipt.completed_at = timezone.now()
+            receipt.next_retry_at = None
             receipt.claimed_at = None
             receipt.claimed_until = None
             receipt.lease_token = None
@@ -1073,46 +1217,19 @@ def consume_event(
                 update_fields=(
                     "state",
                     "last_error_code",
+                    "completed_at",
                     "next_retry_at",
-                    "dead_lettered_at",
                     "claimed_at",
                     "claimed_until",
                     "lease_token",
                 )
             )
             return {
-                "state": receipt.state,
+                "state": "succeeded",
                 "attempt": receipt.attempts,
-                "retry_at": (
-                    receipt.next_retry_at.isoformat() if receipt.next_retry_at else None
-                ),
+                "result": result,
             }
-
-    with transaction.atomic():
-        receipt = _lock_owned_consumer_receipt(
-            event_id=event_id,
-            consumer_name=consumer_name,
-            lease_token=lease_token,
-            lease_generation=lease_generation,
-        )
-        if receipt is None:
-            return {"state": "stale_fenced", "attempt": None}
-        receipt.state = OutboxConsumerReceipt.State.SUCCEEDED
-        receipt.last_error_code = ""
-        receipt.completed_at = timezone.now()
-        receipt.next_retry_at = None
-        receipt.claimed_at = None
-        receipt.claimed_until = None
-        receipt.lease_token = None
-        receipt.save(
-            update_fields=(
-                "state",
-                "last_error_code",
-                "completed_at",
-                "next_retry_at",
-                "claimed_at",
-                "claimed_until",
-                "lease_token",
-            )
-        )
-        return {"state": "succeeded", "attempt": receipt.attempts, "result": result}
+    except DatabaseError as settlement_exc:
+        raise consumer_infrastructure_error(
+            settlement_exc
+        ) from settlement_exc

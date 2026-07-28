@@ -10,7 +10,8 @@ from urllib.parse import urlparse
 
 import httpx
 from celery import shared_task
-from django.db import transaction
+from celery.exceptions import SoftTimeLimitExceeded
+from django.db import DatabaseError, transaction
 from django.utils import timezone
 
 from adapters.extractors.base import (
@@ -73,6 +74,178 @@ from .services import (
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
 
+def _document_input_fingerprint(
+    *,
+    run_source_item_id: Any,
+    input_kind: str,
+    input_checksum: str,
+) -> str:
+    return canonical_hash(
+        {
+            "schema": "document-input-v1",
+            "run_source_item_id": str(run_source_item_id),
+            "input_kind": input_kind,
+            "input_checksum": input_checksum,
+        }
+    )
+
+
+def _get_or_create_document_extraction(
+    *,
+    run_source_item,
+    source_item,
+    input_asset: EvidenceAsset,
+    input_object_key: str,
+    input_object_version: str,
+    input_kind: str,
+    input_mime_type: str,
+    input_checksum: str,
+    input_page_count: int,
+    expected_page_indices: list[int],
+    input_frame_count: int | None = None,
+) -> DocumentExtraction:
+    fingerprint = _document_input_fingerprint(
+        run_source_item_id=run_source_item.id,
+        input_kind=input_kind,
+        input_checksum=input_checksum,
+    )
+    document, created = DocumentExtraction.objects.get_or_create(
+        input_fingerprint=fingerprint,
+        defaults={
+            "run_source_item": run_source_item,
+            "source_item": source_item,
+            "input_asset": input_asset,
+            "input_object_key": input_object_key,
+            "input_object_version": input_object_version,
+            "input_kind": input_kind,
+            "input_mime_type": input_mime_type,
+            "input_frame_count": input_frame_count,
+            "input_checksum": input_checksum,
+            "input_page_count": input_page_count,
+            "expected_page_indices": expected_page_indices,
+        },
+    )
+    if not created and (
+        document.run_source_item_id != run_source_item.id
+        or document.source_item_id != source_item.id
+        or document.input_kind != input_kind
+        or document.input_checksum != input_checksum
+    ):
+        raise PermanentEventError("document_input_identity_conflict")
+    return document
+
+
+def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
+    if evidence is None:
+        return False
+    checksum = evidence.checksum
+    return (
+        bool(evidence.object_key)
+        and isinstance(checksum, str)
+        and len(checksum) == 64
+        and all(character in "0123456789abcdef" for character in checksum)
+    )
+
+
+def _fail_incomplete_legacy_hwp_locked(
+    attempt: GenericExtractionAttempt,
+    *,
+    error_code: str,
+) -> GenericExtractionAttempt:
+    attempt.state = ExtractionState.FAILED
+    attempt.error_code = error_code
+    attempt.error_detail_redacted = (
+        "legacy HWP converted PDF material is incomplete"
+    )
+    attempt.finished_at = timezone.now()
+    attempt.save(
+        update_fields=(
+            "state",
+            "error_code",
+            "error_detail_redacted",
+            "finished_at",
+            "updated_at",
+        )
+    )
+    _enqueue_finalize(
+        str(attempt.run_source_item.run_id),
+        f"generic-terminal:{attempt.id}",
+    )
+    return attempt
+
+
+def _converge_legacy_hwp_document_locked(
+    attempt: GenericExtractionAttempt,
+) -> GenericExtractionAttempt:
+    if (
+        attempt.engine != ExtractionEngine.LEGACY_HWP
+        or attempt.state
+        not in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE)
+    ):
+        return attempt
+
+    evidence = attempt.evidence_asset
+    if not _has_complete_legacy_hwp_pdf(evidence):
+        recoverable = list(
+            attempt.derived_evidence_assets.filter(
+                origin_run_source_item_id=attempt.run_source_item_id,
+                source_item_id=attempt.source_item_id,
+                object_key__isnull=False,
+                checksum__isnull=False,
+            )
+            .exclude(object_key="")
+            .exclude(checksum="")
+            .order_by("created_at", "id")[:2]
+        )
+        if len(recoverable) == 1 and _has_complete_legacy_hwp_pdf(
+            recoverable[0]
+        ):
+            evidence = recoverable[0]
+            attempt.evidence_asset = evidence
+            attempt.save(update_fields=("evidence_asset", "updated_at"))
+        else:
+            error_code = (
+                "legacy_hwp_evidence_ambiguous"
+                if len(recoverable) > 1
+                else "legacy_hwp_conversion_material_missing"
+            )
+            return _fail_incomplete_legacy_hwp_locked(
+                attempt,
+                error_code=error_code,
+            )
+
+    document = _get_or_create_document_extraction(
+        run_source_item=attempt.run_source_item,
+        source_item=attempt.source_item,
+        input_asset=evidence,
+        input_object_key=evidence.object_key,
+        input_object_version=evidence.object_version or evidence.checksum,
+        input_kind=DocumentInputKind.PDF,
+        input_mime_type="application/pdf",
+        input_checksum=evidence.checksum,
+        input_page_count=1,
+        expected_page_indices=[0],
+    )
+    _enqueue_document_extraction(document)
+    return attempt
+
+
+def _ensure_legacy_hwp_document(
+    attempt_id: Any,
+) -> GenericExtractionAttempt:
+    with transaction.atomic():
+        attempt = (
+            GenericExtractionAttempt.objects.select_for_update()
+            .select_related(
+                "run_source_item",
+                "source_item",
+                "evidence_asset",
+            )
+            .get(pk=attempt_id)
+        )
+        return _converge_legacy_hwp_document_locked(attempt)
+
+
 def _enqueue_document_extraction(document: DocumentExtraction) -> None:
     enqueue_event(
         event_type="evidence.document_route_requested",
@@ -87,7 +260,7 @@ def _enqueue_document_extraction(document: DocumentExtraction) -> None:
             "input_asset_id": (
                 str(document.input_asset_id) if document.input_asset_id else None
             ),
-            "input_kind": document.input_kind,
+            "input_kind": str(document.input_kind),
             "document_extraction_id": str(document.id),
             "input_checksum": document.input_checksum,
         },
@@ -559,10 +732,10 @@ def _generic_extractor(profile: ExtractionProfileSnapshot):
 def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
     attempt = GenericExtractionAttempt.objects.select_related(
         "run_source_item__run", "run_source_item__source_snapshot__source", "source_item",
-        "input_asset", "extraction_profile_snapshot",
+        "input_asset", "evidence_asset", "extraction_profile_snapshot",
     ).get(pk=attempt_id)
     if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
-        return attempt
+        return _ensure_legacy_hwp_document(attempt.id)
     profile = attempt.extraction_profile_snapshot
     _verify_profile(profile)
     if attempt.input_asset is None or not attempt.input_asset.object_key:
@@ -623,7 +796,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 "extraction_profile_snapshot",
             ).get(pk=attempt_id)
             if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
-                return attempt
+                return _converge_legacy_hwp_document_locked(attempt)
             attempt.state = (
                 ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
             )
@@ -716,7 +889,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
 
             if legacy_info:
                 info, converted_checksum, _ = legacy_info
-                document = DocumentExtraction.objects.create(
+                document = _get_or_create_document_extraction(
                     run_source_item=attempt.run_source_item,
                     source_item=attempt.source_item,
                     input_asset=evidence,
@@ -743,7 +916,7 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
     suffix = Path(filename).suffix.lower()
     if mime_type == "application/pdf":
         with transaction.atomic():
-            document = DocumentExtraction.objects.create(
+            document = _get_or_create_document_extraction(
                 run_source_item=run_source_item,
                 source_item=run_source_item.source_item,
                 input_asset=raw_asset,
@@ -759,7 +932,7 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         return
     if mime_type in {"image/png", "image/jpeg", "image/tiff"}:
         with transaction.atomic():
-            document = DocumentExtraction.objects.create(
+            document = _get_or_create_document_extraction(
                 run_source_item=run_source_item,
                 source_item=run_source_item.source_item,
                 input_asset=raw_asset,
@@ -1006,6 +1179,58 @@ def finalize_run_evidence(run_id: str):
         }
 
 
+@shared_task(name="apps.evidence.tasks.finalize_run_evidence_fanout_failure")
+def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
+    now = timezone.now()
+    redacted_code = str(error_code)[:100]
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().filter(pk=run_id).first()
+        if run is None:
+            return {"runId": run_id, "state": "missing"}
+        if run.state != RunState.EXTRACTING:
+            return {"runId": str(run.id), "state": run.state}
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        stopped = run.stop_requested_at is not None
+        step.state = "stopped" if stopped else "failed"
+        step.error_code = redacted_code
+        step.error_detail_redacted = "evidence fan-out delivery exhausted"
+        step.finished_at = now
+        step.save(
+            update_fields=(
+                "state",
+                "error_code",
+                "error_detail_redacted",
+                "finished_at",
+            )
+        )
+        if stopped:
+            run.state = RunState.STOPPED
+            run.error_summary = None
+        else:
+            run.state = RunState.FAILED
+            run.error_summary = {
+                "stage": "extract",
+                "code": redacted_code,
+            }
+        run.completed_at = now
+        run.save(
+            update_fields=(
+                "state",
+                "error_summary",
+                "completed_at",
+            )
+        )
+        return {
+            "runId": str(run.id),
+            "state": run.state,
+            "code": redacted_code,
+        }
+
+
 @shared_task(name="apps.evidence.tasks.process_run_evidence")
 def process_run_evidence(run_id: str):
     with transaction.atomic():
@@ -1049,7 +1274,9 @@ def process_run_evidence(run_id: str):
                         "attachment": str(attachment.get("title", "attachment"))[:120],
                         "code": getattr(exc, "code", exc.__class__.__name__),
                     })
-        except Exception as exc:
+        except (DatabaseError, SoftTimeLimitExceeded):
+            raise
+        except (ExtractorError, httpx.HTTPError, OSError) as exc:
             failures.append({
                 "runSourceItemId": str(run_source_item.id),
                 "attachment": "source-record",

@@ -536,7 +536,11 @@ def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResp
             PublicationAttempt.State.RECONCILING,
         }:
             _enqueue_reconcile_locked(row)
-            action = "reconcile"
+            action = (
+                "manual_required"
+                if row.state == PublicationAttempt.State.MANUAL_REQUIRED
+                else "reconcile"
+            )
         elif row.state == PublicationAttempt.State.RETRYABLE_FAILED:
             row.state = PublicationAttempt.State.QUEUED
             row.attempt_no += 1
