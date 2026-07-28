@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -47,6 +48,10 @@ class WordPressPublisher:
         if not base_url.lower().startswith("https://"):
             raise ValueError("WordPress Application Password 연결에는 HTTPS가 필요합니다.")
         self.site_url = redact_url(base_url).rstrip("/")
+        public_host = urlparse(self.site_url).hostname
+        if not public_host:
+            raise ValueError("WordPress public URL host is required")
+        self.public_hosts = {public_host}
         self.api_url = f"{self.site_url}/wp-json/wp/v2"
         self.timeout_seconds = timeout_seconds
         self.write_guard = write_guard or (lambda: None)
@@ -199,6 +204,7 @@ class WordPressPublisher:
                 url,
                 max_bytes=MAX_PUBLIC_VERIFICATION_BYTES,
                 timeout=self.timeout_seconds,
+                allowed_hosts=self.public_hosts,
                 headers={"User-Agent": "WisdomeWriter/1.0"},
                 max_elapsed_seconds=self.timeout_seconds,
             )

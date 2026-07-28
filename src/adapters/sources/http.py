@@ -8,7 +8,12 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from defusedxml import ElementTree
 
-from wisdome_writer.infrastructure.http_safety import redact_url, safe_get
+from wisdome_writer.infrastructure.http_safety import (
+    redact_url,
+    redact_url_values,
+    redact_urls_in_text,
+    safe_get,
+)
 
 from .base import CollectedSourceRecord, SourceAttachment
 
@@ -97,14 +102,18 @@ class PublicHtmlAdapter(HttpSourceAdapter):
             safe_entrypoint = redact_url(entrypoint)
             parser = _PageParser()
             parser.feed(response.text)
-            attachments = tuple(
-                SourceAttachment(
-                    url=redact_url(urljoin(entrypoint, href)),
-                    title=label or href.rsplit("/", 1)[-1],
+            attachments: list[SourceAttachment] = []
+            for href, label in parser.links:
+                if not urlparse(href).path.lower().endswith(ATTACHMENT_EXTENSIONS):
+                    continue
+                safe_attachment_url = redact_url(urljoin(entrypoint, href))
+                safe_fallback_title = urlparse(safe_attachment_url).path.rsplit("/", 1)[-1]
+                attachments.append(
+                    SourceAttachment(
+                        url=safe_attachment_url,
+                        title=redact_urls_in_text(label) if label else safe_fallback_title,
+                    )
                 )
-                for href, label in parser.links
-                if urlparse(href).path.lower().endswith(ATTACHMENT_EXTENSIONS)
-            )
             records.append(
                 CollectedSourceRecord(
                     external_id=response.headers.get("ETag") or safe_entrypoint,
@@ -115,7 +124,7 @@ class PublicHtmlAdapter(HttpSourceAdapter):
                     collected_at=now,
                     body_text="\n".join(parser.text),
                     metadata={"contentType": response.headers.get("Content-Type", "text/html")},
-                    attachments=attachments,
+                    attachments=tuple(attachments),
                 )
             )
         return records
@@ -130,12 +139,13 @@ class RssAdapter(HttpSourceAdapter):
             for item in root.findall(".//item"):
                 link = (item.findtext("link") or "").strip()
                 safe_link = redact_url(link)
+                guid = (item.findtext("guid") or "").strip()
                 published = _parse_date(item.findtext("pubDate"))
                 if published and not (since <= published <= until):
                     continue
                 records.append(
                     CollectedSourceRecord(
-                        external_id=(item.findtext("guid") or safe_link).strip(),
+                        external_id=redact_urls_in_text(guid) if guid else safe_link,
                         canonical_url=safe_link,
                         title=(item.findtext("title") or "제목 없음").strip(),
                         publisher=self.source.owner_name,
@@ -157,16 +167,19 @@ class OpenDataJsonAdapter(HttpSourceAdapter):
             for row in rows:
                 url = row.get("url") or entrypoint
                 safe_url = redact_url(str(url))
+                identity = row.get("id") or row.get("noticeId")
                 records.append(
                     CollectedSourceRecord(
-                        external_id=str(row.get("id") or row.get("noticeId") or safe_url),
+                        external_id=(
+                            redact_urls_in_text(str(identity)) if identity is not None else safe_url
+                        ),
                         canonical_url=safe_url,
                         title=str(row.get("title") or row.get("name") or "제목 없음"),
                         publisher=self.source.owner_name,
                         published_at=_parse_date(row.get("publishedAt") or row.get("date")),
                         collected_at=now,
                         body_text=str(row.get("content") or row.get("summary") or ""),
-                        metadata={"structured": row},
+                        metadata={"structured": redact_url_values(row)},
                     )
                 )
         return records

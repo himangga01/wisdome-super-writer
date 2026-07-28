@@ -6,6 +6,7 @@ import socket
 import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -63,6 +64,23 @@ def redact_urls_in_text(text: str) -> str:
     """Redact URL secrets before exception or log text is persisted."""
 
     return _URL_PATTERN.sub(lambda match: redact_url(match.group(0)), str(text))
+
+
+def redact_url_values(value: Any) -> Any:
+    """Recursively redact URL-shaped strings while preserving non-URL identities."""
+
+    if isinstance(value, Mapping):
+        return {
+            redact_urls_in_text(key) if isinstance(key, str) else key: redact_url_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_url_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_url_values(item) for item in value)
+    if isinstance(value, str):
+        return redact_urls_in_text(value)
+    return value
 
 
 def safe_get(
