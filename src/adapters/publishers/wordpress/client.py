@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import mimetypes
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import PurePath
-from typing import Any, Callable
-from urllib.parse import urlparse
+from typing import Any
 
 import httpx
 
@@ -15,6 +15,9 @@ from apps.publishing.contracts import (
     PublisherError,
     PublishResult,
 )
+from wisdome_writer.infrastructure.http_safety import HttpSafetyError, redact_url, safe_get
+
+MAX_PUBLIC_VERIFICATION_BYTES = 1024 * 1024
 
 
 class WordPressPublisher:
@@ -43,7 +46,7 @@ class WordPressPublisher:
     ):
         if not base_url.lower().startswith("https://"):
             raise ValueError("WordPress Application Password 연결에는 HTTPS가 필요합니다.")
-        self.site_url = base_url.rstrip("/")
+        self.site_url = redact_url(base_url).rstrip("/")
         self.api_url = f"{self.site_url}/wp-json/wp/v2"
         self.timeout_seconds = timeout_seconds
         self.write_guard = write_guard or (lambda: None)
@@ -191,14 +194,16 @@ class WordPressPublisher:
         return self._post_result(response)
 
     def verify_public_url(self, url: str) -> bool:
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or not parsed.netloc:
-            return False
         try:
-            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as public_client:
-                response = public_client.get(url, headers={"User-Agent": "WisdomeWriter/1.0"})
+            response = safe_get(
+                url,
+                max_bytes=MAX_PUBLIC_VERIFICATION_BYTES,
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": "WisdomeWriter/1.0"},
+                max_elapsed_seconds=self.timeout_seconds,
+            )
             return response.status_code == 200
-        except httpx.HTTPError:
+        except (HttpSafetyError, httpx.HTTPError):
             return False
 
     def upload_media(
@@ -245,7 +250,7 @@ class WordPressPublisher:
         return PublishResult(
             status="succeeded",
             remote_post_id=media_id,
-            remote_url=media.get("source_url"),
+            remote_url=redact_url(media["source_url"]) if media.get("source_url") else None,
             remote_state="published",
             request_id=response.headers.get("X-WP-Request-ID"),
             http_status=response.status_code,
@@ -267,7 +272,7 @@ class WordPressPublisher:
             return PublishResult(
                 status="succeeded",
                 remote_post_id=str(item["id"]),
-                remote_url=item.get("source_url"),
+                remote_url=redact_url(item["source_url"]) if item.get("source_url") else None,
                 remote_state="published",
                 http_status=response.status_code,
             )
@@ -343,7 +348,7 @@ class WordPressPublisher:
         return PublishResult(
             status="succeeded",
             remote_post_id=str(payload.get("id")) if payload.get("id") is not None else None,
-            remote_url=payload.get("link"),
+            remote_url=redact_url(payload["link"]) if payload.get("link") else None,
             remote_state=state_map.get(status, "unknown"),
             remote_revision=response.headers.get("ETag") or payload.get("modified_gmt"),
             published_at=published_at,

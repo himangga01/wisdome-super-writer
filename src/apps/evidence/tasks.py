@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -29,6 +30,13 @@ from adapters.extractors.structured import StructuredDataExtractor
 from adapters.storage import S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
 from apps.collection.models import CollectionRun, RunState, RunStep
+from wisdome_writer.infrastructure.http_safety import (
+    HttpSafetyError,
+    OutboundResponseTooLarge,
+    UnsafeOutboundUrl,
+    redact_url,
+    safe_get,
+)
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import (
@@ -61,7 +69,6 @@ from .services import (
     profile_material,
     route_pdf_pages,
 )
-
 
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
@@ -163,18 +170,36 @@ def _download_attachment(run_source_item, attachment: Mapping[str, Any]) -> tupl
     source = run_source_item.source_snapshot.source
     allowed_hosts = {urlparse(source.base_url).hostname}
     allowed_hosts.update(run_source_item.source_snapshot.config.get("allowedAttachmentHosts", []))
-    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
-        raise ExtractorError("attachment_url_not_allowed", "Attachment URL is outside the approved source hosts")
-    with httpx.Client(
-        timeout=httpx.Timeout(60, connect=10),
-        follow_redirects=False,
-        headers={"User-Agent": "WisdomeSuperWriter/0.1 (+admin-managed research bot)"},
-    ) as client:
-        response = client.get(url)
+    try:
+        response = safe_get(
+            url,
+            max_bytes=MAX_ATTACHMENT_BYTES,
+            timeout=httpx.Timeout(60, connect=10),
+            allowed_hosts=allowed_hosts,
+            headers={"User-Agent": "WisdomeSuperWriter/0.1 (+admin-managed research bot)"},
+            max_elapsed_seconds=60.0,
+        )
         response.raise_for_status()
-    if len(response.content) > MAX_ATTACHMENT_BYTES:
-        raise ExtractorError("attachment_limit_exceeded", "Attachment exceeds the configured byte limit")
-    mime_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0].strip()
+    except OutboundResponseTooLarge:
+        raise ExtractorError(
+            "attachment_limit_exceeded",
+            "Attachment exceeds the configured byte limit",
+        ) from None
+    except UnsafeOutboundUrl:
+        raise ExtractorError(
+            "attachment_url_not_allowed",
+            "Attachment URL is outside the approved public source hosts",
+        ) from None
+    except HttpSafetyError as exc:
+        raise ExtractorError(
+            "attachment_download_failed",
+            str(exc),
+        ) from None
+    mime_type = (
+        response.headers.get("content-type", "application/octet-stream")
+        .split(";", 1)[0]
+        .strip()
+    )
     filename = Path(parsed.path).name or "attachment.bin"
     return response.content, mime_type, filename
 
@@ -214,7 +239,10 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
         mime_type=info.content_type,
         byte_size=info.size,
         checksum=checksum,
-        structured_data={"title": attachment.get("title"), "source_url": attachment.get("url")},
+        structured_data={
+            "title": attachment.get("title"),
+            "source_url": redact_url(str(attachment.get("url", ""))),
+        },
         evidence_content_hash=content_hash,
         review_subject_hash="0" * 64,
         review_state=ReviewState.PASSED,

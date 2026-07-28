@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import email.utils
-import ipaddress
-import socket
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -10,23 +8,12 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from defusedxml import ElementTree
 
-from .base import CollectedSourceRecord, SourceAttachment
+from wisdome_writer.infrastructure.http_safety import redact_url, safe_get
 
+from .base import CollectedSourceRecord, SourceAttachment
 
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 ATTACHMENT_EXTENSIONS = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xls", ".csv")
-
-
-def _public_host(host: str) -> bool:
-    try:
-        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return False
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            return False
-    return True
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -84,21 +71,20 @@ class HttpSourceAdapter:
     def __init__(self, *, source, config):
         self.source = source
         self.config = config
-        self.allowed_hosts = {urlparse(source.base_url).hostname}
+        self.allowed_hosts = {host for host in (urlparse(source.base_url).hostname,) if host}
         self.timeout = httpx.Timeout(20, connect=10)
 
     def _get(self, url: str) -> httpx.Response:
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in self.allowed_hosts:
-            raise ValueError(f"URL outside approved source host: {url}")
-        if not _public_host(parsed.hostname):
-            raise ValueError(f"Source host does not resolve to a public address: {parsed.hostname}")
         headers = {"User-Agent": "WisdomeSuperWriter/0.1 (+admin-managed research bot)"}
-        with httpx.Client(timeout=self.timeout, follow_redirects=False, headers=headers) as client:
-            response = client.get(url)
-            response.raise_for_status()
-        if len(response.content) > MAX_RESPONSE_BYTES:
-            raise ValueError("Source response exceeds the configured safety limit")
+        response = safe_get(
+            url,
+            max_bytes=MAX_RESPONSE_BYTES,
+            timeout=self.timeout,
+            allowed_hosts=self.allowed_hosts,
+            headers=headers,
+            max_elapsed_seconds=20.0,
+        )
+        response.raise_for_status()
         return response
 
 
@@ -108,17 +94,21 @@ class PublicHtmlAdapter(HttpSourceAdapter):
         records: list[CollectedSourceRecord] = []
         for entrypoint in self.config.get("entrypoints", []):
             response = self._get(entrypoint)
+            safe_entrypoint = redact_url(entrypoint)
             parser = _PageParser()
             parser.feed(response.text)
             attachments = tuple(
-                SourceAttachment(url=urljoin(entrypoint, href), title=label or href.rsplit("/", 1)[-1])
+                SourceAttachment(
+                    url=redact_url(urljoin(entrypoint, href)),
+                    title=label or href.rsplit("/", 1)[-1],
+                )
                 for href, label in parser.links
                 if urlparse(href).path.lower().endswith(ATTACHMENT_EXTENSIONS)
             )
             records.append(
                 CollectedSourceRecord(
-                    external_id=response.headers.get("ETag") or entrypoint,
-                    canonical_url=entrypoint,
+                    external_id=response.headers.get("ETag") or safe_entrypoint,
+                    canonical_url=safe_entrypoint,
                     title=parser.title or self.source.display_name,
                     publisher=self.source.owner_name,
                     published_at=_parse_date(response.headers.get("Last-Modified")),
@@ -139,13 +129,14 @@ class RssAdapter(HttpSourceAdapter):
             root = ElementTree.fromstring(self._get(entrypoint).content)
             for item in root.findall(".//item"):
                 link = (item.findtext("link") or "").strip()
+                safe_link = redact_url(link)
                 published = _parse_date(item.findtext("pubDate"))
                 if published and not (since <= published <= until):
                     continue
                 records.append(
                     CollectedSourceRecord(
-                        external_id=(item.findtext("guid") or link).strip(),
-                        canonical_url=link,
+                        external_id=(item.findtext("guid") or safe_link).strip(),
+                        canonical_url=safe_link,
                         title=(item.findtext("title") or "제목 없음").strip(),
                         publisher=self.source.owner_name,
                         published_at=published,
@@ -165,10 +156,11 @@ class OpenDataJsonAdapter(HttpSourceAdapter):
             rows = payload.get("items", payload if isinstance(payload, list) else [])
             for row in rows:
                 url = row.get("url") or entrypoint
+                safe_url = redact_url(str(url))
                 records.append(
                     CollectedSourceRecord(
-                        external_id=str(row.get("id") or row.get("noticeId") or url),
-                        canonical_url=url,
+                        external_id=str(row.get("id") or row.get("noticeId") or safe_url),
+                        canonical_url=safe_url,
                         title=str(row.get("title") or row.get("name") or "제목 없음"),
                         publisher=self.source.owner_name,
                         published_at=_parse_date(row.get("publishedAt") or row.get("date")),
