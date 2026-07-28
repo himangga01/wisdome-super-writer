@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import socket
+import uuid
 from datetime import datetime
 
 from celery import current_app, shared_task
 from django.utils import timezone
 
-from .event_routes import queue_for, route_for
+from .event_routes import EventRoutingError, queue_for, route_for
 from .models import OutboxMessage
 from .outbox import (
     ForbiddenEventPayload,
@@ -45,9 +46,9 @@ def dispatch_outbox(limit: int = 100):
     dispatched = dead_lettered = failed = 0
     for message in claim_events(limit=limit, lease_owner=owner):
         envelope = event_envelope(message)
-        route = route_for(message.topic)
+        route = route_for(message.topic, message.event_version)
         if route is None:
-            mark_failed(message, error_code="unknown_event_type", permanent=True)
+            mark_failed(message, error_code="unsupported_event_type_version", permanent=True)
             dead_lettered += 1
             continue
         try:
@@ -63,9 +64,15 @@ def dispatch_outbox(limit: int = 100):
                 message,
                 error_code=str(getattr(exc, "code", exc.__class__.__name__)),
                 retry_after=getattr(exc, "retry_after_seconds", None),
-                permanent=isinstance(exc, (ForbiddenEventPayload, OutboxConflict)),
+                permanent=isinstance(
+                    exc,
+                    (ForbiddenEventPayload, OutboxConflict, EventRoutingError),
+                ),
             )
-            failed += 1
+            if isinstance(exc, (ForbiddenEventPayload, OutboxConflict, EventRoutingError)):
+                dead_lettered += 1
+            else:
+                failed += 1
         else:
             mark_published(message)
             dispatched += 1
@@ -79,23 +86,39 @@ def dispatch_outbox(limit: int = 100):
 @shared_task(
     bind=True,
     name="wisdome_writer.infrastructure.tasks.consume_outbox_event",
-    max_retries=None,
+    max_retries=6,
     acks_late=True,
     reject_on_worker_lost=True,
 )
 def consume_outbox_event(self, envelope: dict):
+    def unaddressable(code: str):
+        # Without a valid persisted event_id there is no row on which to store a
+        # durable receipt. Bound broker redelivery and terminate after three tries.
+        if self.request.retries < 2:
+            raise self.retry(countdown=2 ** self.request.retries)
+        logger.error("unaddressable outbox envelope discarded after bounded retries: %s", code)
+        return {"state": "dead_letter", "code": code, "attempt": self.request.retries + 1}
+
+    if not isinstance(envelope, dict):
+        return unaddressable("envelope_not_object")
     try:
-        persisted_type = OutboxMessage.objects.values_list("topic", flat=True).get(
-            pk=envelope.get("event_id")
+        event_id = uuid.UUID(str(envelope.get("event_id")))
+    except (ValueError, TypeError, AttributeError):
+        return unaddressable("event_id_invalid")
+    try:
+        persisted_type, persisted_version = OutboxMessage.objects.values_list(
+            "topic", "event_version"
+        ).get(
+            pk=event_id
         )
-    except (OutboxMessage.DoesNotExist, ValueError, TypeError):
-        return {"state": "dead_letter", "code": "event_not_found"}
-    route = route_for(persisted_type)
+    except OutboxMessage.DoesNotExist:
+        return unaddressable("event_not_found")
+    route = route_for(persisted_type, persisted_version)
     if route is None:
         return dead_letter_consumer_event(
-            envelope["event_id"],
+            event_id,
             consumer_name="unknown-event",
-            error_code="unknown_event_type",
+            error_code="unsupported_event_type_version",
         )
 
     def handler(*args):
@@ -106,11 +129,23 @@ def consume_outbox_event(self, envelope: dict):
         # without publishing another broker message.
         return task(*args)
 
+    def terminal_handler(*args):
+        if route.terminal_task_name is None:
+            return None
+        task = current_app.tasks.get(route.terminal_task_name)
+        if task is None:
+            raise LookupError(
+                f"terminal event handler task is not registered: {route.terminal_task_name}"
+            )
+        return task(*args)
+
     result = consume_event(
         envelope=envelope,
         consumer_name=route.consumer_name,
         handler=handler,
         argument_keys=route.argument_keys,
+        terminal_handler=terminal_handler if route.terminal_task_name else None,
+        terminal_argument_keys=route.terminal_argument_keys,
         max_attempts=CONSUMER_MAX_ATTEMPTS,
     )
     if result["state"] == "retry":

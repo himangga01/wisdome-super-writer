@@ -16,6 +16,7 @@ from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle
 from .models import (
+    Publication,
     PublicationAttempt,
     PublicationMedia,
     PublicationTarget,
@@ -71,9 +72,18 @@ def _retry_countdown(attempt_no: int, retry_after: int | None = None) -> int:
     max_retries=3,
     acks_late=True,
 )
-def run_target_preflight_task(self, target_id: str):
+def run_target_preflight_task(
+    self,
+    target_id: str,
+    target_snapshot_id: str,
+    target_config_hash: str,
+):
     try:
-        target = run_target_preflight(target_id)
+        target, applied = run_target_preflight(
+            target_id,
+            expected_snapshot_id=target_snapshot_id,
+            expected_config_hash=target_config_hash,
+        )
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             raise
@@ -83,6 +93,7 @@ def run_target_preflight_task(self, target_id: str):
         "connectionState": target.connection_state,
         "preflightState": target.preflight_state,
         "snapshotId": str(target.current_snapshot_id),
+        "applied": applied,
     }
 
 
@@ -150,6 +161,12 @@ def execute_publication_attempt(self, attempt_id: str):
         return {"attemptId": attempt_id, "state": "stale", "code": exc.code}
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
+    if command is None:
+        return {
+            "attemptId": attempt_id,
+            "state": attempt.state,
+            "reconcileQueued": True,
+        }
     adapter = publisher_for_target(attempt.publication.target)
     error: PublisherError | None = None
     try:
@@ -162,7 +179,7 @@ def execute_publication_attempt(self, attempt_id: str):
             if not result.remote_url or not adapter.verify_public_url(result.remote_url):
                 raise PublisherError(
                     "wordpress_public_url_not_ready",
-                    category="retryable",
+                    category="unknown_outcome",
                     http_status=result.http_status,
                 )
     except PublisherError as exc:
@@ -180,12 +197,10 @@ def execute_publication_attempt(self, attempt_id: str):
                 job_id=persisted.id,
                 dedupe_key=(
                     f"publication.reconcile_requested:{persisted.id}:"
-                    f"{persisted.attempt_no}:automatic"
+                    f"{persisted.attempt_no}:outcome"
                 ),
-                available_at=timezone.now() + timedelta(seconds=10),
                 payload={
                     "publication_attempt_id": str(persisted.id),
-                    "channel": persisted.publication.target.channel,
                 },
             )
     if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
@@ -216,6 +231,7 @@ def reconcile_publication_attempt(self, attempt_id: str):
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
     adapter = publisher_for_target(attempt.publication.target)
+    retry_after = None
     try:
         result = adapter.reconcile(command)
         if (
@@ -227,11 +243,47 @@ def reconcile_publication_attempt(self, attempt_id: str):
             raise PublisherError("wordpress_public_url_not_ready", category="retryable")
     except PublisherError as exc:
         result = publisher_error_result(exc)
+        retry_after = exc.retry_after_seconds
     finally:
         adapter.close()
-    persisted = persist_publish_result(attempt_id, result)
-    if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
-        raise self.retry(countdown=_retry_countdown(persisted.attempt_no))
+    with transaction.atomic():
+        persisted = persist_publish_result(attempt_id, result)
+        if persisted.state in {
+            PublicationAttempt.State.RETRYABLE_FAILED,
+            PublicationAttempt.State.UNKNOWN_OUTCOME,
+        }:
+            if persisted.attempt_no >= 5:
+                persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
+                persisted.error_code = (
+                    persisted.error_code or "reconcile_attempts_exhausted"
+                )
+                persisted.save(update_fields=("state", "error_code"))
+                persisted.publication.state = Publication.State.MANUAL_REQUIRED
+                persisted.publication.last_error_code = persisted.error_code
+                persisted.publication.save(
+                    update_fields=("state", "last_error_code", "updated_at")
+                )
+            else:
+                persisted.attempt_no += 1
+                persisted.next_retry_at = timezone.now() + timedelta(
+                    seconds=_retry_countdown(
+                        persisted.attempt_no,
+                        retry_after,
+                    )
+                )
+                persisted.save(update_fields=("attempt_no", "next_retry_at"))
+                enqueue_event(
+                    event_type="publication.reconcile_requested",
+                    aggregate_type="publication_attempt",
+                    aggregate_id=persisted.id,
+                    job_id=persisted.id,
+                    dedupe_key=(
+                        f"publication.reconcile_requested:{persisted.id}:"
+                        f"{persisted.attempt_no}:followup"
+                    ),
+                    available_at=persisted.next_retry_at,
+                    payload={"publication_attempt_id": str(persisted.id)},
+                )
     return {"attemptId": attempt_id, "state": persisted.state}
 
 
@@ -429,7 +481,18 @@ def delete_public_delivery_asset(self, asset_id: str, expected_lease_generation:
 
 
 @shared_task(name="apps.publishing.tasks.reconcile_remote_media")
-def reconcile_remote_media(remote_media_id: str):
+def reconcile_remote_media(
+    remote_media_id: str,
+    publication_attempt_id: str,
+    publication_intent_id: str,
+):
+    attempt = PublicationAttempt.objects.filter(
+        id=publication_attempt_id,
+        publication_intent_id=publication_intent_id,
+        publication__media_bindings__remote_media_id=remote_media_id,
+    ).first()
+    if attempt is None:
+        raise Conflict("media reconcile identity does not match the publication attempt")
     remote = RemoteMedia.objects.select_related("target").get(id=remote_media_id)
     if remote.state not in {RemoteMedia.State.RECONCILING, RemoteMedia.State.UPLOADING}:
         return {"remoteMediaId": remote_media_id, "state": remote.state}

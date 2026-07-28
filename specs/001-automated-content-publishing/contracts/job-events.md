@@ -6,8 +6,8 @@
 - 메시지는 엔터티 ID와 정책 버전만 전달하고 본문·원문·토큰은 PostgreSQL/객체 저장소에서
   권한을 확인한 뒤 읽는다.
 - DB 상태가 기준이며 브로커 결과 backend는 업무 성공의 기준이 아니다.
-- 생산자는 DB 트랜잭션 커밋 후 메시지를 보낸다. 필요한 경우 outbox 행을 같은
-  트랜잭션에 만들고 별도 디스패처가 전송한다.
+- 생산자는 업무 상태와 outbox 행을 같은 DB 트랜잭션에 만든다. 커밋 뒤 broker로 직접
+  보내지 않으며, lease/fencing을 가진 별도 dispatcher만 outbox를 전송한다.
 - 새 버전은 하위 호환 필드 추가만 허용한다. 제거·의미 변경은 새 `event_version`을 만든다.
 
 ## 공통 Envelope
@@ -179,3 +179,111 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 - 외부 응답의 개인정보 또는 비밀 헤더
 
 이벤트와 로그에는 객체/DB ID, 체크섬, 건수, 상태와 분류된 오류만 포함한다.
+
+## T005 구현 보충: 버전·전송·내부 오케스트레이션
+
+### 엄격한 라우팅과 검증
+
+- 소비자 route와 payload schema의 식별자는 `(event_type, event_version)`이다.
+- 등록되지 않은 버전, 선언되지 않은 payload 필드, 잘못된 UUID/SHA-256/enum/version,
+  자격 증명·query·fragment가 포함된 URL, 비밀처럼 보이는 값은 fail-closed 처리한다.
+- 공통 envelope는 위에 선언한 최상위 필드만 허용하고 `attempt`를 포함해 저장 행과
+  정확히 같아야 한다. 저장된 immutable material은 dispatcher와 consumer가 각각
+  SHA-256을 다시 계산해 상수 시간 비교한다.
+- `event_id`를 읽을 수 있는 잘못된 이벤트는 영속 consumer receipt와 outbox DLQ에
+  기록한다. `event_id` 자체가 없거나 UUID가 아니어서 영속 행을 특정할 수 없는 transport
+  메시지는 3회로 제한해 broker 재전달한 뒤 오류 로그와 함께 종료한다.
+- `run.requested`, publication/canary/disconnect 이벤트에는 queue 선택용 `topic_code` 또는
+  `channel`을 넣지 않는다. dispatcher가 payload의 엔터티 ID로 DB 기준 topic/channel을
+  다시 조회하며, 엔터티가 없거나 채널을 확정할 수 없으면 안전하게 DLQ 처리한다.
+
+### 구현 전용 내부 이벤트
+
+아래 이벤트는 상위 aggregate를 분할하거나 기존 coarse-grained 단계를 연결하기 위한
+내부 오케스트레이션 계약이다. 모두 `event_version=1`이며 payload 추가·삭제·의미 변경은
+새 버전으로만 수행한다.
+
+| 내부 이벤트 | v1 최소 Payload | 용도 |
+|---|---|---|
+| `run.evidence_requested` | `run_id` | 수집 종료 후 run 단위 evidence fan-out 시작 |
+| `evidence.document_route_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `input_kind`, `document_extraction_id`, `input_checksum` | 상위 DocumentExtraction이 page route와 child run을 결정하도록 요청 |
+| `evidence.finalize_requested` | `run_id` | ready 또는 terminal 결과 뒤 run evidence 종료 조건 재평가 |
+| `evidence.profile_decided` | `profile_snapshot_id`, `decision_id`, `decision`, `profile_material_hash` | profile 관리자 판정 durable audit 신호 |
+| `run.draft_requested` | `run_id` | 현재 run 단위 생성 단계 진입; GenerationAttempt 생성 전 coarse-grained 연결 |
+| `publication.scheduled_run_requested` | `run_id` | validated schedule run의 publication intent/attempt 생성 |
+| `publication.preflight_requested` | `target_id`, `target_snapshot_id`, `target_config_hash` | 고정된 target fence로 preflight 시작 |
+| `publishing.target_preflight.completed` | `target_id`, `target_snapshot_id`, `target_config_hash`, `result_hash`, `passed` | fence가 유지된 preflight 결과의 durable 완료 신호 |
+| `publishing.target_canary.requested` | `canary_run_id`, `target_id` | target canary 실행 |
+| `publishing.target_disconnect.requested` | `decision_id`, `target_id` | 승인된 credential revoke 실행 |
+
+`evidence.document_extract_requested`는 child `ExtractionRun` 단위의 공개 내부 계약이고,
+`article.draft_requested`는 미리 생성된 `GenerationAttempt` 단위 계약이다. 현재 상위
+orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. 상위 문서 routing은
+`evidence.document_route_requested`, GenerationAttempt 생성 전 run 연결은
+`run.draft_requested`를 사용한다.
+
+### 발행·추출 재전달 규칙 보충
+
+- `PublicationAttempt=running`인 `publication.requested`가 재전달되면 외부 write를 다시
+  호출하지 않는다. 같은 트랜잭션에서 `unknown_outcome`으로 전환하고
+  `publication.reconcile_requested`를 영속 생성한다.
+- reconcile의 `retryable_failed`와 반복 `unknown_outcome`은 새 dedupe key의 후속
+  reconcile 이벤트로 최대 5회 이어지며, 한도를 넘으면 `manual_required`가 된다.
+- generic attempt 생성과 `evidence.other_extract_requested` 생성은 같은 트랜잭션이다.
+  일시 추출 오류는 `queued`로 되돌리고 finalizer를 깨우지 않는다. 영구 오류 또는
+  consumer 재시도 소진 시에만 `failed`와 단 하나의 terminal finalizer 이벤트를 같은
+  트랜잭션에 기록한다.
+- target preflight는 짧은 DB fence snapshot, transaction 밖 외부 호출, fence를 다시
+  확인하는 결과·audit·완료 이벤트 transaction의 세 단계로 수행한다.
+
+## English — T005 Versioned Internal Event Addendum
+
+### Strict routing and validation
+
+- Route and payload-schema identity is the tuple `(event_type, event_version)`.
+- Unsupported versions, undeclared fields, malformed UUID/SHA-256/enum/version values,
+  credentialed or query-bearing URLs, and secret-looking values fail closed.
+- The transport envelope permits only the declared top-level fields. Every field,
+  including `attempt`, must equal the persisted event. Dispatcher and consumer both
+  recompute the complete immutable-material SHA-256 and compare it in constant time.
+- A malformed message with an extractable `event_id` is recorded in the durable receipt
+  and outbox DLQ. If no valid `event_id` exists, broker retries are bounded to three
+  deliveries because no durable row can be addressed.
+- Queue selection metadata is not added to domain payloads. The dispatcher resolves the
+  topic or publication channel from the referenced database entity and dead-letters an
+  event when that identity cannot be resolved safely.
+
+### Implementation-only orchestration events
+
+All entries below are version 1. Any field removal or semantic change requires a new
+event version.
+
+| Event key | Exact v1 payload |
+|---|---|
+| `run.evidence_requested@1` | `run_id` |
+| `evidence.document_route_requested@1` | `run_id`, `run_source_item_id`, `source_item_id`, optional `input_asset_id`, `input_kind`, `document_extraction_id`, `input_checksum` |
+| `evidence.finalize_requested@1` | `run_id` |
+| `evidence.profile_decided@1` | `profile_snapshot_id`, `decision_id`, `decision`, `profile_material_hash` |
+| `run.draft_requested@1` | `run_id` |
+| `publication.scheduled_run_requested@1` | `run_id` |
+| `publication.preflight_requested@1` | `target_id`, `target_snapshot_id`, `target_config_hash` |
+| `publishing.target_preflight.completed@1` | `target_id`, `target_snapshot_id`, `target_config_hash`, `result_hash`, `passed` |
+| `publishing.target_canary.requested@1` | `canary_run_id`, `target_id` |
+| `publishing.target_disconnect.requested@1` | `decision_id`, `target_id` |
+
+The implementation does not overload `evidence.document_extract_requested` with a
+parent-document payload, and it does not overload `article.draft_requested` with a
+run payload. The former remains the child `ExtractionRun` contract; the latter remains
+the pre-created `GenerationAttempt` contract.
+
+### Redelivery state machine
+
+1. Redelivery of a `running` publication attempt never repeats the external write.
+   It atomically records `unknown_outcome` and enqueues reconciliation.
+2. Retryable or repeatedly unknown reconciliation creates a new durable follow-up event
+   and becomes `manual_required` after five bounded attempts.
+3. Generic attempt creation and its request event are atomic. Retryable extraction
+   failures return to `queued`; only permanent failure or exhausted consumer retries
+   records `failed` and one terminal finalizer wake-up.
+4. Target preflight is split into a short database fence snapshot, external I/O outside
+   a database transaction, and a fenced result/audit/completion-event transaction.

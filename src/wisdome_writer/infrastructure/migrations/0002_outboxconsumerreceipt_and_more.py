@@ -34,12 +34,29 @@ def backfill_envelope(apps, schema_editor):
                 "target_id": message.payload.get("target_id")
                 or message.payload.get("targetId"),
             }
+        elif message.topic == "run.requested":
+            message.payload = {"run_id": message.payload.get("run_id")}
+        elif message.topic == "article.draft_requested":
+            message.topic = "run.draft_requested"
+            message.payload = {"run_id": message.payload.get("run_id")}
+        elif message.topic in {
+            "publication.requested",
+            "publication.reconcile_requested",
+        }:
+            message.payload = {
+                "publication_attempt_id": message.payload.get(
+                    "publication_attempt_id"
+                )
+            }
         message.job_id = message.aggregate_id
         message.occurred_at = message.created_at
+        message.not_before = message.available_at
         message.status = "published" if message.published_at else "pending"
         material = {
+            "event_id": str(message.id),
             "event_type": message.topic,
             "event_version": message.event_version,
+            "occurred_at": message.occurred_at.isoformat(),
             "correlation_id": str(message.correlation_id),
             "causation_id": None,
             "job_id": str(message.aggregate_id),
@@ -48,7 +65,7 @@ def backfill_envelope(apps, schema_editor):
             "operation": message.operation,
             "dedupe_key": message.message_key,
             "policy_versions": message.policy_versions,
-            "not_before": message.available_at.isoformat(),
+            "not_before": message.not_before.isoformat(),
             "payload": message.payload,
         }
         message.immutable_material_hash = hashlib.sha256(
@@ -58,7 +75,9 @@ def backfill_envelope(apps, schema_editor):
             update_fields=(
                 "job_id",
                 "occurred_at",
+                "not_before",
                 "status",
+                "topic",
                 "payload",
                 "immutable_material_hash",
             )
@@ -145,6 +164,11 @@ class Migration(migrations.Migration):
             model_name='outboxmessage',
             name='max_attempts',
             field=models.PositiveSmallIntegerField(default=5),
+        ),
+        migrations.AddField(
+            model_name='outboxmessage',
+            name='not_before',
+            field=models.DateTimeField(default=django.utils.timezone.now),
         ),
         migrations.AddField(
             model_name='outboxmessage',

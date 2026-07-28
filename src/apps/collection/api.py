@@ -57,7 +57,7 @@ def runs(request):
                 aggregate_id=run.id,
                 job_id=run.id,
                 dedupe_key=f"run.requested:{run.id}",
-                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+                payload={"run_id": str(run.id)},
             )
     return JsonResponse(_run_payload(run), status=201 if created else 200)
 
@@ -108,6 +108,6 @@ def retry_run(request, run_id):
                 aggregate_id=run.id,
                 job_id=run.id,
                 dedupe_key=f"run.requested:{run.id}",
-                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+                payload={"run_id": str(run.id)},
             )
     return JsonResponse(_run_payload(run), status=202)

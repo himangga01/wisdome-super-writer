@@ -702,12 +702,13 @@ def decide_evidence_review(
         message_key=f"evidence.review_decided:{snapshot.id}:{request_key}",
         correlation_id=correlation_id,
         payload={
+            "evidence_audit_snapshot_id": str(snapshot.id),
             "evidence_asset_id": str(evidence.id),
-            "evidence_review_decision_id": str(record.id),
-            "review_subject_schema_version": evidence.review_subject_schema_version,
-            "review_subject_hash": evidence.review_subject_hash,
+            "review_decision_id": str(record.id),
+            "review_subject_schema_version": record.review_subject_schema_version,
+            "review_subject_hash": record.review_subject_hash,
+            "request_key": request_key,
             "decision": decision,
-            "publishable": evidence.publishable,
         },
     )
     return record, True

@@ -284,7 +284,11 @@ def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
             aggregate_id=target.id,
             job_id=target.id,
             dedupe_key=f"publication.preflight_requested:{target.id}:{target.current_snapshot_version}",
-            payload={"target_id": str(target.id), "channel": target.channel},
+            payload={
+                "target_id": str(target.id),
+                "target_snapshot_id": str(target.current_snapshot_id),
+                "target_config_hash": target.current_config_hash,
+            },
         )
     return JsonResponse({"jobId": str(event.id), "state": "queued"}, status=202)
 
@@ -539,7 +543,6 @@ def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResp
                 dedupe_key=f"publication.reconcile_requested:{row.id}:{row.attempt_no}",
                 payload={
                     "publication_attempt_id": str(row.id),
-                    "channel": row.publication.target.channel,
                 },
             )
             action = "reconcile"
@@ -568,7 +571,6 @@ def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResp
                 dedupe_key=f"publication.requested:{row.id}:{row.attempt_no}",
                 payload={
                     "publication_attempt_id": str(row.id),
-                    "channel": row.publication.target.channel,
                 },
             )
             action = "retry"

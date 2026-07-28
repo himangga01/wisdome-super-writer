@@ -26,7 +26,7 @@ x-runtime-environment: &runtime-environment
   SECRET_PROVIDER_CLASSES: ${SECRET_PROVIDER_CLASSES:-{}}
   TZ: ${TZ:-Asia/Seoul}
 
-x-publisher-environment: &publisher-environment
+x-blogger-environment: &blogger-environment
   BLOGGER_OAUTH_CLIENT_ID_REF: ${BLOGGER_OAUTH_CLIENT_ID_REF:-}
   BLOGGER_OAUTH_CLIENT_SECRET_REF: ${BLOGGER_OAUTH_CLIENT_SECRET_REF:-}
   BLOGGER_OAUTH_CLIENT_ID: ${BLOGGER_OAUTH_CLIENT_ID:-}
@@ -151,7 +151,7 @@ services:
   web:
     <<: *app
     environment:
-      <<: [*runtime-environment, *publisher-environment]
+      <<: [*runtime-environment, *blogger-environment]
     command: ["/app/deploy/containers/app/entrypoint.sh"]
     ports:
       - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8000}:8000"
@@ -196,7 +196,7 @@ services:
   worker-publish:
     <<: *app
     environment:
-      <<: [*runtime-environment, *publisher-environment]
+      <<: *runtime-environment
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish.media.wordpress,publish.wordpress"]
     networks:
       - database
@@ -207,7 +207,7 @@ services:
   worker-publish-blogger:
     <<: *app
     environment:
-      <<: [*runtime-environment, *publisher-environment]
+      <<: [*runtime-environment, *blogger-environment]
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish.blogger"]
     networks:
       - database
@@ -218,7 +218,9 @@ services:
   worker-reconcile:
     <<: *app
     environment:
-      <<: [*runtime-environment, *publisher-environment]
+      # Reconcile handles both publication channels, so it needs the Blogger
+      # credential resolver inputs. The WordPress-only publish worker does not.
+      <<: [*runtime-environment, *blogger-environment]
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=reconcile"]
     networks:
       - database

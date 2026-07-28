@@ -83,7 +83,7 @@ def dispatch_schedule(schedule_id, scheduled_for: datetime | None = None):
                 aggregate_id=run.id,
                 job_id=run.id,
                 dedupe_key=f"run.requested:{run.id}",
-                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+                payload={"run_id": str(run.id)},
             )
     dispatch.save()
     schedule.last_dispatched_at = scheduled_for
@@ -140,7 +140,7 @@ def release_queued_dispatch(schedule_id):
         aggregate_id=run.id,
         job_id=run.id,
         dedupe_key=f"run.requested:{run.id}",
-        payload={"run_id": str(run.id), "topic_code": run.topic_code},
+        payload={"run_id": str(run.id)},
     )
     return dispatch
 

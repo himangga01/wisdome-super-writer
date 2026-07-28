@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import re
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from django.db import IntegrityError, transaction
 from django.db.models import F, Q
@@ -15,8 +18,8 @@ from django.utils import timezone
 from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_hash
 from wisdome_writer.observability import correlation_context, current_correlation_id
 
-from .models import OutboxConsumerReceipt, OutboxMessage
 from .event_routes import payload_schema_for
+from .models import OutboxConsumerReceipt, OutboxMessage
 
 CURRENT_EVENT_ID: ContextVar[str | None] = ContextVar("outbox_event_id", default=None)
 CURRENT_EVENT_CORRELATION_ID: ContextVar[str | None] = ContextVar(
@@ -56,6 +59,22 @@ MAX_POLICY_BYTES = 8 * 1024
 MAX_PAYLOAD_DEPTH = 8
 MAX_CONTAINER_ITEMS = 100
 MAX_STRING_LENGTH = 4096
+MAX_DEDUPE_KEY_LENGTH = 200
+SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$")
+SAFE_DOMAIN_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$")
+SAFE_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,119}$")
+SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+SECRET_VALUE_PATTERNS = (
+    re.compile(
+        r"(?i)(?:access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|"
+        r"authorization|cookie|client[_-]?secret|credential)\s*(?:=|:|\s)\s*\S+"
+    ),
+    re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"(?i)\btop[-_]?secret\b"),
+)
 
 
 class OutboxConflict(ValueError):
@@ -68,6 +87,14 @@ class ForbiddenEventPayload(ValueError):
 
 class LostOutboxLease(RuntimeError):
     pass
+
+
+class PermanentEventError(RuntimeError):
+    permanent = True
+
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(detail or code)
+        self.code = code
 
 
 def _uuid(value: uuid.UUID | str | None, *, fallback: uuid.UUID | None = None) -> uuid.UUID:
@@ -88,6 +115,8 @@ def _validate_payload(value: Any, *, path: str = "payload", depth: int = 0) -> N
         if len(value) > MAX_CONTAINER_ITEMS:
             raise ForbiddenEventPayload(f"event payload object is too large: {path}")
         for key, child in value.items():
+            if not isinstance(key, str):
+                raise ForbiddenEventPayload(f"event payload key must be a string: {path}")
             normalized = str(key).lower().replace("-", "_")
             if normalized in FORBIDDEN_EXACT_KEYS or any(
                 part in normalized for part in FORBIDDEN_KEY_PARTS
@@ -107,18 +136,68 @@ def _validate_payload(value: Any, *, path: str = "payload", depth: int = 0) -> N
         raise ForbiddenEventPayload(f"non-JSON event payload value is forbidden: {path}")
     if isinstance(value, str) and len(value) > MAX_STRING_LENGTH:
         raise ForbiddenEventPayload(f"event payload string is too large: {path}")
+    if isinstance(value, str) and any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS):
+        raise ForbiddenEventPayload(f"secret-looking event payload value is forbidden: {path}")
 
 
-def _validate_event_payload(event_type: str, payload: dict[str, Any]) -> None:
+def _validate_formatted_value(*, key: str, value: Any, value_format: str) -> None:
+    if value is None:
+        return
+    if value_format == "uuid":
+        try:
+            uuid.UUID(str(value))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ForbiddenEventPayload(f"event payload field is not a UUID: {key}") from exc
+        return
+    if value_format == "sha256":
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise ForbiddenEventPayload(
+                f"event payload field is not a lowercase SHA-256 digest: {key}"
+            )
+        return
+    if value_format == "version":
+        if not isinstance(value, str) or SAFE_VERSION_RE.fullmatch(value) is None:
+            raise ForbiddenEventPayload(f"event payload field is not a safe version: {key}")
+        return
+    if value_format == "domain_key":
+        if not isinstance(value, str) or SAFE_DOMAIN_KEY_RE.fullmatch(value) is None:
+            raise ForbiddenEventPayload(f"event payload field is not a safe domain key: {key}")
+        return
+    if value_format == "url":
+        if not isinstance(value, str):
+            raise ForbiddenEventPayload(f"event payload URL field must be a string: {key}")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or bool(parsed.query)
+            or bool(parsed.fragment)
+        ):
+            raise ForbiddenEventPayload(
+                f"event payload URL cannot contain credentials, query, or fragment: {key}"
+            )
+        return
+    raise ForbiddenEventPayload(f"unknown event payload field format: {key}")
+
+
+def _validate_event_payload(
+    event_type: str,
+    event_version: int,
+    payload: dict[str, Any],
+) -> None:
     _validate_payload(payload)
     encoded = json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     if len(encoded) > MAX_PAYLOAD_BYTES:
         raise ForbiddenEventPayload("event payload exceeds the 64 KiB limit")
-    schema = payload_schema_for(event_type)
+    schema = payload_schema_for(event_type, event_version)
     if schema is None:
-        raise ForbiddenEventPayload(f"no payload schema is registered for event type: {event_type}")
+        raise ForbiddenEventPayload(
+            f"no payload schema is registered for event: {event_type}@{event_version}"
+        )
     keys = set(payload)
     missing = schema.required - keys
     extra = keys - set(schema.fields)
@@ -137,12 +216,55 @@ def _validate_event_payload(event_type: str, payload: dict[str, Any]) -> None:
             raise ForbiddenEventPayload(
                 f"event payload field has invalid type: {key} (expected {expected})"
             )
+        if key in schema.formats:
+            _validate_formatted_value(
+                key=key,
+                value=value,
+                value_format=schema.formats[key],
+            )
+        if key in schema.choices and value not in schema.choices[key]:
+            raise ForbiddenEventPayload(f"event payload field has unsupported value: {key}")
+
+
+def _validate_policy_versions(policy_versions: Any) -> dict[str, int | str]:
+    if not isinstance(policy_versions, dict):
+        raise ForbiddenEventPayload("policy_versions must be a JSON object")
+    _validate_payload(policy_versions, path="policy_versions")
+    encoded = json.dumps(
+        policy_versions,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > MAX_POLICY_BYTES:
+        raise ForbiddenEventPayload("policy_versions exceeds the 8 KiB limit")
+    for key, value in policy_versions.items():
+        if SAFE_DOMAIN_KEY_RE.fullmatch(key) is None:
+            raise ForbiddenEventPayload("policy_versions contains an invalid policy name")
+        if type(value) is int:
+            if value < 1:
+                raise ForbiddenEventPayload("policy_versions integers must be positive")
+            continue
+        if type(value) is str:
+            if (
+                SAFE_VERSION_RE.fullmatch(value) is None
+                or (
+                    not any(character.isdigit() for character in value)
+                    and not SHA256_RE.fullmatch(value)
+                )
+            ):
+                raise ForbiddenEventPayload("policy_versions contains an invalid version")
+            continue
+        raise ForbiddenEventPayload("policy_versions values must be positive integers or versions")
+    return policy_versions
 
 
 def _material(
     *,
+    event_id: uuid.UUID,
     event_type: str,
     event_version: int,
+    occurred_at: datetime,
     correlation_id: uuid.UUID,
     causation_id: uuid.UUID | None,
     job_id: uuid.UUID,
@@ -155,8 +277,10 @@ def _material(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     return {
+        "event_id": str(event_id),
         "event_type": event_type,
         "event_version": event_version,
+        "occurred_at": occurred_at.isoformat(),
         "correlation_id": str(correlation_id),
         "causation_id": str(causation_id) if causation_id else None,
         "job_id": str(job_id),
@@ -168,6 +292,106 @@ def _material(
         "not_before": not_before.isoformat(),
         "payload": payload,
     }
+
+
+def _material_hash(
+    *,
+    event_id: uuid.UUID,
+    event_type: str,
+    event_version: int,
+    occurred_at: datetime,
+    correlation_id: uuid.UUID,
+    causation_id: uuid.UUID | None,
+    job_id: uuid.UUID,
+    entity_type: str,
+    entity_id: uuid.UUID,
+    operation: str,
+    dedupe_key: str,
+    policy_versions: dict[str, Any],
+    not_before: datetime,
+    payload: dict[str, Any],
+) -> str:
+    return canonical_hash(
+        _material(
+            event_id=event_id,
+            event_type=event_type,
+            event_version=event_version,
+            occurred_at=occurred_at,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            job_id=job_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            operation=operation,
+            dedupe_key=dedupe_key,
+            policy_versions=policy_versions,
+            not_before=not_before,
+            payload=payload,
+        ),
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
+    )
+
+
+def _validate_material_identity(
+    *,
+    event_type: Any,
+    event_version: Any,
+    occurred_at: Any,
+    correlation_id: Any,
+    causation_id: Any,
+    job_id: Any,
+    entity_type: Any,
+    entity_id: Any,
+    operation: Any,
+    dedupe_key: Any,
+) -> None:
+    if not isinstance(event_type, str) or SAFE_EVENT_TYPE_RE.fullmatch(event_type) is None:
+        raise ForbiddenEventPayload("event_type is invalid")
+    if type(event_version) is not int or event_version < 1:
+        raise ForbiddenEventPayload("event_version must be a positive integer")
+    if not isinstance(occurred_at, datetime) or timezone.is_naive(occurred_at):
+        raise ForbiddenEventPayload("occurred_at must be an aware datetime")
+    for key, value, nullable in (
+        ("correlation_id", correlation_id, False),
+        ("causation_id", causation_id, True),
+        ("job_id", job_id, False),
+        ("entity_id", entity_id, False),
+    ):
+        if value is None and nullable:
+            continue
+        try:
+            uuid.UUID(str(value))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ForbiddenEventPayload(f"{key} must be a UUID") from exc
+    for key, value in (("entity_type", entity_type), ("operation", operation)):
+        if not isinstance(value, str) or SAFE_NAME_RE.fullmatch(value) is None:
+            raise ForbiddenEventPayload(f"{key} is invalid")
+    if (
+        not isinstance(dedupe_key, str)
+        or not dedupe_key
+        or len(dedupe_key) > MAX_DEDUPE_KEY_LENGTH
+        or any(pattern.search(dedupe_key) for pattern in SECRET_VALUE_PATTERNS)
+    ):
+        raise ForbiddenEventPayload("dedupe_key is invalid")
+
+
+def compute_material_hash(message: OutboxMessage) -> str:
+    return _material_hash(
+        event_id=message.id,
+        event_type=message.topic,
+        event_version=message.event_version,
+        occurred_at=message.occurred_at,
+        correlation_id=message.correlation_id,
+        causation_id=message.causation_id,
+        job_id=message.job_id,
+        entity_type=message.aggregate_type,
+        entity_id=message.aggregate_id,
+        operation=message.operation,
+        dedupe_key=message.message_key,
+        policy_versions=message.policy_versions,
+        not_before=message.not_before,
+        payload=message.payload,
+    )
 
 
 def enqueue_event(
@@ -195,15 +419,10 @@ def enqueue_event(
         raise ValueError("outbox event_type is required")
     if not isinstance(payload, dict):
         raise ForbiddenEventPayload("event payload must be a JSON object")
-    _validate_event_payload(event_type, payload)
-    policy_versions = policy_versions or {}
-    _validate_payload(policy_versions, path="policy_versions")
-    if len(
-        json.dumps(
-            policy_versions, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
-    ) > MAX_POLICY_BYTES:
-        raise ForbiddenEventPayload("policy_versions exceeds the 8 KiB limit")
+    _validate_event_payload(event_type, event_version, payload)
+    policy_versions = _validate_policy_versions(
+        {} if policy_versions is None else policy_versions
+    )
     entity_id = _uuid(aggregate_id)
     entity_type = aggregate_type or event_type.split(".", 1)[0]
     dedupe_key = dedupe_key or message_key
@@ -211,24 +430,44 @@ def enqueue_event(
         raise ValueError("outbox dedupe_key is required")
     requested_not_before = available_at
     not_before = requested_not_before or timezone.now()
+    if not isinstance(not_before, datetime) or timezone.is_naive(not_before):
+        raise ForbiddenEventPayload("not_before must be an aware datetime")
     inherited_correlation = CURRENT_EVENT_CORRELATION_ID.get()
-    raw_correlation = correlation_id or inherited_correlation or current_correlation_id()
-    correlation_was_generated = False
-    try:
+    correlation_is_implicit = correlation_id is None and inherited_correlation is None
+    raw_correlation = correlation_id or inherited_correlation
+    if raw_correlation is not None:
         resolved_correlation = _uuid(raw_correlation)
-    except ValueError:
-        resolved_correlation = uuid.uuid4()
-        correlation_was_generated = True
+    else:
+        try:
+            resolved_correlation = _uuid(current_correlation_id())
+        except ValueError:
+            resolved_correlation = uuid.uuid4()
     inherited_causation = CURRENT_EVENT_ID.get()
     resolved_causation = (
         _uuid(causation_id or inherited_causation)
         if causation_id or inherited_causation
         else None
     )
-    resolved_job_id = _uuid(job_id, fallback=entity_id)
-    material = _material(
+    resolved_job_id = _uuid(job_id) if job_id is not None else entity_id
+    event_id = uuid.uuid4()
+    occurred_at = timezone.now()
+    _validate_material_identity(
         event_type=event_type,
         event_version=event_version,
+        occurred_at=occurred_at,
+        correlation_id=resolved_correlation,
+        causation_id=resolved_causation,
+        job_id=resolved_job_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        operation=operation,
+        dedupe_key=dedupe_key,
+    )
+    material_hash = _material_hash(
+        event_id=event_id,
+        event_type=event_type,
+        event_version=event_version,
+        occurred_at=occurred_at,
         correlation_id=resolved_correlation,
         causation_id=resolved_causation,
         job_id=resolved_job_id,
@@ -240,11 +479,11 @@ def enqueue_event(
         not_before=not_before,
         payload=payload,
     )
-    material_hash = canonical_hash(material, schema_version=CANONICAL_HASH_SCHEMA_V1)
     defaults = {
+        "id": event_id,
         "topic": event_type,
         "event_version": event_version,
-        "occurred_at": timezone.now(),
+        "occurred_at": occurred_at,
         "aggregate_type": entity_type,
         "aggregate_id": entity_id,
         "payload": payload,
@@ -254,40 +493,43 @@ def enqueue_event(
         "operation": operation,
         "policy_versions": policy_versions,
         "immutable_material_hash": material_hash,
+        "not_before": not_before,
         "available_at": not_before,
         "max_attempts": min(max(int(max_attempts), 1), 5),
     }
+
+    def comparison_hash(existing: OutboxMessage) -> str:
+        validate_persisted_event(existing)
+        return _material_hash(
+            event_id=existing.id,
+            event_type=event_type,
+            event_version=event_version,
+            occurred_at=existing.occurred_at,
+            correlation_id=(
+                existing.correlation_id
+                if correlation_is_implicit
+                else resolved_correlation
+            ),
+            causation_id=resolved_causation,
+            job_id=resolved_job_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            operation=operation,
+            dedupe_key=dedupe_key,
+            policy_versions=policy_versions,
+            not_before=(
+                existing.not_before
+                if requested_not_before is None
+                else requested_not_before
+            ),
+            payload=payload,
+        )
+
     with transaction.atomic():
         existing = OutboxMessage.objects.select_for_update().filter(message_key=dedupe_key).first()
         if existing is not None:
-            comparison_hash = material_hash
-            if requested_not_before is None or correlation_was_generated:
-                comparison_hash = canonical_hash(
-                    _material(
-                        event_type=event_type,
-                        event_version=event_version,
-                        correlation_id=(
-                            existing.correlation_id
-                            if correlation_was_generated
-                            else resolved_correlation
-                        ),
-                        causation_id=resolved_causation,
-                        job_id=resolved_job_id,
-                        entity_type=entity_type,
-                        entity_id=entity_id,
-                        operation=operation,
-                        dedupe_key=dedupe_key,
-                        policy_versions=policy_versions,
-                        not_before=(
-                            existing.available_at
-                            if requested_not_before is None
-                            else requested_not_before
-                        ),
-                        payload=payload,
-                    ),
-                    schema_version=CANONICAL_HASH_SCHEMA_V1,
-                )
-            if existing.immutable_material_hash != comparison_hash:
+            candidate_hash = comparison_hash(existing)
+            if not hmac.compare_digest(existing.immutable_material_hash, candidate_hash):
                 raise OutboxConflict("dedupe key already exists with different immutable material")
             return existing
         try:
@@ -295,34 +537,8 @@ def enqueue_event(
                 return OutboxMessage.objects.create(message_key=dedupe_key, **defaults)
         except IntegrityError:
             existing = OutboxMessage.objects.select_for_update().get(message_key=dedupe_key)
-            comparison_hash = material_hash
-            if requested_not_before is None or correlation_was_generated:
-                comparison_hash = canonical_hash(
-                    _material(
-                        event_type=event_type,
-                        event_version=event_version,
-                        correlation_id=(
-                            existing.correlation_id
-                            if correlation_was_generated
-                            else resolved_correlation
-                        ),
-                        causation_id=resolved_causation,
-                        job_id=resolved_job_id,
-                        entity_type=entity_type,
-                        entity_id=entity_id,
-                        operation=operation,
-                        dedupe_key=dedupe_key,
-                        policy_versions=policy_versions,
-                        not_before=(
-                            existing.available_at
-                            if requested_not_before is None
-                            else requested_not_before
-                        ),
-                        payload=payload,
-                    ),
-                    schema_version=CANONICAL_HASH_SCHEMA_V1,
-                )
-            if existing.immutable_material_hash != comparison_hash:
+            candidate_hash = comparison_hash(existing)
+            if not hmac.compare_digest(existing.immutable_material_hash, candidate_hash):
                 raise OutboxConflict(
                     "dedupe key concurrently created with different immutable material"
                 )
@@ -399,14 +615,37 @@ def event_envelope(message: OutboxMessage) -> dict[str, Any]:
         "attempt": message.attempts,
         "dedupe_key": message.message_key,
         "policy_versions": message.policy_versions,
-        "not_before": message.available_at.isoformat(),
+        "not_before": message.not_before.isoformat(),
         "payload": message.payload,
     }
 
 
 def validate_persisted_event(message: OutboxMessage) -> None:
-    _validate_event_payload(message.topic, message.payload)
-    _validate_payload(message.policy_versions, path="policy_versions")
+    if not isinstance(message.payload, dict):
+        raise ForbiddenEventPayload("persisted event payload must be a JSON object")
+    _validate_material_identity(
+        event_type=message.topic,
+        event_version=message.event_version,
+        occurred_at=message.occurred_at,
+        correlation_id=message.correlation_id,
+        causation_id=message.causation_id,
+        job_id=message.job_id,
+        entity_type=message.aggregate_type,
+        entity_id=message.aggregate_id,
+        operation=message.operation,
+        dedupe_key=message.message_key,
+    )
+    if not isinstance(message.not_before, datetime) or timezone.is_naive(
+        message.not_before
+    ):
+        raise ForbiddenEventPayload("persisted not_before must be an aware datetime")
+    _validate_event_payload(message.topic, message.event_version, message.payload)
+    _validate_policy_versions(message.policy_versions)
+    if SHA256_RE.fullmatch(message.immutable_material_hash or "") is None:
+        raise OutboxConflict("persisted immutable material hash is malformed")
+    recomputed = compute_material_hash(message)
+    if not hmac.compare_digest(message.immutable_material_hash, recomputed):
+        raise OutboxConflict("persisted immutable material hash does not match the event")
 
 
 @transaction.atomic
@@ -509,11 +748,21 @@ def mark_failed(
 
 
 def _verify_received_envelope(event: OutboxMessage, envelope: dict[str, Any]) -> None:
+    if not isinstance(envelope, dict):
+        raise ForbiddenEventPayload("received event envelope must be an object")
     expected = event_envelope(event)
-    for key in expected:
-        if key == "attempt":
-            continue
-        if envelope.get(key) != expected[key]:
+    received_keys = set(envelope)
+    expected_keys = set(expected)
+    if received_keys != expected_keys:
+        missing = ",".join(sorted(expected_keys - received_keys))
+        extra = ",".join(sorted(received_keys - expected_keys))
+        raise OutboxConflict(
+            f"received envelope fields do not match contract: missing={missing}; extra={extra}"
+        )
+    if type(envelope["attempt"]) is not int or envelope["attempt"] < 1:
+        raise ForbiddenEventPayload("received event attempt must be a positive integer")
+    for key, expected_value in expected.items():
+        if envelope[key] != expected_value:
             raise OutboxConflict(f"received envelope does not match persisted event: {key}")
 
 
@@ -535,8 +784,12 @@ def consume_event(
     consumer_name: str,
     handler: Callable[..., Any],
     argument_keys: tuple[str, ...],
+    terminal_handler: Callable[..., Any] | None = None,
+    terminal_argument_keys: tuple[str, ...] = (),
     max_attempts: int = 5,
 ) -> dict[str, Any]:
+    if not isinstance(envelope, dict):
+        raise ForbiddenEventPayload("received event envelope must be an object")
     payload = envelope.get("payload")
     event_id = _uuid(envelope.get("event_id"))
     now = timezone.now()
@@ -664,6 +917,19 @@ def consume_event(
                     "lease_token",
                 )
             )
+            event = OutboxMessage.objects.select_for_update().get(pk=event_id)
+            event.status = OutboxMessage.Status.DEAD_LETTER
+            event.dead_lettered_at = timezone.now()
+            event.last_error_at = timezone.now()
+            event.last_error_code = receipt.last_error_code
+            event.save(
+                update_fields=(
+                    "status",
+                    "dead_lettered_at",
+                    "last_error_at",
+                    "last_error_code",
+                )
+            )
             return {"state": "dead_letter", "attempt": receipt.attempts}
 
     try:
@@ -674,6 +940,7 @@ def consume_event(
             result = handler(*args)
     except Exception as exc:
         with transaction.atomic():
+            event = OutboxMessage.objects.select_for_update().get(pk=event_id)
             receipt = OutboxConsumerReceipt.objects.select_for_update().get(
                 event_id=event_id,
                 consumer_name=consumer_name,
@@ -682,18 +949,34 @@ def consume_event(
                 state=OutboxConsumerReceipt.State.PROCESSING,
                 claimed_until__gt=timezone.now(),
             )
-            terminal = receipt.attempts >= min(max(max_attempts, 1), 5)
+            terminal = bool(getattr(exc, "permanent", False)) or (
+                receipt.attempts >= min(max(max_attempts, 1), 5)
+            )
+            error_code = str(getattr(exc, "code", exc.__class__.__name__))[:120]
+            if terminal and terminal_handler is not None:
+                terminal_args = [event.payload[key] for key in terminal_argument_keys]
+                terminal_handler(*terminal_args, error_code)
             receipt.state = (
                 OutboxConsumerReceipt.State.DEAD_LETTER
                 if terminal
                 else OutboxConsumerReceipt.State.RETRY
             )
-            receipt.last_error_code = str(
-                getattr(exc, "code", exc.__class__.__name__)
-            )[:120]
+            receipt.last_error_code = error_code
             if terminal:
                 receipt.dead_lettered_at = timezone.now()
                 receipt.next_retry_at = None
+                event.status = OutboxMessage.Status.DEAD_LETTER
+                event.dead_lettered_at = timezone.now()
+                event.last_error_at = timezone.now()
+                event.last_error_code = error_code
+                event.save(
+                    update_fields=(
+                        "status",
+                        "dead_lettered_at",
+                        "last_error_at",
+                        "last_error_code",
+                    )
+                )
             else:
                 retry_after = getattr(exc, "retry_after_seconds", None)
                 receipt.next_retry_at = timezone.now() + timedelta(

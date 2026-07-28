@@ -37,7 +37,7 @@ from wisdome_writer.infrastructure.http_safety import (
     redact_url,
     safe_get,
 )
-from wisdome_writer.infrastructure.outbox import enqueue_event
+from wisdome_writer.infrastructure.outbox import PermanentEventError, enqueue_event
 
 from .models import (
     DocumentExtraction,
@@ -75,14 +75,51 @@ MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
 def _enqueue_document_extraction(document: DocumentExtraction) -> None:
     enqueue_event(
-        event_type="evidence.document_extract_requested",
+        event_type="evidence.document_route_requested",
         aggregate_type="document_extraction",
         aggregate_id=document.id,
         job_id=document.run_source_item.run_id,
-        dedupe_key=f"evidence.document_extract_requested:{document.id}",
+        dedupe_key=f"evidence.document_route_requested:{document.id}",
         payload={
             "run_id": str(document.run_source_item.run_id),
+            "run_source_item_id": str(document.run_source_item_id),
+            "source_item_id": str(document.source_item_id),
+            "input_asset_id": (
+                str(document.input_asset_id) if document.input_asset_id else None
+            ),
+            "input_kind": document.input_kind,
             "document_extraction_id": str(document.id),
+            "input_checksum": document.input_checksum,
+        },
+    )
+
+
+def _enqueue_generic_extraction(attempt: GenericExtractionAttempt) -> None:
+    enqueue_event(
+        event_type="evidence.other_extract_requested",
+        aggregate_type="generic_extraction_attempt",
+        aggregate_id=attempt.id,
+        job_id=attempt.run_source_item.run_id,
+        dedupe_key=f"evidence.other_extract_requested:{attempt.id}",
+        payload={
+            "run_id": str(attempt.run_source_item.run_id),
+            "run_source_item_id": str(attempt.run_source_item_id),
+            "source_item_id": str(attempt.source_item_id),
+            "input_asset_id": (
+                str(attempt.input_asset_id) if attempt.input_asset_id else None
+            ),
+            "generic_extraction_attempt_id": str(attempt.id),
+            "profile_snapshot_id": str(attempt.extraction_profile_snapshot_id),
+            "profile_material_hash": attempt.profile_material_hash,
+            "engine": attempt.engine,
+            "extractor_version": attempt.extractor_version,
+            "config_hash": attempt.config_hash,
+            "validation_mode": attempt.validation_mode,
+            "calibration_profile_key": attempt.calibration_profile_key,
+            "calibration_profile_version": attempt.calibration_profile_version,
+            "calibration_profile_hash": attempt.calibration_profile_hash,
+            "fingerprint_schema_version": attempt.fingerprint_schema_version,
+            "extraction_fingerprint": attempt.extraction_fingerprint,
         },
     )
 
@@ -494,6 +531,14 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                     "document_complete": True,
                 },
             )
+        elif document.state in {
+            ExtractionState.FAILED,
+            ExtractionState.LOW_CONFIDENCE,
+        }:
+            _enqueue_finalize(
+                str(document.run_source_item.run_id),
+                f"document-terminal:{document.id}:{document.state}",
+            )
     return document
 
 
@@ -751,75 +796,149 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         input_checksum=raw_asset.checksum,
         profile=profile,
     )
-    attempt, _ = GenericExtractionAttempt.objects.get_or_create(
-        run_source_item=run_source_item,
-        extraction_fingerprint=fingerprint,
-        defaults={
-            "source_item": run_source_item.source_item,
-            "input_asset": raw_asset,
-            "extraction_profile_snapshot": profile,
-            "profile_material_hash": profile.profile_material_hash,
-            "engine": profile.engine,
-            "extractor_version": profile.extractor_version,
-            "config_hash": profile.config_hash,
-            "validation_mode": profile.validation_mode or GenericValidationMode.DETERMINISTIC,
-            "calibration_profile_key": profile.calibration_profile_key,
-            "calibration_profile_version": profile.calibration_profile_version,
-            "calibration_profile_hash": profile.calibration_profile_hash,
-        },
-    )
-    _run_generic_extraction(attempt.id)
-
-
-@shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
-def process_document_extraction(self, document_id: str):
-    try:
-        run_id = str(
-            DocumentExtraction.objects.values_list("run_source_item__run_id", flat=True).get(pk=document_id)
+    with transaction.atomic():
+        attempt, _ = GenericExtractionAttempt.objects.get_or_create(
+            run_source_item=run_source_item,
+            extraction_fingerprint=fingerprint,
+            defaults={
+                "source_item": run_source_item.source_item,
+                "input_asset": raw_asset,
+                "extraction_profile_snapshot": profile,
+                "profile_material_hash": profile.profile_material_hash,
+                "engine": profile.engine,
+                "extractor_version": profile.extractor_version,
+                "config_hash": profile.config_hash,
+                "validation_mode": (
+                    profile.validation_mode or GenericValidationMode.DETERMINISTIC
+                ),
+                "calibration_profile_key": profile.calibration_profile_key,
+                "calibration_profile_version": profile.calibration_profile_version,
+                "calibration_profile_hash": profile.calibration_profile_hash,
+            },
         )
+        _enqueue_generic_extraction(attempt)
+
+
+def _queue_document_retry(document_id: str, exc: Exception) -> None:
+    DocumentExtraction.objects.filter(pk=document_id).update(
+        state=ExtractionState.QUEUED,
+        document_complete=False,
+        error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
+        error_detail_redacted=str(
+            getattr(exc, "detail_redacted", str(exc))
+        )[:1000],
+        finished_at=None,
+    )
+
+
+def _queue_generic_retry(attempt_id: str, exc: Exception) -> None:
+    GenericExtractionAttempt.objects.filter(pk=attempt_id).update(
+        state=ExtractionState.QUEUED,
+        error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
+        error_detail_redacted=str(
+            getattr(exc, "detail_redacted", str(exc))
+        )[:1000],
+        finished_at=None,
+    )
+
+
+@shared_task
+def finalize_document_extraction_failure(document_id: str, error_code: str):
+    with transaction.atomic():
+        document = (
+            DocumentExtraction.objects.select_for_update()
+            .select_related("run_source_item")
+            .get(pk=document_id)
+        )
+        if document.state in {
+            ExtractionState.SUCCEEDED,
+            ExtractionState.LOW_CONFIDENCE,
+        }:
+            return {"documentExtractionId": str(document.id), "state": document.state}
+        document.state = ExtractionState.FAILED
+        document.document_complete = False
+        document.error_code = error_code[:120]
+        document.finished_at = timezone.now()
+        document.save(
+            update_fields=(
+                "state",
+                "document_complete",
+                "error_code",
+                "finished_at",
+                "updated_at",
+            )
+        )
+        _enqueue_finalize(
+            str(document.run_source_item.run_id),
+            f"document-terminal:{document.id}",
+        )
+        return {"documentExtractionId": str(document.id), "state": document.state}
+
+
+@shared_task
+def finalize_generic_extraction_failure(attempt_id: str, error_code: str):
+    with transaction.atomic():
+        attempt = (
+            GenericExtractionAttempt.objects.select_for_update()
+            .select_related("run_source_item")
+            .get(pk=attempt_id)
+        )
+        if attempt.state in {
+            ExtractionState.SUCCEEDED,
+            ExtractionState.LOW_CONFIDENCE,
+        }:
+            return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+        attempt.state = ExtractionState.FAILED
+        attempt.error_code = error_code[:120]
+        attempt.finished_at = timezone.now()
+        attempt.save(
+            update_fields=("state", "error_code", "finished_at", "updated_at")
+        )
+        _enqueue_finalize(
+            str(attempt.run_source_item.run_id),
+            f"generic-terminal:{attempt.id}",
+        )
+        return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+
+
+@shared_task
+def process_document_extraction(document_id: str):
+    try:
         document = _run_document_extraction(document_id)
         return {"documentExtractionId": str(document.id), "state": document.state}
     except ExtractorError as exc:
         with transaction.atomic():
-            DocumentExtraction.objects.filter(pk=document_id).update(
-                state=ExtractionState.FAILED,
-                document_complete=False,
-                error_code=exc.code,
-                error_detail_redacted=exc.detail_redacted,
-                finished_at=timezone.now(),
-            )
-            _enqueue_finalize(run_id, f"document-failed:{document_id}")
+            _queue_document_retry(document_id, exc)
         if exc.retryable:
-            raise TimeoutError(exc.detail_redacted) from exc
-        return {"documentExtractionId": str(document_id), "state": "failed", "errorCode": exc.code}
+            raise
+        raise PermanentEventError(exc.code, exc.detail_redacted) from exc
+    except Exception as exc:
+        with transaction.atomic():
+            _queue_document_retry(document_id, exc)
+        raise
 
 
-@shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
-def process_paddleocr_document(self, document_id: str):
+@shared_task
+def process_paddleocr_document(document_id: str):
     """Dedicated queue entry point; page routing still comes from the parent aggregate."""
     return process_document_extraction.run(document_id)
 
 
-@shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
-def process_generic_extraction(self, attempt_id: str):
+@shared_task
+def process_generic_extraction(attempt_id: str):
     try:
-        run_id = str(
-            GenericExtractionAttempt.objects.values_list("run_source_item__run_id", flat=True).get(pk=attempt_id)
-        )
         attempt = _run_generic_extraction(attempt_id)
         return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
     except ExtractorError as exc:
         with transaction.atomic():
-            GenericExtractionAttempt.objects.filter(pk=attempt_id).update(
-                state=ExtractionState.FAILED,
-                error_code=exc.code,
-                error_detail_redacted=exc.detail_redacted,
-                finished_at=timezone.now(),
-            )
-            _enqueue_finalize(run_id, f"generic-failed:{attempt_id}")
+            _queue_generic_retry(attempt_id, exc)
         if exc.retryable:
-            raise TimeoutError(exc.detail_redacted) from exc
-        return {"genericExtractionAttemptId": str(attempt_id), "state": "failed", "errorCode": exc.code}
+            raise
+        raise PermanentEventError(exc.code, exc.detail_redacted) from exc
+    except Exception as exc:
+        with transaction.atomic():
+            _queue_generic_retry(attempt_id, exc)
+        raise
 
 
 @shared_task
@@ -863,11 +982,11 @@ def finalize_run_evidence(run_id: str):
         }
         run.save(update_fields=("state", "counters"))
         enqueue_event(
-            event_type="article.draft_requested",
+            event_type="run.draft_requested",
             aggregate_type="collection_run",
             aggregate_id=run.id,
             job_id=run.id,
-            dedupe_key=f"article.draft_requested:{run.id}",
+            dedupe_key=f"run.draft_requested:{run.id}",
             payload={"run_id": str(run.id)},
         )
         return {

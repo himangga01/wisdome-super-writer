@@ -45,6 +45,7 @@ class OutboxMessage(UUIDModel):
     operation = models.CharField(max_length=80, default="process")
     policy_versions = models.JSONField(default=dict)
     immutable_material_hash = models.CharField(max_length=64)
+    not_before = models.DateTimeField(default=timezone.now)
     available_at = models.DateTimeField(default=timezone.now, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     status = models.CharField(

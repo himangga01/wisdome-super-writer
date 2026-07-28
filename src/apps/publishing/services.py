@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta, timezone as dt_timezone
 from typing import Any, Iterable
 
@@ -355,14 +356,60 @@ def update_target(target_id: str, data: dict[str, Any]) -> PublicationTarget:
     return target
 
 
+@dataclass(frozen=True)
+class TargetPreflightFence:
+    target_id: uuid.UUID
+    target_snapshot_id: uuid.UUID
+    target_config_hash: str
+    target_snapshot_version: int
+
+
 @transaction.atomic
-def run_target_preflight(target_id: str, *, resolver: Any | None = None) -> PublicationTarget:
+def begin_target_preflight(
+    target_id: str,
+    *,
+    expected_snapshot_id: str,
+    expected_config_hash: str,
+) -> tuple[PublicationTarget, TargetPreflightFence] | None:
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
-    adapter = publisher_for_target(target, resolver=resolver)
-    try:
-        result = adapter.preflight_connection()
-    finally:
-        adapter.close()
+    if (
+        not target.current_snapshot_id
+        or str(target.current_snapshot_id) != str(expected_snapshot_id)
+        or target.current_config_hash != expected_config_hash
+    ):
+        _audit(
+            "publication_target.preflight_stale_before_call",
+            target,
+            expected_config_hash,
+            target.current_config_hash,
+        )
+        return None
+    return target, TargetPreflightFence(
+        target_id=target.id,
+        target_snapshot_id=target.current_snapshot_id,
+        target_config_hash=target.current_config_hash,
+        target_snapshot_version=target.current_snapshot_version,
+    )
+
+
+@transaction.atomic
+def persist_target_preflight_result(
+    fence: TargetPreflightFence,
+    result,
+) -> tuple[PublicationTarget, bool]:
+    target = PublicationTarget.objects.select_for_update().get(id=fence.target_id)
+    if (
+        target.current_snapshot_id != fence.target_snapshot_id
+        or target.current_config_hash != fence.target_config_hash
+        or target.current_snapshot_version != fence.target_snapshot_version
+    ):
+        _audit(
+            "publication_target.preflight_stale_after_call",
+            target,
+            fence.target_config_hash,
+            target.current_config_hash,
+        )
+        return target, False
     target.capabilities = result.capabilities.as_dict()
     target.preflight_state = ValidationState.PASSED if result.passed else ValidationState.FAILED
     if result.passed:
@@ -387,8 +434,58 @@ def run_target_preflight(target_id: str, *, resolver: Any | None = None) -> Publ
     target.last_preflight_at = timezone.now()
     target.save()
     _snapshot_locked(target)
-    _audit("publication_target.preflight", target, None, sha256_hex(result.checks))
-    return target
+    result_hash = sha256_hex(
+        {
+            "passed": result.passed,
+            "remoteIdentity": result.remote_identity,
+            "remoteUrl": result.remote_url,
+            "capabilities": result.capabilities.as_dict(),
+            "checks": result.checks,
+            "errorCode": result.error_code,
+        }
+    )
+    _audit("publication_target.preflight", target, None, result_hash)
+    _enqueue_event(
+        "publishing.target_preflight.completed",
+        {
+            "target_id": str(target.id),
+            "target_snapshot_id": str(fence.target_snapshot_id),
+            "target_config_hash": fence.target_config_hash,
+            "result_hash": result_hash,
+            "passed": result.passed,
+        },
+        dedupe_key=(
+            f"publishing.target_preflight.completed:{target.id}:"
+            f"{fence.target_snapshot_id}:{result_hash}"
+        ),
+        aggregate_type="publication_target",
+        aggregate_id=target.id,
+        job_id=target.id,
+    )
+    return target, True
+
+
+def run_target_preflight(
+    target_id: str,
+    *,
+    expected_snapshot_id: str,
+    expected_config_hash: str,
+    resolver: Any | None = None,
+) -> tuple[PublicationTarget, bool]:
+    prepared = begin_target_preflight(
+        target_id,
+        expected_snapshot_id=expected_snapshot_id,
+        expected_config_hash=expected_config_hash,
+    )
+    if prepared is None:
+        return PublicationTarget.objects.get(id=target_id), False
+    target, fence = prepared
+    adapter = publisher_for_target(target, resolver=resolver)
+    try:
+        result = adapter.preflight_connection()
+    finally:
+        adapter.close()
+    return persist_target_preflight_result(fence, result)
 
 
 @transaction.atomic
@@ -417,7 +514,6 @@ def create_canary_run(
         {
             "canary_run_id": str(run.id),
             "target_id": str(target.id),
-            "channel": target.channel,
         },
         dedupe_key=f"target-canary:{run.id}",
     )
@@ -1226,7 +1322,6 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
         "publication.requested",
         {
             "publication_attempt_id": str(attempt.id),
-            "channel": attempt.publication.target.channel,
         },
         dedupe_key=f"publication.requested:{attempt.id}:{attempt.attempt_no}",
         aggregate_type="publication_attempt",
@@ -1425,15 +1520,65 @@ def _command_for_attempt(attempt: PublicationAttempt, render: ArticleChannelRend
     )
 
 
+def _enqueue_reconcile_locked(
+    attempt: PublicationAttempt,
+    *,
+    reason: str = "outcome",
+    available_at=None,
+) -> None:
+    _enqueue_event(
+        "publication.reconcile_requested",
+        {"publication_attempt_id": str(attempt.id)},
+        dedupe_key=(
+            f"publication.reconcile_requested:{attempt.id}:"
+            f"{attempt.attempt_no}:{reason}"
+        ),
+        aggregate_type="publication_attempt",
+        aggregate_id=attempt.id,
+        job_id=attempt.id,
+        available_at=available_at,
+    )
+
+
 @transaction.atomic
-def begin_attempt(attempt_id: str) -> tuple[PublicationAttempt, PublishCommand]:
+def begin_attempt(
+    attempt_id: str,
+) -> tuple[PublicationAttempt, PublishCommand | None]:
     attempt = PublicationAttempt.objects.select_for_update().select_related(
         "publication__target", "publication_intent", "approval__article_channel_render"
     ).get(id=attempt_id)
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
-        return attempt, _command_for_attempt(attempt, _final_render(attempt))
-    if attempt.state in {PublicationAttempt.State.RECONCILING, PublicationAttempt.State.UNKNOWN_OUTCOME}:
-        raise Conflict("결과 불명 attempt는 reconcile만 실행할 수 있습니다.")
+        return attempt, None
+    if attempt.state == PublicationAttempt.State.RUNNING:
+        attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
+        attempt.finished_at = timezone.now()
+        attempt.error_code = "delivery_redelivered_after_begin"
+        attempt.save(update_fields=["state", "finished_at", "error_code"])
+        publication = attempt.publication
+        publication.state = Publication.State.RECONCILING
+        publication.remote_state = Publication.RemoteState.UNKNOWN
+        publication.last_error_code = attempt.error_code
+        publication.save(
+            update_fields=(
+                "state",
+                "remote_state",
+                "last_error_code",
+                "updated_at",
+            )
+        )
+        _enqueue_reconcile_locked(attempt)
+        return attempt, None
+    if attempt.state in {
+        PublicationAttempt.State.RECONCILING,
+        PublicationAttempt.State.UNKNOWN_OUTCOME,
+    }:
+        _enqueue_reconcile_locked(attempt)
+        return attempt, None
+    if attempt.state not in {
+        PublicationAttempt.State.QUEUED,
+        PublicationAttempt.State.RETRYABLE_FAILED,
+    }:
+        raise Conflict("terminal publication attempt cannot be executed again")
     try:
         validate_attempt_gate(attempt)
     except Conflict:
@@ -1580,7 +1725,6 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
             "publication.requested",
             {
                 "publication_attempt_id": str(attempt_id),
-                "channel": ChannelCode.BLOGGER,
             },
             dedupe_key=f"publication.requested:{attempt_id}:1",
             aggregate_type="publication_attempt",
@@ -1599,6 +1743,7 @@ def begin_reconcile(attempt_id: str) -> tuple[PublicationAttempt, PublishCommand
     if attempt.state not in {
         PublicationAttempt.State.UNKNOWN_OUTCOME,
         PublicationAttempt.State.RECONCILING,
+        PublicationAttempt.State.RETRYABLE_FAILED,
     }:
         raise Conflict("unknown-outcome attempt만 조정할 수 있습니다.")
     attempt.state = PublicationAttempt.State.RECONCILING
@@ -1797,7 +1942,6 @@ def disconnect_target(
         {
             "decision_id": str(decision.id),
             "target_id": str(target.id),
-            "channel": target.channel,
         },
         dedupe_key=f"target-disconnect:{decision.id}",
     )
