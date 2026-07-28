@@ -95,7 +95,7 @@ def kill_switch(request):
     if request.method == "PUT":
         body = json.loads(request.body or b"{}")
         try:
-            set_kill_switch(
+            decision = set_kill_switch(
                 enabled=body["enabled"],
                 expected_version=body["expectedVersion"],
                 request_key=body["requestKey"],
@@ -107,7 +107,13 @@ def kill_switch(request):
         except ValueError as exc:
             transaction.set_rollback(True)
             return JsonResponse({"detail": str(exc)}, status=409)
-        control.refresh_from_db()
+        return JsonResponse(
+            {
+                "enabled": decision.enabled,
+                "version": decision.expected_version + 1,
+                "reason": decision.reason,
+            }
+        )
     return JsonResponse(
         {"enabled": control.enabled, "version": control.version, "reason": control.reason}
     )

@@ -390,6 +390,7 @@ class Approval(models.Model):
     approval_subject_hash = models.CharField(max_length=64)
     supersedes_approval_id = models.UUIDField(null=True, blank=True)
     request_key = models.CharField(max_length=200)
+    request_hash = models.CharField(max_length=64, null=True, blank=True)
     reauth_proof_id = models.UUIDField(null=True, blank=True)
     policy_snapshot_hash = models.CharField(max_length=64)
     quality_report_hash = models.CharField(max_length=64)

@@ -495,7 +495,7 @@ def create_auto_publish_validation(target_id: str, data: dict[str, Any]) -> Auto
 @transaction.atomic
 def decide_auto_publish_validation(
     target_id: str, validation_id: str, data: dict[str, Any], *, request
-) -> AutoPublishValidationDecision:
+) -> tuple[AutoPublishValidationDecision, bool]:
     user = request.user
     validation = AutoPublishValidation.objects.select_for_update().select_related("target").get(
         id=validation_id, target_id=target_id
@@ -505,7 +505,7 @@ def decide_auto_publish_validation(
     if existing:
         if existing.request_hash != request_hash or existing.decided_by_id != user.pk:
             raise Conflict("같은 request key가 다른 decision payload에 사용되었습니다.")
-        return existing
+        return existing, False
     if _id(validation.latest_decision_id) != _id(data.get("expectedLatestDecisionId")):
         raise Conflict("validation decision이 갱신되었습니다. 다시 불러오세요.")
     consume_reauthentication_proof(
@@ -558,7 +558,7 @@ def decide_auto_publish_validation(
             state__in=[PublicationIntent.State.APPROVED, PublicationIntent.State.AWAITING_APPROVAL],
         ).update(state=PublicationIntent.State.STALE)
     _audit("auto_publish_validation.decided", validation, None, decision_hash)
-    return decision
+    return decision, True
 
 
 def _normalized_validation_refs(refs: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
@@ -575,7 +575,9 @@ def _normalized_validation_refs(refs: Iterable[dict[str, Any]]) -> list[dict[str
 
 
 @transaction.atomic
-def set_auto_publish(target_id: str, data: dict[str, Any], *, request) -> AutoPublishActivation:
+def set_auto_publish(
+    target_id: str, data: dict[str, Any], *, request
+) -> tuple[AutoPublishActivation, bool]:
     user = request.user
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _request_hash(data)
@@ -583,7 +585,7 @@ def set_auto_publish(target_id: str, data: dict[str, Any], *, request) -> AutoPu
     if existing:
         if existing.request_hash != request_hash or existing.decided_by_id != user.pk:
             raise Conflict("같은 request key가 다른 activation payload에 사용되었습니다.")
-        return existing
+        return existing, False
     if _id(target.latest_auto_publish_activation_id) != _id(data.get("expectedLatestActivationId")):
         raise Conflict("자동발행 상태가 갱신되었습니다. 다시 불러오세요.")
     consume_reauthentication_proof(
@@ -671,7 +673,7 @@ def set_auto_publish(target_id: str, data: dict[str, Any], *, request) -> AutoPu
             state__in=[PublicationIntent.State.APPROVED, PublicationIntent.State.AWAITING_APPROVAL],
         ).update(state=PublicationIntent.State.STALE)
     _audit("auto_publish_activation.decided", target, None, activation_hash)
-    return activation
+    return activation, True
 
 
 def _target_ref_map(refs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -981,10 +983,11 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
 @transaction.atomic
 def decide_approval(
     article_id: str, target_id: str, data: dict[str, Any], *, user, request=None
-) -> Approval:
+) -> tuple[Approval, bool]:
     intent = PublicationIntent.objects.select_for_update().get(
         id=data["publicationIntentId"], article_id=article_id
     )
+    request_hash = _request_hash(data)
     existing = Approval.objects.filter(
         publication_intent=intent,
         target_id=target_id,
@@ -992,16 +995,11 @@ def decide_approval(
     ).first()
     if existing:
         if (
-            existing.revision_no != data["revisionNo"]
-            or _id(existing.supersedes_approval_id)
-            != _id(data.get("expectedLatestApprovalId"))
-            or existing.decision != data["decision"]
-            or existing.action_subject != data["actionSubject"]
-            or _id(existing.reauth_proof_id) != _id(data.get("reauthProofId"))
+            existing.request_hash != request_hash
             or existing.admin_id != user.pk
         ):
             raise Conflict("같은 request key가 다른 승인 대상에 사용되었습니다.")
-        return existing
+        return existing, False
     latest_intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
     if not latest_intent or latest_intent.id != intent.id or intent.state == PublicationIntent.State.STALE:
         raise Conflict("current 발행 의도만 승인할 수 있습니다.")
@@ -1080,6 +1078,7 @@ def decide_approval(
         approval_subject_hash=approval_subject_hash,
         supersedes_approval_id=latest.id if latest else None,
         request_key=data["requestKey"],
+        request_hash=request_hash,
         reauth_proof_id=data.get("reauthProofId"),
         policy_snapshot_hash=intent.quality_gate_manifest_hash,
         quality_report_hash=intent.quality_report_hash,
@@ -1099,7 +1098,7 @@ def decide_approval(
         intent.state = PublicationIntent.State.APPROVED
         intent.save(update_fields=["state"])
     _audit("publication_approval.decided", approval, None, approval.approval_subject_hash)
-    return approval
+    return approval, True
 
 
 def _publication_for(article_id: str, target: PublicationTarget) -> Publication:
