@@ -1,13 +1,42 @@
 name: wisdome-super-writer
 
+x-runtime-environment: &runtime-environment
+  WISDOME_ENVIRONMENT: ${WISDOME_ENVIRONMENT:?set development or production}
+  DJANGO_SETTINGS_MODULE: wisdome_writer.settings
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY}
+  DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?set DJANGO_ALLOWED_HOSTS}
+  DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?set DJANGO_CSRF_TRUSTED_ORIGINS}
+  DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+  REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+  CELERY_BROKER_URL: ${CELERY_BROKER_URL:?set CELERY_BROKER_URL}
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:?set CELERY_RESULT_BACKEND}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY}
+  AWS_STORAGE_BUCKET_NAME: ${AWS_STORAGE_BUCKET_NAME:?set AWS_STORAGE_BUCKET_NAME}
+  AWS_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT_URL:-}
+  AWS_S3_REGION_NAME: ${AWS_S3_REGION_NAME:?set AWS_S3_REGION_NAME}
+  AWS_S3_ADDRESSING_STYLE: ${AWS_S3_ADDRESSING_STYLE:-path}
+  OBJECT_STORAGE_PRESIGN_TTL_SECONDS: ${OBJECT_STORAGE_PRESIGN_TTL_SECONDS:-300}
+  AUDIT_CURSOR_SIGNING_KEY: ${AUDIT_CURSOR_SIGNING_KEY:?set AUDIT_CURSOR_SIGNING_KEY}
+  REAUTH_PROOF_TTL_SECONDS: ${REAUTH_PROOF_TTL_SECONDS:-300}
+  REAUTH_MFA_REQUIRED: ${REAUTH_MFA_REQUIRED:-false}
+  REAUTH_MFA_VALIDATOR: ${REAUTH_MFA_VALIDATOR:-}
+  SECRET_PROVIDER_CLASSES: ${SECRET_PROVIDER_CLASSES:-{}}
+  TZ: ${TZ:-Asia/Seoul}
+
+x-publisher-environment: &publisher-environment
+  BLOGGER_OAUTH_CLIENT_ID_REF: ${BLOGGER_OAUTH_CLIENT_ID_REF:-}
+  BLOGGER_OAUTH_CLIENT_SECRET_REF: ${BLOGGER_OAUTH_CLIENT_SECRET_REF:-}
+  BLOGGER_OAUTH_CLIENT_ID: ${BLOGGER_OAUTH_CLIENT_ID:-}
+  BLOGGER_OAUTH_CLIENT_SECRET: ${BLOGGER_OAUTH_CLIENT_SECRET:-}
+  BLOGGER_ACCESS_TOKEN: ${BLOGGER_ACCESS_TOKEN:-}
+  BLOGGER_OAUTH_TOKEN_STORE: ${BLOGGER_OAUTH_TOKEN_STORE:-}
+
 x-app: &app
   build:
     context: .
     dockerfile: deploy/containers/app/Dockerfile
-  env_file: .env
-  volumes:
-    - ./src:/app/src
-    - ./config:/app/config:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -19,40 +48,50 @@ x-app: &app
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     environment:
-      POSTGRES_DB: wisdome
-      POSTGRES_USER: wisdome
-      POSTGRES_PASSWORD: wisdome
-      TZ: Asia/Seoul
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      TZ: ${TZ:-Asia/Seoul}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wisdome -d wisdome"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 3s
       retries: 20
+    networks:
+      - database
+    restart: unless-stopped
 
   redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
       interval: 5s
       timeout: 3s
       retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    networks:
+      - broker
+    restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
     command: server /data --console-address :9001
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
     healthcheck:
@@ -60,40 +99,97 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    networks:
+      - object-storage
+    restart: unless-stopped
 
   minio-bootstrap:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      AWS_STORAGE_BUCKET_NAME: ${AWS_STORAGE_BUCKET_NAME:?set AWS_STORAGE_BUCKET_NAME}
     entrypoint:
       - /bin/sh
       - -ec
       - |
-        mc alias set local http://minio:9000 minioadmin minioadmin
-        mc mb --ignore-existing local/wisdome-writer
-        mc version enable local/wisdome-writer
-        mc anonymous set none local/wisdome-writer
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${AWS_STORAGE_BUCKET_NAME}"
+        mc version enable "local/$${AWS_STORAGE_BUCKET_NAME}"
+        mc anonymous set none "local/$${AWS_STORAGE_BUCKET_NAME}"
+    networks:
+      - object-storage
+    restart: "no"
 
   web:
     <<: *app
-    command: python src/manage.py runserver 0.0.0.0:8000
+    environment:
+      <<: [*runtime-environment, *publisher-environment]
+    command: ["/app/deploy/containers/app/entrypoint.sh"]
     ports:
-      - "8000:8000"
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8000}:8000"
+    networks:
+      - web
+      - database
+      - broker
+      - object-storage
+      - publishing-egress
 
-  worker:
+  worker-collect:
     <<: *app
-    command: celery -A wisdome_writer worker --loglevel=INFO --queues=default,collect,extract.generic,generate,publish
+    environment:
+      <<: *runtime-environment
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect"]
+    networks:
+      - database
+      - broker
+      - object-storage
+      - collection-egress
+
+  worker-extract:
+    <<: *app
+    environment:
+      <<: *runtime-environment
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.generic"]
+    networks:
+      - database
+      - broker
+      - object-storage
+
+  worker-editorial:
+    <<: *app
+    environment:
+      <<: *runtime-environment
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=default,generate"]
+    networks:
+      - database
+      - broker
+      - object-storage
+
+  worker-publish:
+    <<: *app
+    environment:
+      <<: [*runtime-environment, *publisher-environment]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish"]
+    networks:
+      - database
+      - broker
+      - object-storage
+      - publishing-egress
 
   ocr-worker:
     build:
       context: .
       dockerfile: deploy/containers/paddleocr-worker/Dockerfile
-    env_file: .env
-    command: celery -A wisdome_writer worker --loglevel=INFO --queues=extract.ocr.paddle --concurrency=1
+    environment:
+      <<: *runtime-environment
+      PADDLEOCR_HOME: /models/paddleocr
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.ocr.paddle", "--concurrency=1"]
     volumes:
-      - ./src:/app/src
-      - ./config:/app/config:ro
       - paddle-models:/models/paddleocr:ro
     depends_on:
       postgres:
@@ -102,14 +198,34 @@ services:
         condition: service_healthy
       minio-bootstrap:
         condition: service_completed_successfully
+    networks:
+      - database
+      - broker
+      - object-storage
     restart: unless-stopped
 
   beat:
     <<: *app
-    command: celery -A wisdome_writer beat --loglevel=INFO
+    environment:
+      <<: *runtime-environment
+    command: ["celery", "-A", "wisdome_writer", "beat", "--loglevel=INFO"]
+    networks:
+      - database
+      - broker
 
 volumes:
   postgres-data:
   redis-data:
   minio-data:
   paddle-models:
+
+networks:
+  web:
+  collection-egress:
+  publishing-egress:
+  database:
+    internal: true
+  broker:
+    internal: true
+  object-storage:
+    internal: true

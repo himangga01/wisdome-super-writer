@@ -1,8 +1,10 @@
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 from kombu import Queue
 
@@ -10,6 +12,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPOSITORY_ROOT / "src"
 BASE_DIR = SRC_ROOT
 load_dotenv(REPOSITORY_ROOT / ".env")
+
+
+def env_value(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -20,10 +26,139 @@ def env_list(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "development-only-secret-key")
-DEBUG = env_bool("DJANGO_DEBUG", False)
-ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
+WISDOME_ENVIRONMENT = env_value("WISDOME_ENVIRONMENT")
+if WISDOME_ENVIRONMENT not in {"development", "production"}:
+    raise ImproperlyConfigured(
+        "WISDOME_ENVIRONMENT must be explicitly set to 'development' or 'production'."
+    )
+
+IS_PRODUCTION = WISDOME_ENVIRONMENT == "production"
+SECRET_KEY = env_value(
+    "DJANGO_SECRET_KEY",
+    "development-only-secret-key" if not IS_PRODUCTION else "",
+)
+DEBUG = env_bool("DJANGO_DEBUG", not IS_PRODUCTION)
+ALLOWED_HOSTS = env_list(
+    "DJANGO_ALLOWED_HOSTS",
+    "localhost,127.0.0.1" if not IS_PRODUCTION else "",
+)
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
+
+DATABASE_URL = env_value(
+    "DATABASE_URL",
+    f"sqlite:///{REPOSITORY_ROOT / 'db.sqlite3'}" if not IS_PRODUCTION else "",
+)
+REDIS_URL = env_value("REDIS_URL", "redis://localhost:6379/0" if not IS_PRODUCTION else "")
+CELERY_BROKER_URL = env_value("CELERY_BROKER_URL", REDIS_URL)
+CELERY_RESULT_BACKEND = env_value(
+    "CELERY_RESULT_BACKEND",
+    "redis://localhost:6379/1" if not IS_PRODUCTION else "",
+)
+
+AWS_ACCESS_KEY_ID = env_value("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = env_value("AWS_SECRET_ACCESS_KEY")
+AWS_STORAGE_BUCKET_NAME = env_value(
+    "AWS_STORAGE_BUCKET_NAME",
+    "wisdome-writer" if not IS_PRODUCTION else "",
+)
+AWS_S3_ENDPOINT_URL = env_value("AWS_S3_ENDPOINT_URL") or None
+AWS_S3_REGION_NAME = env_value(
+    "AWS_S3_REGION_NAME",
+    "ap-northeast-2" if not IS_PRODUCTION else "",
+)
+AWS_S3_ADDRESSING_STYLE = env_value("AWS_S3_ADDRESSING_STYLE", "path")
+AUDIT_CURSOR_SIGNING_KEY = env_value(
+    "AUDIT_CURSOR_SIGNING_KEY",
+    SECRET_KEY if not IS_PRODUCTION else "",
+)
+
+
+def validate_production_configuration() -> None:
+    if not IS_PRODUCTION:
+        return
+
+    errors: list[str] = []
+    unsafe_values = {
+        "change-me",
+        "changeme",
+        "development-only-secret-key",
+        "minioadmin",
+        "replace-me",
+        "replace-with-a-dedicated-audit-cursor-key",
+        "replace-with-a-long-random-value",
+        "wisdome",
+    }
+
+    def require_safe_secret(name: str, value: str) -> None:
+        if not value:
+            errors.append(f"{name} is required")
+        elif len(value) < 32 or value.lower() in unsafe_values:
+            errors.append(f"{name} must be a non-placeholder value of at least 32 characters")
+
+    require_safe_secret("DJANGO_SECRET_KEY", SECRET_KEY)
+    require_safe_secret("AUDIT_CURSOR_SIGNING_KEY", AUDIT_CURSOR_SIGNING_KEY)
+    if SECRET_KEY and AUDIT_CURSOR_SIGNING_KEY == SECRET_KEY:
+        errors.append("AUDIT_CURSOR_SIGNING_KEY must be distinct from DJANGO_SECRET_KEY")
+    if DEBUG:
+        errors.append("DJANGO_DEBUG must be false")
+    if not ALLOWED_HOSTS or any(
+        host in {"*", "localhost", "127.0.0.1", "::1"} for host in ALLOWED_HOSTS
+    ):
+        errors.append("DJANGO_ALLOWED_HOSTS must contain explicit non-local production hosts")
+    if not CSRF_TRUSTED_ORIGINS or any(
+        not origin.startswith("https://") for origin in CSRF_TRUSTED_ORIGINS
+    ):
+        errors.append("DJANGO_CSRF_TRUSTED_ORIGINS must contain only HTTPS origins")
+
+    database = urlparse(DATABASE_URL)
+    if (
+        database.scheme not in {"postgres", "postgresql"}
+        or not database.hostname
+        or not database.username
+        or not database.password
+        or database.username.lower() in unsafe_values
+        or database.password.lower() in unsafe_values
+    ):
+        errors.append("DATABASE_URL must be an authenticated PostgreSQL URL without defaults")
+
+    for name, value in (
+        ("REDIS_URL", REDIS_URL),
+        ("CELERY_BROKER_URL", CELERY_BROKER_URL),
+        ("CELERY_RESULT_BACKEND", CELERY_RESULT_BACKEND),
+    ):
+        parsed = urlparse(value)
+        internal_redis = parsed.scheme == "redis" and parsed.hostname == "redis"
+        if (parsed.scheme != "rediss" and not internal_redis) or not parsed.password:
+            errors.append(
+                f"{name} must use authenticated TLS or the internal Compose Redis service"
+            )
+
+    for name, value in (
+        ("AWS_ACCESS_KEY_ID", AWS_ACCESS_KEY_ID),
+        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY),
+        ("AWS_STORAGE_BUCKET_NAME", AWS_STORAGE_BUCKET_NAME),
+        ("AWS_S3_REGION_NAME", AWS_S3_REGION_NAME),
+    ):
+        if not value or value.lower() in unsafe_values:
+            errors.append(f"{name} is required and must not use a committed default")
+    object_endpoint = urlparse(AWS_S3_ENDPOINT_URL or "")
+    internal_object_storage = (
+        object_endpoint.scheme == "http" and object_endpoint.hostname == "minio"
+    )
+    if AWS_S3_ENDPOINT_URL and not (
+        AWS_S3_ENDPOINT_URL.startswith("https://") or internal_object_storage
+    ):
+        errors.append(
+            "AWS_S3_ENDPOINT_URL must use HTTPS or the internal Compose object-storage service"
+        )
+
+    if errors:
+        raise ImproperlyConfigured(
+            "Unsafe production configuration: " + "; ".join(errors)
+        )
+
+
+validate_production_configuration()
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -77,7 +212,7 @@ TEMPLATES = [
 
 DATABASES = {
     "default": dj_database_url.parse(
-        os.getenv("DATABASE_URL", f"sqlite:///{REPOSITORY_ROOT / 'db.sqlite3'}"),
+        DATABASE_URL,
         conn_max_age=60,
         conn_health_checks=True,
     )
@@ -115,9 +250,6 @@ CSRF_COOKIE_SECURE = not DEBUG
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60
 CELERY_TASK_SOFT_TIME_LIMIT = 28 * 60
@@ -158,15 +290,8 @@ CELERY_TASK_ROUTES = {
     "apps.audit.*": {"queue": "default"},
 }
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "wisdome-writer")
-AWS_S3_ENDPOINT_URL = os.getenv("AWS_S3_ENDPOINT_URL") or None
-AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "ap-northeast-2")
-AWS_S3_ADDRESSING_STYLE = os.getenv("AWS_S3_ADDRESSING_STYLE", "path")
 OBJECT_STORAGE_PRESIGN_TTL_SECONDS = int(os.getenv("OBJECT_STORAGE_PRESIGN_TTL_SECONDS", "300"))
 
-AUDIT_CURSOR_SIGNING_KEY = os.getenv("AUDIT_CURSOR_SIGNING_KEY", SECRET_KEY)
 REAUTH_PROOF_TTL_SECONDS = min(int(os.getenv("REAUTH_PROOF_TTL_SECONDS", "300")), 300)
 REAUTH_MFA_REQUIRED = env_bool("REAUTH_MFA_REQUIRED", False)
 REAUTH_MFA_VALIDATOR = os.getenv("REAUTH_MFA_VALIDATOR", "")

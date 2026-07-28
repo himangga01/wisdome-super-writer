@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75", "wheel"]
+requires = ["setuptools==83.0.0", "wheel==0.46.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,25 +8,26 @@ version = "0.1.0"
 description = "Administrator-only evidence-driven content collection and publishing service"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "Django>=5.2,<5.3",
-  "celery[redis]>=5.6,<5.7",
-  "psycopg[binary]>=3.2,<4",
-  "dj-database-url>=2.3,<3",
-  "python-dotenv>=1.1,<2",
-  "boto3>=1.38,<2",
-  "httpx>=0.28,<1",
-  "rfc8785>=0.1.4,<1",
-  "croniter>=6,<7",
-  "defusedxml>=0.7,<1",
-  "lxml>=5.4,<7",
-  "selectolax>=0.3.28,<1",
-  "PyMuPDF>=1.25,<2",
-  "pypdf>=5.5,<7",
-  "pdfplumber>=0.11,<1",
-  "openpyxl>=3.1,<4",
-  "Pillow>=11,<13",
-  "bleach>=6.2,<7",
-  "playwright>=1.52,<2",
+  "Django==5.2.16",
+  "gunicorn==23.0.0",
+  "celery[redis]==5.6.3",
+  "psycopg[binary]==3.3.4",
+  "dj-database-url==2.3.0",
+  "python-dotenv==1.2.2",
+  "boto3==1.43.57",
+  "httpx==0.28.1",
+  "rfc8785==0.1.4",
+  "croniter==6.2.4",
+  "defusedxml==0.7.1",
+  "lxml==6.1.1",
+  "selectolax==0.4.11",
+  "PyMuPDF==1.28.0",
+  "pypdf==6.14.2",
+  "pdfplumber==0.11.10",
+  "openpyxl==3.1.5",
+  "Pillow==12.3.0",
+  "bleach==6.4.0",
+  "playwright==1.61.0",
 ]
 
 [project.optional-dependencies]
@@ -35,10 +36,10 @@ ocr = [
   "paddlepaddle==3.2.2",
 ]
 dev = [
-  "pytest>=8.3,<10",
-  "pytest-django>=4.11,<5",
-  "pytest-cov>=6,<8",
-  "ruff>=0.11,<1",
+  "pytest==9.1.1",
+  "pytest-django==4.12.0",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.0",
 ]
 
 [tool.setuptools]

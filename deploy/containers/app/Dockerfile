@@ -1,17 +1,21 @@
-FROM python:3.12-slim
+FROM python:3.12.10-slim@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db
 
+ARG UV_VERSION=0.11.26
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
+    PATH=/app/.venv/bin:$PATH \
     TZ=Asia/Seoul
 
 WORKDIR /app
-RUN pip install --no-cache-dir uv
-COPY pyproject.toml ./
+RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
-RUN uv pip install --system --no-cache .
 COPY config ./config
+COPY deploy/containers/app/entrypoint.sh ./deploy/containers/app/entrypoint.sh
+RUN uv sync --frozen --no-dev \
+    && chmod 0755 ./deploy/containers/app/entrypoint.sh
 
 EXPOSE 8000
-CMD ["python", "src/manage.py", "runserver", "0.0.0.0:8000"]
-
+CMD ["/app/deploy/containers/app/entrypoint.sh"]
