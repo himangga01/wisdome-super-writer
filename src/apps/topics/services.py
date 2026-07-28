@@ -6,7 +6,7 @@ from pathlib import Path
 
 from django.db import transaction
 from django.utils import timezone
-from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_hash
 
 from .models import (
     SourceDefinition,
@@ -31,7 +31,7 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
     topic = data["topicCode"]
     policy_material = data.get("policy", {})
     policy_hash = canonical_hash(
-        policy_material, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+        policy_material, schema_version=CANONICAL_HASH_SCHEMA_V1
     )
     TopicPolicy.objects.get_or_create(
         code=topic,
@@ -68,7 +68,7 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
             "rateLimitPerMinute": raw.get("rateLimitPerMinute", 10),
             "adapter": raw.get("adapter", "public_html"),
         }
-        config_hash = canonical_hash(config, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
+        config_hash = canonical_hash(config, schema_version=CANONICAL_HASH_SCHEMA_V1)
         snapshot, _ = SourceDefinitionSnapshot.objects.get_or_create(
             source=source,
             config_hash=config_hash,
@@ -80,7 +80,7 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
         {"sourceSnapshotId": str(s.id), "configHash": s.config_hash, "enabled": s.source.enabled}
         for s in sorted(snapshots, key=lambda row: str(row.source_id))
     ]
-    manifest_hash = canonical_hash(manifest, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
+    manifest_hash = canonical_hash(manifest, schema_version=CANONICAL_HASH_SCHEMA_V1)
     registry, created = SourceRegistrySnapshot.objects.get_or_create(
         topic_code=topic,
         manifest_hash=manifest_hash,

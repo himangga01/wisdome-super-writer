@@ -9,7 +9,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_hash
 
 from .models import RetentionBatch, RetentionBatchItem, RetentionHold
 
@@ -61,12 +61,12 @@ def create_retention_preview(*, request_key: str, user) -> RetentionBatch:
     batch = RetentionBatch.objects.create(
         policy_version=int(policy["version"]),
         policy_hash=canonical_hash(
-            policy, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+            policy, schema_version=CANONICAL_HASH_SCHEMA_V1
         ),
         cutoff_at=raw_cutoff,
         request_key=request_key,
         preview_manifest_hash=canonical_hash(
-            manifest, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+            manifest, schema_version=CANONICAL_HASH_SCHEMA_V1
         ),
         counters={"candidate": len(candidates), "held": 0, "purged": 0},
         requested_by=user,

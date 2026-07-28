@@ -7,7 +7,7 @@ from adapters.generators import SourceGroundedTemplateGenerator
 from adapters.generators.base import EvidenceInput
 from apps.collection.models import CollectionRun, RunState
 from apps.evidence.models import EvidenceAsset
-from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_hash
 
 from .models import ArticleRevision, Claim, ClaimEvidence, DraftArticle, GenerationAttempt, QualityCheck
 
@@ -36,7 +36,7 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
     ]
     identity = canonical_hash(
         {"run": str(run.id), "topic": run.topic_code},
-        schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
     )
     article, _ = DraftArticle.objects.get_or_create(
         article_identity_key=identity,
@@ -46,7 +46,7 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
         return article
     input_hash = canonical_hash(
         [item.__dict__ for item in inputs],
-        schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
     )
     attempt = GenerationAttempt.objects.create(article=article, input_manifest_hash=input_hash)
     try:
@@ -54,7 +54,7 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
             topic=run.topic_code, evidence=inputs, article_type=article.article_type
         )
         claim_hash = canonical_hash(
-            generated.claims, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+            generated.claims, schema_version=CANONICAL_HASH_SCHEMA_V1
         )
         revision = ArticleRevision.objects.create(
             article=article,
@@ -67,7 +67,7 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
             claim_manifest_hash=claim_hash,
             quality_manifest_hash=canonical_hash(
                 {"policy": "source-grounded-v1", "claims": claim_hash},
-                schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+                schema_version=CANONICAL_HASH_SCHEMA_V1,
             ),
         )
         evidence_by_id = {str(row.id): row for row in evidence_rows}
@@ -124,15 +124,15 @@ def create_manual_revision(article: DraftArticle, *, title: str, summary: str, b
         input_manifest_hash=(
             previous.input_manifest_hash
             if previous
-            else canonical_hash({}, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
+            else canonical_hash({}, schema_version=CANONICAL_HASH_SCHEMA_V1)
         ),
         claim_manifest_hash=canonical_hash(
             {"requiresRevalidation": True},
-            schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+            schema_version=CANONICAL_HASH_SCHEMA_V1,
         ),
         quality_manifest_hash=canonical_hash(
             {"policy": "manual-edit-v1"},
-            schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+            schema_version=CANONICAL_HASH_SCHEMA_V1,
         ),
         quality_state="pending",
         created_by=user,

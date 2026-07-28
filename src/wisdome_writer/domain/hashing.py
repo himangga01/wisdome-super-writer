@@ -1,4 +1,5 @@
 import hashlib
+import json
 import unicodedata
 from collections.abc import Mapping
 from typing import Any
@@ -6,7 +7,20 @@ from typing import Any
 import rfc8785
 
 
-CANONICAL_HASH_SCHEMA_VERSION = "nfc-rfc8785-sha256-v1"
+CANONICAL_HASH_SCHEMA_V1 = "nfc-rfc8785-sha256-v1"
+
+
+def _normalize_legacy_json(value: Any) -> Any:
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, dict):
+        return {
+            _normalize_legacy_json(str(key)): _normalize_legacy_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_legacy_json(item) for item in value]
+    return value
 
 
 def _normalize_json(value: Any) -> Any:
@@ -32,9 +46,9 @@ def _normalize_json(value: Any) -> Any:
 def canonical_json_bytes(
     value: Any,
     *,
-    schema_version: str = CANONICAL_HASH_SCHEMA_VERSION,
+    schema_version: str,
 ) -> bytes:
-    if schema_version != CANONICAL_HASH_SCHEMA_VERSION:
+    if schema_version != CANONICAL_HASH_SCHEMA_V1:
         raise ValueError(f"unsupported canonical hash schema version: {schema_version}")
     return rfc8785.dumps(_normalize_json(value))
 
@@ -51,6 +65,12 @@ def sha256_hex(value: bytes | str | Any) -> str:
     elif isinstance(value, str):
         payload = value.encode("utf-8")
     else:
-        payload = canonical_json_bytes(value)
+        payload = json.dumps(
+            _normalize_legacy_json(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
