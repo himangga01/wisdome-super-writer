@@ -75,3 +75,51 @@
 ### Concern
 
 - Live external TLS/DNS integration and full regression coverage remain intentionally deferred to T032.
+
+---
+
+## 수정 라운드 1
+
+### 상태와 커밋
+
+- 상태: `DONE_WITH_CONCERNS`
+- 구현 커밋: `f83a07a316e25cedb01caaaf34cfa8888216c7f2 fix: close outbound URL redaction gaps`
+- 보고서 경로:
+  `D:\project\wisdome-super-writer\.superpowers\sdd\tasks\task-1-report.md`
+
+### 수정 내용
+
+- attachment 링크 자체뿐 아니라 링크 label과 fallback title에 포함된 URL 비밀도 제거했다.
+- RSS GUID가 HTTP/HTTPS URL일 때만 userinfo, query, fragment를 제거하고 UUID/URN 등 비 URL
+  identity는 그대로 보존한다.
+- OpenData row의 중첩 mapping/list/tuple을 재귀 순회하여 URL-shaped 문자열을 redaction하고,
+  비 URL `id`와 `noticeId`는 변경하지 않는다.
+- WordPress public URL 검증에 configured `site_url` host allowlist를 전달해 최초 URL과 모든
+  redirect가 같은 host 경계 안에 있도록 했다.
+
+### 집중 검사
+
+- 수정 전 attachment fallback title assertion이 raw signed URL 때문에 실패하는 것을 확인했다.
+- attachment URL/title, RSS URL GUID, OpenData stable identity와 중첩 URL metadata redaction:
+  8개 assertion 통과.
+- WordPress same-host redirect 허용 및 cross-host redirect 거부: 4개 assertion 통과.
+- 수정된 3개 Python 파일 `compileall`: exit code 0.
+- 수정된 파일 Ruff import/undefined-name 검사: `All checks passed!`.
+- 수정 diff whitespace 검사: exit code 0.
+- T032 자동화 테스트는 추가하거나 실행하지 않았다.
+
+### 우려 사항
+
+- 실제 외부 TLS/DNS end-to-end와 전체 회귀 검증은 계획대로 T032에 남아 있다.
+
+## Fix round 1 — AI-readable English
+
+- Status: `DONE_WITH_CONCERNS`
+- Implementation commit:
+  `f83a07a316e25cedb01caaaf34cfa8888216c7f2 fix: close outbound URL redaction gaps`
+- Sanitized attachment titles, URL-shaped RSS GUIDs, and recursively nested OpenData metadata
+  while preserving non-URL external identities.
+- Restricted WordPress public URL verification and every redirect to the configured site host.
+- Focused checks: 8 persistence-redaction assertions and 4 redirect-host assertions passed;
+  compileall, focused Ruff, and diff checks passed.
+- Concern: live external integration and the full regression suite remain deferred to T032.
