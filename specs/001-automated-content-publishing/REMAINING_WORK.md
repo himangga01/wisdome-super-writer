@@ -1,8 +1,11 @@
 # Wisdome Super Writer 남은 작업 인수인계
 
-**작성일**: 2026-07-17  
-**기준 브랜치/커밋**: `main` / `34d81fe`  
-**기준 문서**: `spec.md`, `plan.md`, `tasks.md`, Constitution 1.0.1  
+**작성일**: 2026-07-17
+
+**기준 브랜치/커밋**: `main` / `34d81fe`
+
+**기준 문서**: `spec.md`, `plan.md`, `tasks.md`, Constitution 1.0.1
+
 **정본 작업 목록**: [`tasks.md`](tasks.md)
 
 이 문서는 다음 작업자가 구현을 바로 이어가기 위한 실행용 요약이다. 완료 여부와 task ID는
@@ -427,4 +430,3 @@ specs/001-automated-content-publishing/REMAINING_WORK.md와 tasks.md를 읽고
 권장 Wave A부터 구현을 계속하라. 기능 구현 속도를 우선하고 T039~T044 테스트는 마지막에 수행하라.
 PaddleOCR는 PP-StructureV3만 사용하고 완료한 task만 tasks.md에서 체크하라.
 ```
-
