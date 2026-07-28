@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from adapters.publishers.blogger import BloggerOAuthClient, BloggerPublisher
 from adapters.publishers.wordpress import WordPressPublisher
+from apps.accounts.services import consume_reauthentication_proof
 from wisdome_writer.domain.errors import Conflict, Forbidden, InvalidInput, NotFound
 from wisdome_writer.domain.hashing import sha256_hex
 
@@ -493,20 +494,27 @@ def create_auto_publish_validation(target_id: str, data: dict[str, Any]) -> Auto
 
 @transaction.atomic
 def decide_auto_publish_validation(
-    target_id: str, validation_id: str, data: dict[str, Any], *, user
+    target_id: str, validation_id: str, data: dict[str, Any], *, request
 ) -> AutoPublishValidationDecision:
+    user = request.user
     validation = AutoPublishValidation.objects.select_for_update().select_related("target").get(
         id=validation_id, target_id=target_id
     )
     request_hash = _request_hash(data)
     existing = validation.decisions.filter(request_key=data["requestKey"]).first()
     if existing:
-        if existing.request_hash != request_hash:
+        if existing.request_hash != request_hash or existing.decided_by_id != user.pk:
             raise Conflict("같은 request key가 다른 decision payload에 사용되었습니다.")
         return existing
     if _id(validation.latest_decision_id) != _id(data.get("expectedLatestDecisionId")):
         raise Conflict("validation decision이 갱신되었습니다. 다시 불러오세요.")
-    _consume_reauth(data["reauthProofId"], user=user, scope="auto_publish_validation")
+    consume_reauthentication_proof(
+        request=request,
+        proof_id=data["reauthProofId"],
+        action_scope="auto_publish_change",
+        entity_type="auto_publish_validation",
+        entity_id=validation.id,
+    )
     if validation.target.current_snapshot_id != validation.target_snapshot_id:
         raise Conflict("validation target snapshot이 이미 만료되었습니다.")
     if validation.target.current_config_hash != validation.target_config_hash:
@@ -567,17 +575,24 @@ def _normalized_validation_refs(refs: Iterable[dict[str, Any]]) -> list[dict[str
 
 
 @transaction.atomic
-def set_auto_publish(target_id: str, data: dict[str, Any], *, user) -> AutoPublishActivation:
+def set_auto_publish(target_id: str, data: dict[str, Any], *, request) -> AutoPublishActivation:
+    user = request.user
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _request_hash(data)
     existing = target.activations.filter(request_key=data["requestKey"]).first()
     if existing:
-        if existing.request_hash != request_hash:
+        if existing.request_hash != request_hash or existing.decided_by_id != user.pk:
             raise Conflict("같은 request key가 다른 activation payload에 사용되었습니다.")
         return existing
     if _id(target.latest_auto_publish_activation_id) != _id(data.get("expectedLatestActivationId")):
         raise Conflict("자동발행 상태가 갱신되었습니다. 다시 불러오세요.")
-    _consume_reauth(data["reauthProofId"], user=user, scope="auto_publish_activation")
+    consume_reauthentication_proof(
+        request=request,
+        proof_id=data["reauthProofId"],
+        action_scope="auto_publish_change",
+        entity_type="publication_target",
+        entity_id=target.id,
+    )
     enabled = bool(data["enabled"])
     refs = _normalized_validation_refs(data.get("validationRefs", []))
     if enabled:
@@ -964,10 +979,29 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
 
 
 @transaction.atomic
-def decide_approval(article_id: str, target_id: str, data: dict[str, Any], *, user) -> Approval:
+def decide_approval(
+    article_id: str, target_id: str, data: dict[str, Any], *, user, request=None
+) -> Approval:
     intent = PublicationIntent.objects.select_for_update().get(
         id=data["publicationIntentId"], article_id=article_id
     )
+    existing = Approval.objects.filter(
+        publication_intent=intent,
+        target_id=target_id,
+        request_key=data["requestKey"],
+    ).first()
+    if existing:
+        if (
+            existing.revision_no != data["revisionNo"]
+            or _id(existing.supersedes_approval_id)
+            != _id(data.get("expectedLatestApprovalId"))
+            or existing.decision != data["decision"]
+            or existing.action_subject != data["actionSubject"]
+            or _id(existing.reauth_proof_id) != _id(data.get("reauthProofId"))
+            or existing.admin_id != user.pk
+        ):
+            raise Conflict("같은 request key가 다른 승인 대상에 사용되었습니다.")
+        return existing
     latest_intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
     if not latest_intent or latest_intent.id != intent.id or intent.state == PublicationIntent.State.STALE:
         raise Conflict("current 발행 의도만 승인할 수 있습니다.")
@@ -982,14 +1016,6 @@ def decide_approval(article_id: str, target_id: str, data: dict[str, Any], *, us
     latest = Approval.objects.filter(publication_intent=intent, target=target).order_by("-decided_at").first()
     if _id(latest.id if latest else None) != _id(data.get("expectedLatestApprovalId")):
         raise Conflict("승인 상태가 갱신되었습니다. 다시 불러오세요.")
-    request_hash = _request_hash(data)
-    existing = Approval.objects.filter(
-        publication_intent=intent, target=target, request_key=data["requestKey"]
-    ).first()
-    if existing:
-        if existing.approval_subject_hash != sha256_hex(data["actionSubject"]):
-            raise Conflict("같은 request key가 다른 승인 대상에 사용되었습니다.")
-        return existing
     subject = data["actionSubject"]
     action = command["resolvedAction"]
     render = None
@@ -999,10 +1025,18 @@ def decide_approval(article_id: str, target_id: str, data: dict[str, Any], *, us
             raise InvalidInput("철회 승인 대상 형식이 올바르지 않습니다.")
         if not data.get("reauthProofId"):
             raise Forbidden("철회에는 최근 재인증이 필요합니다.")
-        _consume_reauth(data["reauthProofId"], user=user, scope="publication_unpublish")
         publication = Publication.objects.filter(article_id=article_id, target=target).first()
         if not publication or publication.remote_post_id != subject.get("remotePostId"):
             raise Conflict("현재 원격 게시물과 철회 승인 대상이 다릅니다.")
+        if request is None:
+            raise Forbidden("철회에는 관리자 session 재인증이 필요합니다.")
+        consume_reauthentication_proof(
+            request=request,
+            proof_id=data["reauthProofId"],
+            action_scope="unpublish",
+            entity_type="publication",
+            entity_id=publication.id,
+        )
         source_manifest_hash = subject["correctionEvidenceManifestHash"]
     else:
         if subject.get("kind") != "content_preview" or subject.get("action") != action:
@@ -1701,12 +1735,15 @@ def schedule_public_delivery_deletion(asset_id: str) -> PublicDeliveryAsset:
 
 
 @transaction.atomic
-def disconnect_target(target_id: str, data: dict[str, Any], *, user) -> TargetDisconnectDecision:
+def disconnect_target(
+    target_id: str, data: dict[str, Any], *, request
+) -> TargetDisconnectDecision:
+    user = request.user
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _request_hash(data)
     existing = TargetDisconnectDecision.objects.filter(target=target, request_key=data["requestKey"]).first()
     if existing:
-        if existing.request_hash != request_hash:
+        if existing.request_hash != request_hash or existing.decided_by_id != user.pk:
             raise Conflict("같은 request key가 다른 연결 해제 payload에 사용되었습니다.")
         return existing
     if (
@@ -1714,7 +1751,13 @@ def disconnect_target(target_id: str, data: dict[str, Any], *, user) -> TargetDi
         or target.current_config_hash != data["expectedTargetConfigHash"]
     ):
         raise Conflict("target snapshot이 바뀌었습니다.")
-    _consume_reauth(data["reauthProofId"], user=user, scope="publication_target_disconnect")
+    consume_reauthentication_proof(
+        request=request,
+        proof_id=data["reauthProofId"],
+        action_scope="credential_disconnect",
+        entity_type="publication_target",
+        entity_id=target.id,
+    )
     decision = TargetDisconnectDecision.objects.create(
         target=target,
         expected_target_snapshot_id=data["expectedTargetSnapshotId"],
@@ -1739,31 +1782,6 @@ def disconnect_target(target_id: str, data: dict[str, Any], *, user) -> TargetDi
         lambda: _delay("apps.publishing.tasks.revoke_target_credentials", str(decision.id))
     )
     return decision
-
-
-def _consume_reauth(proof_id: str, *, user, scope: str) -> None:
-    try:
-        ReauthenticationProof = apps.get_model("accounts", "ReauthenticationProof")
-    except LookupError as exc:
-        raise Forbidden("재인증 기능이 구성되지 않았습니다.") from exc
-    proof = ReauthenticationProof.objects.select_for_update().get(id=proof_id)
-    if hasattr(proof, "consume"):
-        proof.consume(user=user, scope=scope)
-        return
-    state = getattr(proof, "state", "active")
-    expires_at = getattr(proof, "expires_at", None)
-    account_id = getattr(proof, "admin_id", getattr(proof, "user_id", None))
-    scopes = getattr(proof, "action_scopes", []) or []
-    if str(account_id) != str(user.id) or state != "active" or (expires_at and expires_at <= timezone.now()):
-        raise Forbidden("재인증 증명이 유효하지 않습니다.")
-    if scopes and scope not in scopes:
-        raise Forbidden("재인증 증명 scope가 작업과 다릅니다.")
-    if hasattr(proof, "consumed_at"):
-        proof.consumed_at = timezone.now()
-    if hasattr(proof, "state"):
-        proof.state = "consumed"
-    proof.save()
-
 
 def _audit(action: str, entity: Any, before_hash: str | None, after_hash: str | None) -> None:
     try:

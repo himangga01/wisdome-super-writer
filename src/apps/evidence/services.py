@@ -13,6 +13,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from adapters.storage import S3ObjectStorage
+from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
@@ -425,6 +426,8 @@ def decide_extraction_profile(
     request_key: str,
     reason: str,
     admin: Any,
+    request: Any,
+    reauth_proof_id: Any,
 ) -> tuple[ExtractionProfileDecision, bool]:
     profile = ExtractionProfileSnapshot.objects.select_for_update().get(pk=profile_id)
     request_payload = {
@@ -441,9 +444,16 @@ def decide_extraction_profile(
         profile_snapshot=profile, request_key=request_key
     ).first()
     if existing:
-        if existing.request_hash != request_hash:
+        if existing.request_hash != request_hash or existing.decided_by_id != admin.pk:
             raise EvidenceConflict("The request key was already used with a different payload")
         return existing, False
+    consume_reauthentication_proof(
+        request=request,
+        proof_id=reauth_proof_id,
+        action_scope="profile_decision",
+        entity_type="extraction_profile_snapshot",
+        entity_id=profile.id,
+    )
     if profile.profile_material_hash != expected_material_hash:
         raise EvidenceConflict("The extraction profile material changed")
     current = str(profile.latest_decision_id) if profile.latest_decision_id else None

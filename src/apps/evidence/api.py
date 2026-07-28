@@ -6,13 +6,11 @@ from typing import Any, Mapping
 
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
-from django.db import transaction
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.views.decorators.http import require_GET, require_POST
 
 from adapters.storage import S3ObjectStorage
-from apps.accounts.services import consume_reauthentication_proof
 from wisdome_writer.api.problems import problem_response
 
 from .models import (
@@ -130,23 +128,17 @@ def extraction_profile_decisions(request, profile_id):
         }
         if missing := required - set(body):
             raise ValidationError(f"Missing fields: {', '.join(sorted(missing))}")
-        with transaction.atomic():
-            consume_reauthentication_proof(
-                request=request,
-                proof_id=body["reauthProofId"],
-                action_scope="profile_decision",
-                entity_type="ExtractionProfileSnapshot",
-                entity_id=profile_id,
-            )
-            decision, created = decide_extraction_profile(
-                profile_id=profile_id,
-                decision=body["decision"],
-                expected_material_hash=body["expectedMaterialHash"],
-                expected_latest_decision_id=body["expectedLatestDecisionId"],
-                request_key=body["requestKey"],
-                reason=body["reason"],
-                admin=request.user,
-            )
+        decision, created = decide_extraction_profile(
+            profile_id=profile_id,
+            decision=body["decision"],
+            expected_material_hash=body["expectedMaterialHash"],
+            expected_latest_decision_id=body["expectedLatestDecisionId"],
+            request_key=body["requestKey"],
+            reason=body["reason"],
+            admin=request.user,
+            request=request,
+            reauth_proof_id=body["reauthProofId"],
+        )
         return JsonResponse(_profile_decision_payload(decision), status=201 if created else 200)
     except (EvidenceConflict, EvidenceInvariantError) as exc:
         return problem_response(status=409, code="profile_decision_conflict", detail=str(exc))

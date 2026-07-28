@@ -16,11 +16,16 @@ def reauthenticate(request: HttpRequest) -> JsonResponse:
         raise InvalidInput("Request body must be valid JSON") from exc
     if set(payload) - {"currentPassword", "mfaCode", "actionScopes"}:
         raise InvalidInput("Request contains unsupported fields")
+    action_scopes = payload.get("actionScopes")
+    if not isinstance(action_scopes, list) or any(
+        not isinstance(scope, str) for scope in action_scopes
+    ):
+        raise InvalidInput("actionScopes must be an array of supported scope names")
     proof = issue_reauthentication_proof(
         request=request,
         current_password=payload.get("currentPassword", ""),
         mfa_code=payload.get("mfaCode"),
-        action_scopes=payload.get("actionScopes") or [],
+        action_scopes=action_scopes,
     )
     return JsonResponse(
         {

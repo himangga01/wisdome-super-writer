@@ -312,7 +312,7 @@ def auto_publish_validation_decisions(
     request: HttpRequest, target_id: str, validation_id: str
 ) -> JsonResponse:
     row = decide_auto_publish_validation(
-        target_id, validation_id, _body(request), user=request.user
+        target_id, validation_id, _body(request), request=request
     )
     return JsonResponse(
         {
@@ -373,7 +373,7 @@ def auto_publish_validation_report(
 @admin_api
 @require_http_methods(["PUT"])
 def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
-    activation = set_auto_publish(target_id, _body(request), user=request.user)
+    activation = set_auto_publish(target_id, _body(request), request=request)
     return JsonResponse(
         {
             "activation": activation_json(activation),
@@ -386,7 +386,7 @@ def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
 @admin_api
 @require_http_methods(["DELETE"])
 def target_connection(request: HttpRequest, target_id: str) -> JsonResponse:
-    decision = disconnect_target(target_id, _body(request), user=request.user)
+    decision = disconnect_target(target_id, _body(request), request=request)
     return JsonResponse({"jobId": str(decision.id), "state": decision.state}, status=202)
 
 
@@ -457,7 +457,9 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
     target_id = data.get("actionSubject", {}).get("targetId")
     if not target_id:
         raise InvalidInput("actionSubject.targetId가 필요합니다.")
-    row = decide_approval(article_id, target_id, data, user=request.user)
+    row = decide_approval(
+        article_id, target_id, data, user=request.user, request=request
+    )
     return JsonResponse(approval_json(row), status=201)
 
 

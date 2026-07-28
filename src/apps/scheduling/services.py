@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from apps.accounts.services import consume_reauthentication_proof
 from apps.collection.models import CollectionRun, RunState
 from apps.collection.services import create_run
 from apps.collection.tasks import execute_collection_run
@@ -143,13 +145,41 @@ def release_waiting_for_topic(topic_code: str) -> None:
 
 
 @transaction.atomic
-def set_kill_switch(*, enabled: bool, expected_version: int, request_key: str, reason: str, user):
+def set_kill_switch(
+    *,
+    enabled: bool,
+    expected_version: int,
+    request_key: str,
+    reason: str,
+    user,
+    request=None,
+    reauth_proof_id=None,
+):
+    control, _ = OperationalControl.objects.select_for_update().get_or_create(
+        key="global_kill_switch"
+    )
     existing = KillSwitchDecision.objects.filter(request_key=request_key).first()
     if existing:
+        if (
+            existing.enabled != enabled
+            or existing.expected_version != expected_version
+            or existing.reason != reason
+            or existing.decided_by_id != user.pk
+        ):
+            raise ValueError("request_key_conflict")
         return existing
-    control, _ = OperationalControl.objects.select_for_update().get_or_create(key="global_kill_switch")
     if control.version != expected_version:
         raise ValueError("stale_control_version")
+    if not enabled:
+        if request is None or not reauth_proof_id:
+            raise ValueError("reauthentication_required")
+        consume_reauthentication_proof(
+            request=request,
+            proof_id=reauth_proof_id,
+            action_scope="kill_switch_disable",
+            entity_type="operational_control",
+            entity_id=UUID("00000000-0000-4000-8000-000000000001"),
+        )
     decision = KillSwitchDecision.objects.create(
         expected_version=expected_version,
         enabled=enabled,

@@ -1,5 +1,4 @@
 import json
-from uuid import UUID
 
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
@@ -7,8 +6,6 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
-
-from apps.accounts.services import consume_reauthentication_proof
 
 from .models import OperationalControl, Schedule
 from .services import calculate_next_run, set_kill_switch
@@ -97,14 +94,6 @@ def kill_switch(request):
     control, _ = OperationalControl.objects.get_or_create(key="global_kill_switch")
     if request.method == "PUT":
         body = json.loads(request.body or b"{}")
-        if body["enabled"] is False:
-            consume_reauthentication_proof(
-                request=request,
-                proof_id=body["reauthProofId"],
-                action_scope="kill_switch_disable",
-                entity_type="operational_control",
-                entity_id=UUID("00000000-0000-4000-8000-000000000001"),
-            )
         try:
             set_kill_switch(
                 enabled=body["enabled"],
@@ -112,10 +101,12 @@ def kill_switch(request):
                 request_key=body["requestKey"],
                 reason=body["reason"],
                 user=request.user,
+                request=request,
+                reauth_proof_id=body.get("reauthProofId"),
             )
-        except ValueError:
+        except ValueError as exc:
             transaction.set_rollback(True)
-            return JsonResponse({"detail": "stale_control_version"}, status=409)
+            return JsonResponse({"detail": str(exc)}, status=409)
         control.refresh_from_db()
     return JsonResponse(
         {"enabled": control.enabled, "version": control.version, "reason": control.reason}
