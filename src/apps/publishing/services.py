@@ -1523,16 +1523,24 @@ def _command_for_attempt(attempt: PublicationAttempt, render: ArticleChannelRend
 def _enqueue_reconcile_locked(
     attempt: PublicationAttempt,
     *,
-    reason: str = "outcome",
     available_at=None,
 ) -> None:
+    from wisdome_writer.infrastructure.models import OutboxMessage
+
+    reconcile_attempt_no = attempt.reconcile_attempt_no + 1
+    dedupe_key = (
+        f"publication.reconcile_requested:{attempt.id}:{reconcile_attempt_no}"
+    )
+    if OutboxMessage.objects.filter(message_key=dedupe_key).exists():
+        return
     _enqueue_event(
         "publication.reconcile_requested",
-        {"publication_attempt_id": str(attempt.id)},
-        dedupe_key=(
-            f"publication.reconcile_requested:{attempt.id}:"
-            f"{attempt.attempt_no}:{reason}"
-        ),
+        {
+            "publication_attempt_id": str(attempt.id),
+            "reconcile_attempt_no": reconcile_attempt_no,
+        },
+        event_version=2,
+        dedupe_key=dedupe_key,
         aggregate_type="publication_attempt",
         aggregate_id=attempt.id,
         job_id=attempt.id,
@@ -1734,20 +1742,33 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
 
 
 @transaction.atomic
-def begin_reconcile(attempt_id: str) -> tuple[PublicationAttempt, PublishCommand]:
+def begin_reconcile(
+    attempt_id: str,
+    expected_reconcile_attempt_no: int | None = None,
+) -> tuple[PublicationAttempt, PublishCommand | None]:
     attempt = PublicationAttempt.objects.select_for_update().select_related(
         "publication__target", "publication_intent", "approval__article_channel_render"
     ).get(id=attempt_id)
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
-        return attempt, _command_for_attempt(attempt, _final_render(attempt))
+        return attempt, None
     if attempt.state not in {
         PublicationAttempt.State.UNKNOWN_OUTCOME,
         PublicationAttempt.State.RECONCILING,
         PublicationAttempt.State.RETRYABLE_FAILED,
     }:
         raise Conflict("unknown-outcome attempt만 조정할 수 있습니다.")
+    if expected_reconcile_attempt_no is None:
+        expected_reconcile_attempt_no = attempt.reconcile_attempt_no + 1
+    if expected_reconcile_attempt_no < attempt.reconcile_attempt_no:
+        return attempt, None
+    if expected_reconcile_attempt_no > attempt.reconcile_attempt_no + 1:
+        raise Conflict("reconcile attempt sequence has a gap")
+    if expected_reconcile_attempt_no == attempt.reconcile_attempt_no + 1:
+        if expected_reconcile_attempt_no > 5:
+            raise Conflict("reconcile attempt budget is exhausted")
+        attempt.reconcile_attempt_no = expected_reconcile_attempt_no
     attempt.state = PublicationAttempt.State.RECONCILING
-    attempt.save(update_fields=["state"])
+    attempt.save(update_fields=["state", "reconcile_attempt_no"])
     attempt.publication.state = Publication.State.RECONCILING
     attempt.publication.save(update_fields=["state", "updated_at"])
     return attempt, _command_for_attempt(attempt, _final_render(attempt))
@@ -1978,6 +1999,7 @@ def _enqueue_event(
     event_type: str,
     payload: dict[str, Any],
     *,
+    event_version: int = 1,
     dedupe_key: str,
     aggregate_type: str | None = None,
     aggregate_id=None,
@@ -1994,6 +2016,7 @@ def _enqueue_event(
     )
     enqueue_event(
         event_type=event_type,
+        event_version=event_version,
         aggregate_type=aggregate_type
         or (event_type.split(".")[1] if "." in event_type else "publishing"),
         aggregate_id=uuid.UUID(str(resolved_id)),

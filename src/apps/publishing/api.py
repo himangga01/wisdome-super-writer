@@ -29,6 +29,7 @@ from .models import (
 )
 from .corrections import prepare_verified_correction
 from .services import (
+    _enqueue_reconcile_locked,
     create_auto_publish_validation,
     create_canary_run,
     create_publication_intent,
@@ -509,6 +510,7 @@ def publication_attempts(request: HttpRequest, publication_id: str) -> JsonRespo
                 "state": row.state,
                 "action": row.resolved_action,
                 "attemptNo": row.attempt_no,
+                "reconcileAttemptNo": row.reconcile_attempt_no,
                 "errorCode": row.error_code or None,
                 "httpStatus": row.http_status,
                 "startedAt": row.started_at.isoformat() if row.started_at else None,
@@ -533,18 +535,7 @@ def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResp
             PublicationAttempt.State.UNKNOWN_OUTCOME,
             PublicationAttempt.State.RECONCILING,
         }:
-            row.attempt_no += 1
-            row.save(update_fields=["attempt_no"])
-            enqueue_event(
-                event_type="publication.reconcile_requested",
-                aggregate_type="publication_attempt",
-                aggregate_id=row.id,
-                job_id=row.id,
-                dedupe_key=f"publication.reconcile_requested:{row.id}:{row.attempt_no}",
-                payload={
-                    "publication_attempt_id": str(row.id),
-                },
-            )
+            _enqueue_reconcile_locked(row)
             action = "reconcile"
         elif row.state == PublicationAttempt.State.RETRYABLE_FAILED:
             row.state = PublicationAttempt.State.QUEUED

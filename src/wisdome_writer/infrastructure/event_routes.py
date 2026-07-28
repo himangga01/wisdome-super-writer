@@ -40,6 +40,7 @@ class EventRoute:
     argument_keys: tuple[str, ...]
     terminal_task_name: str | None = None
     terminal_argument_keys: tuple[str, ...] = ()
+    max_attempts: int = 5
 
 
 class EventRoutingError(ValueError):
@@ -52,6 +53,7 @@ UUID_FORMAT = "uuid"
 SHA256_FORMAT = "sha256"
 VERSION_FORMAT = "version"
 KEY_FORMAT = "domain_key"
+POSITIVE_INTEGER_FORMAT = "positive_integer"
 EXTRACTION_ENGINE_VALUES = frozenset(
     {
         "native_pdf",
@@ -79,6 +81,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "extract.generic",
         "apps.evidence.tasks.process_run_evidence",
         ("run_id",),
+        max_attempts=3,
     ),
     ("evidence.document_route_requested", 1): EventRoute(
         "document-extraction",
@@ -143,6 +146,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "publish.wordpress",
         "apps.publishing.tasks.run_target_preflight",
         ("target_id", "target_snapshot_id", "target_config_hash"),
+        max_attempts=4,
     ),
     ("publishing.target_preflight.completed", 1): EventRoute(
         "target-preflight-completed-ack",
@@ -161,6 +165,12 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "reconcile",
         "apps.publishing.tasks.reconcile_publication_attempt",
         ("publication_attempt_id",),
+    ),
+    ("publication.reconcile_requested", 2): EventRoute(
+        "publication-reconcile",
+        "reconcile",
+        "apps.publishing.tasks.reconcile_publication_attempt",
+        ("publication_attempt_id", "reconcile_attempt_no"),
     ),
     ("publishing.target_canary.requested", 1): EventRoute(
         "target-canary",
@@ -414,6 +424,16 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
     ("publication.reconcile_requested", 1): _schema(
         {"publication_attempt_id": STR},
         formats={"publication_attempt_id": UUID_FORMAT},
+    ),
+    ("publication.reconcile_requested", 2): _schema(
+        {
+            "publication_attempt_id": STR,
+            "reconcile_attempt_no": (int,),
+        },
+        formats={
+            "publication_attempt_id": UUID_FORMAT,
+            "reconcile_attempt_no": POSITIVE_INTEGER_FORMAT,
+        },
     ),
     ("publishing.target_canary.requested", 1): _schema(
         {"canary_run_id": STR, "target_id": STR},

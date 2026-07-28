@@ -112,6 +112,7 @@ class RunStep(models.Model):
     error_code = models.CharField(max_length=100, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=500, null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
+    fanout_completed_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

@@ -187,12 +187,20 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 - 소비자 route와 payload schema의 식별자는 `(event_type, event_version)`이다.
 - 등록되지 않은 버전, 선언되지 않은 payload 필드, 잘못된 UUID/SHA-256/enum/version,
   자격 증명·query·fragment가 포함된 URL, 비밀처럼 보이는 값은 fail-closed 처리한다.
-- 공통 envelope는 위에 선언한 최상위 필드만 허용하고 `attempt`를 포함해 저장 행과
-  정확히 같아야 한다. 저장된 immutable material은 dispatcher와 consumer가 각각
-  SHA-256을 다시 계산해 상수 시간 비교한다.
+- 공통 envelope는 위에 선언한 최상위 필드만 허용한다. immutable 필드는 저장 행과
+  정확히 같아야 하고 dispatcher와 consumer가 SHA-256을 다시 계산해 상수 시간 비교한다.
+  `attempt`는 immutable identity가 아니라 양의 dispatcher 전달 세대다. 수신 값이 저장된
+  현재 dispatch attempts 이하이면 at-least-once 과거 전달로 허용하고, 현재 값보다 큰
+  미래 세대만 fail-closed 처리한다.
+- `succeeded` 또는 `dead_letter`인 terminal consumer receipt는 늦은 과거/future/malformed
+  전달로 강등하거나 event 상태를 덮어쓰지 않는다.
 - `event_id`를 읽을 수 있는 잘못된 이벤트는 영속 consumer receipt와 outbox DLQ에
   기록한다. `event_id` 자체가 없거나 UUID가 아니어서 영속 행을 특정할 수 없는 transport
   메시지는 3회로 제한해 broker 재전달한 뒤 오류 로그와 함께 종료한다.
+- consumer의 DB/receipt 인프라 오류는 1/2/4초의 독립 bounded retry 뒤에도 DB가
+  불능이면 ACK하지 않고 broker에 requeue한다. hard timeout과 worker loss도 requeue하며,
+  receipt lease는 hard limit보다 10분 길다. 정산은 만료 시각만으로 거부하지 않고
+  token+generation의 현재 소유권으로 fence한다.
 - `run.requested`, publication/canary/disconnect 이벤트에는 queue 선택용 `topic_code` 또는
   `channel`을 넣지 않는다. dispatcher가 payload의 엔터티 ID로 DB 기준 topic/channel을
   다시 조회하며, 엔터티가 없거나 채널을 확정할 수 없으면 안전하게 DLQ 처리한다.
@@ -229,12 +237,22 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   `publication.reconcile_requested`를 영속 생성한다.
 - reconcile의 `retryable_failed`와 반복 `unknown_outcome`은 새 dedupe key의 후속
   reconcile 이벤트로 최대 5회 이어지며, 한도를 넘으면 `manual_required`가 된다.
+  `publication.reconcile_requested@2`의 exact payload는 `publication_attempt_id`,
+  `reconcile_attempt_no`이고, 이 번호는 execute/admin `attempt_no`와 분리된 영속
+  counter다. v1은 기존 outbox 호환용으로만 소비한다.
 - generic attempt 생성과 `evidence.other_extract_requested` 생성은 같은 트랜잭션이다.
   일시 추출 오류는 `queued`로 되돌리고 finalizer를 깨우지 않는다. 영구 오류 또는
   consumer 재시도 소진 시에만 `failed`와 단 하나의 terminal finalizer 이벤트를 같은
   트랜잭션에 기록한다.
 - target preflight는 짧은 DB fence snapshot, transaction 밖 외부 호출, fence를 다시
   확인하는 결과·audit·완료 이벤트 transaction의 세 단계로 수행한다.
+- run evidence parent는 외부 download/storage I/O 밖의 짧은 row-lock transaction에서
+  `RunStep.fanout_completed_at`, counters, `evidence.finalize_requested`를 함께 기록한다.
+  finalizer는 marker 전에는 run을 전진시키지 않으므로 0 child, 빠른 child, 중간 실패도
+  fan-out 완료 wake-up 뒤에만 재평가된다.
+- 영구 오류 또는 retry 소진 terminal handler는 원 consumed envelope의 event context
+  안에서 실행한다. 따라서 terminal finalizer outbox는 원 correlation ID와
+  `causation_id=current event_id`를 유지하며 receipt terminal 전이와 원자적이다.
 
 ## English — T005 Versioned Internal Event Addendum
 
@@ -243,12 +261,22 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
 - Route and payload-schema identity is the tuple `(event_type, event_version)`.
 - Unsupported versions, undeclared fields, malformed UUID/SHA-256/enum/version values,
   credentialed or query-bearing URLs, and secret-looking values fail closed.
-- The transport envelope permits only the declared top-level fields. Every field,
-  including `attempt`, must equal the persisted event. Dispatcher and consumer both
-  recompute the complete immutable-material SHA-256 and compare it in constant time.
+- The transport envelope permits only the declared top-level fields. Immutable fields
+  must exactly match the persisted event, and dispatcher and consumer recompute and
+  constant-time compare the complete immutable-material SHA-256. `attempt` is a positive
+  dispatcher delivery generation, not immutable identity: a received generation at or
+  below the persisted dispatch-attempt count is valid at-least-once delivery, while a
+  future generation fails closed.
+- A terminal `succeeded` or `dead_letter` consumer receipt cannot be downgraded, nor can
+  its event be overwritten, by a late stale, future, or malformed delivery.
 - A malformed message with an extractable `event_id` is recorded in the durable receipt
   and outbox DLQ. If no valid `event_id` exists, broker retries are bounded to three
   deliveries because no durable row can be addressed.
+- Consumer database/receipt infrastructure failures use independent bounded 1/2/4-second
+  retries and broker requeue instead of ACK when the database remains unavailable. Hard
+  timeout and worker loss requeue as well. The receipt lease exceeds the hard limit by
+  ten minutes, and settlement is fenced by current token+generation ownership rather
+  than lease-clock expiry alone.
 - Queue selection metadata is not added to domain payloads. The dispatcher resolves the
   topic or publication channel from the referenced database entity and dead-letters an
   event when that identity cannot be resolved safely.
@@ -281,9 +309,17 @@ the pre-created `GenerationAttempt` contract.
 1. Redelivery of a `running` publication attempt never repeats the external write.
    It atomically records `unknown_outcome` and enqueues reconciliation.
 2. Retryable or repeatedly unknown reconciliation creates a new durable follow-up event
-   and becomes `manual_required` after five bounded attempts.
+   and becomes `manual_required` after five bounded attempts. Version 2 carries the exact
+   payload `publication_attempt_id` plus `reconcile_attempt_no`; this persisted counter is
+   independent of execute/admin `attempt_no`. Version 1 remains a legacy-consumption path.
 3. Generic attempt creation and its request event are atomic. Retryable extraction
    failures return to `queued`; only permanent failure or exhausted consumer retries
    records `failed` and one terminal finalizer wake-up.
 4. Target preflight is split into a short database fence snapshot, external I/O outside
    a database transaction, and a fenced result/audit/completion-event transaction.
+5. The evidence parent atomically persists `RunStep.fanout_completed_at`, counters, and a
+   finalizer wake-up after all child attempt/outbox fan-out. Finalizers cannot advance the
+   run before that marker, including zero-child, fast-child, and partial-failure paths.
+6. Permanent/exhausted terminal handlers run inside the original consumed event context,
+   preserving correlation and setting the terminal wake-up causation to the consumed
+   event ID in the same receipt-terminal transaction.

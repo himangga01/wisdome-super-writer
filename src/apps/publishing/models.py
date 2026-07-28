@@ -492,6 +492,7 @@ class PublicationAttempt(models.Model):
     request_fingerprint = models.CharField(max_length=64)
     state = models.CharField(max_length=24, choices=State.choices, default=State.QUEUED)
     attempt_no = models.PositiveIntegerField(default=1)
+    reconcile_attempt_no = models.PositiveIntegerField(default=0)
     remote_request_id = models.CharField(max_length=255, blank=True)
     http_status = models.PositiveIntegerField(null=True, blank=True)
     error_code = models.CharField(max_length=100, blank=True)

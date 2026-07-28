@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime
 
 from celery import current_app, shared_task
+from celery.exceptions import Reject
+from django.db import DatabaseError
 from django.utils import timezone
 
 from .event_routes import EventRoutingError, queue_for, route_for
@@ -23,7 +25,6 @@ from .outbox import (
 )
 
 logger = logging.getLogger(__name__)
-CONSUMER_MAX_ATTEMPTS = 5
 
 
 @shared_task(name="wisdome_writer.infrastructure.tasks.acknowledge_domain_event")
@@ -86,16 +87,41 @@ def dispatch_outbox(limit: int = 100):
 @shared_task(
     bind=True,
     name="wisdome_writer.infrastructure.tasks.consume_outbox_event",
-    max_retries=6,
+    max_retries=None,
     acks_late=True,
+    acks_on_failure_or_timeout=False,
     reject_on_worker_lost=True,
+    soft_time_limit=28 * 60,
+    time_limit=30 * 60,
 )
-def consume_outbox_event(self, envelope: dict):
+def consume_outbox_event(
+    self,
+    envelope: dict,
+    infra_retry_count: int = 0,
+):
+    def retry_infrastructure(exc: DatabaseError):
+        if infra_retry_count >= 3:
+            logger.exception(
+                "outbox consumer infrastructure remained unavailable; requeueing",
+                exc_info=exc,
+            )
+            raise Reject(exc, requeue=True)
+        raise self.retry(
+            args=(envelope,),
+            kwargs={"infra_retry_count": infra_retry_count + 1},
+            exc=exc,
+            countdown=2**infra_retry_count,
+        )
+
     def unaddressable(code: str):
         # Without a valid persisted event_id there is no row on which to store a
         # durable receipt. Bound broker redelivery and terminate after three tries.
         if self.request.retries < 2:
-            raise self.retry(countdown=2 ** self.request.retries)
+            raise self.retry(
+                args=(envelope,),
+                kwargs={"infra_retry_count": 0},
+                countdown=2**self.request.retries,
+            )
         logger.error("unaddressable outbox envelope discarded after bounded retries: %s", code)
         return {"state": "dead_letter", "code": code, "attempt": self.request.retries + 1}
 
@@ -106,20 +132,26 @@ def consume_outbox_event(self, envelope: dict):
     except (ValueError, TypeError, AttributeError):
         return unaddressable("event_id_invalid")
     try:
-        persisted_type, persisted_version = OutboxMessage.objects.values_list(
-            "topic", "event_version"
-        ).get(
-            pk=event_id
-        )
-    except OutboxMessage.DoesNotExist:
-        return unaddressable("event_not_found")
+        try:
+            persisted_type, persisted_version = OutboxMessage.objects.values_list(
+                "topic", "event_version"
+            ).get(
+                pk=event_id
+            )
+        except OutboxMessage.DoesNotExist:
+            return unaddressable("event_not_found")
+    except DatabaseError as exc:
+        return retry_infrastructure(exc)
     route = route_for(persisted_type, persisted_version)
     if route is None:
-        return dead_letter_consumer_event(
-            event_id,
-            consumer_name="unknown-event",
-            error_code="unsupported_event_type_version",
-        )
+        try:
+            return dead_letter_consumer_event(
+                event_id,
+                consumer_name="unknown-event",
+                error_code="unsupported_event_type_version",
+            )
+        except DatabaseError as exc:
+            return retry_infrastructure(exc)
 
     def handler(*args):
         task = current_app.tasks.get(route.task_name)
@@ -139,17 +171,24 @@ def consume_outbox_event(self, envelope: dict):
             )
         return task(*args)
 
-    result = consume_event(
-        envelope=envelope,
-        consumer_name=route.consumer_name,
-        handler=handler,
-        argument_keys=route.argument_keys,
-        terminal_handler=terminal_handler if route.terminal_task_name else None,
-        terminal_argument_keys=route.terminal_argument_keys,
-        max_attempts=CONSUMER_MAX_ATTEMPTS,
-    )
+    try:
+        result = consume_event(
+            envelope=envelope,
+            consumer_name=route.consumer_name,
+            handler=handler,
+            argument_keys=route.argument_keys,
+            terminal_handler=terminal_handler if route.terminal_task_name else None,
+            terminal_argument_keys=route.terminal_argument_keys,
+            max_attempts=route.max_attempts,
+        )
+    except DatabaseError as exc:
+        return retry_infrastructure(exc)
     if result["state"] == "retry":
         retry_at = datetime.fromisoformat(result["retry_at"])
         countdown = max(1, int((retry_at - timezone.now()).total_seconds()))
-        raise self.retry(countdown=countdown)
+        raise self.retry(
+            args=(envelope,),
+            kwargs={"infra_retry_count": 0},
+            countdown=countdown,
+        )
     return result

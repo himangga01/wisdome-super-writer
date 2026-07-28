@@ -27,6 +27,7 @@ from .models import (
     ValidationState,
 )
 from .services import (
+    _enqueue_reconcile_locked,
     _kill_switch_enabled,
     _snapshot_locked,
     begin_attempt,
@@ -67,27 +68,19 @@ def _retry_countdown(attempt_no: int, retry_after: int | None = None) -> int:
 
 
 @shared_task(
-    bind=True,
     name="apps.publishing.tasks.run_target_preflight",
-    max_retries=3,
     acks_late=True,
 )
 def run_target_preflight_task(
-    self,
     target_id: str,
     target_snapshot_id: str,
     target_config_hash: str,
 ):
-    try:
-        target, applied = run_target_preflight(
-            target_id,
-            expected_snapshot_id=target_snapshot_id,
-            expected_config_hash=target_config_hash,
-        )
-    except Exception as exc:
-        if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries + 1))
+    target, applied = run_target_preflight(
+        target_id,
+        expected_snapshot_id=target_snapshot_id,
+        expected_config_hash=target_config_hash,
+    )
     return {
         "targetId": str(target.id),
         "connectionState": target.connection_state,
@@ -190,19 +183,7 @@ def execute_publication_attempt(self, attempt_id: str):
     with transaction.atomic():
         persisted = persist_publish_result(attempt_id, result)
         if persisted.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
-            enqueue_event(
-                event_type="publication.reconcile_requested",
-                aggregate_type="publication_attempt",
-                aggregate_id=persisted.id,
-                job_id=persisted.id,
-                dedupe_key=(
-                    f"publication.reconcile_requested:{persisted.id}:"
-                    f"{persisted.attempt_no}:outcome"
-                ),
-                payload={
-                    "publication_attempt_id": str(persisted.id),
-                },
-            )
+            _enqueue_reconcile_locked(persisted)
     if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
         if persisted.attempt_no >= self.max_retries + 1:
             return {"attemptId": attempt_id, "state": persisted.state, "code": persisted.error_code}
@@ -223,13 +204,27 @@ def execute_publication_attempt(self, attempt_id: str):
     max_retries=4,
     acks_late=True,
 )
-def reconcile_publication_attempt(self, attempt_id: str):
+def reconcile_publication_attempt(
+    self,
+    attempt_id: str,
+    reconcile_attempt_no: int | None = None,
+):
     try:
-        attempt, command = begin_reconcile(attempt_id)
+        attempt, command = begin_reconcile(
+            attempt_id,
+            expected_reconcile_attempt_no=reconcile_attempt_no,
+        )
     except Conflict as exc:
         return {"attemptId": attempt_id, "state": "ignored", "code": exc.code}
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
+    if command is None:
+        return {
+            "attemptId": attempt_id,
+            "state": attempt.state,
+            "reconcileAttemptNo": attempt.reconcile_attempt_no,
+            "duplicate": True,
+        }
     adapter = publisher_for_target(attempt.publication.target)
     retry_after = None
     try:
@@ -252,7 +247,7 @@ def reconcile_publication_attempt(self, attempt_id: str):
             PublicationAttempt.State.RETRYABLE_FAILED,
             PublicationAttempt.State.UNKNOWN_OUTCOME,
         }:
-            if persisted.attempt_no >= 5:
+            if persisted.reconcile_attempt_no >= 5:
                 persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
                 persisted.error_code = (
                     persisted.error_code or "reconcile_attempts_exhausted"
@@ -264,27 +259,22 @@ def reconcile_publication_attempt(self, attempt_id: str):
                     update_fields=("state", "last_error_code", "updated_at")
                 )
             else:
-                persisted.attempt_no += 1
                 persisted.next_retry_at = timezone.now() + timedelta(
                     seconds=_retry_countdown(
-                        persisted.attempt_no,
+                        persisted.reconcile_attempt_no,
                         retry_after,
                     )
                 )
-                persisted.save(update_fields=("attempt_no", "next_retry_at"))
-                enqueue_event(
-                    event_type="publication.reconcile_requested",
-                    aggregate_type="publication_attempt",
-                    aggregate_id=persisted.id,
-                    job_id=persisted.id,
-                    dedupe_key=(
-                        f"publication.reconcile_requested:{persisted.id}:"
-                        f"{persisted.attempt_no}:followup"
-                    ),
+                persisted.save(update_fields=("next_retry_at",))
+                _enqueue_reconcile_locked(
+                    persisted,
                     available_at=persisted.next_retry_at,
-                    payload={"publication_attempt_id": str(persisted.id)},
                 )
-    return {"attemptId": attempt_id, "state": persisted.state}
+    return {
+        "attemptId": attempt_id,
+        "state": persisted.state,
+        "reconcileAttemptNo": persisted.reconcile_attempt_no,
+    }
 
 
 @shared_task(

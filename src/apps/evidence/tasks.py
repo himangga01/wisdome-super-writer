@@ -947,6 +947,18 @@ def finalize_run_evidence(run_id: str):
         run = CollectionRun.objects.select_for_update().get(pk=run_id)
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
+        step = (
+            RunStep.objects.select_for_update()
+            .filter(run=run, name="extract", attempt_no=1)
+            .first()
+        )
+        if step is None or step.fanout_completed_at is None:
+            return {
+                "runId": str(run.id),
+                "state": run.state,
+                "pending": True,
+                "fanoutComplete": False,
+            }
         pending_documents = DocumentExtraction.objects.filter(
             run_source_item__run=run,
             state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
@@ -965,7 +977,6 @@ def finalize_run_evidence(run_id: str):
             run_source_item__run=run, state=ExtractionState.FAILED
         ).count()
         failure_count = document_failures + generic_failures
-        step, _ = RunStep.objects.select_for_update().get_or_create(run=run, name="extract", attempt_no=1)
         step.output_count = evidence_count
         step.error_code = "partial_extraction_failure" if failure_count else None
         step.error_detail_redacted = (
@@ -995,16 +1006,28 @@ def finalize_run_evidence(run_id: str):
         }
 
 
-@shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
-def process_run_evidence(self, run_id: str):
-    run = CollectionRun.objects.get(pk=run_id)
-    if run.state not in {RunState.EXTRACTING, RunState.VALIDATING}:
-        return {"runId": str(run.id), "state": run.state}
-    step, _ = RunStep.objects.get_or_create(run=run, name="extract", attempt_no=1)
-    step.state = "running"
-    step.started_at = step.started_at or timezone.now()
-    step.input_count = run.run_source_items.count()
-    step.save(update_fields=("state", "started_at", "input_count"))
+@shared_task(name="apps.evidence.tasks.process_run_evidence")
+def process_run_evidence(run_id: str):
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        if run.state != RunState.EXTRACTING:
+            return {"runId": str(run.id), "state": run.state}
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        if step.fanout_completed_at is not None:
+            return {
+                "runId": str(run.id),
+                "state": run.state,
+                "fanoutComplete": True,
+            }
+        step.state = "running"
+        step.started_at = step.started_at or timezone.now()
+        step.input_count = run.run_source_items.count()
+        step.save(update_fields=("state", "started_at", "input_count"))
+
     output_count = 0
     failures: list[dict[str, str]] = []
     items = run.run_source_items.select_related(
@@ -1032,19 +1055,53 @@ def process_run_evidence(self, run_id: str):
                 "attachment": "source-record",
                 "code": getattr(exc, "code", exc.__class__.__name__),
             })
-    step.output_count = output_count
-    step.error_code = "partial_extraction_failure" if failures else None
-    step.error_detail_redacted = json.dumps(failures[:20], ensure_ascii=False)[:500] if failures else None
-    step.save(update_fields=("output_count", "error_code", "error_detail_redacted"))
-    if run.stop_requested_at:
-        run.state = RunState.STOPPED
-        run.completed_at = timezone.now()
-        run.save(update_fields=("state", "completed_at"))
-        return {"runId": str(run.id), "state": run.state}
-    run.counters = {
-        **run.counters,
-        "evidence": output_count,
-        "extractionFailures": len(failures),
-    }
-    run.save(update_fields=("counters",))
-    return finalize_run_evidence.run(str(run.id))
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        step = RunStep.objects.select_for_update().get(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        if run.stop_requested_at:
+            run.state = RunState.STOPPED
+            run.completed_at = timezone.now()
+            run.save(update_fields=("state", "completed_at"))
+            return {"runId": str(run.id), "state": run.state}
+        if run.state != RunState.EXTRACTING:
+            return {"runId": str(run.id), "state": run.state}
+        if step.fanout_completed_at is not None:
+            return {
+                "runId": str(run.id),
+                "state": run.state,
+                "fanoutComplete": True,
+            }
+        step.output_count = output_count
+        step.error_code = "partial_extraction_failure" if failures else None
+        step.error_detail_redacted = (
+            json.dumps(failures[:20], ensure_ascii=False)[:500]
+            if failures
+            else None
+        )
+        step.fanout_completed_at = timezone.now()
+        step.save(
+            update_fields=(
+                "output_count",
+                "error_code",
+                "error_detail_redacted",
+                "fanout_completed_at",
+            )
+        )
+        run.counters = {
+            **run.counters,
+            "evidence": output_count,
+            "extractionFailures": len(failures),
+        }
+        run.save(update_fields=("counters",))
+        _enqueue_finalize(str(run.id), "fanout-complete")
+        return {
+            "runId": str(run.id),
+            "state": run.state,
+            "fanoutComplete": True,
+            "outputCount": output_count,
+            "failureCount": len(failures),
+        }

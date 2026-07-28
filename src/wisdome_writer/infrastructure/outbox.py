@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
@@ -162,6 +163,12 @@ def _validate_formatted_value(*, key: str, value: Any, value_format: str) -> Non
     if value_format == "domain_key":
         if not isinstance(value, str) or SAFE_DOMAIN_KEY_RE.fullmatch(value) is None:
             raise ForbiddenEventPayload(f"event payload field is not a safe domain key: {key}")
+        return
+    if value_format == "positive_integer":
+        if type(value) is not int or value < 1:
+            raise ForbiddenEventPayload(
+                f"event payload field is not a positive integer: {key}"
+            )
         return
     if value_format == "url":
         if not isinstance(value, str):
@@ -661,6 +668,15 @@ def dead_letter_consumer_event(
         event=event,
         consumer_name=consumer_name,
     )
+    if (
+        receipt.state == OutboxConsumerReceipt.State.SUCCEEDED
+        or event.consumer_receipts.filter(
+            state=OutboxConsumerReceipt.State.SUCCEEDED
+        ).exists()
+    ):
+        return {"state": "duplicate", "attempt": receipt.attempts}
+    if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
+        return {"state": "dead_letter", "attempt": receipt.attempts}
     receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
     receipt.attempts += 1
     receipt.last_error_code = error_code[:120]
@@ -761,7 +777,11 @@ def _verify_received_envelope(event: OutboxMessage, envelope: dict[str, Any]) ->
         )
     if type(envelope["attempt"]) is not int or envelope["attempt"] < 1:
         raise ForbiddenEventPayload("received event attempt must be a positive integer")
+    if envelope["attempt"] > event.attempts:
+        raise OutboxConflict("received event attempt is from a future dispatch generation")
     for key, expected_value in expected.items():
+        if key == "attempt":
+            continue
         if envelope[key] != expected_value:
             raise OutboxConflict(f"received envelope does not match persisted event: {key}")
 
@@ -776,6 +796,31 @@ def event_context(envelope: dict[str, Any]):
     finally:
         CURRENT_EVENT_CORRELATION_ID.reset(correlation_token)
         CURRENT_EVENT_ID.reset(event_token)
+
+
+def _lock_owned_consumer_receipt(
+    *,
+    event_id: uuid.UUID,
+    consumer_name: str,
+    lease_token: uuid.UUID,
+    lease_generation: int,
+) -> OutboxConsumerReceipt | None:
+    receipt = (
+        OutboxConsumerReceipt.objects.select_for_update()
+        .filter(
+            event_id=event_id,
+            consumer_name=consumer_name,
+            state=OutboxConsumerReceipt.State.PROCESSING,
+        )
+        .first()
+    )
+    if (
+        receipt is None
+        or receipt.lease_token != lease_token
+        or receipt.lease_generation != lease_generation
+    ):
+        return None
+    return receipt
 
 
 def consume_event(
@@ -793,18 +838,23 @@ def consume_event(
     payload = envelope.get("payload")
     event_id = _uuid(envelope.get("event_id"))
     now = timezone.now()
+    consumer_attempt_limit = min(max(max_attempts, 1), 5)
     with transaction.atomic():
         event = OutboxMessage.objects.select_for_update().get(pk=event_id)
+        receipt, _ = OutboxConsumerReceipt.objects.select_for_update().get_or_create(
+            event=event,
+            consumer_name=consumer_name,
+        )
+        if receipt.state == OutboxConsumerReceipt.State.SUCCEEDED:
+            return {"state": "duplicate", "attempt": receipt.attempts}
+        if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
+            return {"state": "dead_letter", "attempt": receipt.attempts}
         try:
             if not isinstance(payload, dict):
                 raise ForbiddenEventPayload("received event payload must be an object")
             _verify_received_envelope(event, envelope)
             validate_persisted_event(event)
         except (ForbiddenEventPayload, OutboxConflict) as exc:
-            receipt, _ = OutboxConsumerReceipt.objects.select_for_update().get_or_create(
-                event=event,
-                consumer_name=consumer_name,
-            )
             receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
             receipt.attempts += 1
             receipt.last_error_code = str(
@@ -838,14 +888,6 @@ def consume_event(
                 )
             )
             return {"state": "dead_letter", "attempt": receipt.attempts}
-        receipt, _ = OutboxConsumerReceipt.objects.select_for_update().get_or_create(
-            event=event,
-            consumer_name=consumer_name,
-        )
-        if receipt.state == OutboxConsumerReceipt.State.SUCCEEDED:
-            return {"state": "duplicate", "attempt": receipt.attempts}
-        if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
-            return {"state": "dead_letter", "attempt": receipt.attempts}
         if (
             receipt.state == OutboxConsumerReceipt.State.PROCESSING
             and receipt.claimed_until
@@ -866,12 +908,53 @@ def consume_event(
                 "attempt": receipt.attempts,
                 "retry_at": receipt.next_retry_at.isoformat(),
             }
+        if receipt.attempts >= consumer_attempt_limit:
+            error_code = "consumer_attempts_exhausted"
+            if terminal_handler is not None:
+                terminal_args = [
+                    event.payload[key] for key in terminal_argument_keys
+                ]
+                with event_context(envelope):
+                    terminal_handler(*terminal_args, error_code)
+            receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
+            receipt.last_error_code = error_code
+            receipt.dead_lettered_at = now
+            receipt.next_retry_at = None
+            receipt.claimed_at = None
+            receipt.claimed_until = None
+            receipt.lease_token = None
+            receipt.save(
+                update_fields=(
+                    "state",
+                    "last_error_code",
+                    "dead_lettered_at",
+                    "next_retry_at",
+                    "claimed_at",
+                    "claimed_until",
+                    "lease_token",
+                )
+            )
+            event.status = OutboxMessage.Status.DEAD_LETTER
+            event.dead_lettered_at = now
+            event.last_error_at = now
+            event.last_error_code = error_code
+            event.save(
+                update_fields=(
+                    "status",
+                    "dead_lettered_at",
+                    "last_error_at",
+                    "last_error_code",
+                )
+            )
+            return {"state": "dead_letter", "attempt": receipt.attempts}
         receipt.state = OutboxConsumerReceipt.State.PROCESSING
         receipt.attempts += 1
         receipt.started_at = now
         receipt.next_retry_at = None
         receipt.claimed_at = now
-        receipt.claimed_until = now + timedelta(minutes=30)
+        receipt.claimed_until = now + timedelta(
+            seconds=max(int(settings.OUTBOX_CONSUMER_LEASE_SECONDS), 1)
+        )
         receipt.lease_token = uuid.uuid4()
         receipt.lease_generation += 1
         lease_token = receipt.lease_token
@@ -893,14 +976,14 @@ def consume_event(
         args = [payload[key] for key in argument_keys]
     except KeyError as exc:
         with transaction.atomic():
-            receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+            receipt = _lock_owned_consumer_receipt(
                 event_id=event_id,
                 consumer_name=consumer_name,
                 lease_token=lease_token,
                 lease_generation=lease_generation,
-                state=OutboxConsumerReceipt.State.PROCESSING,
-                claimed_until__gt=timezone.now(),
             )
+            if receipt is None:
+                return {"state": "stale_fenced", "attempt": None}
             receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
             receipt.last_error_code = f"missing_payload_{exc.args[0]}"[:120]
             receipt.dead_lettered_at = timezone.now()
@@ -941,21 +1024,22 @@ def consume_event(
     except Exception as exc:
         with transaction.atomic():
             event = OutboxMessage.objects.select_for_update().get(pk=event_id)
-            receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+            receipt = _lock_owned_consumer_receipt(
                 event_id=event_id,
                 consumer_name=consumer_name,
                 lease_token=lease_token,
                 lease_generation=lease_generation,
-                state=OutboxConsumerReceipt.State.PROCESSING,
-                claimed_until__gt=timezone.now(),
             )
+            if receipt is None:
+                return {"state": "stale_fenced", "attempt": None}
             terminal = bool(getattr(exc, "permanent", False)) or (
-                receipt.attempts >= min(max(max_attempts, 1), 5)
+                receipt.attempts >= consumer_attempt_limit
             )
             error_code = str(getattr(exc, "code", exc.__class__.__name__))[:120]
             if terminal and terminal_handler is not None:
                 terminal_args = [event.payload[key] for key in terminal_argument_keys]
-                terminal_handler(*terminal_args, error_code)
+                with event_context(envelope):
+                    terminal_handler(*terminal_args, error_code)
             receipt.state = (
                 OutboxConsumerReceipt.State.DEAD_LETTER
                 if terminal
@@ -1005,14 +1089,14 @@ def consume_event(
             }
 
     with transaction.atomic():
-        receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+        receipt = _lock_owned_consumer_receipt(
             event_id=event_id,
             consumer_name=consumer_name,
             lease_token=lease_token,
             lease_generation=lease_generation,
-            state=OutboxConsumerReceipt.State.PROCESSING,
-            claimed_until__gt=timezone.now(),
         )
+        if receipt is None:
+            return {"state": "stale_fenced", "attempt": None}
         receipt.state = OutboxConsumerReceipt.State.SUCCEEDED
         receipt.last_error_code = ""
         receipt.completed_at = timezone.now()
