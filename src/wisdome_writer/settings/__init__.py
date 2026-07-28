@@ -1,7 +1,9 @@
 import json
+import ipaddress
 import os
+import re
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -43,6 +45,10 @@ ALLOWED_HOSTS = env_list(
     "localhost,127.0.0.1" if not IS_PRODUCTION else "",
 )
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
+PUBLIC_BASE_URL = env_value(
+    "PUBLIC_BASE_URL",
+    "http://localhost:8000" if not IS_PRODUCTION else "",
+)
 
 DATABASE_URL = env_value(
     "DATABASE_URL",
@@ -95,20 +101,83 @@ def validate_production_configuration() -> None:
         elif len(value) < 32 or value.lower() in unsafe_values:
             errors.append(f"{name} must be a non-placeholder value of at least 32 characters")
 
+    def is_public_hostname(hostname: str) -> bool:
+        hostname = hostname.rstrip(".").lower()
+        if hostname == "localhost" or hostname.endswith(".local"):
+            return False
+        try:
+            return ipaddress.ip_address(hostname).is_global
+        except ValueError:
+            try:
+                ascii_hostname = hostname.encode("idna").decode("ascii")
+            except UnicodeError:
+                return False
+            labels = ascii_hostname.split(".")
+            return len(labels) > 1 and all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            )
+
+    def parse_https_origin(name: str, value: str) -> tuple[str, str] | None:
+        if not value:
+            errors.append(f"{name} is required")
+            return None
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            errors.append(f"{name} must be a valid HTTPS origin")
+            return None
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or port == 0
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or not is_public_hostname(hostname)
+        ):
+            errors.append(
+                f"{name} must be a public HTTPS origin without credentials, path, query, or fragment"
+            )
+            return None
+        normalized = f"https://{hostname.lower()}"
+        if port and port != 443:
+            normalized = f"{normalized}:{port}"
+        return normalized, hostname.lower()
+
     require_safe_secret("DJANGO_SECRET_KEY", SECRET_KEY)
     require_safe_secret("AUDIT_CURSOR_SIGNING_KEY", AUDIT_CURSOR_SIGNING_KEY)
     if SECRET_KEY and AUDIT_CURSOR_SIGNING_KEY == SECRET_KEY:
         errors.append("AUDIT_CURSOR_SIGNING_KEY must be distinct from DJANGO_SECRET_KEY")
     if DEBUG:
         errors.append("DJANGO_DEBUG must be false")
-    if not ALLOWED_HOSTS or any(
-        host in {"*", "localhost", "127.0.0.1", "::1"} for host in ALLOWED_HOSTS
+    normalized_allowed_hosts = {host.rstrip(".").lower() for host in ALLOWED_HOSTS}
+    if not normalized_allowed_hosts or any(
+        not is_public_hostname(host) for host in normalized_allowed_hosts
     ):
         errors.append("DJANGO_ALLOWED_HOSTS must contain explicit non-local production hosts")
-    if not CSRF_TRUSTED_ORIGINS or any(
-        not origin.startswith("https://") for origin in CSRF_TRUSTED_ORIGINS
-    ):
-        errors.append("DJANGO_CSRF_TRUSTED_ORIGINS must contain only HTTPS origins")
+
+    public_origin = parse_https_origin("PUBLIC_BASE_URL", PUBLIC_BASE_URL)
+    csrf_origins = [
+        parsed
+        for index, origin in enumerate(CSRF_TRUSTED_ORIGINS)
+        if (parsed := parse_https_origin(f"DJANGO_CSRF_TRUSTED_ORIGINS[{index}]", origin))
+    ]
+    if not CSRF_TRUSTED_ORIGINS:
+        errors.append("DJANGO_CSRF_TRUSTED_ORIGINS is required")
+    for origin, hostname in csrf_origins:
+        if hostname not in normalized_allowed_hosts:
+            errors.append(f"CSRF trusted origin host {hostname!r} must be in DJANGO_ALLOWED_HOSTS")
+    if public_origin:
+        origin, hostname = public_origin
+        if hostname not in normalized_allowed_hosts:
+            errors.append("PUBLIC_BASE_URL host must be in DJANGO_ALLOWED_HOSTS")
+        if origin not in {csrf_origin for csrf_origin, _ in csrf_origins}:
+            errors.append("PUBLIC_BASE_URL must be included in DJANGO_CSRF_TRUSTED_ORIGINS")
 
     database = urlparse(DATABASE_URL)
     if (
@@ -180,6 +249,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -237,6 +307,12 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = REPOSITORY_ROOT / "staticfiles"
 STATICFILES_DIRS = [SRC_ROOT / "static"]
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 MEDIA_ROOT = REPOSITORY_ROOT / "media"
 MEDIA_URL = "/media/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -248,6 +324,11 @@ CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_SSL_REDIRECT = IS_PRODUCTION
+SECURE_HSTS_SECONDS = 31_536_000 if IS_PRODUCTION else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = IS_PRODUCTION
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if IS_PRODUCTION else None
+SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 
 CELERY_TASK_TRACK_STARTED = True
