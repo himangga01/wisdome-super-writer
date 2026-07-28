@@ -6,13 +6,15 @@ from typing import Any
 from django.conf import settings
 from django.core import signing
 
-from wisdome_writer.domain.hashing import canonical_json_bytes
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_json_bytes
 
 SALT = "wisdome-writer.audit-cursor.v1"
 
 
 def filter_hash(filters: dict[str, Any]) -> str:
-    return hashlib.sha256(canonical_json_bytes(filters)).hexdigest()
+    return hashlib.sha256(
+        canonical_json_bytes(filters, schema_version=CANONICAL_HASH_SCHEMA_V1)
+    ).hexdigest()
 
 
 def encode_cursor(
