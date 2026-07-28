@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import uuid
+from datetime import timedelta
 
 from celery import shared_task
 from django.db import transaction
@@ -11,6 +12,7 @@ from adapters.publishers.wordpress import WordPressPublisher
 from adapters.storage import S3ObjectStorage
 from wisdome_writer.domain.errors import Conflict
 from wisdome_writer.domain.hashing import sha256_hex
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle
 from .models import (
@@ -168,10 +170,25 @@ def execute_publication_attempt(self, attempt_id: str):
         result = publisher_error_result(exc)
     finally:
         adapter.close()
-    persisted = persist_publish_result(attempt_id, result)
-    if persisted.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
-        reconcile_publication_attempt.apply_async(args=[attempt_id], countdown=10)
-    elif persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
+    with transaction.atomic():
+        persisted = persist_publish_result(attempt_id, result)
+        if persisted.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
+            enqueue_event(
+                event_type="publication.reconcile_requested",
+                aggregate_type="publication_attempt",
+                aggregate_id=persisted.id,
+                job_id=persisted.id,
+                dedupe_key=(
+                    f"publication.reconcile_requested:{persisted.id}:"
+                    f"{persisted.attempt_no}:automatic"
+                ),
+                available_at=timezone.now() + timedelta(seconds=10),
+                payload={
+                    "publication_attempt_id": str(persisted.id),
+                    "channel": persisted.publication.target.channel,
+                },
+            )
+    if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
         if persisted.attempt_no >= self.max_retries + 1:
             return {"attemptId": attempt_id, "state": persisted.state, "code": persisted.error_code}
         PublicationAttempt.objects.filter(id=attempt_id).update(attempt_no=persisted.attempt_no + 1)

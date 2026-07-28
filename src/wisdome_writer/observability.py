@@ -1,5 +1,6 @@
 import logging
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from django.http import HttpRequest, HttpResponse
@@ -9,6 +10,15 @@ _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
 
 def current_correlation_id() -> str:
     return _correlation_id.get()
+
+
+@contextmanager
+def correlation_context(correlation_id: str):
+    token = _correlation_id.set(correlation_id)
+    try:
+        yield
+    finally:
+        _correlation_id.reset(token)
 
 
 class CorrelationIdFilter(logging.Filter):

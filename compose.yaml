@@ -166,7 +166,7 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect.housing,collect.semiconductor"]
     networks:
       - database
       - broker
@@ -177,7 +177,7 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.generic"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.document,extract.generic"]
     networks:
       - database
       - broker
@@ -187,7 +187,7 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=default,generate"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=editorial,maintenance"]
     networks:
       - database
       - broker
@@ -197,7 +197,29 @@ services:
     <<: *app
     environment:
       <<: [*runtime-environment, *publisher-environment]
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish.media.wordpress,publish.wordpress"]
+    networks:
+      - database
+      - broker
+      - object-storage
+      - publishing-egress
+
+  worker-publish-blogger:
+    <<: *app
+    environment:
+      <<: [*runtime-environment, *publisher-environment]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=publish.blogger"]
+    networks:
+      - database
+      - broker
+      - object-storage
+      - publishing-egress
+
+  worker-reconcile:
+    <<: *app
+    environment:
+      <<: [*runtime-environment, *publisher-environment]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=reconcile"]
     networks:
       - database
       - broker

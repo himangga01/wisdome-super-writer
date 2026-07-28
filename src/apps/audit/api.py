@@ -11,13 +11,14 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_http_methods
 
 from wisdome_writer.domain.errors import InvalidInput
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .cursor import decode_cursor, encode_cursor
 from apps.accounts.services import consume_reauthentication_proof
 
 from .models import AuditEvent, RetentionBatch
 from .redaction import redaction_policy_hash, sanitize_metadata
-from .retention import approve_retention_batch, create_retention_preview, execute_retention_batch_task
+from .retention import approve_retention_batch, create_retention_preview
 
 PAGE_SIZE = 50
 
@@ -159,6 +160,14 @@ def approve_retention(request: HttpRequest, batch_id) -> JsonResponse:
 @login_required
 @require_http_methods(["POST"])
 def execute_retention(request: HttpRequest, batch_id) -> JsonResponse:
-    batch = get_object_or_404(RetentionBatch, id=batch_id, state=RetentionBatch.State.APPROVED)
-    execute_retention_batch_task.delay(str(batch.id))
+    with transaction.atomic():
+        batch = get_object_or_404(RetentionBatch, id=batch_id, state=RetentionBatch.State.APPROVED)
+        enqueue_event(
+            event_type="retention.expire_requested",
+            aggregate_type="retention_batch",
+            aggregate_id=batch.id,
+            job_id=batch.id,
+            dedupe_key=f"retention.expire_requested:{batch.id}:{batch.row_version}",
+            payload={"retention_batch_id": str(batch.id)},
+        )
     return JsonResponse(_retention_payload(batch), status=202)

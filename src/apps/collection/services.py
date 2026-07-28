@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from adapters.sources import build_source_adapter
 from apps.topics.services import current_registry
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import CollectionRun, RunSourceItem, RunState, RunStep, SourceCollectionAttempt, SourceItem
 
@@ -126,15 +127,32 @@ def collect_run(run: CollectionRun) -> CollectionRun:
             attempt.error_detail_redacted = str(exc)[:500]
         attempt.finished_at = timezone.now()
         attempt.save()
-    if run.stop_requested_at:
-        run.state = RunState.STOPPED
-        run.completed_at = timezone.now()
-    else:
-        run.state = RunState.EXTRACTING
-    run.counters = {**run.counters, "sources": memberships.count(), "items": collected, "sourceFailures": failed}
-    run.save(update_fields=["state", "completed_at", "counters"])
-    step.state = "succeeded" if failed < memberships.count() else "failed"
-    step.output_count = collected
-    step.finished_at = timezone.now()
-    step.save(update_fields=["state", "output_count", "finished_at"])
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run.pk)
+        step = RunStep.objects.select_for_update().get(pk=step.pk)
+        if run.stop_requested_at:
+            run.state = RunState.STOPPED
+            run.completed_at = timezone.now()
+        else:
+            run.state = RunState.EXTRACTING
+        run.counters = {
+            **run.counters,
+            "sources": memberships.count(),
+            "items": collected,
+            "sourceFailures": failed,
+        }
+        run.save(update_fields=["state", "completed_at", "counters"])
+        step.state = "succeeded" if failed < memberships.count() else "failed"
+        step.output_count = collected
+        step.finished_at = timezone.now()
+        step.save(update_fields=["state", "output_count", "finished_at"])
+        if run.state == RunState.EXTRACTING:
+            enqueue_event(
+                event_type="run.evidence_requested",
+                aggregate_type="collection_run",
+                aggregate_id=run.id,
+                job_id=run.id,
+                dedupe_key=f"run.evidence_requested:{run.id}",
+                payload={"run_id": str(run.id)},
+            )
     return run

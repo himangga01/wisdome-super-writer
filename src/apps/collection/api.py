@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 
 from django.contrib.auth.decorators import login_required
+from django.db import transaction
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -9,7 +10,7 @@ from django.views.decorators.http import require_http_methods
 
 from .models import CollectionRun, RunState
 from .services import create_run
-from .tasks import execute_collection_run
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 
 def _run_payload(run):
@@ -45,11 +46,19 @@ def runs(request):
     )
     if timezone.is_naive(window_start):
         window_start = timezone.make_aware(window_start)
-    run, created = create_run(
-        topic_code=body["topic"], window_start=window_start, window_end=window_end, user=request.user
-    )
-    if created:
-        execute_collection_run.delay(str(run.id))
+    with transaction.atomic():
+        run, created = create_run(
+            topic_code=body["topic"], window_start=window_start, window_end=window_end, user=request.user
+        )
+        if created:
+            enqueue_event(
+                event_type="run.requested",
+                aggregate_type="collection_run",
+                aggregate_id=run.id,
+                job_id=run.id,
+                dedupe_key=f"run.requested:{run.id}",
+                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+            )
     return JsonResponse(_run_payload(run), status=201 if created else 200)
 
 
@@ -84,13 +93,21 @@ def stop_run(request, run_id):
 @require_http_methods(["POST"])
 def retry_run(request, run_id):
     old = get_object_or_404(CollectionRun, id=run_id)
-    run, created = create_run(
-        topic_code=old.topic_code,
-        window_start=old.window_start,
-        window_end=old.window_end,
-        user=request.user,
-        trigger="retry",
-    )
-    if created:
-        execute_collection_run.delay(str(run.id))
+    with transaction.atomic():
+        run, created = create_run(
+            topic_code=old.topic_code,
+            window_start=old.window_start,
+            window_end=old.window_end,
+            user=request.user,
+            trigger="retry",
+        )
+        if created:
+            enqueue_event(
+                event_type="run.requested",
+                aggregate_type="collection_run",
+                aggregate_id=run.id,
+                job_id=run.id,
+                dedupe_key=f"run.requested:{run.id}",
+                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+            )
     return JsonResponse(_run_payload(run), status=202)

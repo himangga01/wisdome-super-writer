@@ -73,6 +73,31 @@ from .services import (
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
 
+def _enqueue_document_extraction(document: DocumentExtraction) -> None:
+    enqueue_event(
+        event_type="evidence.document_extract_requested",
+        aggregate_type="document_extraction",
+        aggregate_id=document.id,
+        job_id=document.run_source_item.run_id,
+        dedupe_key=f"evidence.document_extract_requested:{document.id}",
+        payload={
+            "run_id": str(document.run_source_item.run_id),
+            "document_extraction_id": str(document.id),
+        },
+    )
+
+
+def _enqueue_finalize(run_id: str, cause: str) -> None:
+    enqueue_event(
+        event_type="evidence.finalize_requested",
+        aggregate_type="collection_run",
+        aggregate_id=run_id,
+        job_id=run_id,
+        dedupe_key=f"evidence.finalize_requested:{run_id}:{cause}",
+        payload={"run_id": str(run_id)},
+    )
+
+
 def _storage() -> S3ObjectStorage:
     return S3ObjectStorage()
 
@@ -449,25 +474,26 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
             ],
         }
         document.save(update_fields=("routing_manifest", "updated_at"))
-    document = aggregate_document_extraction(document.id)
-    if document.document_complete:
-        enqueue_event(
-            topic="evidence.document_ready",
-            aggregate_type="DocumentExtraction",
-            aggregate_id=document.id,
-            message_key=f"evidence.document_ready:{document.id}:{document.selected_evidence_manifest_hash}",
-            correlation_id=document.run_source_item.run_id,
-            payload={
-                "run_id": str(document.run_source_item.run_id),
-                "run_source_item_id": str(document.run_source_item_id),
-                "source_item_id": str(document.source_item_id),
-                "document_extraction_id": str(document.id),
-                "input_page_count": document.input_page_count,
-                "coverage_manifest_hash": document.coverage_manifest_hash,
-                "selected_evidence_manifest_hash": document.selected_evidence_manifest_hash,
-                "document_complete": True,
-            },
-        )
+    with transaction.atomic():
+        document = aggregate_document_extraction(document.id)
+        if document.document_complete:
+            enqueue_event(
+                topic="evidence.document_ready",
+                aggregate_type="DocumentExtraction",
+                aggregate_id=document.id,
+                message_key=f"evidence.document_ready:{document.id}:{document.selected_evidence_manifest_hash}",
+                correlation_id=document.run_source_item.run_id,
+                payload={
+                    "run_id": str(document.run_source_item.run_id),
+                    "run_source_item_id": str(document.run_source_item_id),
+                    "source_item_id": str(document.source_item_id),
+                    "document_extraction_id": str(document.id),
+                    "input_page_count": document.input_page_count,
+                    "coverage_manifest_hash": document.coverage_manifest_hash,
+                    "selected_evidence_manifest_hash": document.selected_evidence_manifest_hash,
+                    "document_complete": True,
+                },
+            )
     return document
 
 
@@ -506,23 +532,17 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
     with tempfile.TemporaryDirectory(prefix="wisdome-generic-") as temp_dir:
         path = Path(temp_dir) / f"input{suffix or '.bin'}"
         path.write_bytes(data)
-        attempt.state = ExtractionState.RUNNING
-        attempt.started_at = timezone.now()
-        attempt.save(update_fields=("state", "started_at", "updated_at"))
+        with transaction.atomic():
+            GenericExtractionAttempt.objects.select_for_update().filter(pk=attempt.id).update(
+                state=ExtractionState.RUNNING,
+                started_at=timezone.now(),
+            )
         output: GenericExtractionOutput = _generic_extractor(profile).extract(path)
         result = _store_result("generic", attempt.id, output.as_dict())
         reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
-        attempt.state = ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
-        attempt.result_checksum = result.checksum_sha256
-        attempt.low_confidence_reasons_hash = canonical_hash(reasons) if reasons else None
+        reason_info = None
         if reasons:
             reason_info = _store_result("reasons", attempt.id, {"reasons": reasons})
-            attempt.low_confidence_reasons_object_key = reason_info.key
-            attempt.low_confidence_reasons_object_version = reason_info.version_id or reason_info.etag
-        attempt.finished_at = timezone.now()
-        attempt.full_clean()
-        attempt.save()
-
         records = [record.as_dict() for record in output.records]
         first = output.records[0] if output.records else None
         if first is None:
@@ -531,67 +551,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
         structured = {"records": records, "metadata": dict(output.metadata)}
         content_hash = evidence_content_hash(text=text or None, structured_data=structured, checksum=None)
         kind = first.kind if first.kind in EvidenceKind.values else EvidenceKind.TEXT
-        manual = attempt.state == ExtractionState.LOW_CONFIDENCE
-        rights = _rights(attempt.run_source_item)
-        evidence = EvidenceAsset.objects.create(
-            source_item=attempt.source_item,
-            origin_run_source_item=attempt.run_source_item,
-            derivation_type=EvidenceDerivationType.OTHER,
-            generic_extraction_attempt=attempt,
-            parent_asset=attempt.input_asset,
-            kind=kind,
-            locator_type=first.locator_type,
-            locator=dict(first.locator),
-            extracted_text=text or None,
-            structured_data=structured,
-            extraction_method=profile.engine,
-            extractor_version=profile.extractor_version,
-            extraction_config_hash=profile.config_hash,
-            validation_mode=profile.validation_mode,
-            extraction_result_checksum=attempt.result_checksum,
-            calibration_profile_key=profile.calibration_profile_key,
-            calibration_profile_version=profile.calibration_profile_version,
-            calibration_profile_hash=profile.calibration_profile_hash,
-            confidence=first.confidence if profile.validation_mode == GenericValidationMode.CALIBRATED else None,
-            low_confidence_reasons=reasons,
-            evidence_content_hash=content_hash,
-            review_subject_hash="0" * 64,
-            review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
-            manual_review_required=manual,
-            alt_text=first.alt_text,
-            **rights,
-        )
-        evidence.review_subject_hash = calculate_review_subject_hash(evidence)
-        evidence.publishable = calculate_publishable(evidence)
-        evidence.full_clean()
-        evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
-        attempt.evidence_asset = evidence
-        attempt.save(update_fields=("evidence_asset", "updated_at"))
-
-        enqueue_event(
-            topic="evidence.other_ready",
-            aggregate_type="GenericExtractionAttempt",
-            aggregate_id=attempt.id,
-            message_key=f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}",
-            correlation_id=attempt.run_source_item.run_id,
-            payload={
-                "run_id": str(attempt.run_source_item.run_id),
-                "run_source_item_id": str(attempt.run_source_item_id),
-                "source_item_id": str(attempt.source_item_id),
-                "generic_extraction_attempt_id": str(attempt.id),
-                "evidence_asset_id": str(evidence.id),
-                "engine": attempt.engine,
-                "locator_type": evidence.locator_type,
-                "validation_mode": attempt.validation_mode,
-                "result_checksum": attempt.result_checksum,
-                "low_confidence_reasons_hash": attempt.low_confidence_reasons_hash,
-                "calibration_profile_key": attempt.calibration_profile_key,
-                "calibration_profile_version": attempt.calibration_profile_version,
-                "calibration_profile_hash": attempt.calibration_profile_hash,
-                "extraction_fingerprint": attempt.extraction_fingerprint,
-            },
-        )
-
+        legacy_info = None
         if profile.engine == ExtractionEngine.LEGACY_HWP:
             converted_path = Path(first.object_path or "")
             if not converted_path.is_file():
@@ -607,27 +567,123 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 checksum_sha256=converted_checksum,
                 metadata={"generic_attempt_id": str(attempt.id)},
             )
-            evidence.object_key = info.key
-            evidence.object_version = info.version_id or info.etag or converted_checksum
-            evidence.mime_type = "application/pdf"
-            evidence.byte_size = len(converted_data)
-            evidence.checksum = converted_checksum
-            evidence.save(update_fields=(
-                "object_key", "object_version", "mime_type", "byte_size", "checksum", "updated_at"
-            ))
-            document = DocumentExtraction.objects.create(
-                run_source_item=attempt.run_source_item,
-                source_item=attempt.source_item,
-                input_asset=evidence,
-                input_object_key=info.key,
-                input_object_version=info.version_id or info.etag or converted_checksum,
-                input_kind=DocumentInputKind.PDF,
-                input_mime_type="application/pdf",
-                input_checksum=converted_checksum,
-                input_page_count=1,
-                expected_page_indices=[0],
+            legacy_info = (info, converted_checksum, len(converted_data))
+
+        with transaction.atomic():
+            attempt = GenericExtractionAttempt.objects.select_for_update().select_related(
+                "run_source_item__run",
+                "run_source_item__source_snapshot__source",
+                "source_item",
+                "input_asset",
+                "extraction_profile_snapshot",
+            ).get(pk=attempt_id)
+            if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
+                return attempt
+            attempt.state = (
+                ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
             )
-            transaction.on_commit(lambda: process_paddleocr_document.delay(str(document.id)))
+            attempt.result_checksum = result.checksum_sha256
+            attempt.low_confidence_reasons_hash = canonical_hash(reasons) if reasons else None
+            if reason_info:
+                attempt.low_confidence_reasons_object_key = reason_info.key
+                attempt.low_confidence_reasons_object_version = (
+                    reason_info.version_id or reason_info.etag
+                )
+            attempt.finished_at = timezone.now()
+            attempt.full_clean()
+            attempt.save()
+
+            manual = attempt.state == ExtractionState.LOW_CONFIDENCE
+            rights = _rights(attempt.run_source_item)
+            storage_fields = {}
+            if legacy_info:
+                info, converted_checksum, converted_size = legacy_info
+                storage_fields = {
+                    "object_key": info.key,
+                    "object_version": info.version_id or info.etag or converted_checksum,
+                    "mime_type": "application/pdf",
+                    "byte_size": converted_size,
+                    "checksum": converted_checksum,
+                }
+            evidence = EvidenceAsset.objects.create(
+                source_item=attempt.source_item,
+                origin_run_source_item=attempt.run_source_item,
+                derivation_type=EvidenceDerivationType.OTHER,
+                generic_extraction_attempt=attempt,
+                parent_asset=attempt.input_asset,
+                kind=kind,
+                locator_type=first.locator_type,
+                locator=dict(first.locator),
+                extracted_text=text or None,
+                structured_data=structured,
+                extraction_method=profile.engine,
+                extractor_version=profile.extractor_version,
+                extraction_config_hash=profile.config_hash,
+                validation_mode=profile.validation_mode,
+                extraction_result_checksum=attempt.result_checksum,
+                calibration_profile_key=profile.calibration_profile_key,
+                calibration_profile_version=profile.calibration_profile_version,
+                calibration_profile_hash=profile.calibration_profile_hash,
+                confidence=(
+                    first.confidence
+                    if profile.validation_mode == GenericValidationMode.CALIBRATED
+                    else None
+                ),
+                low_confidence_reasons=reasons,
+                evidence_content_hash=content_hash,
+                review_subject_hash="0" * 64,
+                review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
+                manual_review_required=manual,
+                alt_text=first.alt_text,
+                **storage_fields,
+                **rights,
+            )
+            evidence.review_subject_hash = calculate_review_subject_hash(evidence)
+            evidence.publishable = calculate_publishable(evidence)
+            evidence.full_clean()
+            evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
+            attempt.evidence_asset = evidence
+            attempt.save(update_fields=("evidence_asset", "updated_at"))
+
+            enqueue_event(
+                topic="evidence.other_ready",
+                aggregate_type="GenericExtractionAttempt",
+                aggregate_id=attempt.id,
+                message_key=f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}",
+                correlation_id=attempt.run_source_item.run_id,
+                payload={
+                    "run_id": str(attempt.run_source_item.run_id),
+                    "run_source_item_id": str(attempt.run_source_item_id),
+                    "source_item_id": str(attempt.source_item_id),
+                    "generic_extraction_attempt_id": str(attempt.id),
+                    "evidence_asset_id": str(evidence.id),
+                    "engine": attempt.engine,
+                    "locator_type": evidence.locator_type,
+                    "validation_mode": attempt.validation_mode,
+                    "result_checksum": attempt.result_checksum,
+                    "low_confidence_reasons_hash": attempt.low_confidence_reasons_hash,
+                    "calibration_profile_key": attempt.calibration_profile_key,
+                    "calibration_profile_version": attempt.calibration_profile_version,
+                    "calibration_profile_hash": attempt.calibration_profile_hash,
+                    "extraction_fingerprint": attempt.extraction_fingerprint,
+                },
+            )
+
+            if legacy_info:
+                info, converted_checksum, _ = legacy_info
+                document = DocumentExtraction.objects.create(
+                    run_source_item=attempt.run_source_item,
+                    source_item=attempt.source_item,
+                    input_asset=evidence,
+                    input_object_key=info.key,
+                    input_object_version=info.version_id or info.etag or converted_checksum,
+                    input_kind=DocumentInputKind.PDF,
+                    input_mime_type="application/pdf",
+                    input_checksum=converted_checksum,
+                    input_page_count=1,
+                    expected_page_indices=[0],
+                )
+                _enqueue_document_extraction(document)
     return attempt
 
 
@@ -641,35 +697,37 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
     raw_asset, info = _persist_attachment(run_source_item, attachment, data, mime_type, filename)
     suffix = Path(filename).suffix.lower()
     if mime_type == "application/pdf":
-        document = DocumentExtraction.objects.create(
-            run_source_item=run_source_item,
-            source_item=run_source_item.source_item,
-            input_asset=raw_asset,
-            input_object_key=info.key,
-            input_object_version=info.version_id or info.etag or raw_asset.checksum,
-            input_kind=DocumentInputKind.PDF,
-            input_mime_type=mime_type,
-            input_checksum=raw_asset.checksum,
-            input_page_count=1,
-            expected_page_indices=[0],
-        )
-        transaction.on_commit(lambda: process_paddleocr_document.delay(str(document.id)))
+        with transaction.atomic():
+            document = DocumentExtraction.objects.create(
+                run_source_item=run_source_item,
+                source_item=run_source_item.source_item,
+                input_asset=raw_asset,
+                input_object_key=info.key,
+                input_object_version=info.version_id or info.etag or raw_asset.checksum,
+                input_kind=DocumentInputKind.PDF,
+                input_mime_type=mime_type,
+                input_checksum=raw_asset.checksum,
+                input_page_count=1,
+                expected_page_indices=[0],
+            )
+            _enqueue_document_extraction(document)
         return
     if mime_type in {"image/png", "image/jpeg", "image/tiff"}:
-        document = DocumentExtraction.objects.create(
-            run_source_item=run_source_item,
-            source_item=run_source_item.source_item,
-            input_asset=raw_asset,
-            input_object_key=info.key,
-            input_object_version=info.version_id or info.etag or raw_asset.checksum,
-            input_kind=DocumentInputKind.STANDALONE_IMAGE,
-            input_mime_type=mime_type,
-            input_frame_count=1,
-            input_checksum=raw_asset.checksum,
-            input_page_count=1,
-            expected_page_indices=[0],
-        )
-        transaction.on_commit(lambda: process_paddleocr_document.delay(str(document.id)))
+        with transaction.atomic():
+            document = DocumentExtraction.objects.create(
+                run_source_item=run_source_item,
+                source_item=run_source_item.source_item,
+                input_asset=raw_asset,
+                input_object_key=info.key,
+                input_object_version=info.version_id or info.etag or raw_asset.checksum,
+                input_kind=DocumentInputKind.STANDALONE_IMAGE,
+                input_mime_type=mime_type,
+                input_frame_count=1,
+                input_checksum=raw_asset.checksum,
+                input_page_count=1,
+                expected_page_indices=[0],
+            )
+            _enqueue_document_extraction(document)
         return
     engine = None
     preferred = None
@@ -715,7 +773,6 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
 
 @shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
 def process_document_extraction(self, document_id: str):
-    run_id = None
     try:
         run_id = str(
             DocumentExtraction.objects.values_list("run_source_item__run_id", flat=True).get(pk=document_id)
@@ -723,19 +780,18 @@ def process_document_extraction(self, document_id: str):
         document = _run_document_extraction(document_id)
         return {"documentExtractionId": str(document.id), "state": document.state}
     except ExtractorError as exc:
-        DocumentExtraction.objects.filter(pk=document_id).update(
-            state=ExtractionState.FAILED,
-            document_complete=False,
-            error_code=exc.code,
-            error_detail_redacted=exc.detail_redacted,
-            finished_at=timezone.now(),
-        )
+        with transaction.atomic():
+            DocumentExtraction.objects.filter(pk=document_id).update(
+                state=ExtractionState.FAILED,
+                document_complete=False,
+                error_code=exc.code,
+                error_detail_redacted=exc.detail_redacted,
+                finished_at=timezone.now(),
+            )
+            _enqueue_finalize(run_id, f"document-failed:{document_id}")
         if exc.retryable:
             raise TimeoutError(exc.detail_redacted) from exc
         return {"documentExtractionId": str(document_id), "state": "failed", "errorCode": exc.code}
-    finally:
-        if run_id:
-            finalize_run_evidence.delay(run_id)
 
 
 @shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
@@ -746,7 +802,6 @@ def process_paddleocr_document(self, document_id: str):
 
 @shared_task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=2)
 def process_generic_extraction(self, attempt_id: str):
-    run_id = None
     try:
         run_id = str(
             GenericExtractionAttempt.objects.values_list("run_source_item__run_id", flat=True).get(pk=attempt_id)
@@ -754,18 +809,17 @@ def process_generic_extraction(self, attempt_id: str):
         attempt = _run_generic_extraction(attempt_id)
         return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
     except ExtractorError as exc:
-        GenericExtractionAttempt.objects.filter(pk=attempt_id).update(
-            state=ExtractionState.FAILED,
-            error_code=exc.code,
-            error_detail_redacted=exc.detail_redacted,
-            finished_at=timezone.now(),
-        )
+        with transaction.atomic():
+            GenericExtractionAttempt.objects.filter(pk=attempt_id).update(
+                state=ExtractionState.FAILED,
+                error_code=exc.code,
+                error_detail_redacted=exc.detail_redacted,
+                finished_at=timezone.now(),
+            )
+            _enqueue_finalize(run_id, f"generic-failed:{attempt_id}")
         if exc.retryable:
             raise TimeoutError(exc.detail_redacted) from exc
         return {"genericExtractionAttemptId": str(attempt_id), "state": "failed", "errorCode": exc.code}
-    finally:
-        if run_id:
-            finalize_run_evidence.delay(run_id)
 
 
 @shared_task
@@ -808,9 +862,13 @@ def finalize_run_evidence(run_id: str):
             "extractionFailures": failure_count,
         }
         run.save(update_fields=("state", "counters"))
-        transaction.on_commit(
-            lambda: __import__("apps.editorial.tasks", fromlist=["generate_run_draft"])
-            .generate_run_draft.delay(str(run.id))
+        enqueue_event(
+            event_type="article.draft_requested",
+            aggregate_type="collection_run",
+            aggregate_id=run.id,
+            job_id=run.id,
+            dedupe_key=f"article.draft_requested:{run.id}",
+            payload={"run_id": str(run.id)},
         )
         return {
             "runId": str(run.id), "state": run.state,

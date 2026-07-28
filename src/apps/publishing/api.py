@@ -5,6 +5,7 @@ from functools import wraps
 from typing import Any
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_protect
@@ -13,6 +14,7 @@ from django.views.decorators.http import require_http_methods
 from adapters.storage import S3ObjectStorage
 from wisdome_writer.domain.errors import Conflict, DomainError, InvalidInput
 from wisdome_writer.domain.hashing import sha256_hex
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import (
     Approval,
@@ -40,7 +42,6 @@ from .services import (
     start_blogger_oauth,
     update_target,
 )
-from .tasks import execute_publication_attempt, reconcile_publication_attempt, run_target_preflight_task
 
 
 def admin_api(view):
@@ -275,8 +276,17 @@ def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
 @admin_api
 @require_http_methods(["POST"])
 def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
-    job = run_target_preflight_task.delay(str(target_id))
-    return JsonResponse({"jobId": job.id, "state": "queued"}, status=202)
+    with transaction.atomic():
+        target = PublicationTarget.objects.select_for_update().get(id=target_id)
+        event = enqueue_event(
+            event_type="publication.preflight_requested",
+            aggregate_type="publication_target",
+            aggregate_id=target.id,
+            job_id=target.id,
+            dedupe_key=f"publication.preflight_requested:{target.id}:{target.current_snapshot_version}",
+            payload={"target_id": str(target.id), "channel": target.channel},
+        )
+    return JsonResponse({"jobId": str(event.id), "state": "queued"}, status=202)
 
 
 @admin_api
@@ -509,15 +519,29 @@ def publication_attempts(request: HttpRequest, publication_id: str) -> JsonRespo
 @admin_api
 @require_http_methods(["POST"])
 def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResponse:
-    from django.db import transaction
-
     with transaction.atomic():
-        row = PublicationAttempt.objects.select_for_update().get(id=attempt_id)
+        row = (
+            PublicationAttempt.objects.select_for_update()
+            .select_related("publication__target")
+            .get(id=attempt_id)
+        )
         if row.state in {
             PublicationAttempt.State.UNKNOWN_OUTCOME,
             PublicationAttempt.State.RECONCILING,
         }:
-            transaction.on_commit(lambda: reconcile_publication_attempt.delay(str(row.id)))
+            row.attempt_no += 1
+            row.save(update_fields=["attempt_no"])
+            enqueue_event(
+                event_type="publication.reconcile_requested",
+                aggregate_type="publication_attempt",
+                aggregate_id=row.id,
+                job_id=row.id,
+                dedupe_key=f"publication.reconcile_requested:{row.id}:{row.attempt_no}",
+                payload={
+                    "publication_attempt_id": str(row.id),
+                    "channel": row.publication.target.channel,
+                },
+            )
             action = "reconcile"
         elif row.state == PublicationAttempt.State.RETRYABLE_FAILED:
             row.state = PublicationAttempt.State.QUEUED
@@ -536,7 +560,17 @@ def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResp
                     "error_detail_redacted",
                 ]
             )
-            transaction.on_commit(lambda: execute_publication_attempt.delay(str(row.id)))
+            enqueue_event(
+                event_type="publication.requested",
+                aggregate_type="publication_attempt",
+                aggregate_id=row.id,
+                job_id=row.id,
+                dedupe_key=f"publication.requested:{row.id}:{row.attempt_no}",
+                payload={
+                    "publication_attempt_id": str(row.id),
+                    "channel": row.publication.target.channel,
+                },
+            )
             action = "retry"
         else:
             raise Conflict("재시도 가능 실패 또는 결과 불명 attempt만 안전하게 재개할 수 있습니다.")

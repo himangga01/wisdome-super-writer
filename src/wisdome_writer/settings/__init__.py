@@ -342,33 +342,40 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_ENABLE_UTC = True
-CELERY_TASK_DEFAULT_QUEUE = "default"
+CELERY_TASK_DEFAULT_QUEUE = "maintenance"
 CELERY_TASK_CREATE_MISSING_QUEUES = False
 CELERY_TASK_QUEUES = tuple(
     Queue(name)
     for name in (
-        "default",
-        "collect",
+        "collect.housing",
+        "collect.semiconductor",
+        "extract.document",
         "extract.generic",
         "extract.ocr.paddle",
-        "generate",
-        "publish",
+        "editorial",
+        "publish.media.wordpress",
+        "publish.wordpress",
+        "publish.blogger",
+        "reconcile",
+        "maintenance",
     )
 )
 CELERY_BEAT_SCHEDULE = {
-    "dispatch-due-schedules": {
-        "task": "apps.scheduling.tasks.dispatch_due_schedules_task",
-        "schedule": 60.0,
+    "dispatch-outbox": {
+        "task": "wisdome_writer.infrastructure.tasks.dispatch_outbox",
+        "schedule": 5.0,
+        "options": {"queue": "maintenance"},
     }
 }
 CELERY_TASK_ROUTES = {
     "apps.evidence.tasks.process_paddleocr_document": {"queue": "extract.ocr.paddle"},
-    "apps.collection.*": {"queue": "collect"},
+    "wisdome_writer.infrastructure.tasks.dispatch_outbox": {"queue": "maintenance"},
+    "apps.collection.*": {"queue": "collect.housing"},
     "apps.evidence.*": {"queue": "extract.generic"},
-    "apps.editorial.*": {"queue": "generate"},
-    "apps.publishing.*": {"queue": "publish"},
-    "apps.scheduling.*": {"queue": "default"},
-    "apps.audit.*": {"queue": "default"},
+    "apps.editorial.*": {"queue": "editorial"},
+    "apps.publishing.*": {"queue": "publish.wordpress"},
+    "apps.scheduling.*": {"queue": "maintenance"},
+    "apps.audit.*": {"queue": "maintenance"},
 }
 
 OBJECT_STORAGE_PRESIGN_TTL_SECONDS = int(os.getenv("OBJECT_STORAGE_PRESIGN_TTL_SECONDS", "300"))

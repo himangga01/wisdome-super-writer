@@ -414,10 +414,13 @@ def create_canary_run(
     )
     _enqueue_event(
         "publishing.target_canary.requested",
-        {"canaryRunId": str(run.id), "targetId": str(target.id)},
+        {
+            "canary_run_id": str(run.id),
+            "target_id": str(target.id),
+            "channel": target.channel,
+        },
         dedupe_key=f"target-canary:{run.id}",
     )
-    transaction.on_commit(lambda: _delay("apps.publishing.tasks.run_target_canary", str(run.id)))
     return run
 
 
@@ -1219,8 +1222,17 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
         attempt.publication.state = Publication.State.SCHEDULED
         attempt.publication.scheduled_for = eta
         attempt.publication.save(update_fields=["state", "scheduled_for", "updated_at"])
-    transaction.on_commit(
-        lambda: _delay("apps.publishing.tasks.execute_publication_attempt", str(attempt.id), eta=eta)
+    _enqueue_event(
+        "publication.requested",
+        {
+            "publication_attempt_id": str(attempt.id),
+            "channel": attempt.publication.target.channel,
+        },
+        dedupe_key=f"publication.requested:{attempt.id}:{attempt.attempt_no}",
+        aggregate_type="publication_attempt",
+        aggregate_id=attempt.id,
+        job_id=attempt.id,
+        available_at=eta,
     )
 
 
@@ -1564,8 +1576,16 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
         ).values_list("id", flat=True)
     )
     for attempt_id in dependent:
-        transaction.on_commit(
-            lambda value=str(attempt_id): _delay("apps.publishing.tasks.execute_publication_attempt", value)
+        _enqueue_event(
+            "publication.requested",
+            {
+                "publication_attempt_id": str(attempt_id),
+                "channel": ChannelCode.BLOGGER,
+            },
+            dedupe_key=f"publication.requested:{attempt_id}:1",
+            aggregate_type="publication_attempt",
+            aggregate_id=attempt_id,
+            job_id=attempt_id,
         )
 
 
@@ -1774,11 +1794,12 @@ def disconnect_target(
     _audit("publication_target.disconnected", target, data["expectedTargetConfigHash"], target.current_config_hash)
     _enqueue_event(
         "publishing.target_disconnect.requested",
-        {"decisionId": str(decision.id), "targetId": str(target.id)},
+        {
+            "decision_id": str(decision.id),
+            "target_id": str(target.id),
+            "channel": target.channel,
+        },
         dedupe_key=f"target-disconnect:{decision.id}",
-    )
-    transaction.on_commit(
-        lambda: _delay("apps.publishing.tasks.revoke_target_credentials", str(decision.id))
     )
     return decision
 
@@ -1809,24 +1830,31 @@ def _audit(action: str, entity: Any, before_hash: str | None, after_hash: str | 
         return
 
 
-def _enqueue_event(event_type: str, payload: dict[str, Any], *, dedupe_key: str) -> None:
-    try:
-        from wisdome_writer.infrastructure.outbox import enqueue_event
+def _enqueue_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    dedupe_key: str,
+    aggregate_type: str | None = None,
+    aggregate_id=None,
+    job_id=None,
+    available_at=None,
+) -> None:
+    from wisdome_writer.infrastructure.outbox import enqueue_event
 
-        aggregate_id = payload.get("targetId") or payload.get("canaryRunId") or payload.get("decisionId")
-        enqueue_event(
-            topic=event_type,
-            aggregate_type=event_type.split(".")[1] if "." in event_type else "publishing",
-            aggregate_id=uuid.UUID(str(aggregate_id)),
-            payload=payload,
-            message_key=dedupe_key,
-        )
-    except (ImportError, TypeError):
-        return
-
-
-def _delay(task_name: str, *args: Any, eta=None) -> None:
-    from celery import current_app
-
-    options = {"eta": eta} if eta else {}
-    current_app.send_task(task_name, args=list(args), **options)
+    resolved_id = (
+        aggregate_id
+        or payload.get("target_id")
+        or payload.get("canary_run_id")
+        or payload.get("decision_id")
+    )
+    enqueue_event(
+        event_type=event_type,
+        aggregate_type=aggregate_type
+        or (event_type.split(".")[1] if "." in event_type else "publishing"),
+        aggregate_id=uuid.UUID(str(resolved_id)),
+        job_id=job_id or resolved_id,
+        payload=payload,
+        dedupe_key=dedupe_key,
+        available_at=available_at,
+    )

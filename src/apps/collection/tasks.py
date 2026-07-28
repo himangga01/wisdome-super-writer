@@ -10,8 +10,4 @@ def execute_collection_run(self, run_id: str):
     if run.state not in {RunState.QUEUED, RunState.COLLECTING}:
         return {"runId": str(run.id), "state": run.state}
     run = collect_run(run)
-    if run.state == RunState.EXTRACTING:
-        from apps.evidence.tasks import process_run_evidence
-
-        process_run_evidence.delay(str(run.id))
     return {"runId": str(run.id), "state": run.state}

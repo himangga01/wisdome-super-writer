@@ -11,7 +11,7 @@ from django.utils import timezone
 from apps.accounts.services import consume_reauthentication_proof
 from apps.collection.models import CollectionRun, RunState
 from apps.collection.services import create_run
-from apps.collection.tasks import execute_collection_run
+from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import KillSwitchDecision, OperationalControl, Schedule, ScheduleDispatch
 
@@ -77,7 +77,14 @@ def dispatch_schedule(schedule_id, scheduled_for: datetime | None = None):
             run.save(update_fields=["requested_target_ids", "approval_mode"])
             dispatch.state = ScheduleDispatch.State.DISPATCHED
             dispatch.collection_run = run
-            transaction.on_commit(lambda value=str(run.id): execute_collection_run.delay(value))
+            enqueue_event(
+                event_type="run.requested",
+                aggregate_type="collection_run",
+                aggregate_id=run.id,
+                job_id=run.id,
+                dedupe_key=f"run.requested:{run.id}",
+                payload={"run_id": str(run.id), "topic_code": run.topic_code},
+            )
     dispatch.save()
     schedule.last_dispatched_at = scheduled_for
     schedule.next_run_at = calculate_next_run(schedule, scheduled_for)
@@ -127,7 +134,14 @@ def release_queued_dispatch(schedule_id):
     dispatch.state = ScheduleDispatch.State.DISPATCHED
     dispatch.reason_code = "released_after_terminal_run"
     dispatch.save(update_fields=["collection_run", "state", "reason_code"])
-    transaction.on_commit(lambda value=str(run.id): execute_collection_run.delay(value))
+    enqueue_event(
+        event_type="run.requested",
+        aggregate_type="collection_run",
+        aggregate_id=run.id,
+        job_id=run.id,
+        dedupe_key=f"run.requested:{run.id}",
+        payload={"run_id": str(run.id), "topic_code": run.topic_code},
+    )
     return dispatch
 
 
