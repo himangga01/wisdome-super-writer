@@ -31,7 +31,7 @@ T001~T033으로 재배치한다.
 
 - [X] T001 [P] DNS 재해석·사설 IP·redirect를 차단하고 streaming 크기·시간·메모리 제한과 URL 비밀 redaction을 제공하는 공통 outbound HTTP 보호 계층을 `src/wisdome_writer/infrastructure/http_safety.py`, `src/adapters/sources/http.py`, `src/apps/evidence/tasks.py`, `src/adapters/publishers/wordpress/client.py`에 구현
 - [X] T002 [P] Unicode NFC와 RFC 8785 JCS를 따르는 단일 canonical hash 구현으로 앱별 hash 함수를 통합하고 hash schema version을 `src/wisdome_writer/domain/hashing.py`, `src/apps/topics/services.py`, `src/apps/editorial/services.py`, `src/apps/audit/retention.py`에 적용
-- [ ] T003 [P] production 환경 변수 fail-fast, WSGI 실행, migration/static 시작 절차, dependency·container image 고정, DB·MinIO credential 교체, worker별 비밀 격리와 network 경계를 `src/wisdome_writer/settings/__init__.py`, `compose.yaml`, `deploy/containers/`, `pyproject.toml`, `.env.example`에 구현
+- [X] T003 [P] production 환경 변수 fail-fast, WSGI 실행, migration/static 시작 절차, dependency·container image 고정, DB·MinIO credential 교체, worker별 비밀 격리와 network 경계를 `src/wisdome_writer/settings/__init__.py`, `compose.yaml`, `deploy/containers/`, `pyproject.toml`, `.env.example`에 구현
 
 **Checkpoint**: 외부 입력과 production 실행 환경이 이후 기능에서 재사용할 수 있는 안전한
 기본 경계를 제공한다.
