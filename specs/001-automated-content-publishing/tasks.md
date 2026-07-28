@@ -29,7 +29,7 @@ T001~T033으로 재배치한다.
 **목적**: 외부 네트워크, hash, 배포 환경처럼 모든 사용자 스토리가 공유하는 실행 경계를
 먼저 고정한다.
 
-- [ ] T001 [P] DNS 재해석·사설 IP·redirect를 차단하고 streaming 크기·시간·메모리 제한과 URL 비밀 redaction을 제공하는 공통 outbound HTTP 보호 계층을 `src/wisdome_writer/infrastructure/http_safety.py`, `src/adapters/sources/http.py`, `src/apps/evidence/tasks.py`, `src/adapters/publishers/wordpress/client.py`에 구현
+- [X] T001 [P] DNS 재해석·사설 IP·redirect를 차단하고 streaming 크기·시간·메모리 제한과 URL 비밀 redaction을 제공하는 공통 outbound HTTP 보호 계층을 `src/wisdome_writer/infrastructure/http_safety.py`, `src/adapters/sources/http.py`, `src/apps/evidence/tasks.py`, `src/adapters/publishers/wordpress/client.py`에 구현
 - [ ] T002 [P] Unicode NFC와 RFC 8785 JCS를 따르는 단일 canonical hash 구현으로 앱별 hash 함수를 통합하고 hash schema version을 `src/wisdome_writer/domain/hashing.py`, `src/apps/topics/services.py`, `src/apps/editorial/services.py`, `src/apps/audit/retention.py`에 적용
 - [ ] T003 [P] production 환경 변수 fail-fast, WSGI 실행, migration/static 시작 절차, dependency·container image 고정, DB·MinIO credential 교체, worker별 비밀 격리와 network 경계를 `src/wisdome_writer/settings/__init__.py`, `compose.yaml`, `deploy/containers/`, `pyproject.toml`, `.env.example`에 구현
 
@@ -65,8 +65,8 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 저신뢰 핵심 값, 권리 불명 시각 자료와 속보 검증 미달 자료는 게시 가능 상태가 되면 안 된다.
 
 - [ ] T009 [US1] `TopicRegistryHead`, `SourceRegistryDecision`, `SourceRegistryMutation`과 immutable source snapshot·membership·CAS projection을 `src/apps/topics/models.py`, `src/apps/topics/services.py`, `src/apps/topics/api.py`, `src/apps/topics/urls.py`, `src/templates/admin_console/`에 구현하고 source/registry/check/membership/decision 계약 endpoint를 완성 (depends on T002, T004, T006, T007)
-- [ ] T010 [P] [US1] 청약홈·LH·공공데이터의 목록/상세/pagination/기간 필터, 첨부 원문, stable identity와 corrected/retracted/unavailable/restored 상태 수집을 `src/adapters/sources/housing/`, `src/adapters/sources/http.py`, `config/source-registry/housing_subscription.json`에 구현 (depends on T001, T009)
-- [ ] T011 [P] [US1] 정부·규제기관·거래소·기업 IR·신뢰 뉴스의 RSS+Atom·상세·pagination·기간 필터와 source tier·independence group·origin identity 수집을 `src/adapters/sources/semiconductor/`, `src/adapters/sources/http.py`, `config/source-registry/semiconductor_news.json`에 구현 (depends on T001, T009)
+- [ ] T010 [US1] 청약홈·LH·공공데이터의 목록/상세/pagination/기간 필터, 첨부 원문, stable identity와 corrected/retracted/unavailable/restored 상태 수집을 `src/adapters/sources/housing/`, `src/adapters/sources/http.py`, `config/source-registry/housing_subscription.json`에 구현 (depends on T001, T009)
+- [ ] T011 [US1] 정부·규제기관·거래소·기업 IR·신뢰 뉴스의 RSS+Atom·상세·pagination·기간 필터와 source tier·independence group·origin identity 수집을 `src/adapters/sources/semiconductor/`, `src/adapters/sources/http.py`, `config/source-registry/semiconductor_news.json`에 구현 (depends on T001, T009)
 - [ ] T012 [US1] robots·이용약관·license·허용 MIME·poll/rate limit·Retry-After·freshness·authority와 수집 실패 분류를 실제 요청 경로에서 강제하고 권리 근거 fallback을 제거하도록 `src/apps/topics/services.py`, `src/apps/collection/services.py`, `src/adapters/sources/http.py`, `config/source-registry/`를 정비 (depends on T001, T009, T010, T011)
 - [ ] T013 [US1] `EventClusterItem`, `EventClusterVerification`과 공고·사건 canonical identity, duplicate/conflict/exclusion decision, 독립 출처 검증, 청약 신규·정정 공고별 글 및 반도체 일일 요약·중요 속보 분기를 `src/apps/collection/`, `src/apps/editorial/models.py`, `src/apps/editorial/services.py`에 구현 (depends on T002, T009, T010, T011, T012)
 - [ ] T014 [P] [US1] 모든 extraction profile이 web·worker에서 동일하게 import되도록 PaddleOCR model manifest root·실제 checksum·S3 object version·runtime-network 차단·worker 시작 gate를 `config/extraction-profiles/`, `src/apps/evidence/profiles.py`, `src/apps/evidence/management/commands/`, `deploy/containers/paddleocr-worker/`, `compose.yaml`에 구현 (depends on T002, T003)
@@ -93,7 +93,7 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 - [ ] T020 [US2] intent 생성과 dispatch의 idempotency lookup을 CAS보다 먼저 수행하고 request-key payload hash, 동일 replay, 다른 payload 409, target ID 중복 거부와 target별 정확히 한 attempt 생성을 `src/apps/publishing/services.py`, `src/apps/publishing/api.py`에 구현 (depends on T005, T019)
 - [ ] T021 [US2] PublicationAttempt generation·lease·worker fencing·terminal retry aggregation과 action/content/state-aware reconcile을 구현해 중복 worker와 늦은 응답이 외부 쓰기나 최신 상태를 변경하지 못하도록 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/wordpress/client.py`, `src/adapters/publishers/blogger/client.py`를 정비 (depends on T020)
 - [ ] T022 [US2] `VisualPlacement`, `PublishedEvidenceSnapshot`, `PublishedVisualizationSnapshot`과 immutable revision binding, channel media manifest, WordPress media·Blogger public delivery, lease generation CAS와 orphan cleanup을 `src/apps/editorial/models.py`, `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`에 구현 (depends on T002, T018, T020, T021)
-- [ ] T023 [P] [US2] Blogger OAuth connect·token persistence·refresh·scope verification·revoke와 WordPress credential disconnect의 remote reconciliation을 `src/wisdome_writer/infrastructure/secrets.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/blogger/client.py`, `src/adapters/publishers/wordpress/client.py`에 구현 (depends on T001, T003, T004)
+- [ ] T023 [US2] Blogger OAuth connect·token persistence·refresh·scope verification·revoke와 WordPress credential disconnect의 remote reconciliation을 `src/wisdome_writer/infrastructure/secrets.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/blogger/client.py`, `src/adapters/publishers/wordpress/client.py`에 구현 (depends on T001, T003, T004)
 - [ ] T024 [US2] intent에 동결된 정확한 WordPress target/environment/publication URL만 Blogger render·dependency release·reconcile에서 사용하고 다른 target 또는 test URL 선택을 차단하도록 `src/apps/publishing/services.py`, `src/apps/publishing/automation.py`, `src/apps/publishing/corrections.py`를 정비 (depends on T020, T021, T022, T023)
 - [ ] T025 [US2] registry/profile/generator/editorial/publisher/credential material을 서버에서 직접 조회·검증하고 실제 implementation·secret version hash, 지정 pilot 결과, canary 원격 정리 reference와 recovery를 포함하는 자동발행 validation·activation gate를 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/apps/publishing/api.py`에 구현 (depends on T004, T009, T014, T018, T019, T021, T022, T023, T024)
 - [ ] T026 [US2] target 연결·preflight·OAuth·validation·activation·preview·approve/reject/revoke·dispatch·retry/reconcile·disconnect API와 관리자 UI를 OpenAPI의 path·schema·status·pagination에 맞춰 `src/apps/publishing/api.py`, `src/apps/publishing/urls.py`, `src/templates/admin_console/publishing/`, `src/static/admin_console/`에 완성 (depends on T007, T019, T020, T021, T022, T023, T024, T025)
@@ -115,8 +115,8 @@ unknown outcome을 안전하게 복구할 수 있다.
 
 - [ ] T027 [US3] schedule/version/registry/target/approval/activation material을 `ScheduleDispatch`에 불변으로 동결하고 run identity 충돌, mutable reread, duplicate tick transaction 오류와 queue-one locking을 `src/apps/scheduling/models.py`, `src/apps/scheduling/services.py`, `src/apps/scheduling/tasks.py`, `src/apps/publishing/automation.py`에서 제거 (depends on T002, T004, T005, T006, T009)
 - [ ] T028 [US3] worker의 stop 상태 재조회와 queued 작업 취소, run/step/channel terminal 집계, all-source failure 보존, queue-one 정상 해제, kill-switch payload idempotency와 선택 단계·target 재시도를 `src/apps/collection/`, `src/apps/evidence/tasks.py`, `src/apps/editorial/tasks.py`, `src/apps/publishing/tasks.py`, `src/apps/scheduling/services.py`에 구현 (depends on T005, T006, T020, T021, T027)
-- [ ] T029 [P] [US3] 원문 변경 감시 beat→관리자 verify/reject→새 revision·재검증→정확한 WordPress update/unpublish→Blogger 반영→정정/철회 이력·감사를 intent별 attempt 기준으로 `src/apps/editorial/corrections.py`, `src/apps/publishing/corrections.py`, `src/apps/editorial/tasks.py`, `src/apps/publishing/tasks.py`에 구현 (depends on T005, T006, T013, T018, T021, T022, T024, T028)
-- [ ] T030 [P] [US3] raw·draft·published snapshot·audit·public delivery·WordPress media 전체 category에 immutable preview item과 checksum/object-version precondition, hold dependency graph, 실제 S3/원격 객체 삭제와 tombstone을 `src/apps/audit/retention.py`, `src/apps/audit/models.py`, `src/apps/publishing/models.py`, `config/retention/default.json`에 구현 (depends on T005, T006, T009, T022, T029)
+- [ ] T029 [US3] 원문 변경 감시 beat→관리자 verify/reject→새 revision·재검증→정확한 WordPress update/unpublish→Blogger 반영→정정/철회 이력·감사를 intent별 attempt 기준으로 `src/apps/editorial/corrections.py`, `src/apps/publishing/corrections.py`, `src/apps/editorial/tasks.py`, `src/apps/publishing/tasks.py`에 구현 (depends on T005, T006, T013, T018, T021, T022, T024, T028)
+- [ ] T030 [US3] raw·draft·published snapshot·audit·public delivery·WordPress media 전체 category에 immutable preview item과 checksum/object-version precondition, hold dependency graph, 실제 S3/원격 객체 삭제와 tombstone을 `src/apps/audit/retention.py`, `src/apps/audit/models.py`, `src/apps/publishing/models.py`, `config/retention/default.json`에 구현 (depends on T005, T006, T009, T022, T029)
 - [ ] T031 [US3] schedule CRUD·expected-version CAS, kill switch, run stop·selective retry, correction 검증, retention preview/detail/items/approve/execute와 audit 조회 API·관리자 화면을 OpenAPI와 일치하도록 `src/apps/scheduling/api.py`, `src/apps/audit/api.py`, `src/apps/editorial/api.py`, `src/templates/admin_console/operations/`, `src/static/admin_console/operations.js`에 구현 (depends on T007, T027, T028, T029, T030)
 
 **Checkpoint**: 예약 실행, 운영 중지, 정정과 보존 정책을 관리자 화면에서 일관된 식별자와
@@ -148,9 +148,8 @@ unknown outcome을 안전하게 복구할 수 있다.
 
 - Setup: T001, T002, T003
 - Foundational: T004, T005, T007
-- US1: T010과 T011, 그리고 선행 조건을 충족한 T014
-- US2: T019 계열과 별도 파일 경계의 T023
-- US3: 공통 선행 조건을 충족한 T029와 T030
+- US1: T010 또는 T011과, 별도 추출 파일 경계의 T014
+- US2와 US3는 공통 service 파일과 명시적 의존성이 있으므로 현재 main 작업에서는 순차 실행한다.
 
 ### 출시 차단선
 
@@ -242,9 +241,8 @@ dependencies:
 parallel_groups:
   - ["T001", "T002", "T003"]
   - ["T004", "T005", "T007"]
-  - ["T010", "T011", "T014"]
-  - ["T019", "T023"]
-  - ["T029", "T030"]
+  - ["T010", "T014"]
+  - ["T011", "T014"]
 
 traceability:
   admin_security_and_credentials: ["FR-001", "FR-013", "FR-017", "CR-004", "T003", "T004", "T019", "T023", "T025"]
