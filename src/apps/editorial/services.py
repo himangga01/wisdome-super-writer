@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
-
 from django.db import transaction
 from django.utils import timezone
 
@@ -10,14 +7,9 @@ from adapters.generators import SourceGroundedTemplateGenerator
 from adapters.generators.base import EvidenceInput
 from apps.collection.models import CollectionRun, RunState
 from apps.evidence.models import EvidenceAsset
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
 
 from .models import ArticleRevision, Claim, ClaimEvidence, DraftArticle, GenerationAttempt, QualityCheck
-
-
-def _hash(value) -> str:
-    return hashlib.sha256(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-    ).hexdigest()
 
 
 def _article_type(topic_code: str) -> str:
@@ -42,20 +34,28 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
         )
         for row in evidence_rows
     ]
-    identity = _hash({"run": str(run.id), "topic": run.topic_code})
+    identity = canonical_hash(
+        {"run": str(run.id), "topic": run.topic_code},
+        schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+    )
     article, _ = DraftArticle.objects.get_or_create(
         article_identity_key=identity,
         defaults={"topic_code": run.topic_code, "article_type": _article_type(run.topic_code), "source_run": run},
     )
     if article.current_revision_id:
         return article
-    input_hash = _hash([item.__dict__ for item in inputs])
+    input_hash = canonical_hash(
+        [item.__dict__ for item in inputs],
+        schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+    )
     attempt = GenerationAttempt.objects.create(article=article, input_manifest_hash=input_hash)
     try:
         generated = SourceGroundedTemplateGenerator().generate(
             topic=run.topic_code, evidence=inputs, article_type=article.article_type
         )
-        claim_hash = _hash(generated.claims)
+        claim_hash = canonical_hash(
+            generated.claims, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+        )
         revision = ArticleRevision.objects.create(
             article=article,
             revision_no=1,
@@ -65,7 +65,10 @@ def build_source_grounded_draft(run: CollectionRun) -> DraftArticle:
             body_markdown=generated.body_markdown,
             input_manifest_hash=input_hash,
             claim_manifest_hash=claim_hash,
-            quality_manifest_hash=_hash({"policy": "source-grounded-v1", "claims": claim_hash}),
+            quality_manifest_hash=canonical_hash(
+                {"policy": "source-grounded-v1", "claims": claim_hash},
+                schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+            ),
         )
         evidence_by_id = {str(row.id): row for row in evidence_rows}
         for position, raw in enumerate(generated.claims):
@@ -118,9 +121,19 @@ def create_manual_revision(article: DraftArticle, *, title: str, summary: str, b
         summary=summary,
         body_markdown=body_markdown,
         provenance_kind="admin_edit",
-        input_manifest_hash=previous.input_manifest_hash if previous else _hash({}),
-        claim_manifest_hash=_hash({"requiresRevalidation": True}),
-        quality_manifest_hash=_hash({"policy": "manual-edit-v1"}),
+        input_manifest_hash=(
+            previous.input_manifest_hash
+            if previous
+            else canonical_hash({}, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
+        ),
+        claim_manifest_hash=canonical_hash(
+            {"requiresRevalidation": True},
+            schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+        ),
+        quality_manifest_hash=canonical_hash(
+            {"policy": "manual-edit-v1"},
+            schema_version=CANONICAL_HASH_SCHEMA_VERSION,
+        ),
         quality_state="pending",
         created_by=user,
     )

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
 
 from .models import (
     SourceDefinition,
@@ -16,11 +15,6 @@ from .models import (
     SourceRegistrySnapshot,
     TopicPolicy,
 )
-
-
-def canonical_hash(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -36,7 +30,9 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     topic = data["topicCode"]
     policy_material = data.get("policy", {})
-    policy_hash = canonical_hash(policy_material)
+    policy_hash = canonical_hash(
+        policy_material, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+    )
     TopicPolicy.objects.get_or_create(
         code=topic,
         version=int(data.get("policyVersion", 1)),
@@ -72,7 +68,7 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
             "rateLimitPerMinute": raw.get("rateLimitPerMinute", 10),
             "adapter": raw.get("adapter", "public_html"),
         }
-        config_hash = canonical_hash(config)
+        config_hash = canonical_hash(config, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
         snapshot, _ = SourceDefinitionSnapshot.objects.get_or_create(
             source=source,
             config_hash=config_hash,
@@ -84,7 +80,7 @@ def import_registry_manifest(path: str | Path) -> RegistryImportResult:
         {"sourceSnapshotId": str(s.id), "configHash": s.config_hash, "enabled": s.source.enabled}
         for s in sorted(snapshots, key=lambda row: str(row.source_id))
     ]
-    manifest_hash = canonical_hash(manifest)
+    manifest_hash = canonical_hash(manifest, schema_version=CANONICAL_HASH_SCHEMA_VERSION)
     registry, created = SourceRegistrySnapshot.objects.get_or_create(
         topic_code=topic,
         manifest_hash=manifest_hash,

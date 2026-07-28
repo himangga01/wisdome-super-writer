@@ -15,6 +15,7 @@ dependencies = [
   "python-dotenv>=1.1,<2",
   "boto3>=1.38,<2",
   "httpx>=0.28,<1",
+  "rfc8785>=0.1.4,<1",
   "croniter>=6,<7",
   "defusedxml>=0.7,<1",
   "lxml>=5.4,<7",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -10,14 +9,9 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_VERSION, canonical_hash
 
 from .models import RetentionBatch, RetentionBatchItem, RetentionHold
-
-
-def _hash(value) -> str:
-    return hashlib.sha256(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-    ).hexdigest()
 
 
 def load_retention_policy() -> dict:
@@ -66,10 +60,14 @@ def create_retention_preview(*, request_key: str, user) -> RetentionBatch:
     ]
     batch = RetentionBatch.objects.create(
         policy_version=int(policy["version"]),
-        policy_hash=_hash(policy),
+        policy_hash=canonical_hash(
+            policy, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+        ),
         cutoff_at=raw_cutoff,
         request_key=request_key,
-        preview_manifest_hash=_hash(manifest),
+        preview_manifest_hash=canonical_hash(
+            manifest, schema_version=CANONICAL_HASH_SCHEMA_VERSION
+        ),
         counters={"candidate": len(candidates), "held": 0, "purged": 0},
         requested_by=user,
     )
