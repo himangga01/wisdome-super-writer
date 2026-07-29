@@ -69,9 +69,11 @@ def begin_step_observation(
     task_id = current_task_id()
     if task_id:
         step.worker_task_id = str(task_id)[:255]
-    step.retry_count = max(
-        step.retry_count,
-        max(step.attempt_no - 1, 0),
+    step.retry_count = _bounded_count(
+        max(
+            step.retry_count,
+            step.attempt_no - 1,
+        )
     )
     step.started_at = step.started_at or started_at
     step.finished_at = None
@@ -99,9 +101,11 @@ def project_step_terminal_observation(
     task_id = current_task_id()
     if task_id:
         step.worker_task_id = str(task_id)[:255]
-    step.retry_count = max(
-        step.retry_count,
-        max(step.attempt_no - 1, 0),
+    step.retry_count = _bounded_count(
+        max(
+            step.retry_count,
+            step.attempt_no - 1,
+        )
     )
     step.finished_at = step.finished_at or finished_at
     step.duration_ms = elapsed_milliseconds(

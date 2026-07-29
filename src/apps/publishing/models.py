@@ -528,6 +528,10 @@ class PublicationAttempt(models.Model):
                 condition=Q(reconcile_attempt_no__lte=5),
                 name="ck_publication_reconcile_attempt_no_lte_5",
             ),
+            models.CheckConstraint(
+                condition=Q(attempt_no__gte=1, attempt_no__lte=5),
+                name="ck_publication_attempt_no_1_5",
+            ),
         ]
 
 
@@ -570,8 +574,11 @@ class PublicationExecutionObservation(models.Model):
                 name="uq_publication_execution_observation",
             ),
             models.CheckConstraint(
-                condition=Q(execution_attempt_no__gte=1),
-                name="ck_publication_execution_attempt_no_gte_1",
+                condition=Q(
+                    execution_attempt_no__gte=1,
+                    execution_attempt_no__lte=5,
+                ),
+                name="ck_publication_execution_attempt_no_1_5",
             ),
         ]
 

@@ -40,6 +40,20 @@ def _duration_ms(started_at, finished_at):
     return int((finished_at - started_at).total_seconds() * 1000)
 
 
+def _bounded_count(value):
+    return min(max(int(value), 0), 2147483647)
+
+
+def _validated_attempt_no(attempt):
+    attempt_no = attempt.attempt_no
+    if type(attempt_no) is not int or not 1 <= attempt_no <= 5:
+        raise RuntimeError(
+            "publication observation backfill requires attempt_no in "
+            f"1..5 for attempt {attempt.pk}"
+        )
+    return attempt_no
+
+
 def _recovery_state(state):
     if state == "succeeded":
         return "not_required"
@@ -104,71 +118,11 @@ def backfill_publication_observations(apps, schema_editor):
         "PublicationReconcileGeneration",
     )
     Event = apps.get_model("infrastructure", "OutboxMessage")
-    db_alias = schema_editor.connection.alias
-
-    generations = Generation.objects.using(db_alias).select_related(
-        "source_event"
+    Receipt = apps.get_model(
+        "infrastructure",
+        "OutboxConsumerReceipt",
     )
-    for generation in generations.iterator():
-        executed = (
-            generation.state == "completed"
-            and bool(generation.result_identity)
-            and bool(generation.result_state)
-        )
-        duration_ms = (
-            _duration_ms(
-                generation.started_at,
-                generation.completed_at,
-            )
-            if executed
-            else None
-        )
-        error_code = (
-            generation.source_event.last_error_code or ""
-        )[:100]
-        delivery_failed = (
-            generation.state == "completed"
-            and not executed
-            and (
-                generation.source_event.status == "dead_letter"
-                or bool(error_code)
-            )
-        )
-        if executed:
-            recovery_state = _recovery_state(generation.result_state)
-            impact = _terminal_impact(
-                "reconcile",
-                generation.result_state,
-                error_code,
-            )
-        elif generation.state != "completed":
-            recovery_state = "reconciling"
-            impact = {}
-        elif delivery_failed:
-            recovery_state = "manual_required"
-            impact = _terminal_impact(
-                "reconcile_delivery",
-                "delivery_failed",
-                error_code,
-                scope="publication_delivery",
-            )
-        else:
-            recovery_state = "stopped"
-            impact = {}
-        Generation.objects.using(db_alias).filter(
-            pk=generation.pk
-        ).update(
-            correlation_id=generation.source_event.correlation_id,
-            duration_ms=duration_ms,
-            error_code=error_code,
-            terminal_impact=impact,
-            recovery_state=recovery_state,
-            next_recovery_at=(
-                generation.not_before
-                if generation.state == "started"
-                else None
-            ),
-        )
+    db_alias = schema_editor.connection.alias
 
     attempts = (
         Attempt.objects.using(db_alias)
@@ -198,11 +152,12 @@ def backfill_publication_observations(apps, schema_editor):
                 or intent.id
             )
         )
+        attempt_no = _validated_attempt_no(attempt)
         duration_ms = _duration_ms(
             attempt.started_at,
             attempt.finished_at,
         )
-        completed_execution_retries = max(attempt.attempt_no - 1, 0)
+        completed_execution_retries = max(attempt_no - 1, 0)
         if attempt.state in {
             "queued",
             "running",
@@ -210,14 +165,119 @@ def backfill_publication_observations(apps, schema_editor):
             "stale",
         }:
             completed_execution_retries = max(
-                attempt.attempt_no - 2,
+                attempt_no - 2,
                 0,
             )
         attempt_generations = list(
             Generation.objects.using(db_alias)
+            .select_related("source_event")
             .filter(publication_attempt_id=attempt.id)
             .order_by("generation")
         )
+        generation_event_ids = [
+            generation.source_event_id
+            for generation in attempt_generations
+        ]
+        delivery_dead_letter_event_ids = set(
+            Receipt.objects.using(db_alias)
+            .filter(
+                event_id__in=generation_event_ids,
+                consumer_name="publication-reconcile",
+                state="dead_letter",
+            )
+            .values_list("event_id", flat=True)
+        )
+        parent_recovery_state = _recovery_state(attempt.state)
+        parent_terminal = attempt.state in ATTEMPT_TERMINAL_STATES
+        for index, generation in enumerate(attempt_generations):
+            successor = (
+                attempt_generations[index + 1]
+                if index + 1 < len(attempt_generations)
+                else None
+            )
+            executed = (
+                generation.state == "completed"
+                and bool(generation.result_identity)
+                and bool(generation.result_state)
+            )
+            generation_duration_ms = (
+                _duration_ms(
+                    generation.started_at,
+                    generation.completed_at,
+                )
+                if executed
+                else None
+            )
+            generation_error_code = (
+                generation.source_event.last_error_code or ""
+            )[:100]
+            delivery_failed = (
+                generation.state == "completed"
+                and not executed
+                and (
+                    generation.source_event.status == "dead_letter"
+                    or generation.source_event_id
+                    in delivery_dead_letter_event_ids
+                    or bool(generation_error_code)
+                )
+            )
+            if executed:
+                generation_impact = _terminal_impact(
+                    "reconcile",
+                    generation.result_state,
+                    generation_error_code,
+                )
+            elif delivery_failed:
+                generation_impact = _terminal_impact(
+                    "reconcile_delivery",
+                    "delivery_failed",
+                    generation_error_code,
+                    scope="publication_delivery",
+                )
+            else:
+                generation_impact = {}
+
+            if successor is not None:
+                generation_recovery_state = "automatic_retry"
+                generation_next_recovery_at = successor.not_before
+            elif parent_terminal:
+                generation_recovery_state = parent_recovery_state
+                generation_next_recovery_at = None
+            elif generation.state != "completed":
+                if generation.worker_task_id:
+                    generation_recovery_state = "reconciling"
+                    generation_next_recovery_at = None
+                else:
+                    generation_recovery_state = "automatic_retry"
+                    generation_next_recovery_at = generation.not_before
+            elif delivery_failed:
+                generation_recovery_state = "manual_required"
+                generation_next_recovery_at = None
+            else:
+                generation_recovery_state = parent_recovery_state
+                if generation_recovery_state == "automatic_retry":
+                    generation_recovery_state = "reconciling"
+                generation_next_recovery_at = None
+
+            generation.correlation_id = (
+                generation.source_event.correlation_id
+            )
+            generation.duration_ms = generation_duration_ms
+            generation.error_code = generation_error_code
+            generation.terminal_impact = generation_impact
+            generation.recovery_state = generation_recovery_state
+            generation.next_recovery_at = generation_next_recovery_at
+            Generation.objects.using(db_alias).filter(
+                pk=generation.pk
+            ).update(
+                correlation_id=generation.correlation_id,
+                duration_ms=generation.duration_ms,
+                error_code=generation.error_code,
+                terminal_impact=generation.terminal_impact,
+                recovery_state=generation.recovery_state,
+                next_recovery_at=generation.next_recovery_at,
+            )
+
         executed_generations = [
             generation
             for generation in attempt_generations
@@ -228,11 +288,19 @@ def backfill_publication_observations(apps, schema_editor):
             )
         ]
         completed_reconciles = len(executed_generations)
-        recovery_state = _recovery_state(attempt.state)
+        latest_generation = (
+            attempt_generations[-1] if attempt_generations else None
+        )
+        latest_execution = (
+            executed_generations[-1] if executed_generations else None
+        )
+        recovery_state = parent_recovery_state
+        if latest_generation is not None and not parent_terminal:
+            recovery_state = latest_generation.recovery_state
         direct_execution_terminal = (
             attempt.state in DIRECT_EXECUTION_RESULT_STATES
             and duration_ms is not None
-            and not executed_generations
+            and not attempt_generations
         )
         known_durations = [
             generation.duration_ms
@@ -244,52 +312,81 @@ def backfill_publication_observations(apps, schema_editor):
         aggregate_duration_ms = (
             sum(known_durations) if known_durations else None
         )
-        if executed_generations:
-            latest_execution = executed_generations[-1]
-            impact = _terminal_impact(
-                "reconcile",
-                latest_execution.result_state,
-                latest_execution.error_code,
-            )
+        latest_delivery_matches_parent = bool(
+            latest_generation is not None
+            and latest_generation.terminal_impact.get("scope")
+            == "publication_delivery"
+            and attempt.state == "manual_required"
+            and bool(attempt.error_code)
+            and attempt.error_code == latest_generation.error_code
+        )
+        if latest_delivery_matches_parent:
+            impact = latest_generation.terminal_impact
         elif direct_execution_terminal:
             impact = _terminal_impact(
                 "execution",
                 attempt.state,
                 attempt.error_code,
             )
-        elif (
-            attempt.state in ATTEMPT_TERMINAL_STATES
-            and duration_ms is not None
-        ):
+        elif attempt.state in ATTEMPT_TERMINAL_STATES:
+            if (
+                latest_execution is not None
+                and latest_execution is latest_generation
+                and latest_execution.result_state == attempt.state
+            ):
+                impact = _terminal_impact(
+                    "reconcile",
+                    latest_execution.result_state,
+                    latest_execution.error_code,
+                )
+            else:
+                impact = _terminal_impact(
+                    "aggregate",
+                    attempt.state,
+                    attempt.error_code,
+                )
+        elif latest_execution is not None:
             impact = _terminal_impact(
-                "aggregate",
-                attempt.state,
-                attempt.error_code,
+                "reconcile",
+                latest_execution.result_state,
+                latest_execution.error_code,
             )
         else:
             impact = {}
-        Attempt.objects.using(db_alias).filter(pk=attempt.pk).update(
-            correlation_id=correlation_id,
-            duration_ms=aggregate_duration_ms,
-            retry_count=(
+        next_recovery_at = None
+        if recovery_state in {"automatic_retry", "reconciling"}:
+            next_recovery_at = attempt.next_retry_at
+            if (
+                next_recovery_at is None
+                and latest_generation is not None
+                and latest_generation.state == "started"
+            ):
+                next_recovery_at = latest_generation.next_recovery_at
+        attempt_updates = {
+            "correlation_id": correlation_id,
+            "duration_ms": aggregate_duration_ms,
+            "retry_count": _bounded_count(
                 completed_execution_retries + completed_reconciles
             ),
-            terminal_impact=impact,
-            recovery_state=recovery_state,
-            next_recovery_at=(
-                attempt.next_retry_at
-                if recovery_state
-                in {"automatic_retry", "reconciling"}
-                else None
-            ),
+            "terminal_impact": impact,
+            "recovery_state": recovery_state,
+            "next_recovery_at": next_recovery_at,
+        }
+        if attempt.state == "running":
+            attempt_updates["finished_at"] = None
+        Attempt.objects.using(db_alias).filter(pk=attempt.pk).update(
+            **attempt_updates,
         )
 
         if attempt.started_at is None:
             continue
-        open_execution = attempt.state == "running"
+        open_execution = (
+            attempt.state == "running"
+            and not attempt_generations
+        )
         if not open_execution and not direct_execution_terminal:
             continue
-        execution_attempt_no = attempt.attempt_no
+        execution_attempt_no = attempt_no
         if attempt.state == "retryable_failed" and execution_attempt_no > 1:
             execution_attempt_no -= 1
         source_event = _matching_publication_event(
@@ -497,9 +594,10 @@ class Migration(migrations.Migration):
                     ),
                     models.CheckConstraint(
                         condition=models.Q(
-                            ("execution_attempt_no__gte", 1)
+                            ("execution_attempt_no__gte", 1),
+                            ("execution_attempt_no__lte", 5),
                         ),
-                        name="ck_publication_execution_attempt_no_gte_1",
+                        name="ck_publication_execution_attempt_no_1_5",
                     ),
                 ],
             },
@@ -507,6 +605,16 @@ class Migration(migrations.Migration):
         migrations.RunPython(
             backfill_publication_observations,
             migrations.RunPython.noop,
+        ),
+        migrations.AddConstraint(
+            model_name="publicationattempt",
+            constraint=models.CheckConstraint(
+                condition=models.Q(
+                    ("attempt_no__gte", 1),
+                    ("attempt_no__lte", 5),
+                ),
+                name="ck_publication_attempt_no_1_5",
+            ),
         ),
         migrations.AlterField(
             model_name="publicationattempt",

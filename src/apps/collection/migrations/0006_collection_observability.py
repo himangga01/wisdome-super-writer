@@ -120,7 +120,7 @@ def backfill_collection_observability(apps, schema_editor):
                 step.started_at,
                 step.finished_at,
             ),
-            retry_count=max(step.attempt_no - 1, 0),
+            retry_count=_bounded_count(step.attempt_no - 1),
             retry_at=None,
             terminal_impact=terminal_impact,
             recovery_state=(

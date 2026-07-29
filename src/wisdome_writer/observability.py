@@ -17,7 +17,7 @@ from typing import Any
 from django.http import HttpRequest, HttpResponse
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$")
-_TERMINAL_IMPACT_FIELDS = {
+_TERMINAL_IMPACT_FIELDS = (
     "scope",
     "stage",
     "step",
@@ -26,14 +26,16 @@ _TERMINAL_IMPACT_FIELDS = {
     "count",
     "affected_count",
     "error_code",
-}
+)
 _MAX_OBSERVATION_COUNT = 9_007_199_254_740_991
+_MAX_LOG_INPUT_LENGTH = 4_096
 _MAX_LOG_MESSAGE_LENGTH = 512
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b("
-    r"authorization|cookie|set-cookie|password|passwd|secret|token|"
-    r"api[-_]?key|client[-_]?secret"
-    r")\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)[\"']?\b("
+    r"authorization|cookie|set-cookie|password|passwd|credential|credentials|"
+    r"access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|"
+    r"private[-_]?key|api[-_]?key|client[-_]?secret|secret|token"
+    r")\b[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
 )
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _URI_VALUE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s]+")
@@ -87,6 +89,11 @@ def _resolved_correlation_uuid(
 
 def _safe_identifier(value: Any) -> str | None:
     if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(
+        value,
+        (str, int, uuid.UUID),
+    ):
         return None
     candidate = str(value)
     if _SAFE_IDENTIFIER.fullmatch(candidate) is None:
@@ -253,8 +260,10 @@ def _safe_terminal_impact(value: Mapping[str, Any] | None) -> dict[str, Any] | N
     if not isinstance(value, Mapping):
         return None
     impact: dict[str, Any] = {}
-    for key, item in value.items():
-        if key not in _TERMINAL_IMPACT_FIELDS:
+    for key in _TERMINAL_IMPACT_FIELDS:
+        try:
+            item = value.get(key)
+        except Exception:
             continue
         if key in {"count", "affected_count"}:
             safe_count = _safe_integer(item)
@@ -423,7 +432,7 @@ class SafeJsonFormatter(logging.Formatter):
         # Deliberately omit ``record.args``: arbitrary library log arguments can
         # contain response bodies, URLs, credentials, or exception text.
         if isinstance(record.msg, str):
-            message = record.msg
+            message = record.msg[:_MAX_LOG_INPUT_LENGTH]
         else:
             message = record.msg.__class__.__name__
         message = _URI_VALUE.sub("[uri]", message)
@@ -503,6 +512,7 @@ class SafeJsonFormatter(logging.Formatter):
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
+            allow_nan=False,
         )
 
 

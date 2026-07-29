@@ -61,6 +61,24 @@ def attach_observation_headers(
         attempt=headers.get("attempt"),
     )
     headers.update(propagated)
+
+
+@signals.after_task_publish.connect(weak=False)
+def record_task_published(
+    sender=None,
+    headers=None,
+    **kwargs,
+) -> None:
+    if not isinstance(headers, dict):
+        return
+    propagated = build_observation_headers(
+        correlation_id=headers.get("correlation_id"),
+        job_id=headers.get("job_id"),
+        entity_type=headers.get("entity_type"),
+        entity_id=headers.get("entity_id"),
+        operation=headers.get("operation"),
+        attempt=headers.get("attempt"),
+    )
     log_lifecycle_event(
         logger,
         event="celery.task.published",

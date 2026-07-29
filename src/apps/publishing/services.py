@@ -3310,6 +3310,7 @@ def _project_reconciling_locked(
     attempt: PublicationAttempt,
     *,
     update_counter: bool = False,
+    recovery_state: str = PublicationRecoveryState.AUTOMATIC_RETRY,
 ) -> None:
     terminal_states = {
         PublicationAttempt.State.SUCCEEDED,
@@ -3320,7 +3321,7 @@ def _project_reconciling_locked(
     if attempt.state in terminal_states:
         return
     attempt.state = PublicationAttempt.State.RECONCILING
-    attempt.recovery_state = PublicationRecoveryState.AUTOMATIC_RETRY
+    attempt.recovery_state = recovery_state
     attempt_fields = ["state", "recovery_state", "next_recovery_at"]
     if update_counter:
         attempt_fields.append("reconcile_attempt_no")
@@ -3480,8 +3481,18 @@ def _enqueue_reconcile_locked(
                     ),
                 )
             else:
-                attempt.next_recovery_at = current.not_before
-                _project_reconciling_locked(attempt)
+                active = bool(current.worker_task_id)
+                attempt.next_recovery_at = (
+                    None if active else current.not_before
+                )
+                _project_reconciling_locked(
+                    attempt,
+                    recovery_state=(
+                        PublicationRecoveryState.RECONCILING
+                        if active
+                        else PublicationRecoveryState.AUTOMATIC_RETRY
+                    ),
+                )
             return current
     if attempt.state in {
         PublicationAttempt.State.SUCCEEDED,
@@ -3554,16 +3565,32 @@ def begin_attempt(
         PublicationAttempt.State.MANUAL_REQUIRED,
         PublicationAttempt.State.STALE,
     }:
-        require_audit_replay(
-            context=audit_context,
-            action="publication_attempt.finished",
+        replay = _worker_audit_replay(
+            audit_context,
             entity=attempt,
-            identity_key=(
-                f"{audit_context.event_key}:attempt-result:"
-                f"{attempt.attempt_no}"
+            candidates=(
+                (
+                    "publication_attempt.finished",
+                    (
+                        f"{audit_context.event_key}:attempt-result:"
+                        f"{attempt.attempt_no}"
+                    ),
+                    {"attempt": attempt.attempt_no},
+                ),
+                (
+                    "publication_attempt.reconcile_started",
+                    (
+                        f"{audit_context.event_key}:delivery-redelivery:"
+                        f"{attempt.attempt_no}"
+                    ),
+                    {"attempt": attempt.attempt_no},
+                ),
             ),
-            metadata_expected={"attempt": attempt.attempt_no},
         )
+        if replay is None:
+            raise Conflict(
+                "terminal publication attempt has no matching audit event"
+            )
         return attempt, None
     if attempt.state == PublicationAttempt.State.RUNNING:
         if not _worker_audit_replay(

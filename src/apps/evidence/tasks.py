@@ -96,7 +96,6 @@ def _begin_domain_step_observation(
         run,
         started_at=started_at,
     )
-    step.retry_count = max(step.attempt_no - 1, 0)
 
 
 def _project_domain_step_terminal(
@@ -118,7 +117,6 @@ def _project_domain_step_terminal(
         error_code=error_code,
         recovery_state=recovery_state,
     )
-    step.retry_count = max(step.attempt_no - 1, 0)
 
 
 def _document_input_fingerprint(
