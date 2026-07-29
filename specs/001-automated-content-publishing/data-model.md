@@ -18,7 +18,7 @@
 | 이름 | 값 |
 |---|---|
 | `TopicCode` | `housing_subscription`, `semiconductor_news` |
-| `AuthorityTier` | `primary_official`, `primary_corporate`, `trusted_secondary`, `discovery_only` |
+| `AuthorityTier` | `primary_official`, `primary_regulatory`, `primary_corporate`, `trusted_industry`, `trusted_secondary`, `discovery_only` |
 | `AccessMethod` | `public_api`, `open_data_api`, `rss_atom`, `public_html`, `public_file` |
 | `RightsStatus` | `allowed`, `attribution_required`, `internal_analysis_only`, `unknown`, `prohibited` |
 | `EvidenceKind` | `text`, `table`, `pdf`, `image`, `chart`, `spreadsheet`, `screenshot`, `attachment` |

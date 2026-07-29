@@ -1461,7 +1461,7 @@ components:
         publisher: { type: string, maxLength: 200 }
         authorityTier:
           type: string
-          enum: [primary_official, primary_corporate, trusted_secondary, discovery_only]
+          enum: [primary_official, primary_regulatory, primary_corporate, trusted_industry, trusted_secondary, discovery_only]
         independenceGroupId: { type: string, minLength: 1, maxLength: 200 }
         ownerName: { type: string, minLength: 1, maxLength: 200 }
         editorialControlName: { type: string, minLength: 1, maxLength: 200 }
@@ -1508,7 +1508,7 @@ components:
         publisher: { type: string, maxLength: 200 }
         authorityTier:
           type: string
-          enum: [primary_official, primary_corporate, trusted_secondary, discovery_only]
+          enum: [primary_official, primary_regulatory, primary_corporate, trusted_industry, trusted_secondary, discovery_only]
         independenceGroupId: { type: string, minLength: 1, maxLength: 200 }
         ownerName: { type: string, minLength: 1, maxLength: 200 }
         editorialControlName: { type: string, minLength: 1, maxLength: 200 }

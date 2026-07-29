@@ -353,7 +353,11 @@ def _discovery_kind(*, previous_link, item, status: str) -> str:
             SourceItemStatus.RETRACTED,
             SourceItemStatus.UNAVAILABLE,
         }
-        and status == SourceItemStatus.ACTIVE
+        and status
+        in {
+            SourceItemStatus.ACTIVE,
+            SourceItemStatus.CORRECTED,
+        }
     ):
         return SourceDiscoveryKind.RESTORED
     if (
@@ -788,12 +792,45 @@ def collect_run(run: CollectionRun) -> CollectionRun:
                     days=source_reconciliation_days(snapshot)
                 )
             )
+            reconciliation_observed_before = attempt.started_at
+            if reconciliation_observed_before is None:
+                raise ValueError(
+                    "Source reconciliation requires a fixed attempt cutoff."
+                )
+            snapshot_external_config = snapshot.frozen_config.get(
+                "externalConfig",
+                {},
+            )
+            identity_namespace = (
+                snapshot_external_config.get("identityNamespace")
+                if isinstance(snapshot_external_config, dict)
+                else None
+            )
+            compatible_snapshot_filters = {
+                "source_snapshot__source_id": snapshot.source_id,
+                "source_snapshot__frozen_config__adapterKey": (
+                    expected_adapter_name
+                ),
+            }
+            if isinstance(identity_namespace, str) and identity_namespace:
+                compatible_snapshot_filters[
+                    "source_snapshot__frozen_config__externalConfig__"
+                    "identityNamespace"
+                ] = identity_namespace
+            else:
+                compatible_snapshot_filters[
+                    "source_snapshot__frozen_config__externalConfig__"
+                    "identityNamespace__isnull"
+                ] = True
             reconciliation_links = list(
                 RunSourceItem.objects.filter(
                     source_item__source_id=snapshot.source_id,
                     collection_attempt__state="succeeded",
                     discovered_at__gte=reconciliation_cutoff,
+                    discovered_at__lt=reconciliation_observed_before,
+                    **compatible_snapshot_filters,
                 )
+                .exclude(run=run)
                 .select_related("source_item")
                 .annotate(
                     _reconciliation_rank=Window(

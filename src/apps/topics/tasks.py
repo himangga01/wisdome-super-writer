@@ -33,6 +33,15 @@ def check_source_snapshot(
 
     now = timezone.now()
     try:
+        frozen_config = snapshot.frozen_config
+        if (
+            isinstance(frozen_config, dict)
+            and frozen_config.get("defaultRightsStatus")
+            == "prohibited"
+        ):
+            raise PermissionError(
+                "Prohibited source rights prevent an outbound source check."
+            )
         adapter = build_source_adapter(
             snapshot,
             runtime_mode="source_check",

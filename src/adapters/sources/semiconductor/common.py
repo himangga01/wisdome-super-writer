@@ -5,7 +5,7 @@ import json
 import re
 from datetime import UTC, datetime
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from defusedxml import ElementTree
 from lxml import html
@@ -143,7 +143,12 @@ def canonical_source_url(
         or hostname not in approved_hosts
     ):
         raise SourceSchemaError("Source URL is outside the approved HTTPS host profile.")
-    path = re.sub(r"/+", "/", parsed.path or "/")
+    raw_path = parsed.path or "/"
+    if _unsafe_encoded_path(raw_path):
+        raise SourceSchemaError(
+            "Source URL path contains encoded or literal traversal material."
+        )
+    path = re.sub(r"/+", "/", raw_path)
     if not any(
         (
             re.match(pattern, path) is not None
@@ -155,7 +160,11 @@ def canonical_source_url(
         raise SourceSchemaError("Source URL path is outside the approved route profile.")
     approved_query = frozenset(allowed_query_keys)
     retained: list[tuple[str, str]] = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    normalized_query_keys = [key.lower() for key, _ in query_pairs]
+    if len(normalized_query_keys) != len(set(normalized_query_keys)):
+        raise SourceSchemaError("Source URL contains duplicate query fields.")
+    for key, value in query_pairs:
         normalized = key.lower()
         if normalized in _SENSITIVE_QUERY_KEYS:
             raise SourceSchemaError("Source URL contains a credential-bearing query.")
@@ -210,6 +219,7 @@ def wp_post_id(
     *,
     expected: int | None = None,
     additional_ids: Iterable[int] = (),
+    include_jsonld: bool = True,
 ) -> int:
     candidates: set[int] = {int(value) for value in additional_ids}
     for value in doc.xpath(
@@ -220,17 +230,18 @@ def wp_post_id(
         match = _WP_ID.search(str(value))
         if match:
             candidates.add(int(match.group(1)))
-    for script in doc.xpath("//script[@type='application/ld+json']/text()"):
-        for match in _WP_ID.finditer(script):
-            candidates.add(int(match.group(1)))
-        try:
-            raw = json.loads(script)
-        except (ValueError, TypeError):
-            continue
-        for item in _walk(raw):
-            for key in ("postId", "wpPostId"):
-                if isinstance(item.get(key), int):
-                    candidates.add(item[key])
+    if include_jsonld:
+        for script in doc.xpath("//script[@type='application/ld+json']/text()"):
+            for match in _WP_ID.finditer(script):
+                candidates.add(int(match.group(1)))
+            try:
+                raw = json.loads(script)
+            except (ValueError, TypeError):
+                continue
+            for item in _walk(raw):
+                for key in ("postId", "wpPostId"):
+                    if isinstance(item.get(key), int):
+                        candidates.add(item[key])
     if not candidates:
         raise SourceSchemaError("WordPress provider identity marker is missing.")
     if len(candidates) != 1:
@@ -241,31 +252,88 @@ def wp_post_id(
     return resolved
 
 
-def wordpress_jsonld(doc) -> dict[str, Any]:
+def wordpress_jsonld(
+    doc,
+    *,
+    expected_identity: int | None = None,
+    canonical_url: str | None = None,
+) -> dict[str, Any]:
     identities: set[int] = set()
     published: list[datetime] = []
     modified: list[datetime] = []
+    canonical_path = (
+        urlsplit(canonical_url).path.rstrip("/")
+        if canonical_url
+        else None
+    )
     for script in doc.xpath("//script[@type='application/ld+json']/text()"):
         try:
             raw = json.loads(script)
         except (ValueError, TypeError):
             continue
         for item in _walk(raw):
+            raw_types = item.get("@type")
+            item_types = (
+                {str(value) for value in raw_types}
+                if isinstance(raw_types, list)
+                else {str(raw_types)}
+            )
+            if not item_types.intersection(
+                {"Article", "NewsArticle", "BlogPosting", "Report"}
+            ):
+                continue
+            item_ids: set[int] = set()
             for key in ("postId", "wpPostId"):
                 if isinstance(item.get(key), int):
-                    identities.add(item[key])
+                    item_ids.add(item[key])
+            item_urls: set[str] = set()
             for value in item.values():
                 if isinstance(value, str):
                     for match in _WP_ID.finditer(value):
-                        identities.add(int(match.group(1)))
+                        item_ids.add(int(match.group(1)))
+                    if value.startswith(("https://", "http://", "/")):
+                        item_urls.add(value)
+                elif isinstance(value, Mapping):
+                    for key in ("@id", "url"):
+                        nested = value.get(key)
+                        if isinstance(nested, str):
+                            item_urls.add(nested)
+                            for match in _WP_ID.finditer(nested):
+                                item_ids.add(int(match.group(1)))
+            matches_identity = (
+                expected_identity is not None
+                and expected_identity in item_ids
+            )
+            matches_canonical = (
+                canonical_path is not None
+                and any(
+                    urlsplit(value).path.rstrip("/") == canonical_path
+                    for value in item_urls
+                )
+            )
+            if expected_identity is not None or canonical_path is not None:
+                if not matches_identity and not matches_canonical:
+                    continue
+            identities.update(item_ids)
             for key, target in (("datePublished", published), ("dateModified", modified)):
+                if key not in item:
+                    continue
                 parsed = parse_source_datetime(item.get(key))
-                if parsed:
-                    target.append(parsed)
+                if parsed is None:
+                    raise SourceSchemaError(
+                        "Current article JSON-LD contains an invalid timestamp."
+                    )
+                target.append(parsed)
+    published_values = {value.isoformat(): value for value in published}
+    modified_values = {value.isoformat(): value for value in modified}
+    if len(published_values) > 1 or len(modified_values) > 1:
+        raise SourceSchemaError(
+            "Current article JSON-LD contains conflicting timestamps."
+        )
     return {
         "identities": sorted(identities),
-        "published": published[0] if published else None,
-        "modified": modified[0] if modified else None,
+        "published": next(iter(published_values.values()), None),
+        "modified": next(iter(modified_values.values()), None),
     }
 
 
@@ -332,49 +400,116 @@ def feed_entries(payload: bytes) -> list[dict[str, Any]]:
     return result
 
 
-def parse_motir_list(doc) -> list[dict[str, str]]:
+def parse_motir_list(
+    doc,
+    *,
+    expected_total: int | None = None,
+) -> list[dict[str, str]]:
     parsed: list[dict[str, str]] = []
-    for table in doc.xpath("//table[.//thead//th]"):
-        headers = [
-            _SPACE.sub("", " ".join(node.itertext())).strip()
-            for node in table.xpath(".//thead//th")
-        ]
-        title_indices = [
-            index
-            for index, value in enumerate(headers)
-            if value in {"제목", "보도자료", "설명자료"}
-        ]
-        date_index = _header_index(headers, ("등록일", "게시일", "작성일"))
-        if not title_indices or date_index is None:
-            continue
-        for row in table.xpath(".//tbody/tr"):
-            cells = row.xpath("./th|./td")
-            if max(*title_indices, date_index) >= len(cells):
-                raise SourceSchemaError("MOTIR list row does not match its headers.")
-            matched = []
-            for title_index in title_indices:
-                for link in cells[title_index].xpath(".//a[@href or @onclick]"):
-                    target = (
-                        link.attrib.get("href")
-                        or link.attrib.get("onclick")
-                        or ""
-                    )
-                    match = _MOTIR_VIEW.fullmatch(target.strip())
-                    if match:
-                        matched.append((link, match.group("id")))
-            if len(matched) != 1:
-                continue
-            link, sequence = matched[0]
-            title = _SPACE.sub(" ", " ".join(link.itertext())).strip()
-            published = _SPACE.sub(" ", " ".join(cells[date_index].itertext())).strip()
-            if not title or parse_source_datetime(published) is None:
-                raise SourceSchemaError("MOTIR list title or date is invalid.")
-            parsed.append(
-                {"sequence": sequence, "title": title, "published": published}
+    total = (
+        parse_motir_total(doc)
+        if expected_total is None
+        else expected_total
+    )
+    tables = doc.xpath("//table[@id='mytable']")
+    if len(tables) != 1:
+        raise SourceSchemaError("MOTIR official list table marker changed.")
+    table = tables[0]
+    headers = [
+        _SPACE.sub("", " ".join(node.itertext())).strip()
+        for node in table.xpath("./thead//th")
+    ]
+    title_indices = [
+        index
+        for index, value in enumerate(headers)
+        if value in {"제목", "보도자료", "설명자료"}
+    ]
+    date_index = _header_index(headers, ("등록일", "게시일", "작성일"))
+    bodies = table.xpath("./tbody")
+    if not title_indices or date_index is None or len(bodies) != 1:
+        raise SourceSchemaError("MOTIR official list headers or body changed.")
+    rows = bodies[0].xpath("./tr")
+    if not rows:
+        raise SourceSchemaError("MOTIR official list body is empty.")
+    if len(rows) == 1:
+        row_text = _SPACE.sub(
+            " ", " ".join(rows[0].itertext())
+        ).strip()
+        if (
+            total == 0
+            and not rows[0].xpath(".//a[@href or @onclick]")
+            and re.search(
+                r"(조회|검색).*(결과|내용|자료|내역).*(없습니다|없음)",
+                row_text,
             )
+        ):
+            return []
+    if total == 0:
+        raise SourceSchemaError(
+            "MOTIR zero total conflicts with its list rows."
+        )
+    for row in rows:
+        cells = row.xpath("./th|./td")
+        if max(*title_indices, date_index) >= len(cells):
+            raise SourceSchemaError("MOTIR list row does not match its headers.")
+        matched = []
+        for title_index in title_indices:
+            links = cells[title_index].xpath(".//a[@href or @onclick]")
+            for link in links:
+                targets = [
+                    value
+                    for value in (
+                        link.attrib.get("href"),
+                        link.attrib.get("onclick"),
+                    )
+                    if value
+                ]
+                matches = [
+                    match
+                    for value in targets
+                    if (match := _MOTIR_VIEW.fullmatch(value.strip()))
+                ]
+                if len(matches) > 1 and any(
+                    match.group("id") != matches[0].group("id")
+                    for match in matches[1:]
+                ):
+                    raise SourceSchemaError(
+                        "MOTIR list link identity markers disagree."
+                    )
+                if matches:
+                    matched.append((link, matches[0].group("id")))
+        if len(matched) != 1:
+            raise SourceSchemaError(
+                "MOTIR list row must expose exactly one article.view identity."
+            )
+        link, sequence = matched[0]
+        title = _SPACE.sub(" ", " ".join(link.itertext())).strip()
+        published = _SPACE.sub(" ", " ".join(cells[date_index].itertext())).strip()
+        if not title or parse_source_datetime(published) is None:
+            raise SourceSchemaError("MOTIR list title or date is invalid.")
+        parsed.append(
+            {"sequence": sequence, "title": title, "published": published}
+        )
     if not parsed:
         raise SourceSchemaError("MOTIR official list table markers are missing.")
     return parsed
+
+
+def parse_motir_total(doc) -> int:
+    markers = doc.xpath(
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' board-count ')]"
+    )
+    if len(markers) != 1:
+        raise SourceSchemaError("MOTIR board-count marker changed.")
+    text = _SPACE.sub(" ", " ".join(markers[0].itertext())).strip()
+    values = {
+        int(value.replace(",", ""))
+        for value in re.findall(r"(?<!\d)([\d,]+)(?!\d)", text)
+        if value.replace(",", "").isdigit()
+    }
+    if len(values) != 1:
+        raise SourceSchemaError("MOTIR board-count total is ambiguous.")
+    return next(iter(values))
 
 
 def parse_motir_detail(doc, *, expected_sequence: str) -> dict[str, Any]:
@@ -398,35 +533,48 @@ def parse_motir_detail(doc, *, expected_sequence: str) -> dict[str, Any]:
         or board_markers[0] != "81"
     ):
         raise SourceSchemaError("MOTIR detail provider identity markers disagree.")
+    title_scopes = detail.xpath(
+        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' detail-tit ')]"
+    )
+    info_scopes = detail.xpath(
+        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' detail-info ')]"
+    )
     bodies = detail.xpath(
         ".//*[contains(concat(' ', normalize-space(@class), ' '), ' detail-cont ')"
         " and contains(concat(' ', normalize-space(@class), ' '), ' mViewerContents ')]"
     )
-    if len(bodies) != 1:
-        raise SourceSchemaError("MOTIR detail body marker changed.")
-    titles = detail.xpath(
-        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' board-title ')]"
-        " | .//h1 | .//h2 | .//h3[contains(@class,'title')]"
+    if len(title_scopes) != 1 or len(info_scopes) != 1 or len(bodies) != 1:
+        raise SourceSchemaError("MOTIR detail title, info, or body marker changed.")
+    title = _SPACE.sub(" ", " ".join(title_scopes[0].itertext())).strip()
+    info_text = _SPACE.sub(" ", " ".join(info_scopes[0].itertext())).strip()
+    date_candidates = re.findall(
+        r"(?<!\d)\d{4}[./-]\d{1,2}[./-]\d{1,2}(?!\d)",
+        info_text,
     )
-    if len(titles) != 1:
-        raise SourceSchemaError("MOTIR detail title marker changed.")
-    title = _SPACE.sub(" ", " ".join(titles[0].itertext())).strip()
-    date_candidates = detail.xpath(
-        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' date ')]/text()"
-        " | .//time/@datetime | .//time/text()"
-    )
-    published = next(
-        (
-            value.strip()
-            for value in date_candidates
-            if parse_source_datetime(value.strip()) is not None
-        ),
-        None,
-    )
+    parsed_dates = {
+        value: parse_source_datetime(value)
+        for value in date_candidates
+        if parse_source_datetime(value) is not None
+    }
+    if len({value.isoformat() for value in parsed_dates.values()}) != 1:
+        raise SourceSchemaError("MOTIR detail publication date is ambiguous.")
+    published = next(iter(parsed_dates), None)
     if not title or published is None:
         raise SourceSchemaError("MOTIR detail title or publication date is missing.")
+    body_text = stable_text(bodies[0])
+    if not body_text:
+        raise SourceSchemaError("MOTIR detail body is empty.")
     attachments: list[dict[str, str]] = []
-    for link in root.xpath("//a[@href]"):
+    download_scopes = detail.xpath(
+        ".//*[contains(concat(' ', normalize-space(@class), ' '), ' info-down ')]"
+    )
+    if len(download_scopes) > 1:
+        raise SourceSchemaError("MOTIR attachment scope is ambiguous.")
+    for link in (
+        download_scopes[0].xpath(".//a[@href]")
+        if download_scopes
+        else []
+    ):
         href = link.attrib["href"]
         match = _MOTIR_ATTACHMENT.fullmatch(urlsplit(href).path)
         if not match:
@@ -454,24 +602,37 @@ def parse_motir_detail(doc, *, expected_sequence: str) -> dict[str, Any]:
             if candidate:
                 filename = candidate.group(1)
         suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        mime_type = (
-            link.attrib.get("data-mime")
-            or _MOTIR_EXTENSION_MIMES.get(suffix)
-        )
+        declared_mime = link.attrib.get("data-mime")
+        inferred_mime = _MOTIR_EXTENSION_MIMES.get(suffix)
+        if (
+            declared_mime
+            and inferred_mime
+            and declared_mime.lower() != inferred_mime
+        ):
+            raise SourceSchemaError(
+                "MOTIR attachment MIME markers disagree."
+            )
+        mime_type = declared_mime or inferred_mime
         if not filename or not mime_type:
             raise SourceSchemaError("MOTIR attachment MIME cannot be determined.")
-        attachments.append(
-            {
-                "href": href,
-                "title": filename,
-                "mimeType": mime_type.lower(),
-                "externalId": "motie:file:" + ":".join(match.groups()).lower(),
-            }
-        )
+        item = {
+            "href": href,
+            "title": filename,
+            "mimeType": mime_type.lower(),
+            "externalId": "motie:file:" + ":".join(match.groups()).lower(),
+        }
+        if any(
+            value["externalId"] == item["externalId"]
+            and value != item
+            for value in attachments
+        ):
+            raise SourceSchemaError("MOTIR attachment identity markers disagree.")
+        if not any(value["externalId"] == item["externalId"] for value in attachments):
+            attachments.append(item)
     return {
         "title": title,
         "published": published,
-        "body": stable_text(bodies[0]),
+        "body": body_text,
         "bodyNode": bodies[0],
         "attachments": attachments,
     }
@@ -498,11 +659,18 @@ def parse_krx_document_lineage(value) -> list[dict[str, str]]:
                 pairs.append((role, raw))
     result: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
+    doc_contract: dict[str, tuple[str, str]] = {}
     for role, raw in pairs:
         matches = re.findall(r"(?<!\d)(\d+)\|([YN])(?![A-Z])", raw)
         if not matches:
             raise SourceSchemaError(f"KRX {role} has no exact docNo lineage marker.")
         for doc_no, lineage in matches:
+            existing = doc_contract.get(doc_no)
+            if existing is not None and existing != (role, lineage):
+                raise SourceSchemaError(
+                    "KRX document role or lineage markers disagree."
+                )
+            doc_contract[doc_no] = (role, lineage)
             key = (role, doc_no, lineage)
             if key not in seen:
                 seen.add(key)
@@ -578,6 +746,9 @@ def record_metadata(adapter, *, origin: str, syndication: str, kinds: Iterable[s
             "authorityTier": adapter.source.authority_tier,
             "independenceGroup": adapter.source.independence_group,
             "publisher": adapter.source.publisher,
+            "displayName": adapter.source.display_name,
+            "ownerName": adapter.source.owner_name,
+            "editorialControlName": adapter.source.editorial_control_name,
         },
         "originIdentity": origin,
         "syndicationKind": syndication,
@@ -618,7 +789,7 @@ def _flexible_date(value: str) -> datetime | None:
     parsed = parse_source_datetime(value)
     if parsed is not None:
         return parsed
-    for pattern in ("%B %d, %Y", "%b %d, %Y"):
+    for pattern in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%y", "%m/%d/%Y"):
         try:
             return datetime.strptime(value.strip(), pattern).replace(tzinfo=UTC)
         except ValueError:
@@ -628,6 +799,25 @@ def _flexible_date(value: str) -> datetime | None:
 
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
+
+
+def _unsafe_encoded_path(value: str) -> bool:
+    current = value
+    for _ in range(8):
+        if (
+            "\\" in current
+            or re.search(r"%(?:2e|2f|5c)", current, re.I)
+            or any(
+                segment in {".", ".."}
+                for segment in current.split("/")
+            )
+        ):
+            return True
+        decoded = unquote(current)
+        if decoded == current:
+            return False
+        current = decoded
+    return True
 
 
 def _walk(value: Any):

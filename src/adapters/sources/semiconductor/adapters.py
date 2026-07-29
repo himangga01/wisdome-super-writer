@@ -5,7 +5,7 @@ import mimetypes
 import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from lxml import html
@@ -24,6 +24,7 @@ from .common import (
     parse_krx_document_lineage,
     parse_motir_detail,
     parse_motir_list,
+    parse_motir_total,
     parse_sia_list,
     record_metadata,
     stable_text,
@@ -159,6 +160,36 @@ class SemiconductorAdapter(HttpSourceAdapter):
             for key, value in dict(context.get("metadata") or {}).items()
             if key != "_collection"
         }
+        prior_attachments = []
+        for raw in context.get("attachments", []):
+            value = _attachment_from_context(raw)
+            if (
+                not value.external_id
+                or not value.mime_type
+                or value.mime_type not in self._mimes["attachmentContentTypes"]
+                or value.rights_status != self.RIGHTS_STATUS
+                or value.metadata.get("metadataOnly") is not True
+            ):
+                raise SourceSchemaError(
+                    "Stored reconciliation attachment is outside the frozen contract."
+                )
+            canonical = None
+            for kind in ("attachment", "media", "static"):
+                if kind not in self.URL_PROFILES:
+                    continue
+                try:
+                    candidate = self._canonical(value.url, kind)
+                except SourceSchemaError:
+                    continue
+                if candidate == value.url:
+                    canonical = candidate
+                    break
+            if canonical is None:
+                raise SourceSchemaError(
+                    "Stored reconciliation attachment URL is not safely reusable."
+                )
+            prior_attachments.append(value)
+        prior_attachments = _merge_attachments(prior_attachments)
         return CollectedSourceRecord(
             external_id=context["externalId"],
             canonical_url=context["canonicalUrl"],
@@ -177,7 +208,7 @@ class SemiconductorAdapter(HttpSourceAdapter):
                 }
             ),
             metadata=metadata,
-            attachments=(),
+            attachments=tuple(prior_attachments),
         )
 
     def _finalize(self, records):
@@ -261,20 +292,22 @@ class MotirAdapter(SemiconductorAdapter):
                     },
                 )
                 doc = document(response)
-                rows = parse_motir_list(doc)
+                total = parse_motir_total(doc)
+                rows = parse_motir_list(
+                    doc,
+                    expected_total=total,
+                )
                 signature = checksum(
                     [(row["sequence"], row["title"], row["published"]) for row in rows]
                 )
                 if signature in page_signatures:
                     raise SourceSchemaError("MOTIR list page repeated.")
                 page_signatures.add(signature)
-                total = _page_total(doc)
-                if total is not None:
-                    if stable_total is not None and total != stable_total:
-                        raise SourceSchemaError("MOTIR total count changed during paging.")
-                    stable_total = total
-                    if total > self.max_pages * 50:
-                        raise SourceSchemaError("MOTIR total exceeds the frozen page bound.")
+                if stable_total is not None and total != stable_total:
+                    raise SourceSchemaError("MOTIR total count changed during paging.")
+                stable_total = total
+                if total > self.max_pages * 50:
+                    raise SourceSchemaError("MOTIR total exceeds the frozen page bound.")
                 for row in rows:
                     external_id = f"motie:81:{row['sequence']}"
                     if external_id in endpoint_ids:
@@ -317,17 +350,31 @@ class MotirAdapter(SemiconductorAdapter):
             published = parse_source_datetime(item["published"])
             if not in_window(published, since, until) and external_id not in self.reconciliation_ids:
                 continue
-            entrypoint = sorted(item["entrypoints"])[0]
-            records.append(
-                self._detail(
+            detail_records = []
+            for entrypoint in sorted(item["entrypoints"]):
+                detail_records.append(
+                    self._detail(
                     f"{entrypoint.rstrip('/')}/{item['sequence']}/view",
                     sequence=item["sequence"],
                     since=since,
                     until=until,
                     list_item=item,
                     force_reconciliation=not in_window(published, since, until),
+                    )
                 )
-            )
+            if any(value is None for value in detail_records):
+                raise SourceSchemaError(
+                    "MOTIR entrypoint details disagree on period eligibility."
+                )
+            first = detail_records[0]
+            if any(
+                not _equivalent_source_records(first, value)
+                for value in detail_records[1:]
+            ):
+                raise SourceSchemaError(
+                    "MOTIR entrypoint details disagree after normalization."
+                )
+            records.append(first)
             resolved.add(external_id)
         records.extend(self._reconcile_missing(resolved, since, until))
         return self._finalize(records)
@@ -469,15 +516,12 @@ class KrxKindAdapter(SemiconductorAdapter):
         "viewer": (
             _HOSTS,
             (r"/common/disclsviewer\.do",),
-            frozenset({"method", "acptno", "docNo"}),
+            frozenset({"method", "acptNo", "docNo"}),
         ),
         "static": (
             _HOSTS,
-            (
-                r"/(?:common|disclosure|html|viewer|repository|upload|download)"
-                r"/[A-Za-z0-9_./%+-]+",
-            ),
-            frozenset({"acptno", "docNo"}),
+            (r"/external/[A-Za-z0-9_./%+-]+",),
+            frozenset(),
         ),
     }
     _ITEM = re.compile(
@@ -493,23 +537,22 @@ class KrxKindAdapter(SemiconductorAdapter):
             method = query.get("method")
             if method not in {"search", "searchInitInfo", "searchContents"}:
                 raise SourceSchemaError("KRX viewer method is not approved.")
-            if not re.fullmatch(r"\d{14}", query.get("acptno", "")):
-                raise SourceSchemaError("KRX viewer receipt identity is invalid.")
-            if method == "searchContents" and not query.get("docNo", "").isdigit():
-                raise SourceSchemaError("KRX viewer document identity is invalid.")
-            if method != "searchContents" and "docNo" in query:
-                raise SourceSchemaError("KRX viewer query contains an extra docNo.")
-        elif kind == "static":
-            if (
-                "acptno" in query
-                and not re.fullmatch(r"\d{14}", query["acptno"])
-            ) or (
-                "docNo" in query
-                and not query["docNo"].isdigit()
+            if method == "searchContents":
+                if (
+                    set(query) != {"method", "docNo"}
+                    or not query["docNo"].isdigit()
+                ):
+                    raise SourceSchemaError(
+                        "KRX searchContents query contract is invalid."
+                    )
+            elif (
+                set(query) != {"method", "acptNo"}
+                or not re.fullmatch(r"\d{14}", query["acptNo"])
             ):
-                raise SourceSchemaError(
-                    "KRX static document query identity is invalid."
-                )
+                raise SourceSchemaError("KRX receipt query contract is invalid.")
+        elif kind == "static":
+            if query:
+                raise SourceSchemaError("KRX static document has a query.")
         elif kind == "post" and query:
             raise SourceSchemaError("KRX form POST endpoint has a query.")
 
@@ -548,17 +591,6 @@ class KrxKindAdapter(SemiconductorAdapter):
                 text = decode_krx(response)
                 _reject_krx_error_page(text)
                 doc = html.fromstring(text)
-                items = _krx_list_items(doc, self._ITEM)
-                if not items:
-                    if page == 1:
-                        raise SourceSchemaError("KRX list markers are missing.")
-                    break
-                signature = checksum(
-                    [(item["acptNo"], item["published"]) for item in items]
-                )
-                if signature in page_seen:
-                    raise SourceSchemaError("KRX list page repeated.")
-                page_seen.add(signature)
                 total = _page_total(doc)
                 if total is not None:
                     if stable_total is not None and stable_total != total:
@@ -566,6 +598,17 @@ class KrxKindAdapter(SemiconductorAdapter):
                     stable_total = total
                     if total > self.max_pages * self.page_size:
                         raise SourceSchemaError("KRX total exceeds the page bound.")
+                items = _krx_list_items(doc, self._ITEM)
+                if not items:
+                    if stable_total is not None and len(issuer_seen) != stable_total:
+                        raise SourceSchemaError("KRX total coverage is incomplete.")
+                    break
+                signature = checksum(
+                    [(item["acptNo"], item["published"]) for item in items]
+                )
+                if signature in page_seen:
+                    raise SourceSchemaError("KRX list page repeated.")
+                page_seen.add(signature)
                 for item in items:
                     external_id = f"krx-kind:{item['acptNo']}"
                     if external_id in issuer_seen or external_id in resolved:
@@ -614,17 +657,21 @@ class KrxKindAdapter(SemiconductorAdapter):
         since,
         until,
         force_reconciliation=False,
+        init_response=None,
     ):
         base = "https://kind.krx.co.kr/common/disclsviewer.do"
-        init = self._get_source(
+        init = init_response or self._get_source(
             base,
             kind="viewer",
             mime_field="detailContentTypes",
-            params={"method": "searchInitInfo", "acptno": acpt_no},
+            params={"method": "searchInitInfo", "acptNo": acpt_no},
         )
         init_text = decode_krx(init)
         _reject_krx_error_page(init_text)
-        if acpt_no not in init_text:
+        if not _has_exact_numeric_marker(
+            _krx_identity_scope(init_text),
+            acpt_no,
+        ):
             raise SourceSchemaError("KRX init receipt marker is missing.")
         lineage = parse_krx_document_lineage(init_text)
         documents = []
@@ -636,15 +683,28 @@ class KrxKindAdapter(SemiconductorAdapter):
                 mime_field="detailContentTypes",
                 params={
                     "method": "searchContents",
-                    "acptno": acpt_no,
                     "docNo": item["docNo"],
                 },
             )
             wrapper_text = decode_krx(wrapper)
             _reject_krx_error_page(wrapper_text)
-            if acpt_no not in wrapper_text and item["docNo"] not in wrapper_text:
-                raise SourceSchemaError("KRX wrapper identity marker is missing.")
             static_url = _krx_static_url(wrapper_text, base)
+            wrapper_identity_scope = (
+                _krx_identity_scope(wrapper_text)
+                + " "
+                + static_url
+            )
+            if (
+                not _has_exact_numeric_marker(
+                    wrapper_identity_scope,
+                    acpt_no,
+                )
+                or not _has_exact_numeric_marker(
+                    wrapper_identity_scope,
+                    item["docNo"],
+                )
+            ):
+                raise SourceSchemaError("KRX wrapper identity marker is missing.")
             static_url = self._canonical(static_url, "static")
             static = self._get_source(
                 static_url,
@@ -655,15 +715,28 @@ class KrxKindAdapter(SemiconductorAdapter):
             if mime_type == "text/html":
                 static_text = decode_krx(static)
                 _reject_krx_error_page(static_text)
+                static_doc = html.fromstring(static_text)
+                body = stable_text(static_doc)
+                static_identity_scope = (
+                    body
+                    + " "
+                    + _krx_identity_scope(static_text)
+                    + " "
+                    + static_url
+                )
                 if (
-                    acpt_no not in static_text
-                    and item["docNo"] not in static_text
+                    not _has_exact_numeric_marker(
+                        static_identity_scope,
+                        acpt_no,
+                    )
+                    or not _has_exact_numeric_marker(
+                        static_identity_scope,
+                        item["docNo"],
+                    )
                 ):
                     raise SourceSchemaError(
                         "KRX static document identity marker is missing."
                     )
-                static_doc = html.fromstring(static_text)
-                body = stable_text(static_doc)
             elif (
                 mime_type == "application/pdf"
                 and static.content.startswith(b"%PDF-")
@@ -728,7 +801,7 @@ class KrxKindAdapter(SemiconductorAdapter):
             canonical_url=self._canonical(
                 _with_query(
                     base,
-                    {"method": "search", "acptno": acpt_no},
+                    {"method": "search", "acptNo": acpt_no},
                 ),
                 "viewer",
             ),
@@ -761,14 +834,13 @@ class KrxKindAdapter(SemiconductorAdapter):
             if not match:
                 raise SourceSchemaError("KRX reconciliation identity is invalid.")
             acpt_no = match.group(1)
+            base = "https://kind.krx.co.kr/common/disclsviewer.do"
             try:
-                record = self._detail(
-                    acpt_no,
-                    title=str(context.get("title") or external_id),
-                    published=_context_datetime(context.get("publishedAt")),
-                    since=since,
-                    until=until,
-                    force_reconciliation=True,
+                init_response = self._get_source(
+                    base,
+                    kind="viewer",
+                    mime_field="detailContentTypes",
+                    params={"method": "searchInitInfo", "acptNo": acpt_no},
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in {404, 410}:
@@ -777,13 +849,23 @@ class KrxKindAdapter(SemiconductorAdapter):
                     **context,
                     "canonicalUrl": self._canonical(
                         _with_query(
-                            "https://kind.krx.co.kr/common/disclsviewer.do",
-                            {"method": "search", "acptno": acpt_no},
+                            base,
+                            {"method": "search", "acptNo": acpt_no},
                         ),
                         "viewer",
                     ),
                 }
                 record = self._unavailable(safe_context)
+            else:
+                record = self._detail(
+                    acpt_no,
+                    title=str(context.get("title") or external_id),
+                    published=_context_datetime(context.get("publishedAt")),
+                    since=since,
+                    until=until,
+                    force_reconciliation=True,
+                    init_response=init_response,
+                )
             records.append(record)
         return records
 
@@ -801,6 +883,8 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
         merged: dict[str, dict] = {}
         for feed_url in self.entrypoints:
             seen_pages: set[str] = set()
+            seen_page_sets: set[str] = set()
+            entrypoint_canonicals: set[str] = set()
             for page in range(1, self.max_pages + 1):
                 response = self._get_source(
                     _with_query(feed_url, {"paged": page}),
@@ -816,10 +900,21 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
                     self._canonical(item["url"], "detail") for item in entries
                 ]
                 signature = checksum(normalized_urls)
-                if signature in seen_pages:
+                set_signature = checksum(sorted(normalized_urls))
+                if signature in seen_pages or set_signature in seen_page_sets:
                     raise SourceSchemaError("Newsroom feed page repeated.")
                 seen_pages.add(signature)
+                seen_page_sets.add(set_signature)
+                if len(normalized_urls) != len(set(normalized_urls)):
+                    raise SourceSchemaError(
+                        "One newsroom feed page repeated a canonical identity."
+                    )
                 for item, canonical in zip(entries, normalized_urls, strict=True):
+                    if canonical in entrypoint_canonicals:
+                        raise SourceSchemaError(
+                            "One newsroom feed repeated a canonical identity."
+                        )
+                    entrypoint_canonicals.add(canonical)
                     existing = merged.setdefault(
                         canonical,
                         {
@@ -858,11 +953,6 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
             expected = self._feed_wp_id(item)
             external_id = f"{self.ID_PREFIX}{expected}" if expected else None
             feed_published = item["atomPublished"] or item["rssPublished"]
-            if (
-                not in_window(feed_published, since, until)
-                and external_id not in self.reconciliation_ids
-            ):
-                continue
             record = self._detail(
                 item,
                 expected=expected,
@@ -870,6 +960,7 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
                 until=until,
                 force_reconciliation=(
                     external_id in self.reconciliation_ids
+                    and feed_published is not None
                     and not in_window(feed_published, since, until)
                 ),
             )
@@ -918,12 +1009,7 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
         }
         if self.REQUIRE_ARTICLE_ID and len(article_ids) != 1:
             raise SourceSchemaError("SK hynix article identity marker changed.")
-        jsonld = wordpress_jsonld(doc)
         linked_ids = _wordpress_link_ids(doc, response)
-        if self.REQUIRE_JSONLD_ID and not jsonld["identities"]:
-            raise SourceSchemaError(
-                "Newsroom JSON-LD provider identity marker is missing."
-            )
         if self.REQUIRE_REST_ID and not linked_ids:
             raise SourceSchemaError(
                 "Newsroom REST or shortlink provider identity marker is missing."
@@ -933,10 +1019,23 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
             expected=expected,
             additional_ids={
                 *article_ids,
-                *jsonld["identities"],
                 *linked_ids,
             },
+            include_jsonld=False,
         )
+        jsonld = wordpress_jsonld(
+            doc,
+            expected_identity=post_id,
+            canonical_url=canonical,
+        )
+        if self.REQUIRE_JSONLD_ID and not jsonld["identities"]:
+            raise SourceSchemaError(
+                "Newsroom JSON-LD provider identity marker is missing."
+            )
+        if jsonld["identities"] and set(jsonld["identities"]) != {post_id}:
+            raise SourceSchemaError(
+                "Newsroom current-article JSON-LD identity disagrees."
+            )
         origin = f"{self.ID_PREFIX}{post_id}"
         bodies = doc.xpath(
             f"//*[contains(concat(' ', normalize-space(@class), ' '),"
@@ -974,6 +1073,10 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
                 or jsonld["modified"]
                 or item.get("rssUpdated")
             )
+        if published is None:
+            raise SourceSchemaError(
+                "Newsroom authoritative publication time is missing."
+            )
         if (
             not force_reconciliation
             and not in_window(published, since, until)
@@ -981,13 +1084,29 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
         ):
             return None
         attachments = list(prior_attachments)
+        seen_media_urls = {
+            value.url: value.mime_type
+            for value in attachments
+        }
         for index, enclosure in enumerate(item.get("enclosures", []), 1):
             enclosure_url = urljoin(item["url"], enclosure["url"])
+            enclosure_mime = (
+                str(enclosure["mimeType"]).split(";", 1)[0].strip().lower()
+            )
+            normalized_enclosure_url = self._canonical(enclosure_url, "media")
+            existing_mime = seen_media_urls.get(normalized_enclosure_url)
+            if existing_mime is not None:
+                if existing_mime != enclosure_mime:
+                    raise SourceSchemaError(
+                        "Newsroom media URL has conflicting MIME markers."
+                    )
+                continue
+            seen_media_urls[normalized_enclosure_url] = enclosure_mime
             attachments.append(
                 self._media_attachment(
                     origin,
-                    enclosure_url,
-                    enclosure["mimeType"],
+                    normalized_enclosure_url,
+                    enclosure_mime,
                     "feed-enclosure:"
                     + checksum(
                         [self._canonical(enclosure_url, "media"), enclosure["mimeType"]]
@@ -1022,16 +1141,32 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
                     node.attrib.get("type")
                     or mimetypes.guess_type(urlsplit(raw_url).path)[0]
                 )
+                if mime_type:
+                    mime_type = (
+                        str(mime_type).split(";", 1)[0].strip().lower()
+                    )
                 if mime_type not in self._mimes["attachmentContentTypes"]:
-                    if node.tag == "a":
+                    if node.tag == "a" and mime_type in {None, "text/html"}:
                         continue
                     raise SourceSchemaError(
                         "Newsroom embedded media MIME is not approved."
                     )
+                normalized_media_url = self._canonical(
+                    urljoin(canonical, raw_url),
+                    "media",
+                )
+                existing_mime = seen_media_urls.get(normalized_media_url)
+                if existing_mime is not None:
+                    if existing_mime != mime_type:
+                        raise SourceSchemaError(
+                            "Newsroom media URL has conflicting MIME markers."
+                        )
+                    continue
+                seen_media_urls[normalized_media_url] = mime_type
                 attachments.append(
                     self._media_attachment(
                         origin,
-                        urljoin(canonical, raw_url),
+                        normalized_media_url,
                         mime_type,
                         f"detail-media:{index}:{variant}",
                         title=node.attrib.get("alt")
@@ -1090,6 +1225,9 @@ class WordPressNewsroomAdapter(SemiconductorAdapter):
         title,
         metadata=None,
     ):
+        mime_type = str(mime_type).split(";", 1)[0].strip().lower()
+        if mime_type not in self._mimes["attachmentContentTypes"]:
+            raise SourceSchemaError("Newsroom media MIME is not approved.")
         url = self._canonical(raw_url, "media")
         return attachment(
             url,
@@ -1173,7 +1311,7 @@ class SamsungNewsroomAdapter(WordPressNewsroomAdapter):
     BODY_CLASS = "single_contents"
     TITLE_CLASS = "single-title"
     JSONLD_TIME_FIRST = True
-    REQUIRE_JSONLD_ID = True
+    REQUIRE_JSONLD_ID = False
     REQUIRE_REST_ID = True
     URL_PROFILES = {
         "feed": (
@@ -1374,48 +1512,116 @@ class SiaLatestAdapter(SemiconductorAdapter):
         if len(mains) != 1 or len(canonicals) != 1:
             raise SourceSchemaError("SIA detail main or canonical marker changed.")
         canonical = self._canonical(canonicals[0], "detail")
-        jsonld = wordpress_jsonld(doc)
+        article_ids = {
+            int(match.group(1))
+            for value in mains[0].xpath(".//article/@id | ./@data-post-id")
+            if (match := re.search(r"(?:post-)?(\d+)$", value))
+        }
+        linked_ids = _wordpress_link_ids(doc, response)
+        current_jsonld = wordpress_jsonld(
+            doc,
+            canonical_url=canonical,
+        )
         post_id = wp_post_id(
             doc,
-            additional_ids=jsonld["identities"],
+            additional_ids={
+                *article_ids,
+                *linked_ids,
+                *current_jsonld["identities"],
+            },
+            include_jsonld=False,
+        )
+        jsonld = wordpress_jsonld(
+            doc,
+            expected_identity=post_id,
+            canonical_url=canonical,
         )
         origin = f"sia:wp-post:{post_id}"
-        published_values = doc.xpath(
+        meta_published_values = doc.xpath(
             "//meta[@property='article:published_time']/@content"
-            " | //time/@datetime"
         )
-        modified_values = doc.xpath(
+        scoped_published_values = mains[0].xpath(
+            ".//time[@datetime]/@datetime"
+            " | .//time[not(@datetime)]/text()"
+        )
+        published_values = [
+            *meta_published_values,
+            *scoped_published_values,
+            *(
+                [jsonld["published"]]
+                if jsonld["published"] is not None
+                else []
+            ),
+        ]
+        meta_modified_values = doc.xpath(
             "//meta[@property='article:modified_time']/@content"
         )
-        published = (
-            parse_source_datetime(published_values[0])
-            if published_values
-            else jsonld["published"] or list_published
+        modified_values = [
+            *meta_modified_values,
+            *(
+                [jsonld["modified"]]
+                if jsonld["modified"] is not None
+                else []
+            ),
+        ]
+        published = _single_source_datetime(
+            published_values,
+            field_name="SIA publication",
+            required=True,
         )
+        if (
+            list_published is not None
+            and published.date() != list_published.date()
+        ):
+            raise SourceSchemaError(
+                "SIA list and detail publication dates disagree."
+            )
         if (
             not force_reconciliation
             and not in_window(published, since, until)
             and origin not in self.reconciliation_ids
         ):
             return None
-        modified = (
-            parse_source_datetime(modified_values[0])
-            if modified_values
-            else jsonld["modified"]
+        modified = _single_source_datetime(
+            modified_values,
+            field_name="SIA modification",
+            required=False,
         )
         titles = mains[0].xpath(".//h1")
         if len(titles) != 1:
             raise SourceSchemaError("SIA detail title marker changed.")
         title = " ".join(titles[0].itertext()).strip()
         body = stable_text(mains[0])
+        if not title or not body:
+            raise SourceSchemaError("SIA title or body is empty.")
         attachments = []
         embedded_assets = []
+        seen_asset_urls: set[str] = set()
         for index, link in enumerate(mains[0].xpath(".//a[@href]"), 1):
             raw_url = link.attrib["href"]
             mime_type = mimetypes.guess_type(urlsplit(raw_url).path)[0]
-            if mime_type not in self._mimes["attachmentContentTypes"]:
+            if mime_type in {None, "text/html"}:
                 continue
+            if mime_type not in self._mimes["attachmentContentTypes"]:
+                raise SourceSchemaError("SIA attachment MIME is not approved.")
             asset_url = self._canonical(urljoin(canonical, raw_url), "media")
+            descendant_image_urls = [
+                image_url
+                for image in link.xpath(".//img[@src or @srcset]")
+                for image_url in _image_candidate_urls(image)
+            ]
+            if any(
+                self._canonical(
+                    urljoin(canonical, image_url),
+                    "media",
+                )
+                == asset_url
+                for image_url in descendant_image_urls
+            ):
+                continue
+            if asset_url in seen_asset_urls:
+                continue
+            seen_asset_urls.add(asset_url)
             attachments.append(
                 attachment(
                     asset_url,
@@ -1430,21 +1636,16 @@ class SiaLatestAdapter(SemiconductorAdapter):
         for index, image in enumerate(
             mains[0].xpath(".//img[@src or @srcset]"), 1
         ):
-            raw_urls = []
-            if image.attrib.get("src"):
-                raw_urls.append(image.attrib["src"])
-            if image.attrib.get("srcset"):
-                raw_urls.extend(
-                    item.strip().split()[0]
-                    for item in image.attrib["srcset"].split(",")
-                    if item.strip()
-                )
+            raw_urls = _image_candidate_urls(image)
             locator = f"main#main:image:{index}"
             for variant, raw_url in enumerate(raw_urls, 1):
                 mime_type = mimetypes.guess_type(urlsplit(raw_url).path)[0]
                 if mime_type not in self._mimes["attachmentContentTypes"]:
                     raise SourceSchemaError("SIA image MIME is not approved.")
                 asset_url = self._canonical(urljoin(canonical, raw_url), "media")
+                if asset_url in seen_asset_urls:
+                    continue
+                seen_asset_urls.add(asset_url)
                 is_chart = bool(
                     re.search(
                         r"(chart|graph)",
@@ -1485,12 +1686,19 @@ class SiaLatestAdapter(SemiconductorAdapter):
                     }
                 )
         for index, table in enumerate(mains[0].xpath(".//table"), 1):
+            locator = f"main#main:table:{index}"
+            table_checksum = checksum(stable_text(table))
             embedded_assets.append(
                 {
                     "kind": "table",
                     "mimeType": "text/html",
-                    "locator": f"main#main:table:{index}",
-                    "checksum": checksum(stable_text(table)),
+                    "locator": locator,
+                    "checksum": table_checksum,
+                    "externalId": (
+                        f"{origin}:table:"
+                        f"{checksum(locator)}"
+                    ),
+                    "metadataOnly": True,
                     "rightsStatus": self.RIGHTS_STATUS,
                     "originIdentity": origin,
                 }
@@ -1579,6 +1787,57 @@ def _positive(value, name, maximum):
     return value
 
 
+def _single_source_datetime(values, *, field_name, required):
+    parsed = []
+    for value in values:
+        current = parse_source_datetime(value)
+        if current is None and isinstance(value, str):
+            for pattern in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+                "%m/%d/%y",
+                "%m/%d/%Y",
+            ):
+                try:
+                    current = datetime.strptime(
+                        value.strip(), pattern
+                    ).replace(tzinfo=UTC)
+                    break
+                except ValueError:
+                    continue
+        if current is None:
+            raise SourceSchemaError(f"{field_name} marker is invalid.")
+        parsed.append(current)
+    distinct = {value.isoformat(): value for value in parsed}
+    if len(distinct) > 1:
+        raise SourceSchemaError(f"{field_name} markers disagree.")
+    if not distinct:
+        if required:
+            raise SourceSchemaError(f"{field_name} marker is missing.")
+        return None
+    return next(iter(distinct.values()))
+
+
+def _equivalent_source_records(left, right):
+    return (
+        left is not None
+        and right is not None
+        and left.external_id == right.external_id
+        and left.title == right.title
+        and left.published_at == right.published_at
+        and left.modified_at == right.modified_at
+        and left.body_text == right.body_text
+        and left.status == right.status
+        and left.raw_checksum == right.raw_checksum
+        and [
+            _attachment_material(value) for value in left.attachments
+        ]
+        == [
+            _attachment_material(value) for value in right.attachments
+        ]
+    )
+
+
 def _mime_set(config, field):
     values = config.get(field)
     if not isinstance(values, list) or not values:
@@ -1624,6 +1883,7 @@ def _page_total(doc):
 
 def _krx_list_items(doc, pattern):
     items = []
+    candidate_tables = []
     for table in doc.xpath("//table[.//thead//th]"):
         headers = [
             re.sub(r"\s+", "", " ".join(node.itertext()))
@@ -1639,42 +1899,71 @@ def _krx_list_items(doc, pattern):
             for index, value in enumerate(headers)
             if value in {"공시제목", "보고서명", "제목"}
         ]
-        if len(date_indexes) != 1:
+        if len(date_indexes) != 1 or len(title_indexes) != 1:
             continue
-        date_index = date_indexes[0]
-        for row in table.xpath(".//tbody/tr"):
-            cells = row.xpath("./th|./td")
-            if date_index >= len(cells):
-                raise SourceSchemaError("KRX row does not match its headers.")
-            matches = []
-            for node in row.xpath(".//*[@onclick]"):
-                match = pattern.fullmatch(node.attrib.get("onclick", ""))
-                if match:
-                    matches.append((node, match.group(1)))
-            if not matches:
-                continue
-            if len(matches) != 1:
-                raise SourceSchemaError(
-                    "KRX row has conflicting receipt markers."
-                )
-            node, acpt_no = matches[0]
-            date_text = " ".join(cells[date_index].itertext()).strip()
-            if parse_source_datetime(date_text) is None:
-                raise SourceSchemaError(
-                    "KRX row publication date marker changed."
-                )
-            title = " ".join(node.itertext()).strip()
-            if not title and title_indexes and title_indexes[0] < len(cells):
-                title = " ".join(cells[title_indexes[0]].itertext()).strip()
-            if not title:
-                raise SourceSchemaError("KRX row title is empty.")
-            items.append(
-                {
-                    "acptNo": acpt_no,
-                    "title": title,
-                    "published": date_text,
-                }
+        candidate_tables.append(
+            (table, date_indexes[0], title_indexes[0])
+        )
+    if len(candidate_tables) != 1:
+        raise SourceSchemaError("KRX official list table markers changed.")
+    table, date_index, title_index = candidate_tables[0]
+    bodies = table.xpath("./tbody")
+    if len(bodies) != 1:
+        raise SourceSchemaError("KRX official list body marker changed.")
+    rows = bodies[0].xpath("./tr")
+    if not rows:
+        raise SourceSchemaError("KRX official list body is empty.")
+    for row in rows:
+        cells = row.xpath("./th|./td")
+        row_text = re.sub(r"\s+", " ", " ".join(row.itertext())).strip()
+        if (
+            len(cells) == 1
+            and re.search(
+                r"(조회|검색).*(결과|내용|자료).*(없습니다|없음)",
+                row_text,
             )
+        ):
+            if len(rows) != 1:
+                raise SourceSchemaError(
+                    "KRX no-result placeholder is mixed with data rows."
+                )
+            return []
+        if max(date_index, title_index) >= len(cells):
+            raise SourceSchemaError("KRX row does not match its headers.")
+        viewer_nodes = [
+            node
+            for node in cells[title_index].xpath(
+                ".//*[@onclick] | self::*[@onclick]"
+            )
+            if "openDisclsViewer" in node.attrib.get("onclick", "")
+        ]
+        matches = []
+        for node in viewer_nodes:
+            match = pattern.fullmatch(node.attrib.get("onclick", ""))
+            if match:
+                matches.append((node, match.group(1)))
+        if len(viewer_nodes) != 1 or len(matches) != 1:
+            raise SourceSchemaError(
+                "KRX data row must expose one exact receipt marker."
+            )
+        node, acpt_no = matches[0]
+        date_text = " ".join(cells[date_index].itertext()).strip()
+        if parse_source_datetime(date_text) is None:
+            raise SourceSchemaError(
+                "KRX row publication date marker changed."
+            )
+        title = " ".join(node.itertext()).strip()
+        if not title:
+            title = " ".join(cells[title_index].itertext()).strip()
+        if not title:
+            raise SourceSchemaError("KRX row title is empty.")
+        items.append(
+            {
+                "acptNo": acpt_no,
+                "title": title,
+                "published": date_text,
+            }
+        )
     return items
 
 
@@ -1694,27 +1983,134 @@ def _reject_krx_error_page(value):
         raise SourceSchemaError("KRX returned a login, WAF, or error page.")
 
 
-def _krx_static_url(wrapper_text, base):
-    try:
-        doc = html.fromstring(wrapper_text)
-    except ValueError as exc:
-        raise SourceSchemaError("KRX searchContents wrapper is malformed.") from exc
-    raw_targets = doc.xpath(
-        "//iframe/@src | //frame/@src | //object/@data | //embed/@src"
+def _has_exact_numeric_marker(value, expected):
+    return re.search(
+        rf"(?<!\d){re.escape(str(expected))}(?!\d)",
+        value,
+    ) is not None
+
+
+def _krx_identity_scope(value):
+    without_comments = re.sub(
+        r"<!--.*?-->",
+        " ",
+        value,
+        flags=re.S,
     )
-    if not raw_targets:
-        raw_targets = re.findall(
-            r"['\"]((?:/|https://kind\.krx\.co\.kr/)"
-            r"(?:common|disclosure|html|viewer|repository|upload|download)"
-            r"/[^'\"]+)['\"]",
-            wrapper_text,
-        )
-    resolved = {urljoin(base, value) for value in raw_targets}
-    if len(resolved) != 1:
+    try:
+        doc = html.fromstring(without_comments)
+    except (TypeError, ValueError) as exc:
         raise SourceSchemaError(
-            "KRX wrapper must expose exactly one static document."
+            "KRX identity response is malformed."
+        ) from exc
+    visible = " ".join(
+        doc.xpath(
+            "//body//text()[not(ancestor::script)"
+            " and not(ancestor::style)]"
         )
-    return next(iter(resolved))
+    )
+    named_values = doc.xpath(
+        "//*[@id='acptNo' or @name='acptNo'"
+        " or @id='docNo' or @name='docNo']/@value"
+    )
+    assigned_values = re.findall(
+        r"(?:acptNo|docNo)\s*(?:=|:)\s*['\"]?(\d{1,14})",
+        without_comments,
+        re.I,
+    )
+    return " ".join(
+        [
+            visible,
+            *map(str, named_values),
+            *assigned_values,
+        ]
+    )
+
+
+def _krx_static_url(wrapper_text, base):
+    assignments = re.findall(
+        r"(?:var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*"
+        r"['\"]([^'\"]+)['\"]\s*;?",
+        wrapper_text,
+    )
+    variables = {}
+    for name, value in assignments:
+        if name in variables:
+            raise SourceSchemaError(
+                "KRX parent.setPath variable is defined more than once."
+            )
+        variables[name] = value
+    calls = re.findall(r"parent\.setPath\(([^()]*)\)", wrapper_text)
+    if len(calls) != 1:
+        raise SourceSchemaError(
+            "KRX wrapper must contain exactly one parent.setPath call."
+        )
+    raw_arguments = [value.strip() for value in calls[0].split(",")]
+    if len(raw_arguments) < 3 or any(not value for value in raw_arguments):
+        raise SourceSchemaError("KRX parent.setPath argument list is incomplete.")
+    if raw_arguments[:3] != ["tocUrl", "docUrl", "docServerPath"]:
+        raise SourceSchemaError(
+            "KRX parent.setPath argument roles changed."
+        )
+    resolved_arguments = []
+    for value in raw_arguments:
+        literal = re.fullmatch(r"(['\"])([^'\"]*)\1", value)
+        if literal:
+            resolved_arguments.append(literal.group(2))
+        elif re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", value):
+            if value not in variables:
+                raise SourceSchemaError(
+                    "KRX parent.setPath references an unresolved variable."
+                )
+            resolved_arguments.append(variables[value])
+        else:
+            raise SourceSchemaError(
+                "KRX parent.setPath contains an unsupported argument expression."
+            )
+    doc_url = resolved_arguments[1]
+    doc_server_path = resolved_arguments[2]
+    if "fileupload" in doc_url.lower() or "fileupload" in doc_server_path.lower():
+        raise SourceSchemaError("KRX generated fileupload document is not approved.")
+    if _unsafe_path_material(doc_url) or _unsafe_path_material(doc_server_path):
+        raise SourceSchemaError(
+            "KRX parent.setPath contains traversal path material."
+        )
+    if urlsplit(doc_url).scheme or doc_url.startswith("/"):
+        candidate = urljoin(base, doc_url)
+    else:
+        server_base = urljoin(base, doc_server_path)
+        candidate = urljoin(server_base.rstrip("/") + "/", doc_url)
+    parsed = urlsplit(candidate)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != "kind.krx.co.kr"
+        or not parsed.path.startswith("/external/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SourceSchemaError(
+            "KRX parent.setPath document target is outside /external/."
+        )
+    return candidate
+
+
+def _unsafe_path_material(value):
+    current = urlsplit(value).path
+    for _ in range(8):
+        if (
+            "\\" in current
+            or re.search(r"%(?:2e|2f|5c)", current, re.I)
+            or any(
+                segment in {".", ".."}
+                for segment in current.split("/")
+            )
+        ):
+            return True
+        decoded = unquote(current)
+        if decoded == current:
+            return False
+        current = decoded
+    return True
 
 
 def _krx_correction_of(init_text, current):
@@ -1739,6 +2135,19 @@ def _response_mime(response):
     if not value:
         raise SourceSchemaError("Source response MIME is missing.")
     return value
+
+
+def _image_candidate_urls(node):
+    values = []
+    if node.attrib.get("src"):
+        values.append(node.attrib["src"])
+    if node.attrib.get("srcset"):
+        values.extend(
+            item.strip().split()[0]
+            for item in node.attrib["srcset"].split(",")
+            if item.strip()
+        )
+    return values
 
 
 def _content_kinds(node, attachments):

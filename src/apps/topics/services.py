@@ -176,6 +176,20 @@ _MOTIR_ATTACHMENT_MIMES = frozenset(
         "application/zip",
     }
 )
+_SEMICONDUCTOR_REQUIRED_CONFIG_KEYS = frozenset(
+    {
+        "entrypoints",
+        "identityNamespace",
+        "maxPages",
+        "pageSize",
+        "recordHosts",
+        "reconciliationDays",
+        "maxRequests",
+        "maxElapsedSeconds",
+        "sourceCheckDays",
+        "mediaDownloadPolicy",
+    }
+)
 _SEMICONDUCTOR_PROFILES = {
     "semiconductor_motir": {
         "name": "산업통상부",
@@ -201,6 +215,9 @@ _SEMICONDUCTOR_PROFILES = {
         },
     },
     "semiconductor_krx_kind": {
+        "name": "KRX KIND",
+        "ownerName": "한국거래소",
+        "editorialControlName": "한국거래소",
         "baseUrl": "https://kind.krx.co.kr/",
         "authorityTier": "primary_regulatory",
         "independenceGroupId": "krx-kind",
@@ -225,6 +242,9 @@ _SEMICONDUCTOR_PROFILES = {
         },
     },
     "semiconductor_samsung_newsroom": {
+        "name": "Samsung Global Newsroom Semiconductor",
+        "ownerName": "Samsung Electronics",
+        "editorialControlName": "Samsung Electronics",
         "baseUrl": "https://news.samsung.com/",
         "authorityTier": "primary_corporate",
         "independenceGroupId": "samsung",
@@ -265,6 +285,9 @@ _SEMICONDUCTOR_PROFILES = {
         },
     },
     "semiconductor_skhynix_newsroom": {
+        "name": "SK hynix Newsroom",
+        "ownerName": "SK hynix",
+        "editorialControlName": "SK hynix",
         "baseUrl": "https://news.skhynix.com/",
         "authorityTier": "primary_corporate",
         "independenceGroupId": "skhynix",
@@ -300,6 +323,9 @@ _SEMICONDUCTOR_PROFILES = {
         },
     },
     "semiconductor_sia_latest": {
+        "name": "Semiconductor Industry Association",
+        "ownerName": "Semiconductor Industry Association",
+        "editorialControlName": "Semiconductor Industry Association",
         "baseUrl": "https://www.semiconductors.org/",
         "authorityTier": "trusted_industry",
         "independenceGroupId": "sia",
@@ -830,6 +856,15 @@ def _validate_semiconductor_profile(material: Mapping[str, Any]) -> None:
     if profile is None:
         return
     external_config = material["externalConfig"]
+    required_config_keys = {
+        *_SEMICONDUCTOR_REQUIRED_CONFIG_KEYS,
+        *profile["mimes"],
+    }
+    missing_config_keys = required_config_keys - set(external_config)
+    if missing_config_keys:
+        raise InvalidInput(
+            f"{adapter_key} externalConfig is missing required fields."
+        )
     for field_name in (
         "name",
         "ownerName",
@@ -871,10 +906,10 @@ def _validate_semiconductor_profile(material: Mapping[str, Any]) -> None:
                 "its approved MIME profile."
             )
         required_union.update(actual_values)
-    if not required_union.issubset(approved_mimes):
+    if required_union != approved_mimes:
         raise InvalidInput(
-            "Semiconductor purpose MIME contracts must be included in "
-            "allowedMimeTypes."
+            "Semiconductor allowedMimeTypes must exactly match the union "
+            "of its purpose MIME contracts."
         )
 
 

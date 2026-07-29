@@ -74,9 +74,12 @@ _ADAPTER_IMPLEMENTATION_FILES = {
     **{
         key: (
             *_HTTP_IMPLEMENTATION_FILES,
+            "adapters/sources/__init__.py",
             "adapters/sources/semiconductor/__init__.py",
             "adapters/sources/semiconductor/common.py",
             "adapters/sources/semiconductor/adapters.py",
+            "apps/collection/services.py",
+            "apps/topics/tasks.py",
         )
         for key in (
             "semiconductor_motir",
