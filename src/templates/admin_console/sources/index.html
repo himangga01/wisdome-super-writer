@@ -1,0 +1,191 @@
+{% extends "admin_console/base.html" %}
+{% load static %}
+{% block title %}출처 레지스트리 · Wisdome{% endblock %}
+{% block content %}
+<div class="source-console">
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">SOURCE REGISTRY</p>
+      <h1>출처 레지스트리</h1>
+      <p class="muted">출처 설정 초안을 검토하고, 정확한 매니페스트를 승인하거나 폐기합니다.</p>
+    </div>
+    <div class="source-toolbar">
+      <label>주제
+        <select id="topic-filter" aria-label="주제 선택"></select>
+      </label>
+      <button id="reload-all" type="button" class="secondary-button">새로고침</button>
+    </div>
+  </div>
+
+  <div id="source-message" class="console-message hidden" role="status" aria-live="polite"></div>
+
+  <section class="source-overview">
+    <article class="panel">
+      <div class="section-head">
+        <div>
+          <h2>출처 정의</h2>
+          <p class="muted">설정 변경은 새 불변 초안 스냅샷을 만듭니다.</p>
+        </div>
+        <button id="new-source" type="button">새 출처</button>
+      </div>
+      <div id="source-list" class="list source-list"></div>
+    </article>
+
+    <article class="panel">
+      <div class="section-head">
+        <div>
+          <h2>레지스트리와 현재 헤드</h2>
+          <p id="registry-head" class="muted">현재 승인 헤드를 불러오는 중입니다.</p>
+        </div>
+        <button id="create-registry" type="button">헤드에서 초안 만들기</button>
+      </div>
+      <div id="registry-list" class="list registry-list"></div>
+    </article>
+  </section>
+
+  <section class="panel" id="source-editor-panel">
+    <div class="section-head">
+      <div>
+        <h2 id="source-editor-title">새 출처 정의</h2>
+        <p id="source-snapshot-summary" class="muted">저장하면 첫 번째 초안 스냅샷이 생성됩니다.</p>
+      </div>
+      <span id="source-status" class="badge">신규</span>
+    </div>
+
+    <form id="source-form">
+      <input id="source-id" type="hidden">
+      <input id="expected-draft-id" type="hidden">
+      <div class="source-form-grid">
+        <label>주제
+          <select id="source-topic" name="topic" required></select>
+        </label>
+        <label>출처 이름
+          <input name="name" maxlength="200" required>
+        </label>
+        <label>발행 주체
+          <input name="publisher" maxlength="200" required>
+        </label>
+        <label>권위 등급
+          <select name="authorityTier" required>
+            <option value="primary_official">공식 1차 자료</option>
+            <option value="primary_corporate">기업 1차 자료</option>
+            <option value="trusted_secondary">신뢰 2차 자료</option>
+            <option value="discovery_only">탐색 전용</option>
+          </select>
+        </label>
+        <label>독립성 그룹 ID
+          <input name="independenceGroupId" maxlength="200" required>
+        </label>
+        <label>소유자
+          <input name="ownerName" maxlength="200" required>
+        </label>
+        <label>편집 통제 주체
+          <input name="editorialControlName" maxlength="200" required>
+        </label>
+        <label>기본 URL
+          <input name="baseUrl" type="url" required>
+        </label>
+        <label>접근 방식
+          <select name="accessMethod" required>
+            <option value="public_api">공개 API</option>
+            <option value="open_data_api">공공데이터 API</option>
+            <option value="rss_atom">RSS/Atom</option>
+            <option value="public_html">공개 HTML</option>
+            <option value="public_file">공개 파일</option>
+          </select>
+        </label>
+        <label>어댑터 키
+          <input name="adapterKey" pattern="[a-z0-9_.-]+" required>
+        </label>
+        <label>허용 MIME 유형
+          <input name="allowedMimeTypes" placeholder="text/html, application/rss+xml" required>
+        </label>
+        <label>기본 권리 상태
+          <select name="defaultRightsStatus" required>
+            <option value="allowed">사용 허용</option>
+            <option value="attribution_required">출처 표시 필요</option>
+            <option value="internal_analysis_only">내부 분석 전용</option>
+            <option value="unknown">미확인</option>
+            <option value="prohibited">사용 금지</option>
+          </select>
+        </label>
+        <label>약관 URL
+          <input name="termsUrl" type="url" placeholder="선택 사항">
+        </label>
+        <label>robots.txt URL
+          <input name="robotsUrl" type="url" placeholder="선택 사항">
+        </label>
+        <label>라이선스 URL
+          <input name="licenseUrl" type="url" placeholder="선택 사항">
+        </label>
+        <label>수집 간격(초)
+          <input name="pollIntervalSeconds" type="number" min="60" value="3600" required>
+        </label>
+        <label>최대 동시 요청
+          <input name="maxConcurrency" type="number" min="1" max="50" value="1" required>
+        </label>
+        <label>분당 요청 수
+          <input name="requestsPerMinute" type="number" min="1" max="10000" value="30" required>
+        </label>
+        <label>버스트
+          <input name="burst" type="number" min="1" max="1000" value="1" required>
+        </label>
+        <label class="checkbox-label">
+          <input name="enabled" type="checkbox" checked>
+          사용
+        </label>
+      </div>
+
+      <div class="source-material-grid">
+        <label>외부 설정(JSON, 비밀값 금지)
+          <textarea name="externalConfig" rows="10" spellcheck="false">{}</textarea>
+          <small>토큰·비밀번호·쿠키·Authorization 등 비밀값은 입력하지 마세요.</small>
+        </label>
+        <div>
+          <label>Secret Ref 포인터
+            <input name="secretRef" maxlength="300" autocomplete="off" placeholder="예: vault://sources/example">
+            <small>자격증명 자체가 아닌 비밀 저장소 포인터만 입력합니다.</small>
+          </label>
+          <div class="health-card">
+            <strong>최근 연결 점검</strong>
+            <div id="source-health" class="muted">아직 점검 기록이 없습니다.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">출처 초안 저장</button>
+        <button id="check-source" type="button" class="secondary-button" disabled>접근·파싱 점검</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel" id="registry-detail-panel">
+    <div class="section-head">
+      <div>
+        <h2>레지스트리 매니페스트</h2>
+        <p id="registry-summary" class="muted">위 목록에서 레지스트리를 선택하세요.</p>
+      </div>
+      <span id="registry-status" class="badge">선택 안 됨</span>
+    </div>
+    <div id="manifest-meta" class="manifest-meta hidden"></div>
+    <div id="membership-list" class="membership-list"></div>
+
+    <div id="registry-decision" class="decision-box hidden">
+      <h3>승인·폐기 결정</h3>
+      <p class="muted">현재 비밀번호는 재인증 요청에만 사용되며 화면이나 설정에 저장하지 않습니다.</p>
+      <div class="form-row">
+        <label>결정 사유
+          <input id="decision-reason" maxlength="500" placeholder="3자 이상 입력" autocomplete="off">
+        </label>
+        <label>현재 비밀번호
+          <input id="decision-password" type="password" autocomplete="current-password">
+        </label>
+        <button id="approve-registry" type="button">이 매니페스트 승인</button>
+        <button id="retire-registry" type="button" class="danger-button">현재 헤드 폐기</button>
+      </div>
+    </div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{% static 'admin_console/sources.js' %}"></script>{% endblock %}

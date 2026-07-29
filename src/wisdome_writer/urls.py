@@ -17,6 +17,7 @@ urlpatterns = [
     path("console/runs/", console.runs, name="console-runs"),
     path("console/runs/<uuid:run_id>/", console.run_detail, name="console-run-detail"),
     path("console/articles/", console.articles, name="console-articles"),
+    path("console/sources/", console.sources, name="console-sources"),
     path("console/publishing/", console.publishing, name="console-publishing"),
     path("console/publishing/", include("apps.publishing.console_urls")),
     path("console/operations/", console.operations, name="console-operations"),

@@ -12,9 +12,23 @@ class Command(BaseCommand):
     help = "Import immutable draft source registries from config/source-registry."
 
     def add_arguments(self, parser):
-        parser.add_argument("--root", default=str(settings.BASE_DIR.parent / "config" / "source-registry"))
+        parser.add_argument(
+            "--root",
+            default=str(
+                settings.BASE_DIR.parent / "config" / "source-registry"
+            ),
+        )
+        parser.add_argument(
+            "--version",
+            choices=("initial",),
+            default="initial",
+            help="Repository manifest set to import.",
+        )
 
     def handle(self, *args, **options):
+        del args
+        if options["version"] != "initial":
+            raise ValueError("Only the initial source registry set exists.")
         audit_context = AuditContext.for_system(
             correlation_id=uuid.uuid4(),
             operation_key="source-registry-import",

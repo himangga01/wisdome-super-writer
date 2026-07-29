@@ -266,6 +266,29 @@ _REGISTRY_KEYS = (
     "status",
     "version",
 )
+_REGISTRY_V2_KEYS = _REGISTRY_KEYS + (
+    "after_manifest_hash",
+    "before_manifest_hash",
+    "membership_count",
+    "mutation_id",
+    "prior_head_registry_id",
+    "registry_id",
+    "replacement_registry_id",
+    "repository_hash",
+    "row_version",
+    "source_id",
+    "source_snapshot_id",
+    "snapshot_id",
+)
+_SOURCE_DEFINITION_KEYS = (
+    "config_hash",
+    "job_id",
+    "request_hash",
+    "result",
+    "snapshot_id",
+    "snapshot_version",
+    "source_id",
+)
 _SCHEDULE_KEYS = (
     "coalesced_into_id",
     "collection_run_id",
@@ -388,6 +411,25 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
         for action in (
             "source_registry.imported",
             "source_registry.approved",
+        )
+    },
+    **{
+        (action, "2"): _policy(*_REGISTRY_V2_KEYS)
+        for action in (
+            "source_registry.draft_created",
+            "source_registry.imported",
+            "source_registry.membership_updated",
+            "source_registry.approved",
+            "source_registry.retired",
+            "source_registry.superseded",
+        )
+    },
+    **{
+        (action, "2"): _policy(*_SOURCE_DEFINITION_KEYS)
+        for action in (
+            "source_definition.created",
+            "source_definition.updated",
+            "source_definition.check_requested",
         )
     },
     **{

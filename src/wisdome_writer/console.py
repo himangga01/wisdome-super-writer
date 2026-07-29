@@ -24,6 +24,7 @@ def _console_view(template_name: str, *, fallback: str | None = None):
 home = _console_view("admin_console/index.html")
 runs = _console_view("admin_console/runs.html")
 articles = _console_view("admin_console/articles.html")
+sources = _console_view("admin_console/sources/index.html")
 publishing = _console_view(
     "admin_console/publishing/index.html",
     fallback="admin_console/index.html",

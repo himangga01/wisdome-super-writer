@@ -9,7 +9,7 @@ from datetime import datetime
 from django.db import transaction
 from django.utils import timezone
 
-from adapters.sources import build_source_adapter
+from adapters.sources import build_source_adapter, source_adapter_key
 from apps.topics.services import current_registry
 from wisdome_writer.infrastructure.outbox import enqueue_event
 from wisdome_writer.observability import (
@@ -339,7 +339,7 @@ def collect_run(run: CollectionRun) -> CollectionRun:
         attempt, _ = SourceCollectionAttempt.objects.get_or_create(
             run=run,
             source_snapshot=snapshot,
-            defaults={"adapter_name": snapshot.config.get("adapter", "public_html")},
+            defaults={"adapter_name": source_adapter_key(snapshot)},
         )
         attempt.state = "running"
         attempt.started_at = timezone.now()

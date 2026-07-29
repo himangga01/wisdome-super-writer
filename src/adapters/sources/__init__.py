@@ -1,3 +1,13 @@
-from .base import CollectedSourceRecord, SourceAdapter, build_source_adapter
+from .base import (
+    CollectedSourceRecord,
+    SourceAdapter,
+    build_source_adapter,
+    source_adapter_key,
+)
 
-__all__ = ["CollectedSourceRecord", "SourceAdapter", "build_source_adapter"]
+__all__ = [
+    "CollectedSourceRecord",
+    "SourceAdapter",
+    "build_source_adapter",
+    "source_adapter_key",
+]

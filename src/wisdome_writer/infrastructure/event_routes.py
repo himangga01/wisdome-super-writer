@@ -70,6 +70,18 @@ EXTRACTION_ENGINE_VALUES = frozenset(
 )
 
 EVENT_ROUTES: dict[EventKey, EventRoute] = {
+    ("source.check_requested", 1): EventRoute(
+        "source-check",
+        "maintenance",
+        "apps.topics.tasks.check_source_snapshot",
+        (
+            "source_id",
+            "source_snapshot_id",
+            "source_config_hash",
+            "check_id",
+        ),
+        max_attempts=3,
+    ),
     ("run.requested", 1): EventRoute(
         "collection-run",
         "collect.housing",
@@ -225,6 +237,20 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
 
 
 EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
+    ("source.check_requested", 1): _schema(
+        {
+            "source_id": STR,
+            "source_snapshot_id": STR,
+            "source_config_hash": STR,
+            "check_id": STR,
+        },
+        formats={
+            "source_id": UUID_FORMAT,
+            "source_snapshot_id": UUID_FORMAT,
+            "source_config_hash": SHA256_FORMAT,
+            "check_id": UUID_FORMAT,
+        },
+    ),
     ("run.requested", 1): _schema(
         {"run_id": STR},
         formats={"run_id": UUID_FORMAT},

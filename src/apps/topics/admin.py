@@ -1,6 +1,15 @@
 from django.contrib import admin
 
-from .models import SourceDefinition, SourceDefinitionSnapshot, SourceRegistryMembership, SourceRegistrySnapshot, TopicPolicy
+from .models import (
+    SourceDefinition,
+    SourceDefinitionSnapshot,
+    SourceRegistryDecision,
+    SourceRegistryMembership,
+    SourceRegistryMutation,
+    SourceRegistrySnapshot,
+    TopicPolicy,
+    TopicRegistryHead,
+)
 
 
 class ReadOnlyTopicAdmin(admin.ModelAdmin):
@@ -24,6 +33,9 @@ admin.site.register(
         SourceDefinitionSnapshot,
         SourceRegistrySnapshot,
         SourceRegistryMembership,
+        SourceRegistryMutation,
+        SourceRegistryDecision,
+        TopicRegistryHead,
     ],
     ReadOnlyTopicAdmin,
 )
