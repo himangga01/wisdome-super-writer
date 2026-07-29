@@ -1,5 +1,6 @@
 from .base import (
     CollectedSourceRecord,
+    ReconciliationSourceRecord,
     SourceAdapter,
     build_source_adapter,
     source_attachment_content_types,
@@ -12,6 +13,7 @@ from .base import (
 
 __all__ = [
     "CollectedSourceRecord",
+    "ReconciliationSourceRecord",
     "SourceAdapter",
     "build_source_adapter",
     "source_attachment_content_types",

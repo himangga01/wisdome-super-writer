@@ -50,7 +50,9 @@ class TopicPolicy(models.Model):
 class SourceDefinition(models.Model):
     class AuthorityTier(models.TextChoices):
         PRIMARY_OFFICIAL = "primary_official", "공식 1차 출처"
+        PRIMARY_REGULATORY = "primary_regulatory", "규제기관 1차 출처"
         PRIMARY_CORPORATE = "primary_corporate", "기업 1차 출처"
+        TRUSTED_INDUSTRY = "trusted_industry", "신뢰 산업단체 출처"
         TRUSTED_SECONDARY = "trusted_secondary", "신뢰 보조 출처"
         DISCOVERY_ONLY = "discovery_only", "발견 전용"
 

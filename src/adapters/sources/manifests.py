@@ -19,23 +19,23 @@ ADAPTER_IMPLEMENTATION_MANIFEST_SCHEMA_V1 = (
 
 _ADAPTER_EXECUTIONS: dict[str, tuple[str, str]] = {
     "semiconductor_motir": (
-        "v1",
+        "v2",
         "adapters.sources.semiconductor.adapters.MotirAdapter",
     ),
     "semiconductor_krx_kind": (
-        "v1",
+        "v2",
         "adapters.sources.semiconductor.adapters.KrxKindAdapter",
     ),
     "semiconductor_samsung_newsroom": (
-        "v1",
+        "v2",
         "adapters.sources.semiconductor.adapters.SamsungNewsroomAdapter",
     ),
     "semiconductor_skhynix_newsroom": (
-        "v1",
+        "v2",
         "adapters.sources.semiconductor.adapters.SkHynixNewsroomAdapter",
     ),
     "semiconductor_sia_latest": (
-        "v1",
+        "v2",
         "adapters.sources.semiconductor.adapters.SiaLatestAdapter",
     ),
     "housing_applyhome": (
@@ -106,6 +106,7 @@ _RUNTIME_DEPENDENCIES = (
     "defusedxml",
     "django",
     "httpx",
+    "lxml",
     "rfc8785",
 )
 

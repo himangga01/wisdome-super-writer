@@ -709,6 +709,7 @@ class HttpSourceAdapter:
         authenticated: bool = False,
         credential_parameter: str | None = None,
         expected_content_types: Collection[str] | None = None,
+        url_validator=None,
     ) -> httpx.Response:
         remaining = self._request_deadline - time.monotonic()
         if remaining <= 0:
@@ -729,8 +730,11 @@ class HttpSourceAdapter:
             allowed_hosts=self.allowed_hosts,
             headers=headers,
             max_elapsed_seconds=min(20.0, remaining),
-            https_only=authenticated,
+            https_only=authenticated or bool(
+                getattr(self, "_https_only", False)
+            ),
             before_request=self._consume_request_budget,
+            url_validator=url_validator,
         )
         response.raise_for_status()
         if expected_content_types is not None:
@@ -768,6 +772,7 @@ class HttpSourceAdapter:
         *,
         data: Mapping[str, Any],
         expected_content_types: Collection[str] | None = None,
+        url_validator=None,
     ) -> httpx.Response:
         remaining = self._request_deadline - time.monotonic()
         if remaining <= 0:
@@ -791,6 +796,8 @@ class HttpSourceAdapter:
             },
             max_elapsed_seconds=min(20.0, remaining),
             before_request=self._consume_request_budget,
+            https_only=bool(getattr(self, "_https_only", False)),
+            url_validator=url_validator,
         )
         response.raise_for_status()
         if expected_content_types is not None:

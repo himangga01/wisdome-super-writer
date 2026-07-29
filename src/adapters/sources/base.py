@@ -82,6 +82,25 @@ class CollectedSourceRecord:
         )
 
 
+@dataclass(frozen=True)
+class ReconciliationSourceRecord:
+    external_id: str
+    canonical_url: str
+    title: str
+    published_at: datetime | None
+    modified_at: datetime | None
+    status: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    body_text: str = ""
+    attachments: tuple[dict[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.external_id.strip() or not self.canonical_url.strip():
+            raise ValueError(
+                "Reconciliation records require identity and canonical URL."
+            )
+
+
 class SourceAdapter(Protocol):
     def collect(self, *, since: datetime, until: datetime) -> list[CollectedSourceRecord]: ...
 
@@ -297,6 +316,7 @@ def build_source_adapter(
     *,
     runtime_mode: str = "collection",
     reconciliation_external_ids: tuple[str, ...] = (),
+    reconciliation_records: tuple[ReconciliationSourceRecord, ...] = (),
 ) -> SourceAdapter:
     from .http import OpenDataJsonAdapter, PublicHtmlAdapter, RssAdapter
     from .housing import ApplyHomeAdapter, LhApplyAdapter
@@ -310,6 +330,20 @@ def build_source_adapter(
     config["_reconciliationExternalIds"] = list(
         reconciliation_external_ids
     )
+    config["_reconciliationRecords"] = [
+        {
+            "externalId": item.external_id,
+            "canonicalUrl": item.canonical_url,
+            "title": item.title,
+            "publishedAt": item.published_at,
+            "modifiedAt": item.modified_at,
+            "status": item.status,
+            "metadata": dict(item.metadata),
+            "bodyText": item.body_text,
+            "attachments": [dict(value) for value in item.attachments],
+        }
+        for item in reconciliation_records
+    ]
     adapter_name = source_adapter_key(source_snapshot)
     kwargs = {"source": source, "config": config}
     adapters = {

@@ -7,10 +7,13 @@ import uuid
 from datetime import datetime, timedelta
 
 from django.db import transaction
+from django.db.models import F, Window
+from django.db.models.functions import RowNumber
 from django.utils import timezone
 
 from adapters.sources import (
     build_source_adapter,
+    ReconciliationSourceRecord,
     source_adapter_implementation_manifest_hash,
     source_adapter_key,
     source_adapter_version,
@@ -785,27 +788,56 @@ def collect_run(run: CollectionRun) -> CollectionRun:
                     days=source_reconciliation_days(snapshot)
                 )
             )
-            reconciliation_external_ids = list(
+            reconciliation_links = list(
                 RunSourceItem.objects.filter(
                     source_item__source_id=snapshot.source_id,
                     collection_attempt__state="succeeded",
                     discovered_at__gte=reconciliation_cutoff,
                 )
-                .values_list(
-                    "source_item__external_id",
-                    flat=True,
+                .select_related("source_item")
+                .annotate(
+                    _reconciliation_rank=Window(
+                        expression=RowNumber(),
+                        partition_by=[F("source_item__external_id")],
+                        order_by=[
+                            F("discovered_at").desc(),
+                            F("id").desc(),
+                        ],
+                    )
                 )
-                .distinct()
+                .filter(_reconciliation_rank=1)
                 .order_by("source_item__external_id")[:10001]
             )
-            if len(reconciliation_external_ids) > 10000:
+            if len(reconciliation_links) > 10000:
                 raise ValueError(
                     "Source reconciliation identity budget was exhausted."
                 )
+            reconciliation_records = tuple(
+                ReconciliationSourceRecord(
+                    external_id=link.source_item.external_id,
+                    canonical_url=link.source_item.canonical_url,
+                    title=link.source_item.title,
+                    published_at=link.source_item.published_at,
+                    modified_at=link.source_item.modified_at,
+                    status=link.source_item.status,
+                    metadata={
+                        key: value
+                        for key, value in link.source_item.metadata.items()
+                        if key != "_collection"
+                    },
+                    body_text=link.source_item.body_text,
+                    attachments=tuple(link.source_item.attachments),
+                )
+                for link in reconciliation_links
+            )
             records = build_source_adapter(
                 snapshot,
+                reconciliation_records=reconciliation_records,
                 reconciliation_external_ids=(
-                    tuple(reconciliation_external_ids)
+                    tuple(
+                        item.external_id
+                        for item in reconciliation_records
+                    )
                 ),
             ).collect(
                 since=run.window_start,

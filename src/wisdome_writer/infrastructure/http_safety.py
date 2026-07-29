@@ -94,6 +94,7 @@ def safe_get(
     max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
     https_only: bool = False,
     before_request: Callable[[], None] | None = None,
+    url_validator: Callable[[str], None] | None = None,
 ) -> httpx.Response:
     """GET a public HTTP(S) resource with DNS pinning, redirect checks, and bounded streaming."""
     return _safe_request(
@@ -107,6 +108,7 @@ def safe_get(
         max_elapsed_seconds=max_elapsed_seconds,
         https_only=https_only,
         before_request=before_request,
+        url_validator=url_validator,
     )
 
 
@@ -122,6 +124,7 @@ def safe_post_form(
     max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
     https_only: bool = False,
     before_request: Callable[[], None] | None = None,
+    url_validator: Callable[[str], None] | None = None,
 ) -> httpx.Response:
     """POST an encoded form through the same pinned, bounded path as ``safe_get``."""
     return _safe_request(
@@ -136,6 +139,7 @@ def safe_post_form(
         max_elapsed_seconds=max_elapsed_seconds,
         https_only=https_only,
         before_request=before_request,
+        url_validator=url_validator,
     )
 
 
@@ -151,6 +155,7 @@ def _safe_request(
     max_elapsed_seconds: float,
     https_only: bool,
     before_request: Callable[[], None] | None,
+    url_validator: Callable[[str], None] | None,
     form_data: Mapping[str, Any] | None = None,
 ) -> httpx.Response:
 
@@ -174,6 +179,8 @@ def _safe_request(
 
     for redirect_count in range(max_redirects + 1):
         _remaining_seconds(deadline, current_url)
+        if url_validator is not None:
+            url_validator(current_url)
         target = _validate_target(
             current_url,
             normalized_allowed_hosts,

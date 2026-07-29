@@ -165,6 +165,166 @@ _ADAPTER_CONFIG_KEYS = {
     "public_html": frozenset({"entrypoints"}),
     "rss": frozenset({"entrypoints"}),
 }
+_MOTIR_ATTACHMENT_MIMES = frozenset(
+    {
+        "application/pdf",
+        "application/haansofthwp",
+        "application/x-hwp",
+        "application/vnd.hancom.hwp",
+        "application/hwp+zip",
+        "application/vnd.hancom.hwpx",
+        "application/zip",
+    }
+)
+_SEMICONDUCTOR_PROFILES = {
+    "semiconductor_motir": {
+        "name": "산업통상부",
+        "ownerName": "대한민국 산업통상부",
+        "editorialControlName": "대한민국 산업통상부",
+        "baseUrl": "https://www.motir.go.kr/",
+        "authorityTier": "primary_official",
+        "independenceGroupId": "kr-motie",
+        "defaultRightsStatus": "attribution_required",
+        "termsUrl": "https://www.motir.go.kr/kor/contents/81",
+        "enabled": True,
+        "entrypoints": [
+            "https://www.motir.go.kr/kor/article/ATCL3f49a5a8c",
+            "https://www.motir.go.kr/kor/article/ATCLe0854704d",
+        ],
+        "recordHosts": ["www.motir.go.kr"],
+        "identityNamespace": "motie:81",
+        "pageSize": 50,
+        "mimes": {
+            "listContentTypes": {"text/html"},
+            "detailContentTypes": {"text/html"},
+            "attachmentContentTypes": _MOTIR_ATTACHMENT_MIMES,
+        },
+    },
+    "semiconductor_krx_kind": {
+        "baseUrl": "https://kind.krx.co.kr/",
+        "authorityTier": "primary_regulatory",
+        "independenceGroupId": "krx-kind",
+        "defaultRightsStatus": "internal_analysis_only",
+        "termsUrl": (
+            "https://info.krx.co.kr/contents/KRX/06/06070200/"
+            "KRX06070200.jsp"
+        ),
+        "enabled": True,
+        "entrypoints": [
+            "https://kind.krx.co.kr/disclosure/details.do"
+            "?method=searchDetailsMain"
+        ],
+        "recordHosts": ["kind.krx.co.kr"],
+        "identityNamespace": "krx-kind",
+        "pageSize": 100,
+        "issuerCodes": ["A005930", "A000660"],
+        "mimes": {
+            "listContentTypes": {"text/html"},
+            "detailContentTypes": {"text/html"},
+            "attachmentContentTypes": {"text/html", "application/pdf"},
+        },
+    },
+    "semiconductor_samsung_newsroom": {
+        "baseUrl": "https://news.samsung.com/",
+        "authorityTier": "primary_corporate",
+        "independenceGroupId": "samsung",
+        "defaultRightsStatus": "internal_analysis_only",
+        "termsUrl": "https://news.samsung.com/global/terms",
+        "enabled": True,
+        "entrypoints": [
+            "https://news.samsung.com/global/category/products/"
+            "semiconductors/feed",
+            "https://news.samsung.com/global/category/products/"
+            "semiconductors/feed/atom",
+        ],
+        "recordHosts": [
+            "img.global.news.samsung.com",
+            "news.samsung.com",
+        ],
+        "identityNamespace": "samsung-global:wp-post",
+        "pageSize": 50,
+        "mimes": {
+            "feedContentTypes": {
+                "application/rss+xml",
+                "application/atom+xml",
+                "application/xml",
+                "text/xml",
+            },
+            "detailContentTypes": {"text/html"},
+            "attachmentContentTypes": {
+                "application/pdf",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/jpeg",
+                "image/png",
+                "image/gif",
+                "image/webp",
+                "audio/mpeg",
+                "video/mp4",
+            },
+        },
+    },
+    "semiconductor_skhynix_newsroom": {
+        "baseUrl": "https://news.skhynix.com/",
+        "authorityTier": "primary_corporate",
+        "independenceGroupId": "skhynix",
+        "defaultRightsStatus": "prohibited",
+        "termsUrl": "https://news.skhynix.com/en/terms-of-use/",
+        "enabled": False,
+        "entrypoints": [
+            "https://news.skhynix.com/en/feed/",
+            "https://news.skhynix.com/en/feed/atom/",
+        ],
+        "recordHosts": [
+            "d18r0a86za96sg.cloudfront.net",
+            "news.skhynix.com",
+        ],
+        "identityNamespace": "skhynix:wp-post",
+        "pageSize": 10,
+        "mimes": {
+            "feedContentTypes": {
+                "application/rss+xml",
+                "application/atom+xml",
+                "application/xml",
+                "text/xml",
+            },
+            "detailContentTypes": {"text/html"},
+            "attachmentContentTypes": {
+                "application/pdf",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+            },
+        },
+    },
+    "semiconductor_sia_latest": {
+        "baseUrl": "https://www.semiconductors.org/",
+        "authorityTier": "trusted_industry",
+        "independenceGroupId": "sia",
+        "defaultRightsStatus": "internal_analysis_only",
+        "termsUrl": "https://www.semiconductors.org/terms-of-use/",
+        "enabled": True,
+        "entrypoints": [
+            "https://www.semiconductors.org/news-events/latest-news/"
+        ],
+        "recordHosts": ["www.semiconductors.org"],
+        "identityNamespace": "sia:wp-post",
+        "pageSize": 12,
+        "mimes": {
+            "listContentTypes": {"text/html"},
+            "detailContentTypes": {"text/html"},
+            "attachmentContentTypes": {
+                "application/pdf",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/jpeg",
+                "image/png",
+            },
+        },
+    },
+}
 _AUTHENTICATED_ADAPTER_PROFILES = {
     "housing_applyhome": {
         "secretRef": "env://DATA_GO_KR_SERVICE_KEY",
@@ -664,6 +824,60 @@ def _validate_authenticated_adapter_profile(
         )
 
 
+def _validate_semiconductor_profile(material: Mapping[str, Any]) -> None:
+    adapter_key = str(material["adapterKey"])
+    profile = _SEMICONDUCTOR_PROFILES.get(adapter_key)
+    if profile is None:
+        return
+    external_config = material["externalConfig"]
+    for field_name in (
+        "name",
+        "ownerName",
+        "editorialControlName",
+        "baseUrl",
+        "authorityTier",
+        "independenceGroupId",
+        "defaultRightsStatus",
+        "termsUrl",
+        "enabled",
+    ):
+        if field_name in profile and material[field_name] != profile[field_name]:
+            raise InvalidInput(
+                f"{adapter_key} {field_name} is outside its approved profile."
+            )
+    for field_name in (
+        "entrypoints",
+        "recordHosts",
+        "identityNamespace",
+        "pageSize",
+        "issuerCodes",
+    ):
+        if field_name in profile and external_config.get(field_name) != profile[field_name]:
+            raise InvalidInput(
+                f"{adapter_key} externalConfig.{field_name} does not match "
+                "its approved profile."
+            )
+    if external_config.get("mediaDownloadPolicy") != "metadata_only":
+        raise InvalidInput(
+            "Semiconductor mediaDownloadPolicy must be metadata_only."
+        )
+    approved_mimes = set(material["allowedMimeTypes"])
+    required_union: set[str] = set()
+    for field_name, expected_values in profile["mimes"].items():
+        actual_values = set(external_config.get(field_name, []))
+        if actual_values != set(expected_values):
+            raise InvalidInput(
+                f"{adapter_key} externalConfig.{field_name} does not match "
+                "its approved MIME profile."
+            )
+        required_union.update(actual_values)
+    if not required_union.issubset(approved_mimes):
+        raise InvalidInput(
+            "Semiconductor purpose MIME contracts must be included in "
+            "allowedMimeTypes."
+        )
+
+
 def _source_projection_material(source: SourceDefinition) -> dict[str, Any]:
     return {
         "topic": source.topic_code,
@@ -977,6 +1191,8 @@ def _normalize_source_material(
     material["rateLimitPolicy"] = normalized_rate_policy
     if not isinstance(material["enabled"], bool):
         raise InvalidInput("enabled must be boolean.")
+
+    _validate_semiconductor_profile(material)
 
     # Ensure the exact material is canonicalizable before any row is changed.
     _hash(source_snapshot_material(material))
