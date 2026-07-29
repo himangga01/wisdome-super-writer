@@ -29,7 +29,17 @@ from apps.audit.services import (
     require_audit_replay,
     require_worker_event,
 )
-from wisdome_writer.domain.errors import Conflict, Forbidden, InvalidInput, NotFound
+from wisdome_writer.domain.concurrency import (
+    canonical_request_hash,
+    require_idempotent_match,
+)
+from wisdome_writer.domain.errors import (
+    Conflict,
+    Forbidden,
+    InvalidInput,
+    NotFound,
+    RequestKeyConflict,
+)
 from wisdome_writer.domain.hashing import sha256_hex
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle, RenderedMedia
@@ -275,6 +285,26 @@ def _request_hash(payload: dict[str, Any]) -> str:
     return sha256_hex(payload)
 
 
+def _legacy_admin_request_hash(
+    *,
+    actor_id: Any,
+    request_key: str,
+    reason: str,
+    action: str,
+    payload: dict[str, Any],
+) -> str:
+    return _request_hash(
+        {
+            "schemaVersion": "publishing-admin-request-v1",
+            "action": action,
+            "actorId": str(actor_id),
+            "requestKey": request_key,
+            "reason": reason,
+            "payload": payload,
+        }
+    )
+
+
 def _publication_dispatch_audit_identity(
     *,
     intent_id,
@@ -307,15 +337,35 @@ def _admin_request_hash(
         and payload["reason"] != audit_context.reason_code
     ):
         raise Forbidden("reason differs from audit provenance")
-    return _request_hash(
-        {
-            "schemaVersion": "publishing-admin-request-v1",
-            "action": action,
-            "actorId": str(audit_context.actor_id),
-            "requestKey": audit_context.request_key,
-            "reason": audit_context.reason_code,
-            "payload": payload,
-        }
+    return _legacy_admin_request_hash(
+        actor_id=audit_context.actor_id,
+        request_key=audit_context.request_key,
+        reason=audit_context.reason_code,
+        action=action,
+        payload=payload,
+    )
+
+
+def _canary_request_hash(
+    *,
+    target_id: Any,
+    policy_version: str,
+    reason: str,
+    request_key: str,
+) -> str:
+    return canonical_request_hash(
+        operation_id="canaryPublicationTarget",
+        path="/targets/{targetId}/canary",
+        payload={
+            "path": {"targetId": str(target_id)},
+            "query": {},
+            "body": {
+                "confirmIsolatedTestTarget": True,
+                "policyVersion": policy_version,
+                "reason": reason,
+                "requestKey": request_key,
+            },
+        },
     )
 
 
@@ -1247,39 +1297,97 @@ def create_canary_run(
     _require_audit_actor(audit_context, "admin")
     if audit_context.actor_id != user.pk:
         raise Forbidden("canary audit actor differs from the administrator")
-    target = PublicationTarget.objects.select_for_update().get(id=target_id)
-    if target.environment != TargetEnvironment.TEST:
-        raise Forbidden("쓰기가 발생하는 canary는 격리된 test target에서만 실행할 수 있습니다.")
-    if target.preflight_state != ValidationState.PASSED:
-        raise Conflict("읽기 전용 preflight를 먼저 통과해야 합니다.")
-    request_hash = _admin_request_hash(
-        audit_context=audit_context,
-        action="publication_target.canary_requested",
-        payload={
-            "targetId": str(target.id),
-            "policyVersion": policy_version,
-            "reason": reason,
-            "requestKey": request_key,
-        },
+    if audit_context.request_key != request_key:
+        raise Forbidden("requestKey differs from audit provenance")
+    if audit_context.reason_code != reason:
+        raise Forbidden("reason differs from audit provenance")
+
+    normalized_target_id = str(uuid.UUID(str(target_id)))
+    request_hash = _canary_request_hash(
+        target_id=normalized_target_id,
+        policy_version=policy_version,
+        reason=reason,
+        request_key=request_key,
     )
-    existing = TargetCanaryRun.objects.filter(target=target, request_key=request_key).first()
-    if existing:
-        if (
-            existing.policy_version != policy_version
-            or existing.reason != reason
-            or existing.requested_by_id != user.pk
-        ):
-            raise Conflict(
-                "the canary request key was already used with different material"
+
+    def replay(existing: TargetCanaryRun) -> TargetCanaryRun:
+        canonical_stored_material_hash = _canary_request_hash(
+            target_id=existing.target_id,
+            policy_version=existing.policy_version,
+            reason=existing.reason,
+            request_key=existing.request_key,
+        )
+        require_idempotent_match(
+            stored_hash=canonical_stored_material_hash,
+            expected_hash=request_hash,
+        )
+        if existing.requested_by_id != user.pk:
+            raise RequestKeyConflict(
+                "The request key is already bound to another administrator"
+            )
+        legacy_stored_material_hash = _legacy_admin_request_hash(
+            actor_id=existing.requested_by_id,
+            request_key=existing.request_key,
+            reason=existing.reason,
+            action="publication_target.canary_requested",
+            payload={
+                "targetId": str(existing.target_id),
+                "policyVersion": existing.policy_version,
+                "reason": existing.reason,
+                "requestKey": existing.request_key,
+            },
+        )
+        event = require_audit_replay(
+            context=audit_context,
+            action="publication_target.canary_requested",
+            entity=existing,
+            identity_key=f"canary-request:{existing.id}",
+        )
+        metadata = validate_stored_metadata(
+            action=event.action,
+            metadata_schema_version=event.metadata_schema_version,
+            redaction_policy_version=event.redaction_policy_version,
+            redaction_policy_hash_value=event.redaction_policy_hash,
+            metadata=event.metadata_redacted,
+        )
+        stored_request_hash = metadata.get("request_hash")
+        if stored_request_hash == canonical_stored_material_hash:
+            matched_request_hash = canonical_stored_material_hash
+        elif stored_request_hash == legacy_stored_material_hash:
+            matched_request_hash = legacy_stored_material_hash
+        else:
+            raise RequestKeyConflict(
+                "The stored canary request hash is not compatible with this replay"
             )
         require_audit_replay(
             context=audit_context,
             action="publication_target.canary_requested",
             entity=existing,
             identity_key=f"canary-request:{existing.id}",
-            request_hash=request_hash,
+            request_hash=matched_request_hash,
         )
         return existing
+
+    existing = TargetCanaryRun.objects.filter(
+        target_id=normalized_target_id,
+        request_key=request_key,
+    ).first()
+    if existing:
+        return replay(existing)
+
+    target = PublicationTarget.objects.select_for_update().get(
+        id=normalized_target_id
+    )
+    existing = TargetCanaryRun.objects.filter(
+        target=target,
+        request_key=request_key,
+    ).first()
+    if existing:
+        return replay(existing)
+    if target.environment != TargetEnvironment.TEST:
+        raise Forbidden("쓰기가 발생하는 canary는 격리된 test target에서만 실행할 수 있습니다.")
+    if target.preflight_state != ValidationState.PASSED:
+        raise Conflict("읽기 전용 preflight를 먼저 통과해야 합니다.")
     snapshot = PublicationTargetSnapshot.objects.get(id=target.current_snapshot_id)
     run = TargetCanaryRun.objects.create(
         target=target,

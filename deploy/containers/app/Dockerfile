@@ -13,6 +13,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 COPY config ./config
+COPY specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml \
+    ./specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml
 COPY deploy/containers/app/entrypoint.sh ./deploy/containers/app/entrypoint.sh
 RUN uv sync --frozen --no-dev \
     && chmod 0755 ./deploy/containers/app/entrypoint.sh

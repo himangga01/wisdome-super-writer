@@ -16,10 +16,27 @@ class AdminAccountAdmin(UserAdmin):
     fieldsets = (
         (None, {"fields": ("email", "password")}),
         ("Permissions", {"fields": ("is_active", "is_staff", "is_superuser", "groups")}),
-        ("Timestamps", {"fields": ("last_login", "last_reauthenticated_at")}),
+        (
+            "Timestamps",
+            {
+                "fields": (
+                    "last_login",
+                    "last_reauthenticated_at",
+                    "reauth_failure_count",
+                    "reauth_failure_window_started_at",
+                    "reauth_locked_until",
+                )
+            },
+        ),
     )
     add_fieldsets = ((None, {"fields": ("email", "password1", "password2")}),)
-    readonly_fields = ("last_login", "last_reauthenticated_at")
+    readonly_fields = (
+        "last_login",
+        "last_reauthenticated_at",
+        "reauth_failure_count",
+        "reauth_failure_window_started_at",
+        "reauth_locked_until",
+    )
 
 
 @admin.register(ReauthenticationProof)

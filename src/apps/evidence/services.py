@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from adapters.storage import S3ObjectStorage
@@ -20,6 +21,12 @@ from apps.audit.services import (
     record_audit_event,
     require_audit_replay,
 )
+from wisdome_writer.domain.concurrency import (
+    canonical_request_hash,
+    require_expected_version,
+    require_idempotent_match,
+)
+from wisdome_writer.domain.errors import RequestKeyConflict
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import (
@@ -517,6 +524,14 @@ def _decision_request_hash(payload: Mapping[str, Any]) -> str:
     return canonical_hash(dict(payload))
 
 
+def _review_decision_request_hash(payload: Mapping[str, Any]) -> str:
+    return canonical_request_hash(
+        operation_id="createEvidenceReviewDecision",
+        path="/evidence/{evidenceId}/review-decisions",
+        payload=payload,
+    )
+
+
 def _profile_audit_material(
     profile: ExtractionProfileSnapshot,
 ) -> dict[str, Any]:
@@ -962,6 +977,19 @@ def decide_evidence_review(
         else None
     )
     request_payload = {
+        "path": {"evidenceId": str(evidence_id)},
+        "query": {},
+        "body": {
+            "decision": decision,
+            "subjectSchemaVersion": expected_subject_version,
+            "subjectHash": expected_subject_hash,
+            "expectedLatestDecisionId": expected,
+            "requestKey": request_key,
+            "reason": reason,
+        },
+    }
+    request_hash = _review_decision_request_hash(request_payload)
+    legacy_request_hash = _decision_request_hash({
         "evidence_id": str(evidence_id),
         "decision": decision,
         "expected_subject_version": expected_subject_version,
@@ -970,8 +998,77 @@ def decide_evidence_review(
         "request_key": request_key,
         "reason": reason,
         "admin_id": str(admin.pk),
-    }
-    request_hash = _decision_request_hash(request_payload)
+    })
+
+    def replay(
+        existing: EvidenceReviewDecision,
+    ) -> tuple[EvidenceReviewDecision, bool]:
+        if existing.reviewer_admin_id != admin.pk:
+            raise RequestKeyConflict(
+                "The request key is already bound to another administrator"
+            )
+        if existing.request_hash == request_hash:
+            matched_request_hash = request_hash
+        elif existing.request_hash == legacy_request_hash:
+            matched_request_hash = legacy_request_hash
+        else:
+            require_idempotent_match(
+                stored_hash=existing.request_hash,
+                expected_hash=request_hash,
+            )
+            matched_request_hash = request_hash
+        require_idempotent_match(
+            stored_hash=existing.request_hash,
+            expected_hash=matched_request_hash,
+        )
+        replay_evidence = existing.evidence_asset
+        if replay_evidence is None:
+            original_evidence_id = (
+                existing.evidence_audit_snapshot.original_evidence_asset_id
+            )
+            if (
+                original_evidence_id is None
+                or str(original_evidence_id) != str(evidence_id)
+            ):
+                raise EvidenceInvariantError(
+                    "The durable evidence review identity is unavailable"
+                )
+            replay_evidence = EvidenceAsset(pk=original_evidence_id)
+            replay_evidence._state.adding = False
+            replay_evidence._state.db = alias
+        require_audit_replay(
+            context=audit_context,
+            action="evidence.review_decided",
+            entity=replay_evidence,
+            identity_key=canonical_hash(
+                {
+                    "schema_version": "evidence-review-identity-v1",
+                    "snapshot_id": str(existing.evidence_audit_snapshot_id),
+                    "request_key": request_key,
+                }
+            ),
+            request_hash=matched_request_hash,
+        )
+        return existing, False
+
+    existing = (
+        EvidenceReviewDecision.objects.using(alias)
+        .select_related("evidence_asset", "evidence_audit_snapshot")
+        .filter(
+            request_key=request_key,
+        )
+        .filter(
+            Q(evidence_asset_id=evidence_id)
+            | Q(
+                evidence_audit_snapshot__original_evidence_asset_id=evidence_id
+            )
+        )
+        .order_by("decided_at", "id")
+        .first()
+    )
+    if existing:
+        return replay(existing)
+
     with transaction.atomic(using=alias):
         document_id = (
             EvidenceAsset.objects.using(alias)
@@ -1016,6 +1113,19 @@ def decide_evidence_review(
             raise EvidenceConflict(
                 "The evidence document membership changed; retry the review"
             )
+        existing = (
+            EvidenceReviewDecision.objects.using(alias)
+            .select_related("evidence_asset", "evidence_audit_snapshot")
+            .filter(
+                evidence_asset=evidence,
+                request_key=request_key,
+            )
+            .order_by("decided_at", "id")
+            .first()
+        )
+        if existing:
+            return replay(existing)
+
         calculated = calculate_review_subject_hash(evidence)
         if calculated != evidence.review_subject_hash:
             raise EvidenceInvariantError(
@@ -1042,40 +1152,16 @@ def decide_evidence_review(
             )
 
         snapshot = _ensure_review_snapshot(evidence, using=alias)
-        existing = EvidenceReviewDecision.objects.using(alias).filter(
-            evidence_audit_snapshot=snapshot,
-            request_key=request_key,
-        ).first()
-        if existing:
-            if (
-                existing.request_hash != request_hash
-                or existing.reviewer_admin_id != admin.pk
-            ):
-                raise EvidenceConflict(
-                    "The request key was already used with a different payload"
-                )
-            require_audit_replay(
-                context=audit_context,
-                action="evidence.review_decided",
-                entity=evidence,
-                identity_key=canonical_hash(
-                    {
-                        "schema_version": "evidence-review-identity-v1",
-                        "snapshot_id": str(snapshot.id),
-                        "request_key": request_key,
-                    }
-                ),
-                request_hash=request_hash,
-            )
-            return existing, False
-
         current = (
             str(evidence.latest_review_decision_id)
             if evidence.latest_review_decision_id
             else None
         )
-        if current != expected:
-            raise EvidenceConflict("The evidence review projection is stale")
+        require_expected_version(
+            actual=current,
+            expected=expected,
+            subject="Evidence review projection",
+        )
         if decision not in EvidenceReviewDecision.Decision.values:
             raise ValidationError(
                 {"decision": "Unsupported evidence review decision"}

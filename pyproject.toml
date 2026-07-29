@@ -18,6 +18,8 @@ dependencies = [
   "boto3==1.43.57",
   "httpx==0.28.1",
   "rfc8785==0.1.4",
+  "PyYAML==6.0.3",
+  "jsonschema[format-nongpl]==4.26.0",
   "croniter==6.2.4",
   "defusedxml==0.7.1",
   "lxml==6.1.1",
@@ -48,6 +50,11 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+# PaddleX 3.7.x pins PyYAML 6.0.2 in the optional OCR graph. The application
+# contract loader requires the patched 6.0.3 runtime consistently in every extra.
+override-dependencies = ["PyYAML==6.0.3"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "wisdome_writer.settings"

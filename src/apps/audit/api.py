@@ -8,12 +8,13 @@ from django.http import HttpRequest, JsonResponse
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime
-from django.views.decorators.http import require_GET, require_http_methods
+from django.views.decorators.http import require_http_methods
 
+from wisdome_writer.api.openapi import openapi_operation
 from wisdome_writer.domain.errors import InvalidInput
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
-from .cursor import decode_cursor, encode_cursor
+from .cursor import cursor_key, decode_cursor, encode_cursor
 from apps.accounts.services import consume_reauthentication_proof
 
 from .models import AuditEvent, RetentionBatch
@@ -60,45 +61,47 @@ def _serialize(event: AuditEvent) -> dict:
 
 
 @login_required
-@require_GET
+@openapi_operation("listAuditEvents")
 def list_audit_events(request: HttpRequest) -> JsonResponse:
+    query = request.openapi_query
     filters = {
-        key: request.GET.get(key)
+        key: query[key]
         for key in ("correlationId", "entityType", "entityId", "action", "from", "to")
-        if request.GET.get(key)
+        if query.get(key) not in (None, "")
     }
     queryset = AuditEvent.objects.all()
     try:
         if value := filters.get("correlationId"):
-            queryset = queryset.filter(correlation_id=UUID(value))
+            queryset = queryset.filter(correlation_id=UUID(str(value)))
         if value := filters.get("entityType"):
             queryset = queryset.filter(entity_type=value)
         if value := filters.get("entityId"):
-            queryset = queryset.filter(entity_id=UUID(value))
+            queryset = queryset.filter(entity_id=UUID(str(value)))
         if value := filters.get("action"):
             queryset = queryset.filter(action=value)
         if value := filters.get("from"):
-            parsed = parse_datetime(value)
+            parsed = parse_datetime(str(value))
             if parsed is None:
                 raise ValueError
             queryset = queryset.filter(occurred_at__gte=parsed)
         if value := filters.get("to"):
-            parsed = parse_datetime(value)
+            parsed = parse_datetime(str(value))
             if parsed is None:
                 raise ValueError
             queryset = queryset.filter(occurred_at__lt=parsed)
     except (ValueError, TypeError) as exc:
         raise InvalidInput("Audit filters contain an invalid UUID or timestamp") from exc
 
-    cursor_value = request.GET.get("cursor")
-    watermark: tuple[datetime, str] | None = None
-    if cursor_value:
-        try:
-            cursor = decode_cursor(cursor_value, filters=filters)
-            watermark = (datetime.fromisoformat(cursor["watermark"][0]), cursor["watermark"][1])
-            last = (datetime.fromisoformat(cursor["last"][0]), cursor["last"][1])
-        except (ValueError, KeyError, TypeError) as exc:
-            raise InvalidInput("Audit cursor is invalid or does not match the filters") from exc
+    cursor_value = query.get("cursor")
+    watermark: tuple[datetime, UUID] | None = None
+    if cursor_value is not None:
+        cursor = decode_cursor(
+            cursor_value,
+            filters=filters,
+            limit=PAGE_SIZE,
+        )
+        watermark = cursor_key(cursor.watermark)
+        last = cursor_key(cursor.position)
         queryset = queryset.filter(
             Q(occurred_at__lt=watermark[0])
             | Q(occurred_at=watermark[0], id__lte=watermark[1])
@@ -107,13 +110,13 @@ def list_audit_events(request: HttpRequest) -> JsonResponse:
     events = list(queryset.order_by("-occurred_at", "-id")[: PAGE_SIZE + 1])
     page = events[:PAGE_SIZE]
     if watermark is None and page:
-        watermark = (page[0].occurred_at, str(page[0].pk))
+        watermark = (page[0].occurred_at, page[0].pk)
     next_cursor = None
     if len(events) > PAGE_SIZE and page and watermark:
         tail = page[-1]
         next_cursor = encode_cursor(
             filters=filters,
-            watermark=watermark,
+            watermark=(watermark[0], str(watermark[1])),
             last=(tail.occurred_at, str(tail.pk)),
             limit=PAGE_SIZE,
         )

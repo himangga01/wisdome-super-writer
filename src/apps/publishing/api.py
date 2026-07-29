@@ -4,7 +4,6 @@ import json
 from functools import wraps
 from typing import Any
 
-from django.core.exceptions import ObjectDoesNotExist
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_protect
@@ -12,7 +11,13 @@ from django.views.decorators.http import require_http_methods
 
 from adapters.storage import S3ObjectStorage
 from apps.audit.services import AuditContext
-from wisdome_writer.domain.errors import DomainError, InvalidInput
+from wisdome_writer.api.openapi import openapi_operation, openapi_operations
+from wisdome_writer.api.problems import problem_response
+from wisdome_writer.domain.errors import (
+    InvalidInput,
+    RequestValidationError,
+    ValidationIssue,
+)
 from wisdome_writer.domain.hashing import sha256_hex
 
 from .models import (
@@ -55,29 +60,27 @@ def admin_api(view):
             return _problem(403, "csrf_required", "모든 관리자 API 요청에 CSRF header가 필요합니다.")
         try:
             return view(request, *args, **kwargs)
-        except DomainError as exc:
-            return _problem(exc.status, exc.code, exc.detail or exc.title)
-        except ObjectDoesNotExist:
-            return _problem(404, "not_found", "대상을 찾을 수 없습니다.")
-        except (KeyError, TypeError, ValueError) as exc:
-            return _problem(422, "invalid_input", f"필수 입력값이 올바르지 않습니다: {exc}")
+        except KeyError as exc:
+            if hasattr(request, "openapi_operation_id"):
+                raise
+            raise RequestValidationError(
+                errors=(ValidationIssue(path="/body", code="invalid_value"),),
+            ) from exc
 
     return wrapped
 
 
 def _problem(status: int, code: str, detail: str) -> JsonResponse:
-    return JsonResponse(
-        {
-            "type": f"urn:wisdome-writer:problem:{code}",
-            "title": code.replace("_", " "),
-            "status": status,
-            "detail": detail,
-        },
+    return problem_response(
         status=status,
+        code=code,
+        title=detail,
     )
 
 
 def _body(request: HttpRequest) -> dict[str, Any]:
+    if hasattr(request, "openapi_body"):
+        return request.openapi_body
     try:
         value = json.loads(request.body.decode("utf-8") or "{}")
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -269,6 +272,12 @@ def publication_json(row: Publication) -> dict[str, Any]:
     }
 
 
+@openapi_operations(
+    {
+        "GET": "listPublicationTargets",
+        "POST": "createPublicationTarget",
+    }
+)
 @admin_api
 @require_http_methods(["GET", "POST"])
 def targets(request: HttpRequest) -> JsonResponse:
@@ -297,6 +306,7 @@ def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
     return JsonResponse(target_json(row))
 
 
+@openapi_operation("preflightPublicationTarget")
 @admin_api
 @require_http_methods(["POST"])
 def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -308,6 +318,7 @@ def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
     return JsonResponse({"jobId": str(event.id), "state": "queued"}, status=202)
 
 
+@openapi_operation("canaryPublicationTarget")
 @admin_api
 @require_http_methods(["POST"])
 def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -329,6 +340,12 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
     return JsonResponse({"jobId": str(row.id), "state": row.state}, status=202)
 
 
+@openapi_operations(
+    {
+        "GET": "listAutoPublishValidations",
+        "POST": "createAutoPublishValidation",
+    }
+)
 @admin_api
 @require_http_methods(["GET", "POST"])
 def auto_publish_validations(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -344,6 +361,7 @@ def auto_publish_validations(request: HttpRequest, target_id: str) -> JsonRespon
     return JsonResponse([validation_json(row) for row in rows], safe=False)
 
 
+@openapi_operation("decideAutoPublishValidation")
 @admin_api
 @require_http_methods(["POST"])
 def auto_publish_validation_decisions(
@@ -376,6 +394,7 @@ def auto_publish_validation_decisions(
     )
 
 
+@openapi_operation("getAutoPublishValidationReport")
 @admin_api
 @require_http_methods(["GET"])
 def auto_publish_validation_report(
@@ -413,6 +432,7 @@ def auto_publish_validation_report(
     return JsonResponse(normalized)
 
 
+@openapi_operation("setTargetAutoPublish")
 @admin_api
 @require_http_methods(["PUT"])
 def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -432,6 +452,7 @@ def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
     )
 
 
+@openapi_operation("disconnectPublicationTarget")
 @admin_api
 @require_http_methods(["DELETE"])
 def target_connection(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -445,6 +466,7 @@ def target_connection(request: HttpRequest, target_id: str) -> JsonResponse:
     return JsonResponse({"jobId": str(decision.id), "state": decision.state}, status=202)
 
 
+@openapi_operation("startTargetOAuth")
 @admin_api
 @require_http_methods(["POST"])
 def target_oauth_start(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -460,25 +482,24 @@ def target_oauth_start(request: HttpRequest, target_id: str) -> JsonResponse:
     )
 
 
+@openapi_operation("completeTargetOAuth")
 @require_http_methods(["GET"])
 def blogger_oauth_callback(request: HttpRequest) -> JsonResponse:
     if not request.user.is_authenticated or not request.user.is_active or not request.user.is_staff:
         return _problem(403, "forbidden", "OAuth를 시작한 관리자 로그인이 필요합니다.")
-    if request.GET.get("error"):
+    query = request.openapi_query
+    if query.get("error"):
         return _problem(400, "blogger_oauth_rejected", "Google OAuth 승인이 거절되었습니다.")
-    code = request.GET.get("code")
-    state = request.GET.get("state")
+    code = query.get("code")
+    state = query.get("state")
     if not code or not state:
         return _problem(400, "blogger_oauth_invalid_callback", "OAuth code와 state가 필요합니다.")
-    try:
-        target = complete_blogger_oauth(
-            code=code,
-            state=state,
-            request=request,
-            redirect_uri=request.build_absolute_uri("/api/v1/publishing/oauth/google/callback"),
-        )
-    except DomainError as exc:
-        return _problem(exc.status, exc.code, exc.detail or exc.title)
+    target = complete_blogger_oauth(
+        code=code,
+        state=state,
+        request=request,
+        redirect_uri=request.build_absolute_uri("/api/v1/publishing/oauth/google/callback"),
+    )
     return JsonResponse(
         {
             "targetId": str(target.id),
@@ -517,6 +538,7 @@ def article_preview(request: HttpRequest, article_id: str) -> JsonResponse:
     return JsonResponse(render_json(row))
 
 
+@openapi_operation("decideArticleApproval")
 @admin_api
 @require_http_methods(["POST"])
 def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
@@ -535,6 +557,7 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
     return JsonResponse(approval_json(row), status=201 if created else 200)
 
 
+@openapi_operation("publishArticle")
 @admin_api
 @require_http_methods(["POST"])
 def publish(request: HttpRequest, article_id: str) -> JsonResponse:

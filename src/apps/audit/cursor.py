@@ -1,40 +1,93 @@
-import hashlib
-import json
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
-from django.conf import settings
-from django.core import signing
+from wisdome_writer.api.pagination import (
+    CursorState,
+    canonical_filter_hash,
+    decode_cursor as decode_signed_cursor,
+    encode_cursor as encode_signed_cursor,
+)
+from wisdome_writer.domain.errors import InvalidCursor
 
-from wisdome_writer.domain.hashing import CANONICAL_HASH_SCHEMA_V1, canonical_json_bytes
 
-SALT = "wisdome-writer.audit-cursor.v1"
+RESOURCE = "audit.events"
+ORDER = ("-occurred_at", "-id")
+_POSITION_KEYS = frozenset({"occurred_at", "id"})
 
 
 def filter_hash(filters: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        canonical_json_bytes(filters, schema_version=CANONICAL_HASH_SCHEMA_V1)
-    ).hexdigest()
+    return canonical_filter_hash(filters)
+
+
+def _key(value: object) -> tuple[datetime, UUID]:
+    if not isinstance(value, dict) and not hasattr(value, "keys"):
+        raise InvalidCursor("The audit cursor position is invalid")
+    if set(value.keys()) != _POSITION_KEYS:
+        raise InvalidCursor("The audit cursor position is invalid")
+    occurred_at_value = value["occurred_at"]
+    identifier_value = value["id"]
+    if not isinstance(occurred_at_value, str) or not isinstance(identifier_value, str):
+        raise InvalidCursor("The audit cursor position is invalid")
+    try:
+        occurred_at = datetime.fromisoformat(occurred_at_value)
+        identifier = UUID(identifier_value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidCursor("The audit cursor position is invalid") from exc
+    if (
+        occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+        or occurred_at.isoformat() != occurred_at_value
+        or str(identifier) != identifier_value
+    ):
+        raise InvalidCursor("The audit cursor position is invalid")
+    return occurred_at, identifier
 
 
 def encode_cursor(
-    *, filters: dict[str, Any], watermark: tuple[datetime, str], last: tuple[datetime, str], limit: int
+    *,
+    filters: dict[str, Any],
+    watermark: tuple[datetime, str],
+    last: tuple[datetime, str],
+    limit: int,
 ) -> str:
-    payload = {
-        "filter_hash": filter_hash(filters),
-        "watermark": [watermark[0].isoformat(), watermark[1]],
-        "last": [last[0].isoformat(), last[1]],
-        "limit": limit,
-    }
-    return signing.dumps(payload, key=settings.AUDIT_CURSOR_SIGNING_KEY, salt=SALT, compress=True)
+    return encode_signed_cursor(
+        resource=RESOURCE,
+        filters=filters,
+        order=ORDER,
+        limit=limit,
+        position={
+            "occurred_at": last[0].isoformat(),
+            "id": str(last[1]),
+        },
+        watermark={
+            "occurred_at": watermark[0].isoformat(),
+            "id": str(watermark[1]),
+        },
+    )
 
 
-def decode_cursor(value: str, *, filters: dict[str, Any]) -> dict[str, Any]:
-    try:
-        payload = signing.loads(value, key=settings.AUDIT_CURSOR_SIGNING_KEY, salt=SALT)
-    except signing.BadSignature as exc:
-        raise ValueError("invalid audit cursor") from exc
-    if payload.get("filter_hash") != filter_hash(filters):
-        raise ValueError("audit cursor does not match filters")
-    return payload
+def decode_cursor(
+    value: str,
+    *,
+    filters: dict[str, Any],
+    limit: int,
+) -> CursorState:
+    state = decode_signed_cursor(
+        value,
+        resource=RESOURCE,
+        filters=filters,
+        order=ORDER,
+        limit=limit,
+    )
+    if state.watermark is None:
+        raise InvalidCursor("The audit cursor watermark is missing")
+    _key(state.position)
+    _key(state.watermark)
+    return state
 
+
+def cursor_key(value: object) -> tuple[datetime, UUID]:
+    return _key(value)

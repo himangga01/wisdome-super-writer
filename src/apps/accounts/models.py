@@ -11,6 +11,9 @@ class AdminAccount(AbstractBaseUser, PermissionsMixin, TimestampedUUIDModel):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=True)
     last_reauthenticated_at = models.DateTimeField(null=True, blank=True)
+    reauth_failure_count = models.PositiveSmallIntegerField(default=0)
+    reauth_failure_window_started_at = models.DateTimeField(null=True, blank=True)
+    reauth_locked_until = models.DateTimeField(null=True, blank=True)
 
     objects = AdminAccountManager()
 

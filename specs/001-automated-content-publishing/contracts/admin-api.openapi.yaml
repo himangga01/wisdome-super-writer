@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Wisdome Super Writer Admin API
-  version: 0.4.0
+  version: 0.5.0
   license:
     name: Proprietary project contract
     identifier: LicenseRef-Proprietary
@@ -9,7 +9,9 @@ info:
     Same-origin administrator API. Browser sessions are established by Django's
     login view. Every same-origin API request, including safe reads, requires both the session cookie
     and CSRF header; the OAuth callback explicitly overrides this rule. No public registration or
-    anonymous write operation exists.
+    anonymous write operation exists. Request JSON follows the RFC 8785 interoperable number
+    domain: all integer values, including values nested in adapter-specific objects, must be between
+    -9007199254740991 and 9007199254740991, and non-finite numbers are forbidden.
 servers:
   - url: /api/v1
 security:
@@ -45,6 +47,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ReauthenticationRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '201':
           description: Session-bound proof valid for at most five minutes and consumed atomically once
           content:
@@ -59,6 +62,7 @@ paths:
       summary: List supported topics
       operationId: listTopics
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Supported topics and their active policy versions
           content:
@@ -79,6 +83,7 @@ paths:
           in: query
           schema: { type: boolean }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Approved and draft source definitions
           content:
@@ -97,6 +102,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SourceDefinitionCreateRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing source and draft snapshot for an identical request-key replay
           content:
@@ -118,6 +124,7 @@ paths:
       summary: Get a source definition
       operationId: getSource
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Source definition
           content:
@@ -134,6 +141,7 @@ paths:
           application/merge-patch+json:
             schema: { $ref: '#/components/schemas/SourceDefinitionPatch' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Updated draft; separate registry approval atomically creates a new topic registry version
           content:
@@ -151,6 +159,7 @@ paths:
       summary: Check source access and parsing
       operationId: checkSource
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Non-publishing source access and parser check accepted
           content:
@@ -166,6 +175,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/TopicQuery'
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Immutable registry versions and draft projections
           content:
@@ -184,6 +194,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SourceRegistryDraftRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent draft
           content:
@@ -204,6 +215,7 @@ paths:
       summary: Get an exact registry manifest and membership set
       operationId: getSourceRegistry
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Registry snapshot detail
           content:
@@ -225,6 +237,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SourceRegistryMembershipRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Updated draft with complete membership
           content:
@@ -246,6 +259,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SourceRegistryDecisionRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent decision
           content:
@@ -272,6 +286,7 @@ paths:
           in: query
           schema: { $ref: '#/components/schemas/ExtractionEngine' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Profile material, local-model manifest and calibration report metadata
           content:
@@ -289,6 +304,7 @@ paths:
       summary: Get an immutable extraction profile and verification material
       operationId: getExtractionProfile
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Exact profile snapshot
           content:
@@ -309,6 +325,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ExtractionProfileDecisionRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent decision
           content:
@@ -330,6 +347,7 @@ paths:
       summary: Read the hash-verified non-sensitive golden/calibration report before a decision
       operationId: getExtractionProfileReport
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Normalized samples, metrics, thresholds and pass/fail bound to the profile material hash
           content:
@@ -357,6 +375,7 @@ paths:
           in: query
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Collection runs
           content:
@@ -373,6 +392,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateRunRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Idempotent run accepted
           content:
@@ -388,6 +408,7 @@ paths:
       summary: Get run details and attempts
       operationId: getRun
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Run, step attempts, counters and redacted failure details
           content:
@@ -408,10 +429,12 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [reason]
               properties:
                 reason: { type: string, minLength: 3, maxLength: 500 }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Stop requested; already-started external calls are reconciled
           content:
@@ -445,6 +468,7 @@ paths:
                 reauthProofId: { type: string, format: uuid }
                 reason: { type: string, minLength: 3, maxLength: 500 }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Safe retry accepted
           content:
@@ -472,6 +496,7 @@ paths:
           schema: { $ref: '#/components/schemas/EvidenceKind' }
         - $ref: '#/components/parameters/Cursor'
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Evidence and exclusion reasons
           content:
@@ -487,6 +512,7 @@ paths:
       summary: Get current evidence provenance and review subject
       operationId: getEvidence
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Current subject version/hash, latest decision and publishability projection
           content:
@@ -502,6 +528,7 @@ paths:
       summary: Get the server-computed document completion aggregate
       operationId: getDocumentExtraction
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Parent page coverage, selected evidence manifest and completion state
           content:
@@ -530,6 +557,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/EvidenceReviewDecisionRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing decision returned for an identical idempotent replay
           content:
@@ -562,6 +590,7 @@ paths:
           schema: { $ref: '#/components/schemas/ArticleState' }
         - $ref: '#/components/parameters/Cursor'
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Draft and published articles
           content:
@@ -577,6 +606,7 @@ paths:
       summary: Get an article with evidence and checks
       operationId: getArticle
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Current revision, claims, evidence, checks and publications
           content:
@@ -597,6 +627,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateRevisionRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing revision returned for an identical request-key replay
           content:
@@ -622,6 +653,7 @@ paths:
           required: true
           schema: { type: string, format: uuid }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Sanitized channel render and limit violations
           content:
@@ -642,6 +674,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ApprovalRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent approval decision for the same request key and payload
           content:
@@ -672,6 +705,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PublicationIntentRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent intent
           content:
@@ -697,6 +731,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PublishRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Per-target idempotent publication jobs accepted
           content:
@@ -713,6 +748,7 @@ paths:
       summary: List correction and retraction history
       operationId: listArticleCorrections
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Correction and retraction history
           content:
@@ -728,6 +764,7 @@ paths:
       summary: List schedules
       operationId: listSchedules
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Schedules
           content:
@@ -746,6 +783,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ScheduleInput' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '201':
           description: Schedule created
           content:
@@ -764,8 +802,11 @@ paths:
         required: true
         content:
           application/merge-patch+json:
-            schema: { $ref: '#/components/schemas/ScheduleInput' }
+            schema: { $ref: '#/components/schemas/SchedulePatch' }
+          application/json:
+            schema: { $ref: '#/components/schemas/SchedulePatch' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Updated schedule
           content:
@@ -779,6 +820,7 @@ paths:
       summary: List publication targets and capabilities
       operationId: listPublicationTargets
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Connected and blocked publication targets
           content:
@@ -797,6 +839,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PublicationTargetInput' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '201':
           description: Target created in pending state
           content:
@@ -816,7 +859,10 @@ paths:
         content:
           application/merge-patch+json:
             schema: { $ref: '#/components/schemas/PublicationTargetPatch' }
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicationTargetPatch' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Target updated; validation becomes stale when connection fields change
           content:
@@ -831,7 +877,13 @@ paths:
       tags: [Publishing]
       summary: Run a read-only target connection preflight
       operationId: preflightPublicationTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuditMutationRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Read-only route, identity and declared-capability check accepted
           content:
@@ -852,6 +904,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CanaryRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Create-update-media-publish-withdraw-cleanup canary accepted
           content:
@@ -868,6 +921,7 @@ paths:
       summary: List immutable automatic-publication validation candidates for a target
       operationId: listAutoPublishValidations
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Validation candidates and their current decision/staleness projection
           content:
@@ -887,6 +941,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/AutoPublishValidationCreateRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing candidate for an identical request-key/material replay
           content:
@@ -914,6 +969,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/AutoPublishValidationDecisionRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent decision
           content:
@@ -936,6 +992,7 @@ paths:
       summary: Read the hash-verified non-sensitive canary and regression report before a decision
       operationId: getAutoPublishValidationReport
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Normalized samples, metrics, thresholds and pass/fail bound to the validation material hash
           content:
@@ -961,6 +1018,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/AutoPublishActivationRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent activation decision and recalculated target projection
           content:
@@ -981,7 +1039,13 @@ paths:
       tags: [Publishing]
       summary: Start Google OAuth for a Blogger target
       operationId: startTargetOAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuditMutationRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Short-lived authorization URL with signed state
           content:
@@ -999,22 +1063,48 @@ paths:
       tags: [Publishing]
       summary: Complete Blogger OAuth using signed state
       operationId: completeTargetOAuth
+      x-wisdome-allow-unknown-query-parameters: true
       security:
         - sessionCookie: []
       parameters:
         - name: code
           in: query
           required: false
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 4096 }
         - name: error
           in: query
           required: false
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 200 }
         - name: state
           in: query
           required: true
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, maxLength: 4096 }
+        - name: authuser
+          in: query
+          required: false
+          schema: { type: string, maxLength: 64 }
+        - name: hd
+          in: query
+          required: false
+          schema: { type: string, maxLength: 253 }
+        - name: prompt
+          in: query
+          required: false
+          schema: { type: string, maxLength: 200 }
+        - name: error_description
+          in: query
+          required: false
+          schema: { type: string, maxLength: 1000 }
+        - name: error_uri
+          in: query
+          required: false
+          schema: { type: string, format: uri, maxLength: 2048 }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: OAuth result recorded and a safe completion page returned
         '302':
@@ -1043,6 +1133,7 @@ paths:
                 reauthProofId: { type: string, format: uuid }
                 reason: { type: string, minLength: 3, maxLength: 500 }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Target disabled immediately; local deletion and remote revocation accepted
           content:
@@ -1062,10 +1153,10 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [enabled, expectedControlVersion, requestKey, reauthProofId, reason]
+              required: [enabled, expectedVersion, requestKey, reauthProofId, reason]
               properties:
                 enabled: { type: boolean }
-                expectedControlVersion: { type: integer, minimum: 1 }
+                expectedVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
                 requestKey: { type: string, minLength: 8, maxLength: 200 }
                 reauthProofId: { type: [string, 'null'], format: uuid }
                 reason: { type: string, minLength: 3, maxLength: 500 }
@@ -1081,6 +1172,7 @@ paths:
                     properties:
                       reauthProofId: { type: 'null' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Global dispatch/publish state changed; in-flight calls reconcile
           content:
@@ -1107,6 +1199,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/RetentionPreviewRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent preview
           content:
@@ -1131,13 +1224,13 @@ paths:
           schema: { type: string, format: uuid }
         - name: entityType
           in: query
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 120 }
         - name: entityId
           in: query
           schema: { type: string, format: uuid }
         - name: action
           in: query
-          schema: { type: string }
+          schema: { type: string, minLength: 1, maxLength: 120 }
         - name: from
           in: query
           schema: { type: string, format: date-time }
@@ -1145,6 +1238,7 @@ paths:
           in: query
           schema: { type: string, format: date-time }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: >-
             Descending keyset page. The signed opaque cursor binds canonical filters, initial upper
@@ -1163,6 +1257,7 @@ paths:
       summary: Get retention batch phase, counts, holds and resumable failure state
       operationId: getRetentionBatch
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Retention batch status
           content:
@@ -1183,6 +1278,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/RetentionExecuteRequest' }
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Existing idempotent authorization or current batch state
           content:
@@ -1206,6 +1302,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Cursor'
       responses:
+        default: { $ref: '#/components/responses/Problem' }
         '200':
           description: Verifiable item page whose full-set hash equals the batch impact and hold manifests
           content:
@@ -1232,7 +1329,7 @@ components:
     Cursor:
       name: cursor
       in: query
-      schema: { type: string }
+      schema: { type: string, minLength: 1, maxLength: 4096 }
     SourceId:
       name: sourceId
       in: path
@@ -1292,11 +1389,22 @@ components:
   responses:
     Problem:
       description: RFC 9457-style error with no secret or full source body
+      headers:
+        X-Correlation-ID:
+          description: Correlation identifier mirrored by the response body
+          schema: { type: string, format: uuid }
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
+    AuditMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [requestKey, reason]
+      properties:
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
     ReauthenticationRequest:
       type: object
       additionalProperties: false
@@ -1377,7 +1485,7 @@ components:
         termsUrl: { type: [string, 'null'], format: uri }
         robotsUrl: { type: [string, 'null'], format: uri }
         licenseUrl: { type: [string, 'null'], format: uri }
-        pollIntervalSeconds: { type: integer, minimum: 60 }
+        pollIntervalSeconds: { type: integer, minimum: 60, maximum: 9007199254740991 }
         rateLimitPolicy: { $ref: '#/components/schemas/SourceRateLimitPolicy' }
         enabled: { type: boolean }
     SourceDefinitionCreateRequest:
@@ -1421,7 +1529,7 @@ components:
         termsUrl: { type: [string, 'null'], format: uri }
         robotsUrl: { type: [string, 'null'], format: uri }
         licenseUrl: { type: [string, 'null'], format: uri }
-        pollIntervalSeconds: { type: integer, minimum: 60 }
+        pollIntervalSeconds: { type: integer, minimum: 60, maximum: 9007199254740991 }
         rateLimitPolicy: { $ref: '#/components/schemas/SourceRateLimitPolicy' }
         enabled: { type: boolean }
     SourceDefinition:
@@ -1446,7 +1554,7 @@ components:
       properties:
         topic: { $ref: '#/components/schemas/TopicCode' }
         baseRegistryId: { type: [string, 'null'], format: uuid }
-        expectedLatestRegistryVersion: { type: [integer, 'null'], minimum: 1 }
+        expectedLatestRegistryVersion: { type: [integer, 'null'], minimum: 1, maximum: 9007199254740991 }
         expectedLatestRegistryManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
     SourceRegistryMembership:
@@ -1486,11 +1594,11 @@ components:
       additionalProperties: false
       required: [expectedRowVersion, expectedManifestHash, sourceDefinitionSnapshotId, enabled, displayOrder, requestKey]
       properties:
-        expectedRowVersion: { type: integer, minimum: 1 }
+        expectedRowVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
         expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         sourceDefinitionSnapshotId: { type: string, format: uuid }
         enabled: { type: boolean }
-        displayOrder: { type: integer, minimum: 0 }
+        displayOrder: { type: integer, minimum: 0, maximum: 9007199254740991 }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
     SourceRegistryDecisionRequest:
       type: object
@@ -1498,10 +1606,10 @@ components:
       required: [decision, expectedRowVersion, expectedManifestHash, expectedCurrentHeadRegistryId, expectedCurrentHeadVersion, expectedCurrentHeadManifestHash, expectedLatestDecisionId, requestKey, reauthProofId, reason]
       properties:
         decision: { type: string, enum: [approved, retired] }
-        expectedRowVersion: { type: integer, minimum: 1 }
+        expectedRowVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
         expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         expectedCurrentHeadRegistryId: { type: [string, 'null'], format: uuid }
-        expectedCurrentHeadVersion: { type: [integer, 'null'], minimum: 1 }
+        expectedCurrentHeadVersion: { type: [integer, 'null'], minimum: 1, maximum: 9007199254740991 }
         expectedCurrentHeadManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
         expectedLatestDecisionId: { type: [string, 'null'], format: uuid }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
@@ -1514,7 +1622,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         registryId: { type: string, format: uuid }
-        version: { type: integer, minimum: 1 }
+        version: { type: integer, minimum: 1, maximum: 9007199254740991 }
         decision: { type: string, enum: [approved, retired] }
         expectedRowVersion: { type: integer, minimum: 1 }
         expectedManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
@@ -1613,7 +1721,7 @@ components:
         activationId: { type: string, format: uuid }
         targetId: { type: string, format: uuid }
         targetSnapshotId: { type: string, format: uuid }
-        version: { type: integer, minimum: 1 }
+        version: { type: integer, minimum: 1, maximum: 9007199254740991 }
         activationHash: { type: string, pattern: '^[a-f0-9]{64}$' }
     CollectionRun:
       type: object
@@ -3192,7 +3300,7 @@ components:
         publication remain blocked until claimGraphState and every blocking check pass.
       required: [baseRevisionNo, requestKey, title, summary, bodyBlocks, editReason]
       properties:
-        baseRevisionNo: { type: integer, minimum: 1 }
+        baseRevisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         title: { type: string, minLength: 1 }
         summary: { type: string, minLength: 1 }
@@ -3247,9 +3355,9 @@ components:
         targetCommands must have a one-to-one ID and snapshot/hash match with targetSnapshots. In
         validated_auto mode, target, validation and activation ref sets are also identical and each
         activation binds the exact supplied validation material.
-      required: [revisionNo, expectedRevisionContentHash, correctionCaseId, targetSnapshots, targetCommands, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, expectedLatestIntentId, requestKey]
+      required: [revisionNo, expectedRevisionContentHash, correctionCaseId, targetSnapshots, targetCommands, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, expectedLatestIntentId, requestKey, reason]
       properties:
-        revisionNo: { type: integer, minimum: 1 }
+        revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         expectedRevisionContentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         correctionCaseId: { type: [string, 'null'], format: uuid }
         targetSnapshots:
@@ -3273,6 +3381,7 @@ components:
           items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
         expectedLatestIntentId: { type: [string, 'null'], format: uuid }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
       allOf:
         - if:
             required: [approvalMode]
@@ -3293,7 +3402,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         articleId: { type: string, format: uuid }
-        revisionNo: { type: integer, minimum: 1 }
+        revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         revisionContentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         generationAttemptId: { type: [string, 'null'], format: uuid }
         inputEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
@@ -3364,9 +3473,9 @@ components:
     ApprovalRequest:
       type: object
       additionalProperties: false
-      required: [revisionNo, publicationIntentId, expectedLatestApprovalId, requestKey, reauthProofId, actionSubject, decision]
+      required: [revisionNo, publicationIntentId, expectedLatestApprovalId, requestKey, reauthProofId, actionSubject, decision, reason]
       properties:
-        revisionNo: { type: integer, minimum: 1 }
+        revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         publicationIntentId: { type: string, format: uuid }
         expectedLatestApprovalId: { type: [string, 'null'], format: uuid }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
@@ -3376,7 +3485,7 @@ components:
             - $ref: '#/components/schemas/ContentApprovalSubject'
             - $ref: '#/components/schemas/UnpublishApprovalSubject'
         decision: { type: string, enum: [approved, rejected, revoked] }
-        reason: { type: [string, 'null'], maxLength: 500 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
       allOf:
         - if:
             required: [actionSubject]
@@ -3412,13 +3521,14 @@ components:
         decidedAt: { type: string, format: date-time }
     PublishRequest:
       type: object
+      additionalProperties: false
       description: >-
         Initial requests containing a Blogger target must also contain the
         primary WordPress target unless that exact revision already has a
         successful WordPress publication. WordPress is always dispatched first.
-      required: [revisionNo, publicationIntentId, targetIds, expectedTargetSnapshots, requestKey]
+      required: [revisionNo, publicationIntentId, targetIds, expectedTargetSnapshots, requestKey, reason]
       properties:
-        revisionNo: { type: integer, minimum: 1 }
+        revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         publicationIntentId: { type: string, format: uuid }
         targetIds:
           type: array
@@ -3437,15 +3547,17 @@ components:
           format: date-time
           description: Normalized to UTC; the internal scheduler publishes WordPress first and waits for public verification before Blogger.
         requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
 
-    ScheduleInput:
-      type: object
+    ScheduleConfiguration:
       description: >-
         A schedule containing Blogger must also contain the primary WordPress target. In
         validated_auto mode, targetIds and validation/activation ref targetId sets are identical,
         unique and bound to the same target snapshots; the server rejects relational mismatches.
-      required: [topic, cronExpression, timezone, targetIds, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, overlapPolicy]
+      type: object
+      required: [name, topic, cronExpression, timezone, targetIds, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, overlapPolicy]
       properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
         topic: { $ref: '#/components/schemas/TopicCode' }
         cronExpression: { type: string, pattern: '^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$' }
         timezone: { type: string, default: Asia/Seoul }
@@ -3479,9 +3591,46 @@ components:
             properties:
               autoPublishValidationRefs: { maxItems: 0 }
               autoPublishActivationRefs: { maxItems: 0 }
+    ScheduleInput:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleConfiguration'
+        - type: object
+          required: [requestKey, reason]
+          properties:
+            requestKey: { type: string, minLength: 8, maxLength: 200 }
+            reason: { type: string, minLength: 3, maxLength: 500 }
+      unevaluatedProperties: false
+    SchedulePatch:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, requestKey, reason]
+      properties:
+        expectedVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        cronExpression: { type: string, pattern: '^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$' }
+        timezone: { type: string }
+        windowMinutes: { type: integer, minimum: 1, maximum: 10080 }
+        targetIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        approvalMode: { type: string, enum: [manual, validated_auto] }
+        autoPublishValidationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
+        autoPublishActivationRefs:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
+        overlapPolicy: { type: string, enum: [skip, queue_one] }
+        enabled: { type: boolean }
     Schedule:
       allOf:
-        - $ref: '#/components/schemas/ScheduleInput'
+        - $ref: '#/components/schemas/ScheduleConfiguration'
         - type: object
           required: [id, version, autoValidationManifestHash, autoActivationManifestHash]
           properties:
@@ -3496,12 +3645,13 @@ components:
             nextRunAt: { type: [string, 'null'], format: date-time }
             lastDispatchedAt: { type: [string, 'null'], format: date-time }
             validatedPolicyVersion: { type: [integer, 'null'] }
+      unevaluatedProperties: false
 
     PublicationTargetInput:
       allOf:
         - $ref: '#/components/schemas/ChannelBinding'
         - type: object
-          required: [environment, displayName, baseUrl]
+          required: [environment, displayName, baseUrl, requestKey, reason]
           properties:
             environment: { type: string, enum: [test, production] }
             displayName: { type: string, minLength: 1, maxLength: 200 }
@@ -3510,29 +3660,37 @@ components:
             canaryTargetId: { type: [string, 'null'], format: uuid, description: Same-channel test target required for production automatic publication. }
             usernameRef: { type: [string, 'null'], description: Secret-store reference for the WordPress username. }
             credentialRef: { type: [string, 'null'], description: Secret-store reference; never the credential value. }
+            requestKey: { type: string, minLength: 8, maxLength: 200 }
+            reason: { type: string, minLength: 3, maxLength: 500 }
+      unevaluatedProperties: false
     PublicationTargetPatch:
       type: object
       description: Channel, channelRole, environment, baseUrl and remoteBlogId are immutable destination identity; create a new target to change them.
-      minProperties: 1
+      minProperties: 3
       additionalProperties: false
+      required: [requestKey, reason]
       properties:
         displayName: { type: string, minLength: 1, maxLength: 200 }
         canaryTargetId: { type: [string, 'null'], format: uuid }
         usernameRef: { type: [string, 'null'] }
         credentialRef: { type: [string, 'null'] }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
     TargetValidationState:
       type: string
       enum: [not_run, passed, failed, stale]
     CanaryRequest:
       type: object
-      required: [confirmIsolatedTestTarget, policyVersion, reason]
+      additionalProperties: false
+      required: [confirmIsolatedTestTarget, policyVersion, requestKey, reason]
       properties:
         confirmIsolatedTestTarget: { type: boolean, const: true }
         policyVersion: { type: string, minLength: 1 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
         reason: { type: string, minLength: 3, maxLength: 500 }
-    AutoPublishValidationRequest:
+    AutoPublishValidationMaterial:
       type: object
-      required: [topic, targetSnapshotId, targetConfigHash, sourceRegistrySnapshotId, registryManifestHash, sourceAdapterManifestHash, extractionProfileManifestHash, generationPipelineManifestHash, topicPolicyVersion, editorialPolicyHash, qualityGateManifestHash, renderContractVersion, channelContractVersion, publisherAdapterManifestHash, testReportObjectKey, testReportObjectVersion, testReportHash, requestKey]
+      required: [topic, targetSnapshotId, targetConfigHash, sourceRegistrySnapshotId, registryManifestHash, sourceAdapterManifestHash, extractionProfileManifestHash, generationPipelineManifestHash, topicPolicyVersion, editorialPolicyHash, qualityGateManifestHash, renderContractVersion, channelContractVersion, publisherAdapterManifestHash, testReportObjectKey, testReportObjectVersion, testReportHash]
       properties:
         topic: { $ref: '#/components/schemas/TopicCode' }
         targetSnapshotId: { type: string, format: uuid }
@@ -3542,7 +3700,7 @@ components:
         sourceAdapterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         extractionProfileManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         generationPipelineManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        topicPolicyVersion: { type: integer, minimum: 1 }
+        topicPolicyVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
         editorialPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         qualityGateManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         renderContractVersion: { type: string, minLength: 1 }
@@ -3551,18 +3709,27 @@ components:
         testReportObjectKey: { type: string, minLength: 1 }
         testReportObjectVersion: { type: string, minLength: 1 }
         testReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        requestKey: { type: string, minLength: 8, maxLength: 200 }
+    AutoPublishValidationRequest:
+      allOf:
+        - $ref: '#/components/schemas/AutoPublishValidationMaterial'
+        - type: object
+          required: [requestKey, reason]
+          properties:
+            requestKey: { type: string, minLength: 8, maxLength: 200 }
+            reason: { type: string, minLength: 3, maxLength: 500 }
+      unevaluatedProperties: false
     AutoPublishValidationCreateRequest:
       allOf:
         - $ref: '#/components/schemas/AutoPublishValidationRequest'
       unevaluatedProperties: false
     AutoPublishValidation:
       allOf:
-        - $ref: '#/components/schemas/AutoPublishValidationRequest'
+        - $ref: '#/components/schemas/AutoPublishValidationMaterial'
         - type: object
-          required: [id, materialHash, status, latestDecisionId, decisionVersion, createdAt]
+          required: [id, requestKey, materialHash, status, latestDecisionId, decisionVersion, createdAt]
           properties:
             id: { type: string, format: uuid }
+            requestKey: { type: string, minLength: 8, maxLength: 200 }
             materialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
             status: { type: string, enum: [draft, passed, revoked, stale] }
             latestDecisionId: { type: [string, 'null'], format: uuid }
@@ -3757,7 +3924,7 @@ components:
       description: requestKey is the authorization idempotency key, distinct from the preview request key.
       required: [expectedVersion, previewHash, requestKey, reauthProofId, reason]
       properties:
-        expectedVersion: { type: integer, minimum: 1 }
+        expectedVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
         previewHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         reauthProofId: { type: string, format: uuid }
@@ -3832,14 +3999,33 @@ components:
         jobId: { type: string, format: uuid }
         correlationId: { type: string, format: uuid }
         acceptedAt: { type: string, format: date-time }
+    ProblemIssue:
+      type: object
+      additionalProperties: false
+      required: [path, code]
+      properties:
+        path:
+          type: string
+          maxLength: 512
+          pattern: '^/(body|query|path)(/.*)?$'
+          description: Value-free JSON Pointer or request-component path
+        code:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,63}$'
+          description: Stable machine-readable validation code
     Problem:
       type: object
-      required: [type, title, status, correlationId]
+      additionalProperties: false
+      required: [type, title, status, code, correlationId]
       properties:
         type: { type: string, format: uri-reference }
         title: { type: string }
         status: { type: integer, minimum: 400, maximum: 599 }
         detail: { type: string }
-        code: { type: string }
+        code: { type: string, pattern: '^[a-z][a-z0-9_]{0,63}$' }
+        errors:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/ProblemIssue' }
         correlationId: { type: string, format: uuid }
         remediation: { type: [string, 'null'] }

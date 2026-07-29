@@ -264,6 +264,7 @@ MIDDLEWARE = [
 ROOT_URLCONF = "wisdome_writer.urls"
 WSGI_APPLICATION = "wisdome_writer.wsgi.application"
 ASGI_APPLICATION = "wisdome_writer.asgi.application"
+CSRF_FAILURE_VIEW = "wisdome_writer.api.problems.csrf_failure"
 
 TEMPLATES = [
     {
@@ -386,6 +387,18 @@ CELERY_TASK_ROUTES = {
 OBJECT_STORAGE_PRESIGN_TTL_SECONDS = int(os.getenv("OBJECT_STORAGE_PRESIGN_TTL_SECONDS", "300"))
 
 REAUTH_PROOF_TTL_SECONDS = min(int(os.getenv("REAUTH_PROOF_TTL_SECONDS", "300")), 300)
+REAUTH_FAILURE_LIMIT = min(
+    max(int(os.getenv("REAUTH_FAILURE_LIMIT", "5")), 1),
+    20,
+)
+REAUTH_FAILURE_WINDOW_SECONDS = min(
+    max(int(os.getenv("REAUTH_FAILURE_WINDOW_SECONDS", "300")), 30),
+    3_600,
+)
+REAUTH_LOCK_SECONDS = min(
+    max(int(os.getenv("REAUTH_LOCK_SECONDS", "300")), 30),
+    3_600,
+)
 REAUTH_MFA_REQUIRED = env_bool("REAUTH_MFA_REQUIRED", False)
 REAUTH_MFA_VALIDATOR = os.getenv("REAUTH_MFA_VALIDATOR", "")
 BLOGGER_OAUTH_CLIENT_ID_REF = os.getenv("BLOGGER_OAUTH_CLIENT_ID_REF", "")

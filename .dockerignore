@@ -15,7 +15,10 @@ coverage/
 htmlcov/
 media/
 staticfiles/
-specs/
+specs/**
+!specs/001-automated-content-publishing/
+!specs/001-automated-content-publishing/contracts/
+!specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml
 tests/
 Dockerfile*
 .dockerignore

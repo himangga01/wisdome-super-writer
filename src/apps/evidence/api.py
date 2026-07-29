@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Mapping
+from uuid import UUID
 
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
@@ -12,6 +13,12 @@ from django.views.decorators.http import require_GET, require_POST
 
 from adapters.storage import S3ObjectStorage
 from apps.audit.services import AuditContext
+from wisdome_writer.api.openapi import openapi_operation
+from wisdome_writer.api.pagination import (
+    decode_cursor as decode_signed_cursor,
+    encode_cursor as encode_signed_cursor,
+)
+from wisdome_writer.domain.errors import InvalidCursor
 from wisdome_writer.api.problems import problem_response
 
 from .models import (
@@ -31,6 +38,9 @@ from .services import (
 
 
 _SNAKE = re.compile(r"_([a-z])")
+_RUN_EVIDENCE_CURSOR_RESOURCE = "evidence.run"
+_RUN_EVIDENCE_CURSOR_ORDER = ("id",)
+_RUN_EVIDENCE_PAGE_SIZE = 100
 
 
 def _camel_key(value: str) -> str:
@@ -42,16 +52,6 @@ def _camelize(value: Any) -> Any:
         return {_camel_key(str(key)): _camelize(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_camelize(item) for item in value]
-    return value
-
-
-def _body(request) -> dict[str, Any]:
-    try:
-        value = json.loads(request.body or b"{}")
-    except json.JSONDecodeError as exc:
-        raise ValidationError("Request body is not valid JSON") from exc
-    if not isinstance(value, dict):
-        raise ValidationError("Request body must be a JSON object")
     return value
 
 
@@ -101,17 +101,20 @@ def _profile_decision_payload(decision: ExtractionProfileDecision) -> dict[str, 
 
 
 @login_required
+@openapi_operation("listExtractionProfiles")
 @require_GET
 def extraction_profiles(request):
     queryset = ExtractionProfileSnapshot.objects.select_related("latest_decision")
-    if request.GET.get("approvalState"):
-        queryset = queryset.filter(approval_state=request.GET["approvalState"])
-    if request.GET.get("engine"):
-        queryset = queryset.filter(engine=request.GET["engine"])
+    query = request.openapi_query
+    if query.get("approvalState"):
+        queryset = queryset.filter(approval_state=query["approvalState"])
+    if query.get("engine"):
+        queryset = queryset.filter(engine=query["engine"])
     return JsonResponse([_profile_payload(profile) for profile in queryset[:500]], safe=False)
 
 
 @login_required
+@openapi_operation("getExtractionProfile")
 @require_GET
 def extraction_profile_detail(request, profile_id):
     profile = get_object_or_404(ExtractionProfileSnapshot, pk=profile_id)
@@ -119,16 +122,11 @@ def extraction_profile_detail(request, profile_id):
 
 
 @login_required
+@openapi_operation("decideExtractionProfile")
 @require_POST
 def extraction_profile_decisions(request, profile_id):
     try:
-        body = _body(request)
-        required = {
-            "decision", "expectedMaterialHash", "expectedLatestDecisionId",
-            "requestKey", "reauthProofId", "reason",
-        }
-        if missing := required - set(body):
-            raise ValidationError(f"Missing fields: {', '.join(sorted(missing))}")
+        body = request.openapi_body
         audit_context = AuditContext.for_admin(
             request=request,
             reason_code=body["reason"],
@@ -147,13 +145,14 @@ def extraction_profile_decisions(request, profile_id):
             audit_context=audit_context,
         )
         return JsonResponse(_profile_decision_payload(decision), status=201 if created else 200)
-    except (EvidenceConflict, EvidenceInvariantError) as exc:
-        return problem_response(status=409, code="profile_decision_conflict", detail=str(exc))
-    except ValidationError as exc:
-        return problem_response(status=422, code="profile_decision_invalid", detail=str(exc))
+    except (EvidenceConflict, EvidenceInvariantError):
+        return problem_response(status=409, code="profile_decision_conflict")
+    except ValidationError:
+        return problem_response(status=422, code="profile_decision_invalid")
 
 
 @login_required
+@openapi_operation("getExtractionProfileReport")
 @require_GET
 def extraction_profile_report(request, profile_id):
     profile = get_object_or_404(ExtractionProfileSnapshot, pk=profile_id)
@@ -323,27 +322,69 @@ def _exclusion_reason(evidence: EvidenceAsset) -> str:
 
 
 @login_required
-@require_GET
+@openapi_operation("listRunEvidence")
 def run_evidence(request, run_id):
+    query = request.openapi_query
+    publishable_filter = query.get("publishable")
+    kind_filter = query.get("kind")
+    cursor_filters = {
+        "run_id": request.openapi_path["runId"],
+        "publishable": publishable_filter,
+        "kind": kind_filter,
+    }
     queryset = EvidenceAsset.objects.filter(origin_run_source_item__run_id=run_id).select_related(
         "source_item", "origin_run_source_item", "latest_review_decision",
         "document_extraction", "extraction_run", "generic_extraction_attempt__input_asset",
     ).order_by("id")
-    if request.GET.get("publishable") in {"true", "false"}:
-        queryset = queryset.filter(publishable=request.GET["publishable"] == "true")
-    if request.GET.get("kind"):
-        queryset = queryset.filter(kind=request.GET["kind"])
-    if request.GET.get("cursor"):
-        queryset = queryset.filter(id__gt=request.GET["cursor"])
-    items = list(queryset[:101])
-    next_cursor = str(items[99].id) if len(items) > 100 else None
+    if publishable_filter is not None:
+        queryset = queryset.filter(publishable=publishable_filter)
+    if kind_filter:
+        queryset = queryset.filter(kind=kind_filter)
+    cursor_value = query.get("cursor")
+    if cursor_value is not None:
+        state = decode_signed_cursor(
+            cursor_value,
+            resource=_RUN_EVIDENCE_CURSOR_RESOURCE,
+            filters=cursor_filters,
+            order=_RUN_EVIDENCE_CURSOR_ORDER,
+            limit=_RUN_EVIDENCE_PAGE_SIZE,
+        )
+        if set(state.position) != {"id"}:
+            raise InvalidCursor("The evidence cursor position is invalid")
+        identifier_value = state.position["id"]
+        if not isinstance(identifier_value, str):
+            raise InvalidCursor("The evidence cursor position is invalid")
+        try:
+            identifier = UUID(identifier_value)
+        except ValueError as exc:
+            raise InvalidCursor("The evidence cursor position is invalid") from exc
+        if str(identifier) != identifier_value:
+            raise InvalidCursor("The evidence cursor position is invalid")
+        queryset = queryset.filter(id__gt=identifier)
+    items = list(queryset[: _RUN_EVIDENCE_PAGE_SIZE + 1])
+    next_cursor = None
+    if len(items) > _RUN_EVIDENCE_PAGE_SIZE:
+        next_cursor = encode_signed_cursor(
+            resource=_RUN_EVIDENCE_CURSOR_RESOURCE,
+            filters=cursor_filters,
+            order=_RUN_EVIDENCE_CURSOR_ORDER,
+            limit=_RUN_EVIDENCE_PAGE_SIZE,
+            position={"id": str(items[_RUN_EVIDENCE_PAGE_SIZE - 1].id)},
+        )
     try:
-        return JsonResponse({"items": [_evidence_payload(item) for item in items[:100]], "nextCursor": next_cursor})
-    except EvidenceInvariantError as exc:
-        return problem_response(status=409, code="evidence_lineage_invalid", detail=str(exc))
+        return JsonResponse({
+            "items": [
+                _evidence_payload(item)
+                for item in items[:_RUN_EVIDENCE_PAGE_SIZE]
+            ],
+            "nextCursor": next_cursor,
+        })
+    except EvidenceInvariantError:
+        return problem_response(status=409, code="evidence_lineage_invalid")
 
 
 @login_required
+@openapi_operation("getEvidence")
 @require_GET
 def evidence_detail(request, evidence_id):
     evidence = get_object_or_404(
@@ -355,11 +396,12 @@ def evidence_detail(request, evidence_id):
     )
     try:
         return JsonResponse(_evidence_payload(evidence))
-    except EvidenceInvariantError as exc:
-        return problem_response(status=409, code="evidence_lineage_invalid", detail=str(exc))
+    except EvidenceInvariantError:
+        return problem_response(status=409, code="evidence_lineage_invalid")
 
 
 @login_required
+@openapi_operation("getDocumentExtraction")
 @require_GET
 def document_extraction_detail(request, document_extraction_id):
     document = get_object_or_404(
@@ -408,16 +450,11 @@ def _review_decision_payload(decision: EvidenceReviewDecision) -> dict[str, Any]
 
 
 @login_required
+@openapi_operation("createEvidenceReviewDecision")
 @require_POST
 def evidence_review_decisions(request, evidence_id):
     try:
-        body = _body(request)
-        required = {
-            "subjectSchemaVersion", "subjectHash", "expectedLatestDecisionId",
-            "requestKey", "decision", "reason",
-        }
-        if missing := required - set(body):
-            raise ValidationError(f"Missing fields: {', '.join(sorted(missing))}")
+        body = request.openapi_body
         audit_context = AuditContext.for_admin(
             request=request,
             reason_code=body["reason"],
@@ -435,8 +472,8 @@ def evidence_review_decisions(request, evidence_id):
             audit_context=audit_context,
         )
         return JsonResponse(_review_decision_payload(decision), status=201 if created else 200)
-    except (EvidenceConflict, EvidenceInvariantError) as exc:
-        return problem_response(status=409, code="evidence_review_conflict", detail=str(exc))
-    except ValidationError as exc:
-        return problem_response(status=422, code="evidence_review_invalid", detail=str(exc))
+    except (EvidenceConflict, EvidenceInvariantError):
+        return problem_response(status=409, code="evidence_review_conflict")
+    except ValidationError:
+        return problem_response(status=422, code="evidence_review_invalid")
 
