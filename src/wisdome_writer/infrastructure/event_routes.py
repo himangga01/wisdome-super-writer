@@ -84,7 +84,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ),
     ("run.evidence_requested", 1): EventRoute(
         "run-evidence",
-        "extract.generic",
+        "extract.fanout",
         "apps.evidence.tasks.process_run_evidence",
         ("run_id",),
         "apps.evidence.tasks.finalize_run_evidence_fanout_failure",

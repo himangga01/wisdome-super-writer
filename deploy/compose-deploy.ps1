@@ -1,15 +1,17 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(10, 3600)]
-    [int]$StopTimeoutSeconds = 120
+    [ValidateRange(1801, 7200)]
+    [int]$StopTimeoutSeconds = 2400,
+
+    [ValidateRange(60, 7200)]
+    [int]$LegacyDrainTimeoutSeconds = 2400
 )
 
 $ErrorActionPreference = "Stop"
 
-# 한국어: beat와 모든 Celery worker를 멈춘 상태에서만 migration을 실행한다.
-# English: Run migrations only after beat and every Celery worker are stopped.
-$QuiescedServices = @(
-    "beat",
+# 한국어: web/beat를 먼저 차단하고 구버전 worker로 legacy 큐를 비운 뒤 migration한다.
+# English: Stop web/beat first, drain legacy queues with old workers, then migrate.
+$WorkerServices = @(
     "worker-collect",
     "worker-extract",
     "worker-editorial",
@@ -18,6 +20,10 @@ $QuiescedServices = @(
     "worker-reconcile",
     "ocr-worker"
 )
+$IngressServices = @("web", "beat")
+$ApplicationServices = @($IngressServices + $WorkerServices)
+$LegacyQueues = @("collect", "default", "generate", "publish")
+$LegacyPollSeconds = 5
 
 $ComposeServices = @(& docker compose config --services)
 if ($LASTEXITCODE -ne 0) {
@@ -27,17 +33,16 @@ if ($LASTEXITCODE -ne 0) {
 $ConfiguredConsumers = @(
     $ComposeServices |
         Where-Object {
-            $_ -eq "beat" -or
             $_ -eq "ocr-worker" -or
             $_ -like "worker-*"
         }
 )
 $UntrackedConsumers = @(
     $ConfiguredConsumers |
-        Where-Object { $_ -notin $QuiescedServices }
+        Where-Object { $_ -notin $WorkerServices }
 )
 $MissingServices = @(
-    $QuiescedServices |
+    $ApplicationServices |
         Where-Object { $_ -notin $ComposeServices }
 )
 if ($UntrackedConsumers.Count -gt 0 -or $MissingServices.Count -gt 0) {
@@ -53,14 +58,188 @@ if ($LASTEXITCODE -ne 0) {
     throw "docker compose build failed"
 }
 
-& docker compose stop --timeout $StopTimeoutSeconds @QuiescedServices
+$ExistingWorkerContainerIds = @(
+    foreach ($Service in $WorkerServices) {
+        $ContainerIds = @(& docker compose ps -a -q $Service)
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to inspect existing worker container for $Service"
+        }
+        $ContainerIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    }
+)
+
+function Get-LegacyQueueLengths {
+    $Lengths = @{}
+    foreach ($QueueName in $LegacyQueues) {
+        $RawLength = @(
+            & docker compose exec -T redis sh -ec `
+                'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" LLEN "$1"' `
+                sh $QueueName
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to inspect legacy Redis queue $QueueName"
+        }
+        $LengthText = [string]($RawLength | Select-Object -Last 1)
+        [long]$Length = 0
+        if (-not [long]::TryParse($LengthText.Trim(), [ref]$Length)) {
+            throw "legacy Redis queue $QueueName returned a non-numeric length"
+        }
+        $Lengths[$QueueName] = $Length
+    }
+    return $Lengths
+}
+
+function Get-BrokerUnackedCount {
+    $Counts = @()
+    foreach ($Probe in @(
+        @{ Command = "HLEN"; Key = "unacked" },
+        @{ Command = "ZCARD"; Key = "unacked_index" }
+    )) {
+        $RawCount = @(
+            & docker compose exec -T redis sh -ec `
+                'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" "$1" "$2"' `
+                sh $Probe.Command $Probe.Key
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to inspect Redis broker unacked state"
+        }
+        $CountText = [string]($RawCount | Select-Object -Last 1)
+        [long]$Count = 0
+        if (-not [long]::TryParse($CountText.Trim(), [ref]$Count)) {
+            throw "Redis broker unacked state returned a non-numeric count"
+        }
+        $Counts += $Count
+    }
+    return ($Counts | Measure-Object -Maximum).Maximum
+}
+
+function Wait-LegacyQueueDrain {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Phase
+    )
+
+    $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $Lengths = Get-LegacyQueueLengths
+        [long]$Total = 0
+        foreach ($Length in $Lengths.Values) {
+            $Total += [long]$Length
+        }
+        if ($Total -eq 0) {
+            Write-Host "Legacy Celery queues drained during $Phase."
+            return $true
+        }
+        $Summary = @(
+            foreach ($QueueName in $LegacyQueues) {
+                "$QueueName=$($Lengths[$QueueName])"
+            }
+        ) -join ", "
+        Write-Host "Waiting for legacy Celery queues during $Phase ($Summary)."
+        if ((Get-Date) -ge $Deadline) {
+            return $false
+        }
+        Start-Sleep -Seconds $LegacyPollSeconds
+    }
+}
+
+function Start-ExistingWorkers {
+    if ($ExistingWorkerContainerIds.Count -eq 0) {
+        return
+    }
+    $null = & docker container start @ExistingWorkerContainerIds
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to start existing worker containers for legacy queue drain"
+    }
+}
+
+function Stop-ExistingWorkers {
+    if ($ExistingWorkerContainerIds.Count -eq 0) {
+        return
+    }
+    $null = & docker container stop --timeout $StopTimeoutSeconds @ExistingWorkerContainerIds
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to stop existing worker containers"
+    }
+}
+
+& docker compose stop --timeout 120 @IngressServices
 if ($LASTEXITCODE -ne 0) {
-    throw "failed to stop beat and workers"
+    throw "failed to stop web and beat before legacy queue drain"
 }
 
 & docker compose up -d postgres redis minio minio-bootstrap
 if ($LASTEXITCODE -ne 0) {
     throw "failed to start infrastructure services"
+}
+
+& docker compose up -d --wait --wait-timeout 120 postgres redis minio
+if ($LASTEXITCODE -ne 0) {
+    throw "infrastructure services did not become healthy before legacy queue drain"
+}
+
+Start-ExistingWorkers
+if (-not (Wait-LegacyQueueDrain `
+    -TimeoutSeconds $LegacyDrainTimeoutSeconds `
+    -Phase "initial drain")) {
+    Stop-ExistingWorkers
+    throw (
+        "legacy queue drain timed out before migration; " +
+        "web, beat, and existing workers remain stopped"
+    )
+}
+
+Stop-ExistingWorkers
+$PostStopLengths = Get-LegacyQueueLengths
+[long]$PostStopTotal = 0
+foreach ($Length in $PostStopLengths.Values) {
+    $PostStopTotal += [long]$Length
+}
+$PostStopUnacked = Get-BrokerUnackedCount
+if ($PostStopUnacked -gt 0) {
+    throw (
+        "Redis still contains unacknowledged Celery deliveries after worker stop; " +
+        "migration was not started and web, beat, and existing workers remain stopped"
+    )
+}
+if ($PostStopTotal -gt 0) {
+    Write-Host (
+        "Legacy messages reappeared after graceful worker stop; " +
+        "restarting the same worker containers for one bounded re-drain."
+    )
+    Start-ExistingWorkers
+    if (-not (Wait-LegacyQueueDrain `
+        -TimeoutSeconds $LegacyDrainTimeoutSeconds `
+        -Phase "post-stop re-drain")) {
+        Stop-ExistingWorkers
+        throw (
+            "legacy queue re-drain timed out before migration; " +
+            "web, beat, and existing workers remain stopped"
+        )
+    }
+    Stop-ExistingWorkers
+    $PostRedrainUnacked = Get-BrokerUnackedCount
+    if ($PostRedrainUnacked -gt 0) {
+        throw (
+            "Redis still contains unacknowledged Celery deliveries after re-drain; " +
+            "migration was not started and web, beat, and existing workers remain stopped"
+        )
+    }
+}
+
+$FinalLegacyLengths = Get-LegacyQueueLengths
+[long]$FinalLegacyTotal = 0
+foreach ($Length in $FinalLegacyLengths.Values) {
+    $FinalLegacyTotal += [long]$Length
+}
+if ($FinalLegacyTotal -gt 0) {
+    throw (
+        "legacy queues are not empty after the final worker stop; " +
+        "migration was not started and web, beat, and existing workers remain stopped"
+    )
 }
 
 & docker compose up -d --wait --wait-timeout 120 postgres
@@ -71,10 +250,10 @@ if ($LASTEXITCODE -ne 0) {
 & docker compose up --no-deps --force-recreate `
     --abort-on-container-exit --exit-code-from migrate migrate
 if ($LASTEXITCODE -ne 0) {
-    throw "migration failed; beat and workers remain stopped"
+    throw "migration failed; web, beat, and workers remain stopped"
 }
 
-& docker compose up -d web @QuiescedServices
+& docker compose up -d @ApplicationServices
 if ($LASTEXITCODE -ne 0) {
     throw "migration succeeded but application restart failed"
 }

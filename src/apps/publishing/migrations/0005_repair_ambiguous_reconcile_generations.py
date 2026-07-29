@@ -6,7 +6,19 @@ LEGACY_AMBIGUOUS_CODES = {
     "legacy_reconcile_event_missing",
     "legacy_reconcile_generation_ambiguous",
 }
+TERMINAL_ATTEMPT_STATES = {
+    "succeeded",
+    "permanent_failed",
+    "manual_required",
+    "stale",
+}
 TERMINAL_RECEIPT_STATES = {"succeeded", "dead_letter"}
+SUCCESS_PUBLICATION_STATE_BY_ACTION = {
+    "create": "published",
+    "update": "published",
+    "mark_withdrawn": "marked_withdrawn",
+    "unpublish": "withdrawn",
+}
 
 
 def _event_generation(event, attempt_id, expected_generation):
@@ -204,9 +216,90 @@ def _complete_delivery_generation(
     )
 
 
+def _has_durable_success_proof(
+    Intent,
+    attempt,
+    publication,
+    generations,
+    *,
+    db_alias,
+):
+    if any(
+        generation.state == "completed"
+        and generation.result_state == "succeeded"
+        and bool(generation.result_identity)
+        for generation in generations
+    ):
+        return True
+    if (
+        attempt.finished_at is None
+        or publication.last_success_at is None
+        or attempt.finished_at != publication.last_success_at
+    ):
+        return False
+    revision_no = (
+        Intent.objects.using(db_alias)
+        .filter(pk=attempt.publication_intent_id)
+        .values_list("revision_no", flat=True)
+        .first()
+    )
+    if (
+        revision_no is None
+        or publication.published_revision_no != revision_no
+    ):
+        return False
+    if attempt.resolved_action == "unpublish":
+        return bool(publication.remote_post_id) or (
+            publication.remote_state in {"withdrawn", "deleted"}
+        )
+    return bool(publication.remote_post_id)
+
+
+def _is_latest_attempt(Attempt, attempt, *, db_alias):
+    latest_id = (
+        Attempt.objects.using(db_alias)
+        .filter(publication_id=attempt.publication_id)
+        .order_by("-created_at", "-id")
+        .values_list("id", flat=True)
+        .first()
+    )
+    return latest_id == attempt.id
+
+
+def _restore_success_projection(
+    Attempt,
+    Publication,
+    attempt,
+    publication,
+    *,
+    db_alias,
+):
+    Attempt.objects.using(db_alias).filter(pk=attempt.id).update(
+        state="succeeded",
+        error_code="",
+        error_detail_redacted="",
+    )
+    if (
+        not _is_latest_attempt(Attempt, attempt, db_alias=db_alias)
+        or publication.state != "manual_required"
+        or publication.last_error_code not in LEGACY_AMBIGUOUS_CODES
+    ):
+        return
+    publication_state = SUCCESS_PUBLICATION_STATE_BY_ACTION.get(
+        attempt.resolved_action
+    )
+    if publication_state is None:
+        return
+    Publication.objects.using(db_alias).filter(pk=publication.id).update(
+        state=publication_state,
+        last_error_code="",
+    )
+
+
 def repair_ambiguous_generations(apps, schema_editor):
     Attempt = apps.get_model("publishing", "PublicationAttempt")
     Publication = apps.get_model("publishing", "Publication")
+    Intent = apps.get_model("publishing", "PublicationIntent")
     Generation = apps.get_model(
         "publishing",
         "PublicationReconcileGeneration",
@@ -223,6 +316,11 @@ def repair_ambiguous_generations(apps, schema_editor):
         )
     )
     for attempt in attempts.iterator():
+        publication = (
+            Publication.objects.using(db_alias)
+            .select_for_update()
+            .get(pk=attempt.publication_id)
+        )
         events = list(
             Event.objects.using(db_alias)
             .select_for_update()
@@ -330,12 +428,39 @@ def repair_ambiguous_generations(apps, schema_editor):
             attempt.state == "manual_required"
             and attempt.error_code in LEGACY_AMBIGUOUS_CODES
         )
-        requires_manual = bool(
+        restored_success = bool(
+            legacy_manual
+            and _has_durable_success_proof(
+                Intent,
+                attempt,
+                publication,
+                existing,
+                db_alias=db_alias,
+            )
+        )
+        effective_attempt_state = (
+            "succeeded" if restored_success else attempt.state
+        )
+        success_projection_needs_restore = bool(
+            effective_attempt_state == "succeeded"
+            and publication.state == "manual_required"
+            and publication.last_error_code in LEGACY_AMBIGUOUS_CODES
+            and _is_latest_attempt(
+                Attempt,
+                attempt,
+                db_alias=db_alias,
+            )
+        )
+        ambiguous_repair = bool(
             invalid_events
             or orphan_generations
             or attempt.reconcile_attempt_no > prefix_count
             or legacy_manual
             or prefix_has_dead_letter
+        )
+        requires_manual = bool(
+            ambiguous_repair
+            and effective_attempt_state not in TERMINAL_ATTEMPT_STATES
         )
         requires_repair = bool(
             new_bindings
@@ -346,6 +471,7 @@ def repair_ambiguous_generations(apps, schema_editor):
             or incomplete_terminal_generations
             or synthetic_results
             or prefix_has_dead_letter
+            or success_projection_needs_restore
         )
         if not requires_repair:
             continue
@@ -375,7 +501,7 @@ def repair_ambiguous_generations(apps, schema_editor):
                 pk=generation.pk
             ).update(result_state="")
 
-        if requires_manual:
+        if ambiguous_repair:
             for _, event, generation in prefix:
                 _, completed_at = _settle_event(
                     Receipt,
@@ -435,7 +561,13 @@ def repair_ambiguous_generations(apps, schema_editor):
         )
         highest_bound = max(highest_bound, prefix_count)
         update_fields = {"reconcile_attempt_no": highest_bound}
-        if requires_manual:
+        if restored_success:
+            update_fields.update(
+                state="succeeded",
+                error_code="",
+                error_detail_redacted="",
+            )
+        elif requires_manual:
             completed_at = attempt.finished_at or timezone.now()
             update_fields.update(
                 state="manual_required",
@@ -451,6 +583,14 @@ def repair_ambiguous_generations(apps, schema_editor):
         Attempt.objects.using(db_alias).filter(pk=attempt.id).update(
             **update_fields
         )
+        if restored_success or success_projection_needs_restore:
+            _restore_success_projection(
+                Attempt,
+                Publication,
+                attempt,
+                publication,
+                db_alias=db_alias,
+            )
 
 
 class Migration(migrations.Migration):

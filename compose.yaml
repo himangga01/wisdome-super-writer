@@ -182,7 +182,7 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect.housing,collect.semiconductor"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect.housing,collect.semiconductor,extract.fanout"]
     networks:
       - database
       - broker

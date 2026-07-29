@@ -9,16 +9,21 @@ from .services import collect_run
 @shared_task(name="apps.collection.tasks.execute_collection_run")
 def execute_collection_run(run_id: str):
     run = CollectionRun.objects.select_related("source_registry").get(id=run_id)
+    if (
+        run.state == RunState.STOPPING
+        and run.stop_requested_at is not None
+    ):
+        return _finalize_collection_run_delivery_failure(
+            run_id,
+            "stop_requested",
+        )
     if run.state not in {RunState.QUEUED, RunState.COLLECTING}:
         return {"runId": str(run.id), "state": run.state}
     run = collect_run(run)
     return {"runId": str(run.id), "state": run.state}
 
 
-@shared_task(
-    name="apps.collection.tasks.finalize_collection_run_delivery_failure"
-)
-def finalize_collection_run_delivery_failure(
+def _finalize_collection_run_delivery_failure(
     run_id: str,
     error_code: str,
 ):
@@ -41,6 +46,8 @@ def finalize_collection_run_delivery_failure(
 
         active = run.state in {RunState.QUEUED, RunState.COLLECTING}
         if run.state == RunState.STOPPING:
+            if run.stop_requested_at is None:
+                return {"runId": str(run.id), "state": run.state}
             if RunStep.objects.filter(run=run).exclude(
                 name="collect"
             ).exists():
@@ -109,3 +116,16 @@ def finalize_collection_run_delivery_failure(
             "state": run.state,
             "code": step.error_code,
         }
+
+
+@shared_task(
+    name="apps.collection.tasks.finalize_collection_run_delivery_failure"
+)
+def finalize_collection_run_delivery_failure(
+    run_id: str,
+    error_code: str,
+):
+    return _finalize_collection_run_delivery_failure(
+        run_id,
+        error_code,
+    )

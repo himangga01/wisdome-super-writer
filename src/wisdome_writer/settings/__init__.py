@@ -352,6 +352,7 @@ CELERY_TASK_QUEUES = tuple(
     for name in (
         "collect.housing",
         "collect.semiconductor",
+        "extract.fanout",
         "extract.document",
         "extract.generic",
         "extract.ocr.paddle",
@@ -372,6 +373,7 @@ CELERY_BEAT_SCHEDULE = {
 }
 CELERY_TASK_ROUTES = {
     "apps.evidence.tasks.process_paddleocr_document": {"queue": "extract.ocr.paddle"},
+    "apps.evidence.tasks.process_run_evidence": {"queue": "extract.fanout"},
     "wisdome_writer.infrastructure.tasks.dispatch_outbox": {"queue": "maintenance"},
     "apps.collection.*": {"queue": "collect.housing"},
     "apps.evidence.*": {"queue": "extract.generic"},

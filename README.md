@@ -84,31 +84,54 @@ docker compose run --rm web python src/manage.py import_extraction_profiles --ro
 ### 안전한 Compose 배포 절차
 
 초기 실행과 이후 업그레이드는 항상 `deploy/compose-deploy.ps1`을 사용합니다.
-이 스크립트는 Compose에 등록된 beat와 모든 worker 서비스가 관리 목록에 포함됐는지 먼저
-검사하고, 이미 실행 중인 beat와 worker를 모두 중지한 뒤 one-shot `migrate` 서비스를
-실행합니다. migration이 성공한 경우에만 web, beat, worker를 다시 시작합니다. migration이
-실패하면 소비자는 중지된 상태로 남으므로 원인을 해결한 뒤 같은 스크립트를 다시 실행합니다.
+이 스크립트는 Compose에 등록된 모든 worker 서비스가 관리 목록에 포함됐는지 먼저 검사합니다.
+새 이미지를 빌드한 뒤 `web`과 beat를 먼저 중지해 새로운 HTTP 요청과 예약 생산을 차단하고,
+아직 실행 중인 구버전 worker가 legacy `collect`, `default`, `generate`, `publish` Redis 큐를
+비우도록 `LLEN`을 제한 시간 동안 확인합니다. 큐가 비면 구버전 worker를 최대 40분 동안
+graceful stop하고, stop 과정에서 예약·미확인 메시지가 legacy 큐로 돌아왔는지 다시 확인합니다.
+메시지가 돌아오면 같은 구버전 worker 컨테이너를 한 번 다시 시작해 제한 시간 동안 재-drain한
+뒤 다시 중지합니다. worker 중지 뒤 Redis broker의 `unacked` hash와 `unacked_index`도 모두
+비었는지 확인하므로, 강제 종료로 visibility timeout 안에 숨은 메시지가 있으면 migration 전에
+중단합니다.
+
+legacy 큐를 완전히 비우지 못하면 migration을 시작하지 않고 `web`, beat, 구버전 worker를
+중지된 상태로 남깁니다. 운영자는 큐와 worker 오류를 복구한 뒤 같은 스크립트를 다시 실행해야
+합니다. 모든 drain과 migration이 성공한 경우에만 새 web, beat, worker를 시작합니다. Redis
+비밀번호는 drain 명령 출력에 기록하지 않습니다.
 
 `web` entrypoint는 migration을 자동 실행하지 않습니다. Compose의 web, beat, 모든 일반 worker와
 OCR worker는 `migrate` 서비스의 성공 완료를 시작 조건으로 사용합니다. 따라서 임의로
 `docker compose run --rm web python src/manage.py migrate`를 실행하거나 worker가 동작하는 동안
 migration을 우회 실행하지 않습니다.
 
-기본 worker 종료 대기 시간은 120초입니다. 장시간 작업을 마칠 시간이 더 필요하면 다음처럼
-늘릴 수 있습니다.
+기본 worker 종료 대기와 legacy 큐 drain 제한 시간은 각각 2400초입니다. 작업 시간이 더 길면
+두 값을 함께 늘릴 수 있습니다.
 
 ```powershell
-.\deploy\compose-deploy.ps1 -StopTimeoutSeconds 300
+.\deploy\compose-deploy.ps1 `
+  -StopTimeoutSeconds 3600 `
+  -LegacyDrainTimeoutSeconds 3600
 ```
 
 ### Safe Compose deployment contract (English)
 
 Use `deploy/compose-deploy.ps1` for both first boot and every upgrade. The script verifies
-that its quiesce inventory covers beat and every configured worker, stops those consumers,
-runs the one-shot `migrate` service, and restarts web and the consumers only after migration
-succeeds. A failed migration leaves the consumers stopped. The web entrypoint does not run
-migrations, and all Compose application consumers depend on successful migration completion.
-Do not bypass this path with an ad-hoc migration while workers are running.
+that its inventory covers every configured worker. After building the new images, it stops
+web and beat first so no new HTTP or scheduled work is produced. Existing old worker
+containers remain available while the script polls Redis `LLEN` for the legacy `collect`,
+`default`, `generate`, and `publish` queues. It then gracefully stops those workers and
+checks the queues again. Messages restored during shutdown cause the same old containers
+to be restarted for one bounded re-drain and stopped again. After every worker stop, the
+script also requires the Redis broker's `unacked` hash and `unacked_index` to be empty, so
+a delivery hidden by a forced stop and its visibility timeout blocks migration.
+
+Migration does not start unless all four legacy queues remain empty after the final stop.
+A drain timeout aborts with web, beat, and old workers stopped. Migration failure also
+leaves all application processes stopped. Only a successful drain and migration starts
+the new web, beat, and worker services. Redis credentials are not printed by the drain
+commands. The web entrypoint does not run migrations, and all Compose application
+consumers depend on successful migration completion. Do not bypass this path with an
+ad-hoc migration while workers are running.
 
 접속 주소:
 
@@ -224,16 +247,32 @@ token을 외부 비밀 저장소에 기록한 뒤 `vault://...` 같은 참조 �
 
 | 큐 | 담당 작업 |
 |---|---|
-| `default` | 일정 dispatch, 보존 등 제어 작업 |
-| `collect` | 출처 수집 |
-| `extract.generic` | native PDF, HTML, HWP/HWPX, spreadsheet 및 근거 orchestration |
+| `collect.housing` | 부동산 청약 출처 수집 |
+| `collect.semiconductor` | 반도체 출처 수집 |
+| `extract.fanout` | 외부 첨부 다운로드, 객체 저장 및 추출 fan-out |
+| `extract.document` | 문서 완료 집계와 evidence finalizer |
+| `extract.generic` | 저장된 객체의 native PDF, HTML, HWP/HWPX, spreadsheet 추출 |
 | `extract.ocr.paddle` | PaddleOCR 전용 PDF 인식 |
-| `generate` | 근거 기반 글 생성 |
-| `publish` | WordPress/Blogger 발행과 reconcile |
+| `editorial` | 근거 기반 글 생성 |
+| `publish.media.wordpress` | WordPress media와 공개 객체 작업 |
+| `publish.wordpress` | WordPress preflight, canary와 발행 |
+| `publish.blogger` | Blogger preflight, canary와 발행 |
+| `reconcile` | 채널별 원격 결과 조정 |
+| `maintenance` | outbox dispatch, 감사·보존 등 제어 작업 |
 
-Beat는 한 인스턴스만 실행하고 60초마다
-`apps.scheduling.tasks.dispatch_due_schedules_task`를 호출합니다. 일정 중복 방지는 PostgreSQL
-잠금과 dispatch 멱등키가 담당합니다.
+`extract.fanout`은 `collection-egress`와 object storage에 접근하는 `worker-collect`가
+처리합니다. `worker-extract`는 외부 egress 없이 저장된 객체만 읽습니다. Beat는 한 인스턴스만
+실행하고 5초마다 outbox dispatcher를 호출하며, dispatcher가 due schedule scan과 versioned
+event 전달을 수행합니다.
+
+### Celery queue contract (English)
+
+`extract.fanout` is consumed by `worker-collect`, which has collection egress and object
+storage access for external attachment download and durable fan-out. `worker-extract`
+remains without external egress and only reads stored objects from `extract.document` and
+`extract.generic`. Beat invokes the outbox dispatcher every five seconds; the dispatcher
+runs the due-schedule scan and routes versioned events to the topic- or channel-specific
+queues listed above.
 
 ## 프로젝트 구조
 

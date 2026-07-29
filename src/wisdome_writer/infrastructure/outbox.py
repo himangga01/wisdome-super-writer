@@ -573,13 +573,10 @@ def claim_exhausted_events(
     lease_owner: str = "outbox-dispatcher",
 ) -> list[OutboxMessage]:
     now = timezone.now()
-    claimable = Q(status=OutboxMessage.Status.PENDING) | Q(
-        status=OutboxMessage.Status.DISPATCHING, claimed_until__lte=now
-    )
     messages = list(
         OutboxMessage.objects.select_for_update(skip_locked=True)
         .filter(
-            claimable,
+            status=OutboxMessage.Status.PENDING,
             available_at__lte=now,
             attempts__gte=F("max_attempts"),
         )
@@ -615,35 +612,40 @@ def claim_events(
     lease_owner: str = "outbox-dispatcher",
 ) -> list[OutboxMessage]:
     now = timezone.now()
-    claimable = Q(status=OutboxMessage.Status.PENDING) | Q(
-        status=OutboxMessage.Status.DISPATCHING, claimed_until__lte=now
+    claimable = Q(
+        status=OutboxMessage.Status.PENDING,
+        attempts__lt=F("max_attempts"),
+    ) | Q(
+        status=OutboxMessage.Status.DISPATCHING,
+        claimed_until__lte=now,
     )
     messages = list(
         OutboxMessage.objects.select_for_update(skip_locked=True)
-        .filter(claimable, available_at__lte=now, attempts__lt=F("max_attempts"))
+        .filter(claimable, available_at__lte=now)
         .filter(Q(claimed_until__isnull=True) | Q(claimed_until__lte=now))
         .order_by("available_at", "created_at", "id")[: max(1, limit)]
     )
     lease_until = now + timedelta(seconds=max(1, lease_seconds))
     for message in messages:
+        starts_new_attempt = message.status == OutboxMessage.Status.PENDING
         message.status = OutboxMessage.Status.DISPATCHING
         message.claimed_at = now
         message.claimed_until = lease_until
         message.lease_owner = lease_owner[:160]
         message.lease_token = uuid.uuid4()
         message.lease_generation += 1
-        message.attempts += 1
-        message.save(
-            update_fields=(
-                "status",
-                "claimed_at",
-                "claimed_until",
-                "lease_owner",
-                "lease_token",
-                "lease_generation",
-                "attempts",
-            )
-        )
+        update_fields = [
+            "status",
+            "claimed_at",
+            "claimed_until",
+            "lease_owner",
+            "lease_token",
+            "lease_generation",
+        ]
+        if starts_new_attempt:
+            message.attempts += 1
+            update_fields.append("attempts")
+        message.save(update_fields=update_fields)
     return messages
 
 

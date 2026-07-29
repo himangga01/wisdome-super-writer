@@ -742,25 +742,51 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                 ).extract(path, pages, input_kind=document.input_kind)
             result = _store_result("document", run.id, output.as_dict())
             reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
-            run.state = ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
-            run.processed_page_indices = list(output.processed_page_indices)
-            run.result_object_key = result.key
-            run.result_checksum = result.checksum_sha256
-            run.runtime_version = output.runtime_version
-            run.package_version = output.package_version
-            run.pipeline_name = output.pipeline_name
-            run.device_type = output.device_type
-            run.low_confidence_reasons = reasons or None
-            run.low_confidence_reasons_hash = canonical_hash(reasons) if reasons else None
+            terminal_state = (
+                ExtractionState.LOW_CONFIDENCE
+                if reasons
+                else ExtractionState.SUCCEEDED
+            )
+            reason_info = None
             if reasons:
                 reason_info = _store_result("reasons", run.id, {"reasons": reasons})
-                run.low_confidence_reasons_object_key = reason_info.key
-                run.low_confidence_reasons_object_version = reason_info.version_id or reason_info.etag
-            run.duration_ms = int((timezone.now() - started).total_seconds() * 1000)
-            run.finished_at = timezone.now()
-            run.full_clean()
-            run.save()
-            _make_document_evidence(document, run, output, document.run_source_item)
+            finished_at = timezone.now()
+            duration_ms = int((finished_at - started).total_seconds() * 1000)
+            with transaction.atomic():
+                run = ExtractionRun.objects.select_for_update().get(pk=run.pk)
+                if run.state in (
+                    ExtractionState.SUCCEEDED,
+                    ExtractionState.LOW_CONFIDENCE,
+                ):
+                    selected_by_engine[engine] = run
+                    continue
+                run.state = terminal_state
+                run.processed_page_indices = list(output.processed_page_indices)
+                run.result_object_key = result.key
+                run.result_checksum = result.checksum_sha256
+                run.runtime_version = output.runtime_version
+                run.package_version = output.package_version
+                run.pipeline_name = output.pipeline_name
+                run.device_type = output.device_type
+                run.low_confidence_reasons = reasons or None
+                run.low_confidence_reasons_hash = (
+                    canonical_hash(reasons) if reasons else None
+                )
+                if reason_info is not None:
+                    run.low_confidence_reasons_object_key = reason_info.key
+                    run.low_confidence_reasons_object_version = (
+                        reason_info.version_id or reason_info.etag
+                    )
+                run.duration_ms = duration_ms
+                run.finished_at = finished_at
+                run.full_clean()
+                run.save()
+                _make_document_evidence(
+                    document,
+                    run,
+                    output,
+                    document.run_source_item,
+                )
             selected_by_engine[engine] = run
 
         document.routing_manifest = {
@@ -1451,7 +1477,7 @@ def finalize_run_evidence(run_id: str):
             )
             .count()
         )
-        document_failures = DocumentExtraction.objects.filter(
+        failed_documents = DocumentExtraction.objects.filter(
             run_source_item__run=run,
             input_fingerprint__isnull=False,
             state=ExtractionState.FAILED,
@@ -1477,7 +1503,11 @@ def finalize_run_evidence(run_id: str):
             input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
                 True
             ),
-        ).count()
+        )
+        missing_selected_evidence = failed_documents.filter(
+            error_code="selected_run_evidence_missing",
+        ).exists()
+        document_failures = failed_documents.count()
         generic_failures = GenericExtractionAttempt.objects.filter(
             run_source_item__run=run, state=ExtractionState.FAILED
         ).exclude(
@@ -1490,6 +1520,51 @@ def finalize_run_evidence(run_id: str):
             input_asset__parent_asset__raw_input_fingerprint__isnull=True,
         ).count()
         failure_count = document_failures + generic_failures
+        if missing_selected_evidence:
+            now = timezone.now()
+            error_code = "selected_run_evidence_missing"
+            step.output_count = evidence_count
+            step.error_code = error_code
+            step.error_detail_redacted = (
+                "Selected successful extraction run has no evidence assets"
+            )
+            step.state = "failed"
+            step.finished_at = now
+            step.save(
+                update_fields=(
+                    "output_count",
+                    "error_code",
+                    "error_detail_redacted",
+                    "state",
+                    "finished_at",
+                )
+            )
+            run.state = RunState.FAILED
+            run.error_summary = {
+                "stage": "extract",
+                "code": error_code,
+            }
+            run.completed_at = now
+            run.counters = {
+                **run.counters,
+                "evidence": evidence_count,
+                "extractionFailures": failure_count,
+            }
+            run.save(
+                update_fields=(
+                    "state",
+                    "error_summary",
+                    "completed_at",
+                    "counters",
+                )
+            )
+            return {
+                "runId": str(run.id),
+                "state": run.state,
+                "evidence": evidence_count,
+                "failures": failure_count,
+                "code": error_code,
+            }
         step.output_count = evidence_count
         step.error_code = "partial_extraction_failure" if failure_count else None
         step.error_detail_redacted = (

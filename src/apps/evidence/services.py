@@ -404,14 +404,21 @@ def aggregate_document_extraction(document_id: Any) -> DocumentExtraction:
         .select_related("latest_review_decision", "extraction_run")
         .order_by("id")
     )
+    missing_successful_evidence = False
     if complete:
         for run in selected.values():
             if run.state not in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
                 complete = False
                 break
+            run_evidence = [
+                item for item in evidence if item.extraction_run_id == run.id
+            ]
+            if not run_evidence:
+                missing_successful_evidence = True
+                complete = False
+                break
             if run.state == ExtractionState.LOW_CONFIDENCE:
-                run_evidence = [item for item in evidence if item.extraction_run_id == run.id]
-                if not run_evidence or not all(_approved_current_decision(item) for item in run_evidence):
+                if not all(_approved_current_decision(item) for item in run_evidence):
                     complete = False
                     break
 
@@ -440,7 +447,14 @@ def aggregate_document_extraction(document_id: Any) -> DocumentExtraction:
         document.coverage_manifest_hash = None
         document.selected_evidence_manifest_hash = None
         document.document_complete = False
-        if any(run.state == ExtractionState.FAILED for run in selected.values()):
+        if missing_successful_evidence:
+            document.state = ExtractionState.FAILED
+            document.finished_at = timezone.now()
+            document.error_code = "selected_run_evidence_missing"
+            document.error_detail_redacted = (
+                "Selected successful extraction run has no evidence assets"
+            )
+        elif any(run.state == ExtractionState.FAILED for run in selected.values()):
             document.state = ExtractionState.FAILED
         elif selected:
             document.state = ExtractionState.LOW_CONFIDENCE
