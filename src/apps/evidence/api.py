@@ -11,6 +11,7 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.http import require_GET, require_POST
 
 from adapters.storage import S3ObjectStorage
+from apps.audit.services import AuditContext
 from wisdome_writer.api.problems import problem_response
 
 from .models import (
@@ -128,6 +129,11 @@ def extraction_profile_decisions(request, profile_id):
         }
         if missing := required - set(body):
             raise ValidationError(f"Missing fields: {', '.join(sorted(missing))}")
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code=body["reason"],
+            request_key=body["requestKey"],
+        )
         decision, created = decide_extraction_profile(
             profile_id=profile_id,
             decision=body["decision"],
@@ -138,6 +144,7 @@ def extraction_profile_decisions(request, profile_id):
             admin=request.user,
             request=request,
             reauth_proof_id=body["reauthProofId"],
+            audit_context=audit_context,
         )
         return JsonResponse(_profile_decision_payload(decision), status=201 if created else 200)
     except (EvidenceConflict, EvidenceInvariantError) as exc:
@@ -411,6 +418,11 @@ def evidence_review_decisions(request, evidence_id):
         }
         if missing := required - set(body):
             raise ValidationError(f"Missing fields: {', '.join(sorted(missing))}")
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code=body["reason"],
+            request_key=body["requestKey"],
+        )
         decision, created = decide_evidence_review(
             evidence_id=evidence_id,
             decision=body["decision"],
@@ -420,6 +432,7 @@ def evidence_review_decisions(request, evidence_id):
             request_key=body["requestKey"],
             reason=body["reason"],
             admin=request.user,
+            audit_context=audit_context,
         )
         return JsonResponse(_review_decision_payload(decision), status=201 if created else 200)
     except (EvidenceConflict, EvidenceInvariantError) as exc:

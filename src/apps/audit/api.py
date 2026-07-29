@@ -17,7 +17,7 @@ from .cursor import decode_cursor, encode_cursor
 from apps.accounts.services import consume_reauthentication_proof
 
 from .models import AuditEvent, RetentionBatch
-from .redaction import redaction_policy_hash, sanitize_metadata
+from .redaction import sanitize_reason, validate_stored_metadata
 from .retention import approve_retention_batch, create_retention_preview
 
 PAGE_SIZE = 50
@@ -29,11 +29,17 @@ def _iso(value):
 
 def _serialize(event: AuditEvent) -> dict:
     try:
-        metadata = sanitize_metadata(event.action, event.metadata_redacted)
-        if event.redaction_policy_hash != redaction_policy_hash(event.action):
-            metadata = {"error_code": "redaction_policy_changed"}
+        metadata = validate_stored_metadata(
+            action=event.action,
+            metadata_schema_version=event.metadata_schema_version,
+            redaction_policy_version=event.redaction_policy_version,
+            redaction_policy_hash_value=event.redaction_policy_hash,
+            metadata=event.metadata_redacted,
+        )
+        reason_code = sanitize_reason(event.reason_code)
     except ValueError:
         metadata = {"error_code": "redaction_validation_failed"}
+        reason_code = None
     return {
         "id": str(event.pk),
         "occurredAt": _iso(event.occurred_at),
@@ -45,7 +51,7 @@ def _serialize(event: AuditEvent) -> dict:
         "entityId": str(event.entity_id),
         "beforeHash": event.before_hash,
         "afterHash": event.after_hash,
-        "reasonCode": event.reason_code,
+        "reasonCode": reason_code,
         "metadataSchemaVersion": event.metadata_schema_version,
         "redactionPolicyVersion": event.redaction_policy_version,
         "redactionPolicyHash": event.redaction_policy_hash,

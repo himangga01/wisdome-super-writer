@@ -26,6 +26,15 @@ CURRENT_EVENT_ID: ContextVar[str | None] = ContextVar("outbox_event_id", default
 CURRENT_EVENT_CORRELATION_ID: ContextVar[str | None] = ContextVar(
     "outbox_event_correlation_id", default=None
 )
+CURRENT_EVENT_CONSUMER_NAME: ContextVar[str | None] = ContextVar(
+    "outbox_event_consumer_name", default=None
+)
+CURRENT_EVENT_CONSUMER_LEASE_TOKEN: ContextVar[uuid.UUID | None] = ContextVar(
+    "outbox_event_consumer_lease_token", default=None
+)
+CURRENT_EVENT_CONSUMER_LEASE_GENERATION: ContextVar[int | None] = ContextVar(
+    "outbox_event_consumer_lease_generation", default=None
+)
 
 FORBIDDEN_KEY_PARTS = {
     "access_token",
@@ -805,7 +814,33 @@ def dead_letter_consumer_event(
         else:
             payload = event.payload if isinstance(event.payload, dict) else {}
             terminal_args = [payload[key] for key in terminal_argument_keys]
-        with event_context(event_envelope(event)):
+        has_consumer_ownership = expected_consumer_lease_token is not None
+        if not has_consumer_ownership:
+            receipt.state = OutboxConsumerReceipt.State.PROCESSING
+            receipt.claimed_at = now
+            receipt.claimed_until = now + timedelta(
+                seconds=max(
+                    int(settings.OUTBOX_CONSUMER_LEASE_SECONDS),
+                    1,
+                )
+            )
+            receipt.lease_token = uuid.uuid4()
+            receipt.lease_generation += 1
+            receipt.save(
+                update_fields=(
+                    "state",
+                    "claimed_at",
+                    "claimed_until",
+                    "lease_token",
+                    "lease_generation",
+                )
+            )
+        with event_context(
+            event_envelope(event),
+            consumer_name=consumer_name,
+            lease_token=receipt.lease_token,
+            lease_generation=receipt.lease_generation,
+        ):
             terminal_handler(*terminal_args, error_code[:120])
     receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
     if increment_attempt:
@@ -961,13 +996,29 @@ def _verify_received_envelope(event: OutboxMessage, envelope: dict[str, Any]) ->
 
 
 @contextmanager
-def event_context(envelope: dict[str, Any]):
+def event_context(
+    envelope: dict[str, Any],
+    *,
+    consumer_name: str | None = None,
+    lease_token: uuid.UUID | None = None,
+    lease_generation: int | None = None,
+):
     event_token = CURRENT_EVENT_ID.set(envelope["event_id"])
     correlation_token = CURRENT_EVENT_CORRELATION_ID.set(envelope["correlation_id"])
+    consumer_name_token = CURRENT_EVENT_CONSUMER_NAME.set(consumer_name)
+    consumer_lease_token = CURRENT_EVENT_CONSUMER_LEASE_TOKEN.set(lease_token)
+    consumer_lease_generation_token = (
+        CURRENT_EVENT_CONSUMER_LEASE_GENERATION.set(lease_generation)
+    )
     try:
         with correlation_context(envelope["correlation_id"]):
             yield
     finally:
+        CURRENT_EVENT_CONSUMER_LEASE_GENERATION.reset(
+            consumer_lease_generation_token
+        )
+        CURRENT_EVENT_CONSUMER_LEASE_TOKEN.reset(consumer_lease_token)
+        CURRENT_EVENT_CONSUMER_NAME.reset(consumer_name_token)
         CURRENT_EVENT_CORRELATION_ID.reset(correlation_token)
         CURRENT_EVENT_ID.reset(event_token)
 
@@ -1186,7 +1237,12 @@ def consume_event(
         # Domain tasks own their transaction boundaries. In particular, publisher
         # tasks commit the pre-call fingerprint before external I/O and use
         # reconcile on ambiguous outcomes.
-        with event_context(envelope):
+        with event_context(
+            envelope,
+            consumer_name=consumer_name,
+            lease_token=lease_token,
+            lease_generation=lease_generation,
+        ):
             result = handler(*args)
     except DatabaseError as exc:
         raise consumer_infrastructure_error(exc) from exc

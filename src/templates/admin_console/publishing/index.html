@@ -73,6 +73,8 @@
     event.preventDefault();
     const form = new FormData(event.target);
     const channel = form.get('channel');
+    const reason = prompt('발행 대상 생성 사유를 입력하세요.');
+    if (!reason?.trim()) return;
     const payload = {
       channel,
       channelRole: channel === 'wordpress' ? 'primary_canonical' : 'secondary_distribution',
@@ -81,7 +83,9 @@
       baseUrl: form.get('baseUrl'),
       remoteBlogId: form.get('remoteBlogId') || null,
       usernameRef: form.get('usernameRef') || null,
-      credentialRef: form.get('credentialRef') || null
+      credentialRef: form.get('credentialRef') || null,
+      requestKey: crypto.randomUUID(),
+      reason: reason.trim()
     };
     const response = await fetch(`${api}/targets`, {method: 'POST', headers, body: JSON.stringify(payload)});
     const result = await response.json();

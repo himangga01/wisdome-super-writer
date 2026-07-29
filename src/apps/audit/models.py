@@ -1,45 +1,86 @@
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from django.conf import settings
 from django.db import models
 
 from wisdome_writer.domain.models import UUIDModel
 
-from .redaction import POLICY_VERSION, redaction_policy_hash, sanitize_metadata
+from .redaction import (
+    POLICY_VERSION,
+    redaction_policy_hash,
+    sanitize_metadata,
+    sanitize_reason,
+)
 
 
-class AuditEventManager(models.Manager):
-    def record(
+_AUDIT_INSERT_ALLOWED: ContextVar[bool] = ContextVar(
+    "audit_event_insert_allowed", default=False
+)
+
+
+@contextmanager
+def _allow_audit_event_insert():
+    token = _AUDIT_INSERT_ALLOWED.set(True)
+    try:
+        yield
+    finally:
+        _AUDIT_INSERT_ALLOWED.reset(token)
+
+
+class AuditEventQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("AuditEvent is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    def bulk_create(
         self,
-        *,
-        correlation_id: uuid.UUID | str,
-        actor_type: str,
-        action: str,
-        entity_type: str,
-        entity_id: uuid.UUID,
-        actor_id: uuid.UUID | None = None,
-        before_hash: str | None = None,
-        after_hash: str | None = None,
-        reason_code: str | None = None,
-        metadata: dict | None = None,
-        metadata_schema_version: str = "1",
+        objs,
+        batch_size=None,
+        ignore_conflicts=False,
+        update_conflicts=False,
+        update_fields=None,
+        unique_fields=None,
     ):
-        redacted = sanitize_metadata(action, metadata)
-        return self.create(
-            correlation_id=correlation_id,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            action=action,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            before_hash=before_hash,
-            after_hash=after_hash,
-            reason_code=reason_code,
-            metadata_schema_version=metadata_schema_version,
-            redaction_policy_version=POLICY_VERSION,
-            redaction_policy_hash=redaction_policy_hash(action),
-            metadata_redacted=redacted,
-        )
+        raise TypeError("AuditEvent bulk insertion is forbidden; use record_audit_event()")
+
+    async def abulk_create(
+        self,
+        objs,
+        batch_size=None,
+        ignore_conflicts=False,
+        update_conflicts=False,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        raise TypeError("AuditEvent bulk insertion is forbidden; use record_audit_event()")
+
+
+class AuditEventManager(models.Manager.from_queryset(AuditEventQuerySet)):
+    def record(self, **kwargs):
+        raise TypeError("Use apps.audit.services.record_audit_event()")
 
 
 class AuditEvent(UUIDModel):
@@ -63,7 +104,7 @@ class AuditEvent(UUIDModel):
     entity_id = models.UUIDField(db_index=True)
     before_hash = models.CharField(max_length=64, null=True, blank=True)
     after_hash = models.CharField(max_length=64, null=True, blank=True)
-    reason_code = models.CharField(max_length=100, null=True, blank=True)
+    reason_code = models.CharField(max_length=500, null=True, blank=True)
     metadata_schema_version = models.CharField(max_length=32)
     redaction_policy_version = models.CharField(max_length=64)
     redaction_policy_hash = models.CharField(max_length=64)
@@ -72,6 +113,8 @@ class AuditEvent(UUIDModel):
     objects = AuditEventManager()
 
     class Meta:
+        base_manager_name = "objects"
+        default_manager_name = "objects"
         ordering = ("-occurred_at", "-id")
         indexes = [
             models.Index(fields=("-occurred_at", "-id")),
@@ -80,15 +123,63 @@ class AuditEvent(UUIDModel):
         ]
         constraints = [
             models.CheckConstraint(
-                condition=models.Q(actor_type="admin", actor__isnull=False)
-                | ~models.Q(actor_type="admin"),
-                name="audit_admin_actor_required",
+                condition=(
+                    models.Q(actor_type="admin", actor__isnull=False)
+                    | models.Q(
+                        actor_type__in=("system", "worker"), actor__isnull=True
+                    )
+                ),
+                name="audit_actor_shape_required",
             )
         ]
 
-    def save(self, *args, **kwargs):
+    def _validate_immutable_insert(self) -> None:
+        try:
+            self.correlation_id = uuid.UUID(str(self.correlation_id))
+            self.entity_id = uuid.UUID(str(self.entity_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("AuditEvent correlation and entity IDs must be UUIDs") from exc
+
+        if self.actor_type not in self.ActorType.values:
+            raise ValueError("AuditEvent actor_type is invalid")
+        if self.actor_type == self.ActorType.ADMIN:
+            if self.actor_id is None:
+                raise ValueError("Admin AuditEvent requires an actor")
+        elif self.actor_id is not None:
+            raise ValueError("System and worker AuditEvent rows cannot reference an admin")
+
+        self.reason_code = sanitize_reason(self.reason_code)
+        for field_name in ("before_hash", "after_hash"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"AuditEvent {field_name} must be a lowercase SHA-256 digest")
+
+        if self.redaction_policy_version != POLICY_VERSION:
+            raise ValueError("New AuditEvent rows must use the current redaction policy")
+        expected_policy_hash = redaction_policy_hash(
+            self.action,
+            metadata_schema_version=self.metadata_schema_version,
+        )
+        if self.redaction_policy_hash != expected_policy_hash:
+            raise ValueError("AuditEvent redaction policy hash does not match its policy")
+        self.metadata_redacted = sanitize_metadata(
+            self.action,
+            self.metadata_redacted,
+            metadata_schema_version=self.metadata_schema_version,
+        )
+
+    def save_base(self, *args, **kwargs):
         if not self._state.adding:
             raise TypeError("AuditEvent is append-only")
+        if not _AUDIT_INSERT_ALLOWED.get():
+            raise TypeError("Use apps.audit.services.record_audit_event()")
+        self._validate_immutable_insert()
+        return super().save_base(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

@@ -6,6 +6,7 @@ from typing import Any
 from django.db import transaction
 from django.utils import timezone
 
+from apps.audit.services import AuditContext
 from apps.editorial.models import CorrectionCase
 from wisdome_writer.domain.hashing import sha256_hex
 
@@ -108,6 +109,7 @@ def prepare_verified_correction(
     *,
     user,
     request_key: str,
+    audit_context: AuditContext,
 ) -> PublicationIntent:
     """Create an approval-ready, superseding intent for a verified correction case."""
     case = (
@@ -144,7 +146,12 @@ def prepare_verified_correction(
         "expectedLatestIntentId": str(latest.id) if latest else None,
         "requestKey": request_key,
     }
-    intent = create_publication_intent(str(case.article_id), payload, user=user)
+    intent = create_publication_intent(
+        str(case.article_id),
+        payload,
+        user=user,
+        audit_context=audit_context,
+    )
     if case.state != CorrectionCase.State.APPLYING:
         case.state = CorrectionCase.State.APPLYING
         case.save(update_fields=["state"])

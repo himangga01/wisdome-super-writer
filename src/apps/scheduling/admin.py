@@ -2,4 +2,22 @@ from django.contrib import admin
 
 from .models import KillSwitchDecision, OperationalControl, Schedule, ScheduleDispatch
 
-admin.site.register([Schedule, ScheduleDispatch, OperationalControl, KillSwitchDecision])
+
+class ReadOnlySchedulingAdmin(admin.ModelAdmin):
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+admin.site.register(
+    [Schedule, ScheduleDispatch, OperationalControl, KillSwitchDecision],
+    ReadOnlySchedulingAdmin,
+)

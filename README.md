@@ -246,12 +246,27 @@ SECRET_PROVIDER_CLASSES={"vault":"my_secrets.vault.VaultSecretProvider"}
 
 `BLOGGER_OAUTH_TOKEN_STORE` callable은 `target_id`, `token_payload` keyword 인자를 받고 실제
 token을 외부 비밀 저장소에 기록한 뒤 `vault://...` 같은 참조 문자열만 반환해야 합니다.
+callable이 `operation_key` 또는 임의 keyword 인자를 선언하면 callback은 서명된 OAuth nonce를
+`operation_key`로 함께 전달합니다. 비밀 저장소 writer는 이 값을 멱등 key로 사용해 동일 callback의
+재실행이 새 secret을 만들지 않도록 구현하는 것을 권장합니다. 기존 두 인자 callable도 호환되지만,
+비밀 저장 성공 직후 프로세스가 중단되는 경우의 고아 secret 자동 조정은 T023 후속 범위입니다.
 `SECRET_PROVIDER_CLASSES`는 그 참조 scheme을 읽는 provider를 연결합니다.
 이미 발급한 access token으로 로컬 점검만 할 때는 `BLOGGER_ACCESS_TOKEN`을 환경에 넣고 대상의
 `credentialRef=env://BLOGGER_ACCESS_TOKEN`을 지정할 수 있습니다.
 대상 생성 시 대상 `remoteBlogId`도 지정합니다.
 토큰 만료·폐기 시 발행은 실패 닫힘으로 중단되며, 새 토큰을 비밀 저장소에 반영한 뒤 preflight를
 다시 통과해야 합니다. WordPress가 primary 원문이고 Blogger는 secondary 배포 채널입니다.
+
+### Blogger OAuth secret-store contract (English)
+
+`BLOGGER_OAUTH_TOKEN_STORE` receives `target_id` and `token_payload` keyword arguments,
+writes the token to an external secret store, and returns only a reference such as
+`vault://...`. If the callable declares `operation_key` or arbitrary keyword arguments,
+the callback also passes the signed OAuth nonce as `operation_key`. Secret-store writers
+should use it as an idempotency key so replaying the same callback does not create another
+secret. Existing two-argument writers remain compatible. Automatic reconciliation of an
+orphan secret after a process crash immediately following the secret-store write remains
+in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
 
 ## Celery 큐
 
@@ -343,6 +358,56 @@ pytest
   재인증 proof가 필요합니다.
 - 외부 쓰기 결과가 불명확하면 같은 글을 새로 만들지 말고 remote marker로 reconcile합니다.
 - 원문과 증거에는 출처·권리·checksum을 보존하고, 게시 글의 사실 주장은 근거 snapshot과 연결합니다.
+
+### 감사 데이터베이스 역할 경계
+
+Compose의 `migrate` 서비스만 `POSTGRES_USER`/`POSTGRES_PASSWORD` owner 연결을 사용합니다.
+web, worker, OCR worker, beat는 별도의
+`POSTGRES_RUNTIME_USER`/`POSTGRES_RUNTIME_PASSWORD` 연결을 사용합니다. migration이 끝나면
+`configure_runtime_database_role` 명령이 runtime 역할을 생성하거나 제한된 상태로 다시
+구성합니다. runtime 역할에는 일반 업무 테이블의 `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
+sequence의 `USAGE`/`SELECT`, `audit_auditevent`의 `SELECT`/`INSERT`만 부여합니다. DB/schema
+생성, table 소유권, 역할 상속·생성, replication, RLS 우회, 감사 테이블
+`UPDATE`/`DELETE`/`TRUNCATE` 및 trigger 관리 권한은 부여하지 않습니다. runtime 역할이 owner와
+같거나 이미 객체를 소유하면 구성 명령은 자동 권한 이전 없이 실패합니다.
+
+`AuditEvent` migration은 PostgreSQL에서 일반 SQL `UPDATE`/`DELETE`/`TRUNCATE`를 거부하는
+statement trigger도 설치합니다. SQLite 개발 DB는 raw `UPDATE`/`DELETE` 거부 trigger를
+사용하며 SQLite에는 `TRUNCATE` 문법이 없습니다. owner 자격증명은 migration 서비스 밖에
+제공하지 않아야 하며, 감사 만료를 위한 범용 trigger 우회 설정은 두지 않습니다.
+
+### 감사 데이터베이스 별칭 지원
+
+감사 대상 mutation은 현재 명시적인 `default` 데이터베이스 별칭만 지원합니다. `AuditContext`는
+다른 별칭을 업무 row 변경 전에 거부하고, 업무 entity와 감사 insert가 같은 별칭 및 같은 outer
+transaction에 속하는지 다시 확인합니다. 다중 데이터베이스 감사 mutation은 별도 설계 없이는
+지원되지 않습니다.
+
+### Audit database role boundary (English)
+
+Only the Compose `migrate` service uses the owner connection from
+`POSTGRES_USER`/`POSTGRES_PASSWORD`. Web, workers, the OCR worker, and beat use the
+separate `POSTGRES_RUNTIME_USER`/`POSTGRES_RUNTIME_PASSWORD` connection. After migrations,
+`configure_runtime_database_role` creates or reconfigures the runtime role to a restricted
+state. It grants ordinary business-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`, sequence
+`USAGE`/`SELECT`, and only `SELECT`/`INSERT` on `audit_auditevent`. The runtime role receives
+no database/schema creation, object ownership, role inheritance or creation, replication,
+RLS bypass, audit-table `UPDATE`/`DELETE`/`TRUNCATE`, or trigger-management authority. The
+command fails without transferring ownership if the runtime role equals the owner or
+already owns objects.
+
+The `AuditEvent` migration also installs a PostgreSQL statement trigger rejecting ordinary
+SQL `UPDATE`/`DELETE`/`TRUNCATE`. The SQLite development database rejects raw
+`UPDATE`/`DELETE` with triggers; SQLite has no `TRUNCATE` syntax. Owner credentials must
+remain unavailable outside the migration service. No general audit-retention trigger
+bypass is provided.
+
+### Audit database-alias support (English)
+
+Audited mutations currently support only the explicit `default` database alias.
+`AuditContext` rejects any other alias before changing business rows and rechecks that the
+business entity and audit insert share both the alias and the outer transaction.
+Multi-database audited mutations are unsupported without a separate design.
 
 ## 종료
 

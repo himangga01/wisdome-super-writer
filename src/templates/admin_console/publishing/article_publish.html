@@ -113,34 +113,42 @@
     if (!selected.length) return document.getElementById('intent-message').textContent = '발행 대상을 하나 이상 선택하세요.';
     const wordpress = selected.find(row => row.channel === 'wordpress');
     if (selected.some(row => row.channel === 'blogger') && !wordpress) return document.getElementById('intent-message').textContent = 'Blogger와 함께 대표 WordPress 대상을 선택하세요.';
+    const reason = prompt('발행 의도 생성 사유를 입력하세요.');
+    if (!reason?.trim()) return;
     const refs = selected.map(row => ({targetId:row.id,targetSnapshotId:row.currentSnapshotId,targetConfigHash:row.currentConfigHash}));
     const commands = selected.map(row => ({targetId:row.id,targetSnapshotId:row.currentSnapshotId,targetConfigHash:row.currentConfigHash,resolvedAction:publicationRows.some(item => item.targetId === row.id && item.remotePostId) ? 'update' : 'create',canonicalDependencyTargetId:row.channel === 'blogger' ? wordpress.id : null}));
     try {
-      intent = await api(`/api/v1/articles/${articleId}/publication-intents`, {method:'POST',body:JSON.stringify({revisionNo:article.revisionNo,expectedRevisionContentHash:article.revisionContentHash,correctionCaseId:null,targetSnapshots:refs,targetCommands:commands,approvalMode:'manual',autoPublishValidationRefs:[],autoPublishActivationRefs:[],expectedLatestIntentId:intent?.id||null,requestKey:crypto.randomUUID()})});
+      intent = await api(`/api/v1/articles/${articleId}/publication-intents`, {method:'POST',body:JSON.stringify({revisionNo:article.revisionNo,expectedRevisionContentHash:article.revisionContentHash,correctionCaseId:null,targetSnapshots:refs,targetCommands:commands,approvalMode:'manual',autoPublishValidationRefs:[],autoPublishActivationRefs:[],expectedLatestIntentId:intent?.id||null,requestKey:crypto.randomUUID(),reason:reason.trim()})});
       location.reload();
     } catch (error) { document.getElementById('intent-message').textContent = error.message; }
   });
 
   async function approveTarget(targetId) {
+    const reason = prompt('채널 미리보기 승인 사유를 입력하세요.');
+    if (!reason?.trim()) return;
     const render = intent.renders.find(row => row.targetId === targetId && row.renderStage === 'preview');
     const command = intent.targetCommands.find(row => row.targetId === targetId);
     const prior = (intent.approvals || []).filter(row => row.targetId === targetId).sort((a,b) => a.decidedAt.localeCompare(b.decidedAt)).at(-1);
     try {
-      await api(`/api/v1/articles/${articleId}/approvals`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,expectedLatestApprovalId:prior?.id||null,requestKey:crypto.randomUUID(),reauthProofId:null,actionSubject:{kind:'content_preview',action:command.resolvedAction,renderId:render.id,targetId,targetSnapshotId:command.targetSnapshotId,targetConfigHash:command.targetConfigHash,templateHash:render.templateHash,sourceManifestHash:render.sourceManifestHash},decision:'approved',reason:'관리자 채널 미리보기 승인'})});
+      await api(`/api/v1/articles/${articleId}/approvals`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,expectedLatestApprovalId:prior?.id||null,requestKey:crypto.randomUUID(),reauthProofId:null,actionSubject:{kind:'content_preview',action:command.resolvedAction,renderId:render.id,targetId,targetSnapshotId:command.targetSnapshotId,targetConfigHash:command.targetConfigHash,templateHash:render.templateHash,sourceManifestHash:render.sourceManifestHash},decision:'approved',reason:reason.trim()})});
       location.reload();
     } catch (error) { document.getElementById('approval-message').textContent = error.message; }
   }
 
   document.getElementById('publish-button').addEventListener('click', async () => {
+    const reason = prompt('승인된 채널 발행 사유를 입력하세요.');
+    if (!reason?.trim()) return;
     try {
-      const result = await api(`/api/v1/articles/${articleId}/publish`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,targetIds:intent.targetSnapshots.map(row=>row.targetId),expectedTargetSnapshots:intent.targetSnapshots,publishAt:null,requestKey:crypto.randomUUID()})});
+      const result = await api(`/api/v1/articles/${articleId}/publish`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,targetIds:intent.targetSnapshots.map(row=>row.targetId),expectedTargetSnapshots:intent.targetSnapshots,publishAt:null,requestKey:crypto.randomUUID(),reason:reason.trim()})});
       document.getElementById('publish-message').textContent = `발행 작업 ${result.jobId} 접수 완료`;
       setTimeout(loadPublications, 1500);
     } catch (error) { document.getElementById('publish-message').textContent = error.message; }
   });
 
   async function retryAttempt(attemptId) {
-    try { await api(`/api/v1/publication-attempts/${attemptId}/retry`, {method:'POST',body:'{}'}); await loadPublications(); }
+    const reason = prompt('발행 시도 재시도 사유를 입력하세요.');
+    if (!reason?.trim()) return;
+    try { await api(`/api/v1/publication-attempts/${attemptId}/retry`, {method:'POST',body:JSON.stringify({requestKey:crypto.randomUUID(),reason:reason.trim()})}); await loadPublications(); }
     catch (error) { document.getElementById('publish-message').textContent = error.message; }
   }
 

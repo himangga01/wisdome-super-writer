@@ -81,12 +81,22 @@ def _terminalize_routed_dispatch(message, route, error_code: str):
 def dispatch_outbox(limit: int = 100):
     # Celery beat only publishes this infrastructure task. The due-schedule scan
     # runs here and creates its run + outbox event in the service transaction.
+    schedule_error: Exception | None = None
     try:
+        from apps.audit.services import AuditContext
         from apps.scheduling.services import dispatch_due_schedules
 
-        dispatch_due_schedules()
-    except Exception:
-        logger.exception("due schedule scan failed")
+        schedule_audit_context = AuditContext.for_system(
+            correlation_id=dispatch_outbox.request.id,
+            operation_key="schedule-due-scan",
+            reason_code="scheduled due scan",
+        )
+        dispatch_due_schedules(audit_context=schedule_audit_context)
+    except Exception as exc:
+        schedule_error = exc
+        logger.exception(
+            "due-schedule dispatch failed; continuing the unrelated outbox pass"
+        )
 
     owner = f"{socket.gethostname()}:{dispatch_outbox.request.id or 'manual'}"
     dispatched = dead_lettered = failed = 0
@@ -151,6 +161,8 @@ def dispatch_outbox(limit: int = 100):
         else:
             mark_published(message)
             dispatched += 1
+    if schedule_error is not None:
+        raise schedule_error
     return {
         "dispatched": dispatched,
         "deadLettered": dead_lettered,

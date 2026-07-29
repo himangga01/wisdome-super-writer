@@ -4,6 +4,8 @@ from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 
+from apps.audit.services import AuditContext
+
 from .models import SourceDefinition, SourceRegistrySnapshot, TopicPolicy
 from .services import approve_registry
 
@@ -57,7 +59,24 @@ def registry_detail(request, registry_id):
         body = json.loads(request.body or b"{}")
         if body.get("decision") != "approved":
             return JsonResponse({"detail": "Only approved decision is supported."}, status=422)
-        approve_registry(registry, request.user)
+        required = {"requestKey", "reauthProofId", "reason"}
+        if missing := required - set(body):
+            return JsonResponse(
+                {"detail": f"Missing fields: {', '.join(sorted(missing))}"},
+                status=422,
+            )
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code=body["reason"],
+            request_key=body["requestKey"],
+        )
+        registry = approve_registry(
+            registry_id=registry.id,
+            admin=request.user,
+            request=request,
+            reauth_proof_id=body["reauthProofId"],
+            audit_context=audit_context,
+        )
     return JsonResponse(
         {
             "id": str(registry.id),

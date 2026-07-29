@@ -6,6 +6,8 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.http import require_http_methods
 from wisdome_writer.domain.hashing import sha256_hex
 
+from apps.audit.services import AuditContext
+
 from .models import CorrectionCase, DraftArticle
 from .services import create_manual_revision
 
@@ -66,16 +68,41 @@ def article_detail(request, article_id):
 @login_required
 @require_http_methods(["POST"])
 def revise_article(request, article_id):
-    article = get_object_or_404(DraftArticle.objects.select_related("current_revision"), id=article_id)
     body = json.loads(request.body or b"{}")
-    revision = create_manual_revision(
-        article,
+    required = {
+        "baseRevisionNo",
+        "requestKey",
+        "title",
+        "bodyMarkdown",
+        "editReason",
+    }
+    if missing := required - set(body):
+        return JsonResponse(
+            {"detail": f"Missing fields: {', '.join(sorted(missing))}"},
+            status=422,
+        )
+    get_object_or_404(DraftArticle, id=article_id)
+    audit_context = AuditContext.for_admin(
+        request=request,
+        reason_code=body["editReason"],
+        request_key=body["requestKey"],
+    )
+    revision, created = create_manual_revision(
+        article_id=article_id,
+        base_revision_no=body["baseRevisionNo"],
         title=body["title"],
         summary=body.get("summary", ""),
         body_markdown=body["bodyMarkdown"],
         user=request.user,
+        audit_context=audit_context,
     )
-    return JsonResponse({"articleId": str(article.id), "revisionId": str(revision.id)}, status=201)
+    return JsonResponse(
+        {
+            "articleId": str(article_id),
+            "revisionId": str(revision.id),
+        },
+        status=201 if created else 200,
+    )
 
 
 @login_required

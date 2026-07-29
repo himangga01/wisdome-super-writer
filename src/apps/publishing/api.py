@@ -5,16 +5,15 @@ from functools import wraps
 from typing import Any
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.http import require_http_methods
 
 from adapters.storage import S3ObjectStorage
-from wisdome_writer.domain.errors import Conflict, DomainError, InvalidInput
+from apps.audit.services import AuditContext
+from wisdome_writer.domain.errors import DomainError, InvalidInput
 from wisdome_writer.domain.hashing import sha256_hex
-from wisdome_writer.infrastructure.outbox import enqueue_event
 
 from .models import (
     Approval,
@@ -29,7 +28,6 @@ from .models import (
 )
 from .corrections import prepare_verified_correction
 from .services import (
-    _enqueue_reconcile_locked,
     create_auto_publish_validation,
     create_canary_run,
     create_publication_intent,
@@ -39,6 +37,8 @@ from .services import (
     decide_auto_publish_validation,
     disconnect_target,
     dispatch_publication,
+    request_target_preflight,
+    retry_publication_attempt as retry_publication_attempt_service,
     set_auto_publish,
     start_blogger_oauth,
     update_target,
@@ -85,6 +85,20 @@ def _body(request: HttpRequest) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InvalidInput("JSON object 요청 본문이 필요합니다.")
     return value
+
+
+def _admin_audit_context(
+    request: HttpRequest,
+    data: dict[str, Any] | None = None,
+) -> AuditContext:
+    data = data or {}
+    if not data.get("reason") or not data.get("requestKey"):
+        raise InvalidInput("reason and requestKey are required")
+    return AuditContext.for_admin(
+        request=request,
+        reason_code=data.get("reason"),
+        request_key=data.get("requestKey"),
+    )
 
 
 def target_json(row: PublicationTarget) -> dict[str, Any]:
@@ -259,7 +273,11 @@ def publication_json(row: Publication) -> dict[str, Any]:
 @require_http_methods(["GET", "POST"])
 def targets(request: HttpRequest) -> JsonResponse:
     if request.method == "POST":
-        row = create_target(_body(request))
+        data = _body(request)
+        row = create_target(
+            data,
+            audit_context=_admin_audit_context(request, data),
+        )
         return JsonResponse(target_json(row), status=201)
     return JsonResponse([target_json(row) for row in PublicationTarget.objects.all()], safe=False)
 
@@ -268,7 +286,12 @@ def targets(request: HttpRequest) -> JsonResponse:
 @require_http_methods(["GET", "PATCH"])
 def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
     if request.method == "PATCH":
-        row = update_target(target_id, _body(request))
+        data = _body(request)
+        row = update_target(
+            target_id,
+            data,
+            audit_context=_admin_audit_context(request, data),
+        )
     else:
         row = PublicationTarget.objects.get(id=target_id)
     return JsonResponse(target_json(row))
@@ -277,20 +300,11 @@ def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
 @admin_api
 @require_http_methods(["POST"])
 def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
-    with transaction.atomic():
-        target = PublicationTarget.objects.select_for_update().get(id=target_id)
-        event = enqueue_event(
-            event_type="publication.preflight_requested",
-            aggregate_type="publication_target",
-            aggregate_id=target.id,
-            job_id=target.id,
-            dedupe_key=f"publication.preflight_requested:{target.id}:{target.current_snapshot_version}",
-            payload={
-                "target_id": str(target.id),
-                "target_snapshot_id": str(target.current_snapshot_id),
-                "target_config_hash": target.current_config_hash,
-            },
-        )
+    data = _body(request)
+    event = request_target_preflight(
+        target_id,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse({"jobId": str(event.id), "state": "queued"}, status=202)
 
 
@@ -300,13 +314,17 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
     data = _body(request)
     if data.get("confirmIsolatedTestTarget") is not True:
         raise InvalidInput("격리된 test target 확인이 필요합니다.")
-    request_key = data.get("requestKey") or f"canary:{sha256_hex(data)[:32]}"
+    request_key = data["requestKey"]
     row = create_canary_run(
         target_id,
         policy_version=data["policyVersion"],
         reason=data["reason"],
         request_key=request_key,
         user=request.user,
+        audit_context=_admin_audit_context(
+            request,
+            {**data, "requestKey": request_key},
+        ),
     )
     return JsonResponse({"jobId": str(row.id), "state": row.state}, status=202)
 
@@ -315,7 +333,12 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
 @require_http_methods(["GET", "POST"])
 def auto_publish_validations(request: HttpRequest, target_id: str) -> JsonResponse:
     if request.method == "POST":
-        row = create_auto_publish_validation(target_id, _body(request))
+        data = _body(request)
+        row = create_auto_publish_validation(
+            target_id,
+            data,
+            audit_context=_admin_audit_context(request, data),
+        )
         return JsonResponse(validation_json(row), status=201)
     rows = AutoPublishValidation.objects.filter(target_id=target_id)
     return JsonResponse([validation_json(row) for row in rows], safe=False)
@@ -326,8 +349,13 @@ def auto_publish_validations(request: HttpRequest, target_id: str) -> JsonRespon
 def auto_publish_validation_decisions(
     request: HttpRequest, target_id: str, validation_id: str
 ) -> JsonResponse:
+    data = _body(request)
     row, created = decide_auto_publish_validation(
-        target_id, validation_id, _body(request), request=request
+        target_id,
+        validation_id,
+        data,
+        request=request,
+        audit_context=_admin_audit_context(request, data),
     )
     return JsonResponse(
         {
@@ -388,7 +416,13 @@ def auto_publish_validation_report(
 @admin_api
 @require_http_methods(["PUT"])
 def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
-    activation, created = set_auto_publish(target_id, _body(request), request=request)
+    data = _body(request)
+    activation, created = set_auto_publish(
+        target_id,
+        data,
+        request=request,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse(
         {
             "activation": activation_json(activation),
@@ -401,16 +435,28 @@ def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
 @admin_api
 @require_http_methods(["DELETE"])
 def target_connection(request: HttpRequest, target_id: str) -> JsonResponse:
-    decision = disconnect_target(target_id, _body(request), request=request)
+    data = _body(request)
+    decision = disconnect_target(
+        target_id,
+        data,
+        request=request,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse({"jobId": str(decision.id), "state": decision.state}, status=202)
 
 
 @admin_api
 @require_http_methods(["POST"])
 def target_oauth_start(request: HttpRequest, target_id: str) -> JsonResponse:
+    data = _body(request)
     redirect_uri = request.build_absolute_uri("/api/v1/publishing/oauth/google/callback")
     return JsonResponse(
-        start_blogger_oauth(target_id, user=request.user, redirect_uri=redirect_uri)
+        start_blogger_oauth(
+            target_id,
+            user=request.user,
+            redirect_uri=redirect_uri,
+            audit_context=_admin_audit_context(request, data),
+        )
     )
 
 
@@ -428,7 +474,7 @@ def blogger_oauth_callback(request: HttpRequest) -> JsonResponse:
         target = complete_blogger_oauth(
             code=code,
             state=state,
-            user=request.user,
+            request=request,
             redirect_uri=request.build_absolute_uri("/api/v1/publishing/oauth/google/callback"),
         )
     except DomainError as exc:
@@ -448,7 +494,13 @@ def publication_intents(request: HttpRequest, article_id: str) -> JsonResponse:
     if request.method == "GET":
         row = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
         return JsonResponse({"item": intent_json(row) if row else None})
-    row = create_publication_intent(article_id, _body(request), user=request.user)
+    data = _body(request)
+    row = create_publication_intent(
+        article_id,
+        data,
+        user=request.user,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse(intent_json(row), status=201)
 
 
@@ -473,7 +525,12 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
     if not target_id:
         raise InvalidInput("actionSubject.targetId가 필요합니다.")
     row, created = decide_approval(
-        article_id, target_id, data, user=request.user, request=request
+        article_id,
+        target_id,
+        data,
+        user=request.user,
+        request=request,
+        audit_context=_admin_audit_context(request, data),
     )
     return JsonResponse(approval_json(row), status=201 if created else 200)
 
@@ -481,7 +538,12 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
 @admin_api
 @require_http_methods(["POST"])
 def publish(request: HttpRequest, article_id: str) -> JsonResponse:
-    rows = dispatch_publication(article_id, _body(request))
+    data = _body(request)
+    rows = dispatch_publication(
+        article_id,
+        data,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse(
         {
             "jobId": str(rows[0].id) if rows else None,
@@ -525,52 +587,11 @@ def publication_attempts(request: HttpRequest, publication_id: str) -> JsonRespo
 @admin_api
 @require_http_methods(["POST"])
 def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResponse:
-    with transaction.atomic():
-        row = (
-            PublicationAttempt.objects.select_for_update()
-            .select_related("publication__target")
-            .get(id=attempt_id)
-        )
-        if row.state in {
-            PublicationAttempt.State.UNKNOWN_OUTCOME,
-            PublicationAttempt.State.RECONCILING,
-        }:
-            _enqueue_reconcile_locked(row)
-            action = (
-                "manual_required"
-                if row.state == PublicationAttempt.State.MANUAL_REQUIRED
-                else "reconcile"
-            )
-        elif row.state == PublicationAttempt.State.RETRYABLE_FAILED:
-            row.state = PublicationAttempt.State.QUEUED
-            row.attempt_no += 1
-            row.started_at = None
-            row.finished_at = None
-            row.next_retry_at = None
-            row.error_detail_redacted = ""
-            row.save(
-                update_fields=[
-                    "state",
-                    "attempt_no",
-                    "started_at",
-                    "finished_at",
-                    "next_retry_at",
-                    "error_detail_redacted",
-                ]
-            )
-            enqueue_event(
-                event_type="publication.requested",
-                aggregate_type="publication_attempt",
-                aggregate_id=row.id,
-                job_id=row.id,
-                dedupe_key=f"publication.requested:{row.id}:{row.attempt_no}",
-                payload={
-                    "publication_attempt_id": str(row.id),
-                },
-            )
-            action = "retry"
-        else:
-            raise Conflict("재시도 가능 실패 또는 결과 불명 attempt만 안전하게 재개할 수 있습니다.")
+    data = _body(request)
+    row, action = retry_publication_attempt_service(
+        attempt_id,
+        audit_context=_admin_audit_context(request, data),
+    )
     return JsonResponse({"attemptId": str(row.id), "state": row.state, "action": action}, status=202)
 
 
@@ -582,6 +603,7 @@ def prepare_correction(request: HttpRequest, correction_id: str) -> JsonResponse
         correction_id,
         user=request.user,
         request_key=body["requestKey"],
+        audit_context=_admin_audit_context(request, body),
     )
     return JsonResponse(intent_json(intent), status=201)
 

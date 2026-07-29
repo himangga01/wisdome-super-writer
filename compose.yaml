@@ -8,7 +8,7 @@ x-runtime-environment: &runtime-environment
   DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?set DJANGO_ALLOWED_HOSTS}
   PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL}
   DJANGO_CSRF_TRUSTED_ORIGINS: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL}
-  DATABASE_URL: postgresql://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+  DATABASE_URL: postgresql://${POSTGRES_RUNTIME_USER:?set POSTGRES_RUNTIME_USER}:${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
   CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
   CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/1
@@ -159,7 +159,15 @@ services:
         condition: service_healthy
     environment:
       <<: [*runtime-environment, *blogger-environment]
-    command: ["python", "src/manage.py", "migrate", "--noinput"]
+      DATABASE_URL: postgresql://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:?set POSTGRES_RUNTIME_USER}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        python src/manage.py migrate --noinput
+        python src/manage.py configure_runtime_database_role
     networks:
       - database
     restart: "no"

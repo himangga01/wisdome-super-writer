@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from django.db import transaction
 
+from apps.audit.services import (
+    AuditContext,
+    record_audit_event,
+    require_audit_replay,
+)
 from apps.collection.models import CollectionRun, RunState
 from apps.scheduling.models import ScheduleDispatch
 from wisdome_writer.domain.errors import Conflict, InvalidInput
@@ -17,7 +22,12 @@ from .models import (
     PublicationIntent,
     PublicationTarget,
 )
-from .services import create_publication_intent, decide_approval, dispatch_publication
+from .services import (
+    _require_worker_event,
+    create_publication_intent,
+    decide_approval,
+    dispatch_publication,
+)
 
 
 def _validate_automation_material(schedule, targets: dict[str, PublicationTarget]) -> None:
@@ -59,11 +69,33 @@ def _validate_automation_material(schedule, targets: dict[str, PublicationTarget
 
 
 @transaction.atomic
-def dispatch_validated_schedule_run(run_id: str):
+def dispatch_validated_schedule_run(
+    run_id: str,
+    *,
+    audit_context: AuditContext,
+):
+    if audit_context.actor_type != "worker":
+        raise Conflict("schedule publication requires worker audit provenance")
     run = CollectionRun.objects.select_for_update().get(id=run_id)
+    _require_worker_event(
+        audit_context,
+        topic="publication.scheduled_run_requested",
+        aggregate_id=run.id,
+        payload_identity={"run_id": str(run.id)},
+    )
     if run.approval_mode != ApprovalMode.VALIDATED_AUTO:
         return []
     article = run.articles.select_for_update().select_related("current_revision").get()
+    run_before_material = {
+        "runId": str(run.id),
+        "state": run.state,
+        "topicCode": run.topic_code,
+    }
+    article_before_material = {
+        "articleId": str(article.id),
+        "state": article.state,
+        "currentRevisionId": str(article.current_revision_id),
+    }
     revision = article.current_revision
     if revision is None or revision.quality_state != "passed":
         raise Conflict("자동발행할 current revision이 품질 gate를 통과하지 못했습니다.")
@@ -72,7 +104,9 @@ def dispatch_validated_schedule_run(run_id: str):
     requested_ids = [str(value) for value in run.requested_target_ids]
     targets = {
         str(row.id): row
-        for row in PublicationTarget.objects.select_for_update().filter(id__in=requested_ids)
+        for row in PublicationTarget.objects.select_for_update()
+        .filter(id__in=requested_ids)
+        .order_by("id")
     }
     if not requested_ids or set(targets) != set(requested_ids):
         raise InvalidInput("일정에 존재하지 않는 발행 target이 포함되어 있습니다.")
@@ -136,6 +170,7 @@ def dispatch_validated_schedule_run(run_id: str):
                 "requestKey": request_key,
             },
             user=schedule.updated_by,
+            audit_context=audit_context,
         )
 
     for command in intent.target_commands:
@@ -171,9 +206,18 @@ def dispatch_validated_schedule_run(run_id: str):
                 "reason": "검증 완료 자동발행 일정",
             },
             user=schedule.updated_by,
+            audit_context=audit_context,
         )
     intent.refresh_from_db()
     if intent.state == PublicationIntent.State.DISPATCHED:
+        require_audit_replay(
+            context=audit_context,
+            action="collection_run.publication_started",
+            entity=run,
+            identity_key=(
+                f"{audit_context.event_key}:collection-run-publication"
+            ),
+        )
         return list(intent.attempts.all())
     attempts = dispatch_publication(
         str(article.id),
@@ -185,9 +229,45 @@ def dispatch_validated_schedule_run(run_id: str):
             "publishAt": None,
             "requestKey": f"schedule:{schedule_dispatch.id}:publish",
         },
+        audit_context=audit_context,
     )
     article.state = "publishing"
     article.save(update_fields=["state", "updated_at"])
     run.state = RunState.PUBLISHING
     run.save(update_fields=["state"])
+    record_audit_event(
+        context=audit_context,
+        action="collection_run.publication_started",
+        entity=run,
+        identity_key=(
+            f"{audit_context.event_key}:collection-run-publication"
+        ),
+        material_schema_version="collection-run-publication-audit-v1",
+        before_material={
+            "run": run_before_material,
+            "article": article_before_material,
+        },
+        after_material={
+            "run": {
+                "runId": str(run.id),
+                "state": run.state,
+                "topicCode": run.topic_code,
+            },
+            "article": {
+                "articleId": str(article.id),
+                "state": article.state,
+                "currentRevisionId": str(article.current_revision_id),
+            },
+            "publicationIntentId": str(intent.id),
+            "attemptCount": len(attempts),
+        },
+        metadata={
+            "article_id": str(article.id),
+            "collection_run_id": str(run.id),
+            "intent_id": str(intent.id),
+            "count": len(attempts),
+            "result": "publication_started",
+            "state": run.state,
+        },
+    )
     return attempts

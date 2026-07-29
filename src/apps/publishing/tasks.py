@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import uuid
-from datetime import timedelta
 
 from celery import shared_task
 from django.db import transaction
@@ -10,9 +9,14 @@ from django.utils import timezone
 
 from adapters.publishers.wordpress import WordPressPublisher
 from adapters.storage import S3ObjectStorage
+from apps.audit.services import AuditContext
 from wisdome_writer.domain.errors import Conflict
 from wisdome_writer.domain.hashing import sha256_hex
 from wisdome_writer.infrastructure.outbox import (
+    CURRENT_EVENT_CONSUMER_LEASE_GENERATION,
+    CURRENT_EVENT_CONSUMER_LEASE_TOKEN,
+    CURRENT_EVENT_CONSUMER_NAME,
+    CURRENT_EVENT_CORRELATION_ID,
     CURRENT_EVENT_ID,
     PermanentEventError,
     enqueue_event,
@@ -23,53 +27,63 @@ from .models import (
     Publication,
     PublicationAttempt,
     PublicationMedia,
-    PublicationTarget,
     PublicDeliveryAsset,
-    RemoteMedia,
-    TargetCanaryRun,
     TargetDisconnectDecision,
-    ValidationState,
 )
 from .services import (
-    _enqueue_reconcile_locked,
     _kill_switch_enabled,
-    _snapshot_locked,
     begin_attempt,
+    begin_canary_run,
+    begin_remote_media_reconcile,
     begin_reconcile,
+    begin_target_credential_revoke,
     finalize_reconcile_delivery_failure,
+    persist_canary_run_result,
     persist_publish_result,
+    persist_remote_media_reconcile_result,
+    persist_target_credential_revoke_result,
     publisher_error_result,
     publisher_for_target,
     run_target_preflight,
 )
 
 
+def _worker_audit_context() -> AuditContext:
+    event_id = CURRENT_EVENT_ID.get()
+    correlation_id = CURRENT_EVENT_CORRELATION_ID.get()
+    consumer_name = CURRENT_EVENT_CONSUMER_NAME.get()
+    lease_token = CURRENT_EVENT_CONSUMER_LEASE_TOKEN.get()
+    lease_generation = CURRENT_EVENT_CONSUMER_LEASE_GENERATION.get()
+    if (
+        event_id is None
+        or correlation_id is None
+        or consumer_name is None
+        or lease_token is None
+        or lease_generation is None
+    ):
+        raise PermanentEventError("audit_event_context_missing")
+    try:
+        return AuditContext.for_worker(
+            correlation_id=correlation_id,
+            event_key=event_id,
+            consumer_name=consumer_name,
+            lease_token=lease_token,
+            lease_generation=lease_generation,
+        )
+    except ValueError as exc:
+        raise PermanentEventError("audit_event_context_invalid") from exc
+
+
 @shared_task(name="apps.publishing.tasks.dispatch_scheduled_run_publication")
 def dispatch_scheduled_run_publication(run_id: str):
-    from apps.collection.models import CollectionRun, RunState
-    from apps.scheduling.services import release_waiting_for_topic
     from .automation import dispatch_validated_schedule_run
 
-    try:
-        rows = dispatch_validated_schedule_run(run_id)
-        return {"runId": run_id, "attemptIds": [str(row.id) for row in rows]}
-    except Exception as exc:
-        run = CollectionRun.objects.get(id=run_id)
-        run.state = RunState.FAILED
-        run.error_summary = {"stage": "auto_publish", "code": exc.__class__.__name__}
-        run.finished_at = timezone.now() if hasattr(run, "finished_at") else None
-        update_fields = ["state", "error_summary"]
-        if hasattr(run, "finished_at"):
-            update_fields.append("finished_at")
-        run.save(update_fields=update_fields)
-        release_waiting_for_topic(run.topic_code)
-        raise
-
-
-def _retry_countdown(attempt_no: int, retry_after: int | None = None) -> int:
-    if retry_after is not None:
-        return min(max(retry_after, 5), 3600)
-    return min(15 * (2 ** max(attempt_no - 1, 0)), 1800)
+    audit_context = _worker_audit_context()
+    rows = dispatch_validated_schedule_run(
+        run_id,
+        audit_context=audit_context,
+    )
+    return {"runId": run_id, "attemptIds": [str(row.id) for row in rows]}
 
 
 @shared_task(
@@ -81,10 +95,12 @@ def run_target_preflight_task(
     target_snapshot_id: str,
     target_config_hash: str,
 ):
+    audit_context = _worker_audit_context()
     target, applied = run_target_preflight(
         target_id,
         expected_snapshot_id=target_snapshot_id,
         expected_config_hash=target_config_hash,
+        audit_context=audit_context,
     )
     return {
         "targetId": str(target.id),
@@ -100,46 +116,44 @@ def run_target_preflight_task(
     acks_late=True,
 )
 def revoke_target_credentials(decision_id: str):
-    with transaction.atomic():
-        decision = TargetDisconnectDecision.objects.select_for_update().select_related("target").get(
-            id=decision_id
-        )
-        if decision.state == TargetDisconnectDecision.State.COMPLETED:
-            return {"decisionId": decision_id, "state": decision.state}
-        decision.state = TargetDisconnectDecision.State.REVOKING
-        decision.save(update_fields=["state"])
-        target = decision.target
+    audit_context = _worker_audit_context()
+    prepared = begin_target_credential_revoke(
+        decision_id,
+        audit_context=audit_context,
+    )
+    if prepared is None:
+        decision = TargetDisconnectDecision.objects.get(id=decision_id)
+        return {"decisionId": decision_id, "state": decision.state}
+    decision, target, fence = prepared
     adapter = publisher_for_target(target)
     try:
         adapter.revoke_credentials()
         outcome_hash = sha256_hex({"targetId": str(target.id), "result": "revoked"})
     except PublisherError as exc:
-        with transaction.atomic():
-            decision = TargetDisconnectDecision.objects.select_for_update().get(id=decision_id)
-            decision.state = (
-                TargetDisconnectDecision.State.RECONCILING
-                if exc.category == "unknown_outcome"
-                else TargetDisconnectDecision.State.FAILED
-            )
-            decision.remote_result_hash = sha256_hex(
-                {"targetId": str(target.id), "result": exc.code, "status": exc.http_status}
-            )
-            decision.save(update_fields=["state", "remote_result_hash"])
-        if exc.category in {"retryable", "unknown_outcome"}:
-            raise
+        outcome_hash = sha256_hex(
+            {
+                "targetId": str(target.id),
+                "result": exc.code,
+                "status": exc.http_status,
+            }
+        )
+        decision = persist_target_credential_revoke_result(
+            fence,
+            succeeded=False,
+            outcome_hash=outcome_hash,
+            error_code=exc.code,
+            unknown_outcome=exc.category == "unknown_outcome",
+            audit_context=audit_context,
+        )
         return {"decisionId": decision_id, "state": decision.state}
     finally:
         adapter.close()
-    with transaction.atomic():
-        decision = TargetDisconnectDecision.objects.select_for_update().get(id=decision_id)
-        target = PublicationTarget.objects.select_for_update().get(id=decision.target_id)
-        target.credential_ref = None
-        target.username_ref = None
-        target.save(update_fields=["credential_ref", "username_ref", "updated_at"])
-        _snapshot_locked(target)
-        decision.state = TargetDisconnectDecision.State.COMPLETED
-        decision.remote_result_hash = outcome_hash
-        decision.save(update_fields=["state", "remote_result_hash"])
+    decision = persist_target_credential_revoke_result(
+        fence,
+        succeeded=True,
+        outcome_hash=outcome_hash,
+        audit_context=audit_context,
+    )
     return {"decisionId": decision_id, "state": decision.state}
 
 
@@ -149,12 +163,19 @@ def revoke_target_credentials(decision_id: str):
     reject_on_worker_lost=True,
 )
 def execute_publication_attempt(attempt_id: str):
-    try:
-        attempt, command = begin_attempt(attempt_id)
-    except Conflict as exc:
-        return {"attemptId": attempt_id, "state": "stale", "code": exc.code}
+    audit_context = _worker_audit_context()
+    attempt, command = begin_attempt(
+        attempt_id,
+        audit_context=audit_context,
+    )
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
+    if attempt.state == PublicationAttempt.State.STALE:
+        return {
+            "attemptId": attempt_id,
+            "state": attempt.state,
+            "code": attempt.error_code,
+        }
     if command is None:
         return {
             "attemptId": attempt_id,
@@ -181,39 +202,12 @@ def execute_publication_attempt(attempt_id: str):
         result = publisher_error_result(exc)
     finally:
         adapter.close()
-    with transaction.atomic():
-        persisted = persist_publish_result(attempt_id, result)
-        if persisted.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
-            _enqueue_reconcile_locked(persisted)
+    persisted = persist_publish_result(
+        attempt_id,
+        result,
+        audit_context=audit_context,
+    )
     if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
-        if persisted.attempt_no >= 5:
-            with transaction.atomic():
-                persisted = PublicationAttempt.objects.select_for_update().select_related(
-                    "publication"
-                ).get(id=attempt_id)
-                persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
-                persisted.error_code = (
-                    persisted.error_code
-                    or "publication_attempts_exhausted"
-                )
-                persisted.save(update_fields=("state", "error_code"))
-                persisted.publication.state = Publication.State.MANUAL_REQUIRED
-                persisted.publication.last_error_code = persisted.error_code
-                persisted.publication.save(
-                    update_fields=(
-                        "state",
-                        "last_error_code",
-                        "updated_at",
-                    )
-                )
-            return {
-                "attemptId": attempt_id,
-                "state": persisted.state,
-                "code": persisted.error_code,
-            }
-        PublicationAttempt.objects.filter(id=attempt_id).update(
-            attempt_no=persisted.attempt_no + 1
-        )
         raise error or RuntimeError(persisted.error_code)
     return {"attemptId": attempt_id, "state": persisted.state, "remotePostId": persisted.publication.remote_post_id}
 
@@ -226,17 +220,14 @@ def reconcile_publication_attempt(
     attempt_id: str,
     reconcile_attempt_no: int | None = None,
 ):
-    source_event_id = CURRENT_EVENT_ID.get()
-    if source_event_id is None:
-        raise PermanentEventError("reconcile_event_context_missing")
-    try:
-        attempt, generation, command = begin_reconcile(
-            attempt_id,
-            expected_reconcile_attempt_no=reconcile_attempt_no,
-            source_event_id=source_event_id,
-        )
-    except Conflict as exc:
-        return {"attemptId": attempt_id, "state": "ignored", "code": exc.code}
+    audit_context = _worker_audit_context()
+    source_event_id = audit_context.event_key
+    attempt, generation, command = begin_reconcile(
+        attempt_id,
+        expected_reconcile_attempt_no=reconcile_attempt_no,
+        source_event_id=source_event_id,
+        audit_context=audit_context,
+    )
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return {"attemptId": attempt_id, "state": "succeeded"}
     if command is None or generation is None:
@@ -266,53 +257,14 @@ def reconcile_publication_attempt(
         retry_after = exc.retry_after_seconds
     finally:
         adapter.close()
-    try:
-        with transaction.atomic():
-            persisted = persist_publish_result(
-                attempt_id,
-                result,
-                expected_reconcile_generation=generation.generation,
-                expected_reconcile_event_id=source_event_id,
-            )
-            if persisted.state in {
-                PublicationAttempt.State.RETRYABLE_FAILED,
-                PublicationAttempt.State.UNKNOWN_OUTCOME,
-            }:
-                if generation.generation >= 5:
-                    persisted.state = PublicationAttempt.State.MANUAL_REQUIRED
-                    persisted.error_code = (
-                        persisted.error_code
-                        or "reconcile_attempts_exhausted"
-                    )
-                    persisted.save(update_fields=("state", "error_code"))
-                    persisted.publication.state = Publication.State.MANUAL_REQUIRED
-                    persisted.publication.last_error_code = persisted.error_code
-                    persisted.publication.save(
-                        update_fields=(
-                            "state",
-                            "last_error_code",
-                            "updated_at",
-                        )
-                    )
-                else:
-                    persisted.next_retry_at = timezone.now() + timedelta(
-                        seconds=_retry_countdown(
-                            generation.generation,
-                            retry_after,
-                        )
-                    )
-                    persisted.save(update_fields=("next_retry_at",))
-                    _enqueue_reconcile_locked(
-                        persisted,
-                        available_at=persisted.next_retry_at,
-                    )
-    except Conflict as exc:
-        return {
-            "attemptId": attempt_id,
-            "state": "stale_fenced",
-            "code": exc.code,
-            "reconcileAttemptNo": generation.generation,
-        }
+    persisted = persist_publish_result(
+        attempt_id,
+        result,
+        expected_reconcile_generation=generation.generation,
+        expected_reconcile_event_id=source_event_id,
+        retry_after_seconds=retry_after,
+        audit_context=audit_context,
+    )
     return {
         "attemptId": attempt_id,
         "state": persisted.state,
@@ -327,13 +279,13 @@ def finalize_publication_reconcile_failure(
     attempt_id: str,
     error_code: str,
 ):
-    source_event_id = CURRENT_EVENT_ID.get()
-    if source_event_id is None:
-        raise PermanentEventError("reconcile_event_context_missing")
+    audit_context = _worker_audit_context()
+    source_event_id = audit_context.event_key
     attempt = finalize_reconcile_delivery_failure(
         attempt_id,
         source_event_id=source_event_id,
         error_code=error_code,
+        audit_context=audit_context,
     )
     if attempt is None:
         return {"attemptId": attempt_id, "state": "missing"}
@@ -349,18 +301,13 @@ def finalize_publication_reconcile_failure(
     acks_late=True,
 )
 def run_target_canary(canary_run_id: str):
-    with transaction.atomic():
-        run = TargetCanaryRun.objects.select_for_update().select_related("target").get(id=canary_run_id)
-        if run.state == TargetCanaryRun.State.PASSED:
-            return {"canaryRunId": canary_run_id, "state": run.state}
-        if run.target.current_snapshot_id != run.target_snapshot_id:
-            run.state = TargetCanaryRun.State.FAILED
-            run.stage_results = [{"code": "target_snapshot_stale", "passed": False}]
-            run.finished_at = timezone.now()
-            run.save(update_fields=["state", "stage_results", "finished_at"])
-            return {"canaryRunId": canary_run_id, "state": run.state}
-        run.state = TargetCanaryRun.State.RUNNING
-        run.save(update_fields=["state"])
+    audit_context = _worker_audit_context()
+    run, fence = begin_canary_run(
+        canary_run_id,
+        audit_context=audit_context,
+    )
+    if fence is None:
+        return {"canaryRunId": canary_run_id, "state": run.state}
 
     adapter = publisher_for_target(run.target)
     stages: list[dict[str, object]] = []
@@ -475,23 +422,12 @@ def run_target_canary(canary_run_id: str):
                 stages.append({"code": "post_cleanup_pending", "passed": False})
         adapter.close()
 
-    with transaction.atomic():
-        run = TargetCanaryRun.objects.select_for_update().select_related("target").get(id=canary_run_id)
-        run.stage_results = stages
-        run.report_hash = sha256_hex(stages)
-        run.state = TargetCanaryRun.State.PASSED if passed else TargetCanaryRun.State.FAILED
-        if any(row["code"].endswith("cleanup_pending") for row in stages):
-            run.state = TargetCanaryRun.State.CLEANUP_REQUIRED
-        run.finished_at = timezone.now()
-        run.save(update_fields=["stage_results", "report_hash", "state", "finished_at"])
-        target = PublicationTarget.objects.select_for_update().get(id=run.target_id)
-        target.canary_state = ValidationState.PASSED if passed else ValidationState.FAILED
-        target.canary_policy_version = run.policy_version if passed else target.canary_policy_version
-        target.last_canary_at = timezone.now()
-        if passed:
-            target.connection_state = PublicationTarget.ConnectionState.VERIFIED
-        target.save()
-        _snapshot_locked(target)
+    run = persist_canary_run_result(
+        fence,
+        stages=stages,
+        passed=passed,
+        audit_context=audit_context,
+    )
     return {"canaryRunId": canary_run_id, "state": run.state, "reportHash": run.report_hash}
 
 
@@ -536,15 +472,14 @@ def reconcile_remote_media(
     publication_attempt_id: str,
     publication_intent_id: str,
 ):
-    attempt = PublicationAttempt.objects.filter(
-        id=publication_attempt_id,
+    audit_context = _worker_audit_context()
+    remote, fence = begin_remote_media_reconcile(
+        remote_media_id,
+        publication_attempt_id=publication_attempt_id,
         publication_intent_id=publication_intent_id,
-        publication__media_bindings__remote_media_id=remote_media_id,
-    ).first()
-    if attempt is None:
-        raise Conflict("media reconcile identity does not match the publication attempt")
-    remote = RemoteMedia.objects.select_related("target").get(id=remote_media_id)
-    if remote.state not in {RemoteMedia.State.RECONCILING, RemoteMedia.State.UPLOADING}:
+        audit_context=audit_context,
+    )
+    if fence is None:
         return {"remoteMediaId": remote_media_id, "state": remote.state}
     adapter = publisher_for_target(remote.target)
     try:
@@ -552,17 +487,9 @@ def reconcile_remote_media(
         result = adapter.find_media(remote.remote_lookup_key, marker)
     finally:
         adapter.close()
-    with transaction.atomic():
-        remote = RemoteMedia.objects.select_for_update().get(id=remote_media_id)
-        if result.status == "succeeded":
-            remote.remote_media_id = result.remote_post_id
-            remote.remote_source_url = result.remote_url
-            remote.state = RemoteMedia.State.AVAILABLE
-        else:
-            remote.state = RemoteMedia.State.FAILED
-        remote.last_reconciled_at = timezone.now()
-        remote.last_reconcile_hash = sha256_hex(
-            {"status": result.status, "remoteMediaId": result.remote_post_id, "url": result.remote_url}
-        )
-        remote.save()
+    remote = persist_remote_media_reconcile_result(
+        fence,
+        result,
+        audit_context=audit_context,
+    )
     return {"remoteMediaId": remote_media_id, "state": remote.state}

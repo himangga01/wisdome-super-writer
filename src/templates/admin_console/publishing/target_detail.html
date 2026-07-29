@@ -51,14 +51,17 @@
   const headers = {'Content-Type': 'application/json', 'X-CSRFToken': window.csrfToken};
   const gateMessage = document.getElementById('gate-message');
   document.getElementById('preflight').addEventListener('click', async () => {
-    const response = await fetch(`/api/v1/targets/${targetId}/preflight`, {method:'POST', headers});
+    const reason = prompt('읽기 전용 preflight 실행 사유를 입력하세요.');
+    if (!reason?.trim()) return;
+    const payload = {requestKey:crypto.randomUUID(), reason:reason.trim()};
+    const response = await fetch(`/api/v1/targets/${targetId}/preflight`, {method:'POST', headers, body:JSON.stringify(payload)});
     const result = await response.json(); gateMessage.textContent = response.ok ? `preflight 작업 ${result.jobId} 접수` : result.detail;
   });
   const canary = document.getElementById('canary');
   if (canary) canary.addEventListener('click', async () => {
     const reason = prompt('격리 쓰기 canary 실행 사유를 입력하세요.', '공식 API 연결 검증');
-    if (!reason) return;
-    const payload = {confirmIsolatedTestTarget:true, policyVersion:'publisher-v1', reason};
+    if (!reason?.trim()) return;
+    const payload = {confirmIsolatedTestTarget:true, policyVersion:'publisher-v1', requestKey:crypto.randomUUID(), reason:reason.trim()};
     const response = await fetch(`/api/v1/targets/${targetId}/canary`, {method:'POST', headers, body:JSON.stringify(payload)});
     const result = await response.json(); gateMessage.textContent = response.ok ? `canary ${result.jobId} 접수` : result.detail;
   });
