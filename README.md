@@ -75,14 +75,40 @@ Copy-Item .env.example .env
 PaddleOCR 모델 준비를 먼저 완료한 다음 서비스를 시작합니다.
 
 ```powershell
-docker compose build
-docker compose up -d postgres redis minio minio-bootstrap
-docker compose run --rm web python src/manage.py migrate
+.\deploy\compose-deploy.ps1
 docker compose run --rm web python src/manage.py createsuperuser
 docker compose run --rm web python src/manage.py seed_source_registry
 docker compose run --rm web python src/manage.py import_extraction_profiles --root config/extraction-profiles
-docker compose up -d web worker ocr-worker beat
 ```
+
+### 안전한 Compose 배포 절차
+
+초기 실행과 이후 업그레이드는 항상 `deploy/compose-deploy.ps1`을 사용합니다.
+이 스크립트는 Compose에 등록된 beat와 모든 worker 서비스가 관리 목록에 포함됐는지 먼저
+검사하고, 이미 실행 중인 beat와 worker를 모두 중지한 뒤 one-shot `migrate` 서비스를
+실행합니다. migration이 성공한 경우에만 web, beat, worker를 다시 시작합니다. migration이
+실패하면 소비자는 중지된 상태로 남으므로 원인을 해결한 뒤 같은 스크립트를 다시 실행합니다.
+
+`web` entrypoint는 migration을 자동 실행하지 않습니다. Compose의 web, beat, 모든 일반 worker와
+OCR worker는 `migrate` 서비스의 성공 완료를 시작 조건으로 사용합니다. 따라서 임의로
+`docker compose run --rm web python src/manage.py migrate`를 실행하거나 worker가 동작하는 동안
+migration을 우회 실행하지 않습니다.
+
+기본 worker 종료 대기 시간은 120초입니다. 장시간 작업을 마칠 시간이 더 필요하면 다음처럼
+늘릴 수 있습니다.
+
+```powershell
+.\deploy\compose-deploy.ps1 -StopTimeoutSeconds 300
+```
+
+### Safe Compose deployment contract (English)
+
+Use `deploy/compose-deploy.ps1` for both first boot and every upgrade. The script verifies
+that its quiesce inventory covers beat and every configured worker, stops those consumers,
+runs the one-shot `migrate` service, and restarts web and the consumers only after migration
+succeeds. A failed migration leaves the consumers stopped. The web entrypoint does not run
+migrations, and all Compose application consumers depend on successful migration completion.
+Do not bypass this path with an ad-hoc migration while workers are running.
 
 접속 주소:
 

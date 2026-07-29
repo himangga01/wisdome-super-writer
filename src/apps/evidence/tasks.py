@@ -1608,6 +1608,186 @@ def _stop_run_evidence_locked(
     return {"runId": str(run.id), "state": run.state}
 
 
+def _finalize_run_evidence_wake_failure_locked(
+    run_id: str,
+    error_code: str,
+) -> dict[str, str]:
+    run = (
+        CollectionRun.objects.select_for_update()
+        .filter(pk=run_id)
+        .first()
+    )
+    if run is None:
+        return {"runId": run_id, "state": "missing"}
+    if run.state in {
+        RunState.COMPLETED,
+        RunState.FAILED,
+        RunState.STOPPED,
+    }:
+        return {"runId": str(run.id), "state": run.state}
+
+    extracting = run.state == RunState.EXTRACTING
+    step = None
+    if run.state == RunState.STOPPING:
+        steps = list(
+            RunStep.objects.select_for_update()
+            .filter(run=run)
+            .order_by("attempt_no", "id")
+        )
+        if any(
+            candidate.name not in {"collect", "extract"}
+            for candidate in steps
+        ):
+            return {"runId": str(run.id), "state": run.state}
+        if any(
+            candidate.name == "collect"
+            and candidate.state == "running"
+            for candidate in steps
+        ):
+            return {"runId": str(run.id), "state": run.state}
+        extract_step = next(
+            (
+                candidate
+                for candidate in steps
+                if candidate.name == "extract"
+                and candidate.attempt_no == 1
+            ),
+            None,
+        )
+        if extract_step is not None and extract_step.state not in {
+            "queued",
+            "running",
+        }:
+            return {"runId": str(run.id), "state": run.state}
+        step = extract_step
+        collect_succeeded = any(
+            candidate.name == "collect"
+            and candidate.attempt_no == 1
+            and candidate.state == "succeeded"
+            for candidate in steps
+        )
+        if step is None and not collect_succeeded:
+            return {"runId": str(run.id), "state": run.state}
+        if step is None:
+            step = RunStep.objects.create(
+                run=run,
+                name="extract",
+                attempt_no=1,
+            )
+        stopping = True
+    elif extracting:
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        stopping = run.stop_requested_at is not None
+    else:
+        return {"runId": str(run.id), "state": run.state}
+
+    if stopping:
+        return _stop_run_evidence_locked(run, step)
+
+    now = timezone.now()
+    redacted_code = str(error_code)[:100]
+    step.state = "failed"
+    step.error_code = redacted_code
+    step.error_detail_redacted = (
+        "evidence finalizer delivery exhausted before completion"
+    )
+    step.finished_at = step.finished_at or now
+    step.save(
+        update_fields=(
+            "state",
+            "error_code",
+            "error_detail_redacted",
+            "finished_at",
+        )
+    )
+    run.state = RunState.FAILED
+    run.error_summary = {
+        "stage": "extract",
+        "code": redacted_code,
+    }
+    run.completed_at = run.completed_at or now
+    run.save(
+        update_fields=(
+            "state",
+            "error_summary",
+            "completed_at",
+        )
+    )
+    return {
+        "runId": str(run.id),
+        "state": run.state,
+        "code": redacted_code,
+    }
+
+
+@shared_task(
+    name="apps.evidence.tasks.finalize_run_evidence_wake_failure"
+)
+def finalize_run_evidence_wake_failure(
+    run_id: str,
+    error_code: str,
+):
+    with transaction.atomic():
+        return _finalize_run_evidence_wake_failure_locked(
+            run_id,
+            error_code,
+        )
+
+
+@shared_task(
+    name="apps.evidence.tasks.finalize_document_ready_wake_failure"
+)
+def finalize_document_ready_wake_failure(
+    document_id: str,
+    error_code: str,
+):
+    with transaction.atomic():
+        document = (
+            DocumentExtraction.objects.select_for_update()
+            .select_related("run_source_item")
+            .filter(pk=document_id)
+            .first()
+        )
+        if document is None:
+            return {
+                "documentExtractionId": document_id,
+                "state": "missing",
+            }
+        return _finalize_run_evidence_wake_failure_locked(
+            str(document.run_source_item.run_id),
+            error_code,
+        )
+
+
+@shared_task(
+    name="apps.evidence.tasks.finalize_other_ready_wake_failure"
+)
+def finalize_other_ready_wake_failure(
+    attempt_id: str,
+    error_code: str,
+):
+    with transaction.atomic():
+        attempt = (
+            GenericExtractionAttempt.objects.select_for_update()
+            .select_related("run_source_item")
+            .filter(pk=attempt_id)
+            .first()
+        )
+        if attempt is None:
+            return {
+                "genericExtractionAttemptId": attempt_id,
+                "state": "missing",
+            }
+        return _finalize_run_evidence_wake_failure_locked(
+            str(attempt.run_source_item.run_id),
+            error_code,
+        )
+
+
 @shared_task(name="apps.evidence.tasks.process_run_evidence")
 def process_run_evidence(run_id: str):
     with transaction.atomic():

@@ -45,6 +45,8 @@ x-app: &app
       condition: service_healthy
     minio-bootstrap:
       condition: service_completed_successfully
+    migrate:
+      condition: service_completed_successfully
   restart: unless-stopped
 
 services:
@@ -148,6 +150,20 @@ services:
       - object-storage
     restart: "no"
 
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/containers/app/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: [*runtime-environment, *blogger-environment]
+    command: ["python", "src/manage.py", "migrate", "--noinput"]
+    networks:
+      - database
+    restart: "no"
+
   web:
     <<: *app
     environment:
@@ -245,6 +261,8 @@ services:
       redis:
         condition: service_healthy
       minio-bootstrap:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
     networks:
       - database

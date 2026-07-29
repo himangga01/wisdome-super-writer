@@ -75,6 +75,11 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "collect.housing",
         "apps.collection.tasks.execute_collection_run",
         ("run_id",),
+        (
+            "apps.collection.tasks."
+            "finalize_collection_run_delivery_failure"
+        ),
+        ("run_id",),
         max_attempts=4,
     ),
     ("run.evidence_requested", 1): EventRoute(
@@ -107,18 +112,24 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "extract.document",
         "apps.evidence.tasks.finalize_run_evidence",
         ("run_id",),
+        "apps.evidence.tasks.finalize_run_evidence_wake_failure",
+        ("run_id",),
     ),
     ("evidence.document_ready", 1): EventRoute(
         "document-ready-finalize",
         "extract.document",
         "apps.evidence.tasks.finalize_run_evidence",
         ("run_id",),
+        "apps.evidence.tasks.finalize_document_ready_wake_failure",
+        ("document_extraction_id",),
     ),
     ("evidence.other_ready", 1): EventRoute(
         "other-ready-finalize",
         "extract.document",
         "apps.evidence.tasks.finalize_run_evidence",
         ("run_id",),
+        "apps.evidence.tasks.finalize_other_ready_wake_failure",
+        ("generic_extraction_attempt_id",),
     ),
     ("evidence.profile_decided", 1): EventRoute(
         "profile-decision-ack",

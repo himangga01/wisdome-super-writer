@@ -9,6 +9,12 @@ from django.utils import timezone
 
 RECOVERY_REASON = "deployment_recovery_original_parent_rearmed"
 SUPERSEDED_REASON = "deployment_recovery_parent_superseded"
+PROGRESSED_RUN_STATES = {
+    "validating",
+    "drafting",
+    "awaiting_approval",
+    "publishing",
+}
 
 
 def _normalize_json(value):
@@ -115,7 +121,7 @@ def _existing_receipt(
     )
 
 
-def _assert_quiesced(
+def _delivery_state(
     OutboxConsumerReceipt,
     db_alias,
     event,
@@ -137,12 +143,7 @@ def _assert_quiesced(
         and receipt.claimed_until is not None
         and receipt.claimed_until > now
     )
-    if active_dispatch or active_consumer:
-        raise RuntimeError(
-            "evidence parent recovery requires quiesced dispatchers and "
-            f"consumers for event {event.id}"
-        )
-    return receipt
+    return receipt, active_dispatch or active_consumer
 
 
 def _fence_event(
@@ -285,12 +286,14 @@ def _project_original(
             db_alias,
             event,
         )
-        return
+        return True
     if event.attempts >= 32767:
-        raise RuntimeError(
-            "evidence parent recovery cannot extend an exhausted delivery "
-            f"generation for event {event.id}"
+        _fence_event(
+            OutboxConsumerReceipt,
+            db_alias,
+            event,
         )
+        return False
     receipt.state = "retry"
     receipt.attempts = 0
     receipt.completed_at = None
@@ -341,6 +344,7 @@ def _project_original(
             "lease_token",
         ),
     )
+    return True
 
 
 def _fail_parent_recovery(
@@ -514,14 +518,37 @@ def converge_parent_recovery(apps, schema_editor):
         parents = [*originals]
         if recovery is not None:
             parents.append(recovery)
-        receipts = {
-            parent.id: _assert_quiesced(
+        delivery_states = {
+            parent.id: _delivery_state(
                 OutboxConsumerReceipt,
                 db_alias,
                 parent,
             )
             for parent in parents
         }
+        receipts = {
+            parent_id: state[0]
+            for parent_id, state in delivery_states.items()
+        }
+        active_parent_lease = any(
+            state[1] for state in delivery_states.values()
+        )
+        original_has_children = False
+        recovery_has_children = False
+        if originals and recovery is not None:
+            original_has_children = _has_child_events(
+                OutboxMessage,
+                db_alias,
+                originals[0],
+            )
+            recovery_has_children = _has_child_events(
+                OutboxMessage,
+                db_alias,
+                recovery,
+            )
+        mixed_parent_causation = bool(
+            original_has_children and recovery_has_children
+        )
         incomplete = bool(
             run.state == "extracting"
             and step is not None
@@ -529,6 +556,22 @@ def converge_parent_recovery(apps, schema_editor):
             and step.started_at is not None
             and step.fanout_completed_at is None
         )
+        if run.state in {"completed", "failed", "stopped"}:
+            for parent in parents:
+                _fence_event(
+                    OutboxConsumerReceipt,
+                    db_alias,
+                    parent,
+                )
+            continue
+        if run.state in PROGRESSED_RUN_STATES:
+            for parent in parents:
+                _fence_event(
+                    OutboxConsumerReceipt,
+                    db_alias,
+                    parent,
+                )
+            continue
         if run.stop_requested_at is not None or run.state == "stopping":
             for parent in parents:
                 _fence_event(
@@ -577,23 +620,39 @@ def converge_parent_recovery(apps, schema_editor):
                 ),
             )
             continue
+        if active_parent_lease or mixed_parent_causation:
+            for parent in parents:
+                _fence_event(
+                    OutboxConsumerReceipt,
+                    db_alias,
+                    parent,
+                )
+            if mixed_parent_causation:
+                error_code = (
+                    "deployment_recovery_mixed_parent_causation"
+                )
+                detail = (
+                    "evidence parent deliveries produced mixed child "
+                    "causation and were terminally fenced"
+                )
+            else:
+                error_code = (
+                    "deployment_recovery_active_parent_lease"
+                )
+                detail = (
+                    "active evidence parent delivery was terminally "
+                    "fenced during deployment recovery"
+                )
+            _fail_parent_recovery(
+                run,
+                step,
+                db_alias=db_alias,
+                error_code=error_code,
+                detail=detail,
+            )
+            continue
         if originals and recovery is not None:
             original = originals[0]
-            original_has_children = _has_child_events(
-                OutboxMessage,
-                db_alias,
-                original,
-            )
-            recovery_has_children = _has_child_events(
-                OutboxMessage,
-                db_alias,
-                recovery,
-            )
-            if original_has_children and recovery_has_children:
-                raise RuntimeError(
-                    "evidence parent recovery found mixed child causation "
-                    f"for run {run_id}"
-                )
             recovery_receipt = receipts.get(recovery.id)
             if recovery_has_children or (
                 not original_has_children
@@ -626,12 +685,25 @@ def converge_parent_recovery(apps, schema_editor):
                 ),
             )
             continue
-        _project_original(
+        rearmed = _project_original(
             OutboxConsumerReceipt,
             db_alias,
             canonical,
             completed=False,
         )
+        if not rearmed:
+            _fail_parent_recovery(
+                run,
+                step,
+                db_alias=db_alias,
+                error_code=(
+                    "deployment_recovery_delivery_generation_exhausted"
+                ),
+                detail=(
+                    "evidence parent delivery generation cannot be "
+                    "safely extended"
+                ),
+            )
 
 
 class Migration(migrations.Migration):
