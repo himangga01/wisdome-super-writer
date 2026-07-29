@@ -107,7 +107,8 @@ T045~T057 완료 ─────────────────────
 
 ### T045 — 실제 주제별 수집기와 변경 상태
 
-**상태**: 부분 구현. T010 주택 수집·상태 계보는 구현됐고 T011 반도체 실수집이 남아 있다.
+**상태**: T010 주택 수집과 T011 반도체 출처별 실수집·상태 계보 구현 완료.
+다음 단계는 T012의 공통 권리·접근 정책 강제다.
 
 현재 문제:
 
@@ -132,17 +133,25 @@ T045~T057 완료 ─────────────────────
 - 동시 수집 replay는 성공 response checksum을 재검증하고 run 상태를 후퇴시키지 않는다.
   연속 terminal/restored 영향은 전체 관측 lineage에서 게시물을 찾아 correction case를
   수렴시킨다.
-- 일반 `PublicHtmlAdapter`와 아래 반도체 출처는 아직 목록 page 단위다.
-- MOTIE/KRX/SIA도 일반 목록 page 단위이며 Samsung/SK hynix RSS만 item 단위다.
+- MOTIR은 두 공식 목록의 exact table·total·상세·첨부 identity를 검증하고 동일 ID가 두
+  목록에 나타나면 정규화 결과가 같은지 확인한다.
+- KRX KIND는 승인된 두 발행사의 form pagination, `acptNo`·`docNo`,
+  `searchInitInfo`·`searchContents`·`parent.setPath`·`/external/` 문서 계보를 수집한다.
+- Samsung과 SK hynix는 RSS·Atom을 entrypoint별로 순회하고 상세 WordPress identity,
+  현재 Article JSON-LD 시각과 enclosure·media metadata를 결합한다.
+- SIA는 `MM/DD/YY` 목록 날짜, incremental next cursor, 상세 WordPress identity와
+  PDF·spreadsheet·image·chart·table evidence metadata를 보존한다.
+- reconciliation은 현재 adapter key·identity namespace와 같은 snapshot의 최초 attempt
+  이전 성공 관측만 사용하고, 404/410 unavailable과 restored 계보에서 기존 첨부를 보존한다.
 
 남은 구현:
 
-1. T011에서 MOTIE, KRX, SIA별 목록→상세→첨부 parser와 안정 ID, pagination/cursor,
-   기간·구조 변경 감지를 구현한다.
-2. 반도체 PDF/XLS(X)/이미지/차트/표의 content type, URL, 권리 metadata를 evidence 단계로 전달한다.
-3. 출처별 고정 fixture와 parse failure 격리를 계속 확장한다.
+1. T012에서 robots·이용약관·license·poll/rate limit·Retry-After·freshness·authority와
+   실패 분류를 모든 실제 요청 경로에 공통 강제한다.
+2. T012에서 권리 근거 fallback을 제거하고 승인 snapshot의 권리·MIME·접근 근거만 사용한다.
+3. 전체 자동 fixture·회귀·통합 검증 확장은 계획된 T032 release gate에서 수행한다.
 
-완료 조건:
+T010·T011 완료 확인:
 
 - 모든 enabled source가 목록 item별 상세 record를 만든다.
 - 신규 identity는 window 밖에서 0건이다. 과거 성공 관측 identity만 승인된 reconciliation
@@ -151,14 +160,18 @@ T045~T057 완료 ─────────────────────
 
 #### English — T045 implementation state
 
-T010 housing collection is implemented. ApplyHome and LH use exact purpose-bound HTTPS
+T010 housing collection and T011 semiconductor item-level collection are implemented.
+ApplyHome and LH use exact purpose-bound HTTPS
 profiles, bounded total-count pagination, official detail-page attachment discovery,
 observed-lineage reconciliation, immutable source-version schema cutover, and atomic
 attempt/change-event persistence. Current-schema cutover baselines, immutable registry-bound
 observations, physical request budgets, response credential redaction, frozen attachment
 MIME enforcement, concurrency-safe replay, and full-lineage terminal/restoration impact
 are included. Unchanged and terminal observations do not start fresh evidence extraction.
-T011 remains responsible for the semiconductor source-specific collectors and attachments.
+MOTIR, KRX KIND, Samsung Global Newsroom, SK hynix Newsroom, and SIA now use dedicated,
+fail-closed list/feed, detail, identity, pagination, attachment, and reconciliation
+contracts. T012 remains responsible for cross-source robots, rights, rate, Retry-After,
+freshness, authority, and failure-policy enforcement.
 
 ### T047 — 중복·충돌·글 identity·반도체 속보 검증
 
