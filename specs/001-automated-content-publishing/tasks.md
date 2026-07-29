@@ -64,7 +64,7 @@ T001~T033으로 재배치한다.
 run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation을 확인할 수 있어야 한다.
 저신뢰 핵심 값, 권리 불명 시각 자료와 속보 검증 미달 자료는 게시 가능 상태가 되면 안 된다.
 
-- [ ] T009 [US1] `TopicRegistryHead`, `SourceRegistryDecision`, `SourceRegistryMutation`과 immutable source snapshot·membership·CAS projection을 `src/apps/topics/models.py`, `src/apps/topics/services.py`, `src/apps/topics/api.py`, `src/apps/topics/urls.py`, `src/templates/admin_console/`에 구현하고 source/registry/check/membership/decision 계약 endpoint를 완성 (depends on T002, T004, T006, T007)
+- [X] T009 [US1] `TopicRegistryHead`, `SourceRegistryDecision`, `SourceRegistryMutation`과 immutable source snapshot·membership·CAS projection을 `src/apps/topics/models.py`, `src/apps/topics/services.py`, `src/apps/topics/api.py`, `src/apps/topics/urls.py`, `src/templates/admin_console/`에 구현하고 source/registry/check/membership/decision 계약 endpoint를 완성 (depends on T002, T004, T006, T007)
 - [ ] T010 [US1] 청약홈·LH·공공데이터의 목록/상세/pagination/기간 필터, 첨부 원문, stable identity와 corrected/retracted/unavailable/restored 상태 수집을 `src/adapters/sources/housing/`, `src/adapters/sources/http.py`, `config/source-registry/housing_subscription.json`에 구현 (depends on T001, T009)
 - [ ] T011 [US1] 정부·규제기관·거래소·기업 IR·신뢰 뉴스의 RSS+Atom·상세·pagination·기간 필터와 source tier·independence group·origin identity 수집을 `src/adapters/sources/semiconductor/`, `src/adapters/sources/http.py`, `config/source-registry/semiconductor_news.json`에 구현 (depends on T001, T009)
 - [ ] T012 [US1] robots·이용약관·license·허용 MIME·poll/rate limit·Retry-After·freshness·authority와 수집 실패 분류를 실제 요청 경로에서 강제하고 권리 근거 fallback을 제거하도록 `src/apps/topics/services.py`, `src/apps/collection/services.py`, `src/adapters/sources/http.py`, `config/source-registry/`를 정비 (depends on T001, T009, T010, T011)
