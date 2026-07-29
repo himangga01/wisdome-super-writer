@@ -459,6 +459,15 @@ class Publication(models.Model):
         ]
 
 
+class PublicationRecoveryState(models.TextChoices):
+    NOT_REQUIRED = "not_required", "Not required"
+    IN_PROGRESS = "in_progress", "In progress"
+    AUTOMATIC_RETRY = "automatic_retry", "Automatic retry"
+    RECONCILING = "reconciling", "Reconciling"
+    MANUAL_REQUIRED = "manual_required", "Manual required"
+    STOPPED = "stopped", "Stopped"
+
+
 class PublicationAttempt(models.Model):
     class State(models.TextChoices):
         QUEUED = "queued", "대기"
@@ -493,6 +502,16 @@ class PublicationAttempt(models.Model):
     state = models.CharField(max_length=24, choices=State.choices, default=State.QUEUED)
     attempt_no = models.PositiveIntegerField(default=1)
     reconcile_attempt_no = models.PositiveIntegerField(default=0)
+    correlation_id = models.UUIDField(db_index=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    terminal_impact = models.JSONField(default=dict, blank=True)
+    recovery_state = models.CharField(
+        max_length=32,
+        choices=PublicationRecoveryState.choices,
+        default=PublicationRecoveryState.IN_PROGRESS,
+    )
+    next_recovery_at = models.DateTimeField(null=True, blank=True)
     remote_request_id = models.CharField(max_length=255, blank=True)
     http_status = models.PositiveIntegerField(null=True, blank=True)
     error_code = models.CharField(max_length=100, blank=True)
@@ -508,6 +527,51 @@ class PublicationAttempt(models.Model):
             models.CheckConstraint(
                 condition=Q(reconcile_attempt_no__lte=5),
                 name="ck_publication_reconcile_attempt_no_lte_5",
+            ),
+        ]
+
+
+class PublicationExecutionObservation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication_attempt = models.ForeignKey(
+        PublicationAttempt,
+        on_delete=models.PROTECT,
+        related_name="execution_observations",
+    )
+    execution_attempt_no = models.PositiveIntegerField()
+    correlation_id = models.UUIDField(db_index=True)
+    source_event = models.ForeignKey(
+        "infrastructure.OutboxMessage",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="publication_execution_observations",
+    )
+    worker_task_id = models.CharField(max_length=255, blank=True)
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    result_state = models.CharField(max_length=24, blank=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    retry_at = models.DateTimeField(null=True, blank=True)
+    terminal_impact = models.JSONField(default=dict, blank=True)
+    recovery_state = models.CharField(
+        max_length=32,
+        choices=PublicationRecoveryState.choices,
+        default=PublicationRecoveryState.IN_PROGRESS,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["publication_attempt_id", "execution_attempt_no"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("publication_attempt", "execution_attempt_no"),
+                name="uq_publication_execution_observation",
+            ),
+            models.CheckConstraint(
+                condition=Q(execution_attempt_no__gte=1),
+                name="ck_publication_execution_attempt_no_gte_1",
             ),
         ]
 
@@ -539,6 +603,17 @@ class PublicationReconcileGeneration(models.Model):
     not_before = models.DateTimeField()
     started_at = models.DateTimeField()
     completed_at = models.DateTimeField(null=True, blank=True)
+    correlation_id = models.UUIDField(db_index=True)
+    worker_task_id = models.CharField(max_length=255, blank=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    terminal_impact = models.JSONField(default=dict, blank=True)
+    recovery_state = models.CharField(
+        max_length=32,
+        choices=PublicationRecoveryState.choices,
+        default=PublicationRecoveryState.IN_PROGRESS,
+    )
+    next_recovery_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

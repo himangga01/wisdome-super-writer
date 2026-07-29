@@ -55,7 +55,9 @@ from .models import (
     Publication,
     PublicationAction,
     PublicationAttempt,
+    PublicationExecutionObservation,
     PublicationReconcileGeneration,
+    PublicationRecoveryState,
     PublicationIntent,
     PublicationMedia,
     PublicationTarget,
@@ -2882,6 +2884,8 @@ def dispatch_publication(
             auto_publish_activation_hash=(activation_ref or {}).get("activationHash"),
             idempotency_key=idempotency_key,
             remote_lookup_key=publication.remote_lookup_key,
+            correlation_id=audit_context.correlation_id,
+            recovery_state=PublicationRecoveryState.IN_PROGRESS,
             request_fingerprint=sha256_hex(
                 {
                     "intentHash": intent.intent_hash,
@@ -2960,6 +2964,7 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
         aggregate_id=attempt.id,
         job_id=attempt.id,
         available_at=eta,
+        correlation_id=attempt.correlation_id,
     )
 
 
@@ -3146,8 +3151,159 @@ def _command_for_attempt(attempt: PublicationAttempt, render: ArticleChannelRend
         rendered_article=_rendered_article(render) if render else None,
         publish_at=attempt.publication.scheduled_for,
         requested_at=timezone.now(),
-        correlation_id=str(attempt.publication_intent.origin_collection_run_id or attempt.publication_intent_id),
+        correlation_id=str(attempt.correlation_id),
     )
+
+
+def _current_worker_task_id() -> str:
+    from wisdome_writer.observability import current_task_id
+
+    return (current_task_id() or "")[:255]
+
+
+def _observation_duration_ms(
+    started_at,
+    finished_at,
+) -> int | None:
+    if (
+        started_at is None
+        or finished_at is None
+        or finished_at < started_at
+    ):
+        return None
+    return int((finished_at - started_at).total_seconds() * 1000)
+
+
+def _publication_recovery_state(state: str) -> str:
+    if state == PublicationAttempt.State.SUCCEEDED:
+        return PublicationRecoveryState.NOT_REQUIRED
+    if state in {
+        PublicationAttempt.State.QUEUED,
+        PublicationAttempt.State.RUNNING,
+    }:
+        return PublicationRecoveryState.IN_PROGRESS
+    if state == PublicationAttempt.State.RETRYABLE_FAILED:
+        return PublicationRecoveryState.AUTOMATIC_RETRY
+    if state in {
+        PublicationAttempt.State.UNKNOWN_OUTCOME,
+        PublicationAttempt.State.RECONCILING,
+    }:
+        return PublicationRecoveryState.RECONCILING
+    if state in {
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+    }:
+        return PublicationRecoveryState.MANUAL_REQUIRED
+    return PublicationRecoveryState.STOPPED
+
+
+def _publication_terminal_impact(
+    *,
+    stage: str,
+    final_state: str,
+    error_code: str,
+    scope: str = "publication_channel",
+) -> dict[str, Any]:
+    return {
+        "scope": scope,
+        "stage": stage,
+        "final_state": final_state,
+        "affected_count": 1,
+        "error_code": (error_code or "")[:100],
+    }
+
+
+def _complete_execution_observation_locked(
+    attempt: PublicationAttempt,
+    *,
+    execution_attempt_no: int,
+    finished_at,
+    result_state: str,
+    error_code: str,
+    retry_at=None,
+    recovery_state: str,
+    terminal_state: str | None = None,
+) -> PublicationExecutionObservation:
+    observation = (
+        PublicationExecutionObservation.objects.select_for_update()
+        .filter(
+            publication_attempt=attempt,
+            execution_attempt_no=execution_attempt_no,
+        )
+        .first()
+    )
+    if observation is None:
+        raise Conflict("active publication execution observation is missing")
+    if observation.finished_at is not None:
+        return observation
+    duration_ms = _observation_duration_ms(
+        observation.started_at,
+        finished_at,
+    )
+    terminal_impact = _publication_terminal_impact(
+        stage="execution",
+        final_state=terminal_state or result_state,
+        error_code=error_code,
+    )
+    observation.finished_at = finished_at
+    observation.duration_ms = duration_ms
+    observation.result_state = result_state
+    observation.error_code = (error_code or "")[:100]
+    observation.retry_at = retry_at
+    observation.terminal_impact = terminal_impact
+    observation.recovery_state = recovery_state
+    observation.save(
+        update_fields=(
+            "finished_at",
+            "duration_ms",
+            "result_state",
+            "error_code",
+            "retry_at",
+            "terminal_impact",
+            "recovery_state",
+        )
+    )
+    if duration_ms is not None:
+        attempt.duration_ms = (attempt.duration_ms or 0) + duration_ms
+    if execution_attempt_no > 1:
+        attempt.retry_count += 1
+    attempt.terminal_impact = terminal_impact
+    return observation
+
+
+def _complete_reconcile_observation_locked(
+    attempt: PublicationAttempt,
+    generation: PublicationReconcileGeneration,
+    *,
+    finished_at,
+    result_state: str,
+    error_code: str,
+    next_recovery_at=None,
+    recovery_state: str,
+) -> None:
+    if generation.state == PublicationReconcileGeneration.State.COMPLETED:
+        return
+    duration_ms = _observation_duration_ms(
+        generation.started_at,
+        finished_at,
+    )
+    terminal_impact = _publication_terminal_impact(
+        stage="reconcile",
+        final_state=result_state,
+        error_code=error_code,
+    )
+    generation.state = PublicationReconcileGeneration.State.COMPLETED
+    generation.result_state = result_state
+    generation.completed_at = finished_at
+    generation.duration_ms = duration_ms
+    generation.error_code = (error_code or "")[:100]
+    generation.terminal_impact = terminal_impact
+    generation.recovery_state = recovery_state
+    generation.next_recovery_at = next_recovery_at
+    if duration_ms is not None:
+        attempt.duration_ms = (attempt.duration_ms or 0) + duration_ms
+    attempt.retry_count += 1
+    attempt.terminal_impact = terminal_impact
 
 
 def _project_reconciling_locked(
@@ -3164,7 +3320,8 @@ def _project_reconciling_locked(
     if attempt.state in terminal_states:
         return
     attempt.state = PublicationAttempt.State.RECONCILING
-    attempt_fields = ["state"]
+    attempt.recovery_state = PublicationRecoveryState.AUTOMATIC_RETRY
+    attempt_fields = ["state", "recovery_state", "next_recovery_at"]
     if update_counter:
         attempt_fields.append("reconcile_attempt_no")
     attempt.save(update_fields=attempt_fields)
@@ -3191,11 +3348,21 @@ def _manualize_reconcile_attempt_locked(
     attempt.state = PublicationAttempt.State.MANUAL_REQUIRED
     attempt.error_code = error_code[:100]
     attempt.finished_at = now
+    attempt.recovery_state = PublicationRecoveryState.MANUAL_REQUIRED
+    attempt.next_recovery_at = None
+    attempt.terminal_impact = _publication_terminal_impact(
+        stage="reconcile",
+        final_state=attempt.state,
+        error_code=attempt.error_code,
+    )
     attempt.save(
         update_fields=(
             "state",
             "error_code",
             "finished_at",
+            "recovery_state",
+            "next_recovery_at",
+            "terminal_impact",
         )
     )
     attempt.publication.state = Publication.State.MANUAL_REQUIRED
@@ -3219,32 +3386,55 @@ def _terminalize_reconcile_generation_locked(
     if generation.state == PublicationReconcileGeneration.State.COMPLETED:
         return
     now = timezone.now()
-    result_state = _manualize_reconcile_attempt_locked(
+    preserved_before = attempt.state in {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }
+    _manualize_reconcile_attempt_locked(
         attempt,
         error_code=error_code,
         now=now,
     )
-    generation.state = PublicationReconcileGeneration.State.COMPLETED
-    generation.result_identity = sha256_hex(
-        {
-            "kind": "reconcile_delivery_terminal",
-            "publication_attempt_id": str(attempt.id),
-            "generation": generation.generation,
-            "source_event_id": str(generation.source_event_id),
-            "result_state": result_state,
-            "error_code": error_code[:100],
-        }
+    terminal_impact = _publication_terminal_impact(
+        scope="publication_delivery",
+        stage="reconcile_delivery",
+        final_state="delivery_failed",
+        error_code=error_code,
     )
-    generation.result_state = result_state
+    # A terminal callback means the reconcile message was never executed by the
+    # publisher. Close the delivery generation without inventing a channel
+    # result, duration, or retry.
+    generation.state = PublicationReconcileGeneration.State.COMPLETED
+    generation.result_identity = ""
+    generation.result_state = ""
     generation.completed_at = now
+    generation.duration_ms = None
+    generation.error_code = error_code[:100]
+    generation.terminal_impact = terminal_impact
+    generation.recovery_state = (
+        PublicationRecoveryState.MANUAL_REQUIRED
+        if attempt.state == PublicationAttempt.State.MANUAL_REQUIRED
+        else _publication_recovery_state(attempt.state)
+    )
+    generation.next_recovery_at = None
     generation.save(
         update_fields=(
             "state",
             "result_identity",
             "result_state",
             "completed_at",
+            "duration_ms",
+            "error_code",
+            "terminal_impact",
+            "recovery_state",
+            "next_recovery_at",
         )
     )
+    if not preserved_before or attempt.state == PublicationAttempt.State.MANUAL_REQUIRED:
+        attempt.terminal_impact = terminal_impact
+        attempt.save(update_fields=("terminal_impact",))
 
 
 def _reconcile_generation_delivery_dead_lettered(
@@ -3290,6 +3480,7 @@ def _enqueue_reconcile_locked(
                     ),
                 )
             else:
+                attempt.next_recovery_at = current.not_before
                 _project_reconciling_locked(attempt)
             return current
     if attempt.state in {
@@ -3317,6 +3508,7 @@ def _enqueue_reconcile_locked(
         aggregate_id=attempt.id,
         job_id=attempt.id,
         available_at=available_at,
+        correlation_id=attempt.correlation_id,
     )
     generation, created = PublicationReconcileGeneration.objects.get_or_create(
         publication_attempt=attempt,
@@ -3326,11 +3518,15 @@ def _enqueue_reconcile_locked(
             "state": PublicationReconcileGeneration.State.STARTED,
             "not_before": event.not_before,
             "started_at": event.occurred_at,
+            "correlation_id": event.correlation_id,
+            "recovery_state": PublicationRecoveryState.AUTOMATIC_RETRY,
+            "next_recovery_at": event.not_before,
         },
     )
     if not created and generation.source_event_id != event.id:
         raise Conflict("reconcile generation is bound to a different event")
     attempt.reconcile_attempt_no = reconcile_attempt_no
+    attempt.next_recovery_at = event.not_before
     _project_reconciling_locked(attempt, update_counter=True)
     return generation
 
@@ -3346,7 +3542,7 @@ def begin_attempt(
         "publication__target", "publication_intent", "approval__article_channel_render"
     ).get(id=attempt_id)
     publication = attempt.publication
-    _require_worker_event(
+    source_event = _require_worker_event(
         audit_context,
         topic="publication.requested",
         aggregate_id=attempt.id,
@@ -3391,8 +3587,9 @@ def begin_attempt(
             "attempt": _audit_state(attempt),
             "publication": _audit_state(publication),
         }
+        now = timezone.now()
         attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
-        attempt.finished_at = timezone.now()
+        attempt.finished_at = now
         attempt.error_code = "delivery_redelivered_after_begin"
         attempt.save(update_fields=["state", "finished_at", "error_code"])
         publication.state = Publication.State.RECONCILING
@@ -3406,7 +3603,28 @@ def begin_attempt(
                 "updated_at",
             )
         )
-        _enqueue_reconcile_locked(attempt)
+        generation = _enqueue_reconcile_locked(attempt)
+        _complete_execution_observation_locked(
+            attempt,
+            execution_attempt_no=attempt.attempt_no,
+            finished_at=now,
+            result_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+            error_code=attempt.error_code,
+            retry_at=(
+                generation.not_before if generation is not None else None
+            ),
+            recovery_state=attempt.recovery_state,
+            terminal_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+        )
+        attempt.save(
+            update_fields=(
+                "duration_ms",
+                "retry_count",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
+            )
+        )
         _record_publishing_audit(
             audit_context=audit_context,
             action="publication_attempt.reconcile_started",
@@ -3472,7 +3690,23 @@ def begin_attempt(
         attempt.state = PublicationAttempt.State.STALE
         attempt.finished_at = timezone.now()
         attempt.error_code = "attempt_gate_stale"
-        attempt.save(update_fields=["state", "finished_at", "error_code"])
+        attempt.terminal_impact = _publication_terminal_impact(
+            stage="execution_gate",
+            final_state=attempt.state,
+            error_code=attempt.error_code,
+        )
+        attempt.recovery_state = PublicationRecoveryState.STOPPED
+        attempt.next_recovery_at = None
+        attempt.save(
+            update_fields=[
+                "state",
+                "finished_at",
+                "error_code",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
+            ]
+        )
         _record_publishing_audit(
             audit_context=audit_context,
             action="publication_attempt.finished",
@@ -3499,8 +3733,39 @@ def begin_attempt(
     }
     attempt.state = PublicationAttempt.State.RUNNING
     attempt.started_at = timezone.now()
+    attempt.finished_at = None
     attempt.error_code = ""
-    attempt.save(update_fields=["state", "started_at", "error_code"])
+    attempt.recovery_state = PublicationRecoveryState.IN_PROGRESS
+    attempt.next_recovery_at = None
+    attempt.save(
+        update_fields=[
+            "state",
+            "started_at",
+            "finished_at",
+            "error_code",
+            "recovery_state",
+            "next_recovery_at",
+        ]
+    )
+    observation, created = PublicationExecutionObservation.objects.get_or_create(
+        publication_attempt=attempt,
+        execution_attempt_no=attempt.attempt_no,
+        defaults={
+            "correlation_id": source_event.correlation_id,
+            "source_event": source_event,
+            "worker_task_id": _current_worker_task_id(),
+            "started_at": attempt.started_at,
+            "recovery_state": PublicationRecoveryState.IN_PROGRESS,
+        },
+    )
+    if (
+        not created
+        and (
+            observation.finished_at is not None
+            or observation.source_event_id != source_event.id
+        )
+    ):
+        raise Conflict("publication execution observation fence conflicts")
     publication.state = {
         PublicationAction.CREATE: Publication.State.IN_PROGRESS,
         PublicationAction.UPDATE: Publication.State.UPDATING,
@@ -3620,6 +3885,16 @@ def persist_publish_result(
             },
         )
     result_identity = _publish_result_identity(result)
+    execution_attempt_no = attempt.attempt_no
+    replay_attempt_no = (
+        execution_attempt_no - 1
+        if (
+            expected_reconcile_generation is None
+            and attempt.state == PublicationAttempt.State.RETRYABLE_FAILED
+            and execution_attempt_no > 1
+        )
+        else execution_attempt_no
+    )
     replay_action = (
         "publication_attempt.reconciled"
         if expected_reconcile_generation is not None
@@ -3636,13 +3911,15 @@ def persist_publish_result(
                 "reconcile_attempt_no": expected_reconcile_generation,
             },
         ),
-    ) if expected_reconcile_generation is not None else tuple(
+    ) if expected_reconcile_generation is not None else (
         (
             replay_action,
-            f"{audit_context.event_key}:attempt-result:{attempt_no}",
-            {"attempt": attempt_no},
-        )
-        for attempt_no in range(1, 6)
+            (
+                f"{audit_context.event_key}:attempt-result:"
+                f"{replay_attempt_no}"
+            ),
+            {"attempt": replay_attempt_no},
+        ),
     )
     replay = _worker_audit_replay(
         audit_context,
@@ -3655,7 +3932,6 @@ def persist_publish_result(
                 "worker event was replayed with a different publisher result"
             )
         return attempt
-    execution_attempt_no = attempt.attempt_no
     reconcile_generation = None
     if expected_reconcile_generation is not None:
         reconcile_generation = (
@@ -3759,22 +4035,32 @@ def persist_publish_result(
             attempt.attempt_no = execution_attempt_no + 1
             retry_audit_action = "publication_attempt.retry_scheduled"
             retry_result = "retry_scheduled"
+    attempt.recovery_state = _publication_recovery_state(attempt.state)
+    attempt.next_recovery_at = None
     attempt.save()
     publication.save()
     if reconcile_generation is not None:
         reconcile_result_state = attempt.state
-        reconcile_generation.state = (
-            PublicationReconcileGeneration.State.COMPLETED
-        )
         reconcile_generation.result_identity = result_identity
-        reconcile_generation.result_state = reconcile_result_state
-        reconcile_generation.completed_at = now
+        _complete_reconcile_observation_locked(
+            attempt,
+            reconcile_generation,
+            finished_at=now,
+            result_state=reconcile_result_state,
+            error_code=attempt.error_code,
+            recovery_state=attempt.recovery_state,
+        )
         reconcile_generation.save(
             update_fields=(
                 "state",
                 "result_identity",
                 "result_state",
                 "completed_at",
+                "duration_ms",
+                "error_code",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
             )
         )
         if reconcile_result_state in {
@@ -3803,14 +4089,58 @@ def persist_publish_result(
                 )
                 attempt.next_retry_at = now + timedelta(seconds=delay)
                 attempt.save(update_fields=("next_retry_at",))
-                _enqueue_reconcile_locked(
+                next_generation = _enqueue_reconcile_locked(
                     attempt,
                     available_at=attempt.next_retry_at,
                 )
+                if next_generation is not None:
+                    reconcile_generation.recovery_state = (
+                        PublicationRecoveryState.AUTOMATIC_RETRY
+                    )
+                    reconcile_generation.next_recovery_at = (
+                        next_generation.not_before
+                    )
                 retry_audit_action = "publication_attempt.retry_scheduled"
                 retry_result = "reconcile_scheduled"
     elif attempt.state == PublicationAttempt.State.UNKNOWN_OUTCOME:
         _enqueue_reconcile_locked(attempt)
+    if reconcile_generation is not None:
+        reconcile_generation.recovery_state = attempt.recovery_state
+        reconcile_generation.next_recovery_at = attempt.next_recovery_at
+        reconcile_generation.save(
+            update_fields=("recovery_state", "next_recovery_at")
+        )
+    else:
+        _complete_execution_observation_locked(
+            attempt,
+            execution_attempt_no=execution_attempt_no,
+            finished_at=now,
+            result_state=(
+                result.status
+                if result.status
+                in {
+                    "succeeded",
+                    "retryable_failed",
+                    "permanent_failed",
+                    "unknown_outcome",
+                    "manual_required",
+                }
+                else "permanent_failed"
+            ),
+            error_code=attempt.error_code,
+            retry_at=attempt.next_recovery_at,
+            recovery_state=attempt.recovery_state,
+            terminal_state=attempt.state,
+        )
+    attempt.save(
+        update_fields=(
+            "duration_ms",
+            "retry_count",
+            "terminal_impact",
+            "recovery_state",
+            "next_recovery_at",
+        )
+    )
     audit_action = (
         "publication_attempt.reconciled"
         if reconcile_generation is not None
@@ -3925,9 +4255,9 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
             publication_intent=attempt.publication_intent,
             publication__target__channel=ChannelCode.BLOGGER,
             state=PublicationAttempt.State.QUEUED,
-        ).values_list("id", flat=True)
+        ).values_list("id", "correlation_id")
     )
-    for attempt_id in dependent:
+    for attempt_id, correlation_id in dependent:
         _enqueue_event(
             "publication.requested",
             {
@@ -3937,6 +4267,7 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
             aggregate_type="publication_attempt",
             aggregate_id=attempt_id,
             job_id=attempt_id,
+            correlation_id=correlation_id,
         )
 
 
@@ -4030,6 +4361,9 @@ def begin_reconcile(
             state=PublicationReconcileGeneration.State.STARTED,
             not_before=source_event.not_before,
             started_at=timezone.now(),
+            correlation_id=source_event.correlation_id,
+            worker_task_id=_current_worker_task_id(),
+            recovery_state=PublicationRecoveryState.RECONCILING,
         )
         attempt.reconcile_attempt_no = generation_no
         attempt.save(update_fields=("reconcile_attempt_no",))
@@ -4082,9 +4416,21 @@ def begin_reconcile(
         raise Conflict("unknown-outcome attempt만 조정할 수 있습니다.")
     before_material = _audit_state(attempt)
     attempt.state = PublicationAttempt.State.RECONCILING
-    attempt.save(update_fields=["state"])
+    attempt.recovery_state = PublicationRecoveryState.RECONCILING
+    attempt.next_recovery_at = None
+    attempt.save(
+        update_fields=["state", "recovery_state", "next_recovery_at"]
+    )
     attempt.publication.state = Publication.State.RECONCILING
     attempt.publication.save(update_fields=["state", "updated_at"])
+    generation_updates = ["recovery_state", "next_recovery_at"]
+    generation.recovery_state = PublicationRecoveryState.RECONCILING
+    generation.next_recovery_at = None
+    if not generation.worker_task_id:
+        generation.worker_task_id = _current_worker_task_id()
+        generation.started_at = timezone.now()
+        generation_updates.extend(("worker_task_id", "started_at"))
+    generation.save(update_fields=generation_updates)
     if not _worker_audit_replay(
         audit_context,
         entity=attempt,
@@ -4275,6 +4621,8 @@ def finalize_reconcile_delivery_failure(
                 state=PublicationReconcileGeneration.State.STARTED,
                 not_before=source_event.not_before,
                 started_at=source_event.occurred_at,
+                correlation_id=source_event.correlation_id,
+                recovery_state=PublicationRecoveryState.RECONCILING,
             )
         if generation_no > attempt.reconcile_attempt_no:
             attempt.reconcile_attempt_no = generation_no
@@ -4761,6 +5109,8 @@ def retry_publication_attempt(
         attempt.started_at = None
         attempt.finished_at = None
         attempt.next_retry_at = None
+        attempt.recovery_state = PublicationRecoveryState.IN_PROGRESS
+        attempt.next_recovery_at = None
         attempt.error_detail_redacted = ""
         attempt.save(
             update_fields=[
@@ -4769,6 +5119,8 @@ def retry_publication_attempt(
                 "started_at",
                 "finished_at",
                 "next_retry_at",
+                "recovery_state",
+                "next_recovery_at",
                 "error_detail_redacted",
             ]
         )
@@ -4779,6 +5131,7 @@ def retry_publication_attempt(
             aggregate_type="publication_attempt",
             aggregate_id=attempt.id,
             job_id=attempt.id,
+            correlation_id=attempt.correlation_id,
         )
         action = "retry"
     else:
@@ -5169,6 +5522,7 @@ def _enqueue_event(
     aggregate_id=None,
     job_id=None,
     available_at=None,
+    correlation_id=None,
 ):
     from wisdome_writer.infrastructure.outbox import enqueue_event
 
@@ -5188,4 +5542,5 @@ def _enqueue_event(
         payload=payload,
         dedupe_key=dedupe_key,
         available_at=available_at,
+        correlation_id=correlation_id,
     )

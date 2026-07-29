@@ -8,8 +8,8 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
-from .models import CollectionRun, RunState
-from .services import create_run
+from .models import CollectionRun, RecoveryState, RunState
+from .services import create_run, project_run_terminal_observation
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
 
@@ -24,7 +24,27 @@ def _run_payload(run):
         "windowEnd": run.window_end.isoformat(),
         "counters": run.counters,
         "errorSummary": run.error_summary,
+        "correlationId": str(run.correlation_id),
+        "durationMs": run.duration_ms,
+        "retryCount": run.retry_count,
+        "terminalImpact": run.terminal_impact,
+        "recoveryState": run.recovery_state,
+        "nextRecoveryAt": (
+            run.next_recovery_at.isoformat()
+            if run.next_recovery_at
+            else None
+        ),
         "createdAt": run.created_at.isoformat(),
+        "startedAt": (
+            run.started_at.isoformat()
+            if run.started_at
+            else None
+        ),
+        "completedAt": (
+            run.completed_at.isoformat()
+            if run.completed_at
+            else None
+        ),
     }
 
 
@@ -48,7 +68,11 @@ def runs(request):
         window_start = timezone.make_aware(window_start)
     with transaction.atomic():
         run, created = create_run(
-            topic_code=body["topic"], window_start=window_start, window_end=window_end, user=request.user
+            topic_code=body["topic"],
+            window_start=window_start,
+            window_end=window_end,
+            user=request.user,
+            correlation_id=getattr(request, "correlation_id", None),
         )
         if created:
             enqueue_event(
@@ -58,6 +82,7 @@ def runs(request):
                 job_id=run.id,
                 dedupe_key=f"run.requested:{run.id}",
                 payload={"run_id": str(run.id)},
+                correlation_id=run.correlation_id,
             )
     return JsonResponse(_run_payload(run), status=201 if created else 200)
 
@@ -97,16 +122,28 @@ def stop_run(request, run_id):
                 RunState.QUEUED,
                 RunState.AWAITING_APPROVAL,
             }:
+                now = timezone.now()
                 run.stop_requested_at = (
-                    run.stop_requested_at or timezone.now()
+                    run.stop_requested_at or now
                 )
                 run.state = RunState.STOPPED
-                run.completed_at = run.completed_at or timezone.now()
+                project_run_terminal_observation(
+                    run,
+                    finished_at=now,
+                    stage=previous_state,
+                    final_state=run.state,
+                    error_code="stop_requested",
+                    recovery_state=RecoveryState.STOPPED,
+                )
                 run.save(
                     update_fields=[
                         "state",
                         "stop_requested_at",
                         "completed_at",
+                        "duration_ms",
+                        "terminal_impact",
+                        "recovery_state",
+                        "next_recovery_at",
                     ]
                 )
             elif previous_state == RunState.COLLECTING:
@@ -130,6 +167,7 @@ def stop_run(request, run_id):
                         f"evidence.finalize_requested:stop:{run.id}"
                     ),
                     payload={"run_id": str(run.id)},
+                    correlation_id=run.correlation_id,
                 )
             elif previous_state == RunState.STOPPING:
                 pass
@@ -152,6 +190,8 @@ def retry_run(request, run_id):
             window_end=old.window_end,
             user=request.user,
             trigger="retry",
+            correlation_id=old.correlation_id,
+            retry_count=old.retry_count + 1,
         )
         if created:
             enqueue_event(
@@ -161,5 +201,6 @@ def retry_run(request, run_id):
                 job_id=run.id,
                 dedupe_key=f"run.requested:{run.id}",
                 payload={"run_id": str(run.id)},
+                correlation_id=run.correlation_id,
             )
     return JsonResponse(_run_payload(run), status=202)

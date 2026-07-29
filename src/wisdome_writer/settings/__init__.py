@@ -248,6 +248,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "wisdome_writer.observability.CorrelationIdMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -256,7 +257,6 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "wisdome_writer.observability.CorrelationIdMiddleware",
     "wisdome_writer.api.middleware.AdminApiSecurityMiddleware",
     "wisdome_writer.api.middleware.ProblemDetailsMiddleware",
 ]
@@ -337,6 +337,14 @@ CELERY_TASK_TIME_LIMIT = 30 * 60
 CELERY_TASK_SOFT_TIME_LIMIT = 28 * 60
 CELERY_TASK_ACKS_LATE = True
 OUTBOX_CONSUMER_LEASE_SECONDS = CELERY_TASK_TIME_LIMIT + 10 * 60
+OUTBOX_OBSERVABILITY_STALE_SECONDS = min(
+    max(int(os.getenv("OUTBOX_OBSERVABILITY_STALE_SECONDS", "300")), 30),
+    3_600,
+)
+OUTBOX_OBSERVABILITY_DUE_AGE_SECONDS = min(
+    max(int(os.getenv("OUTBOX_OBSERVABILITY_DUE_AGE_SECONDS", "300")), 30),
+    3_600,
+)
 CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 2 * 60 * 60}
 CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {"visibility_timeout": 2 * 60 * 60}
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
@@ -412,8 +420,7 @@ LOGGING = {
     "filters": {"correlation": {"()": "wisdome_writer.observability.CorrelationIdFilter"}},
     "formatters": {
         "json": {
-            "format": '{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","correlation_id":"%(correlation_id)s","message":"%(message)s"}',
-            "style": "%",
+            "()": "wisdome_writer.observability.SafeJsonFormatter",
         }
     },
     "handlers": {

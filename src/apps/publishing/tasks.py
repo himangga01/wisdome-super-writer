@@ -359,7 +359,7 @@ def run_target_canary(canary_run_id: str):
             remote_post_id=remote_id,
             rendered_article=None if action == "unpublish" else article,
             requested_at=timezone.now(),
-            correlation_id=str(run.id),
+            correlation_id=str(audit_context.correlation_id),
         )
 
     try:

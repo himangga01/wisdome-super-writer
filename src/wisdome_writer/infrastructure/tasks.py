@@ -10,6 +10,11 @@ from celery.exceptions import Reject
 from django.db import DatabaseError
 from django.utils import timezone
 
+from wisdome_writer.observability import (
+    build_observation_headers,
+    current_correlation_uuid,
+)
+
 from .event_routes import EventRoutingError, queue_for, route_for
 from .models import OutboxMessage
 from .outbox import (
@@ -87,7 +92,9 @@ def dispatch_outbox(limit: int = 100):
         from apps.scheduling.services import dispatch_due_schedules
 
         schedule_audit_context = AuditContext.for_system(
-            correlation_id=dispatch_outbox.request.id,
+            correlation_id=current_correlation_uuid(
+                fallback=dispatch_outbox.request.id,
+            ),
             operation_key="schedule-due-scan",
             reason_code="scheduled due scan",
         )
@@ -134,6 +141,14 @@ def dispatch_outbox(limit: int = 100):
                 args=[envelope],
                 queue=queue_for(route, envelope),
                 task_id=f"outbox:{message.id}:{message.attempts}",
+                headers=build_observation_headers(
+                    correlation_id=envelope["correlation_id"],
+                    job_id=envelope["job_id"],
+                    entity_type=envelope["entity_type"],
+                    entity_id=envelope["entity_id"],
+                    operation=envelope["operation"],
+                    attempt=envelope["attempt"],
+                ),
             )
         except Exception as exc:
             terminal = isinstance(

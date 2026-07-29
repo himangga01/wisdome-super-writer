@@ -18,8 +18,18 @@ class RunState(models.TextChoices):
     FAILED = "failed", "실패"
 
 
+class RecoveryState(models.TextChoices):
+    NOT_REQUIRED = "not_required", "Not required"
+    IN_PROGRESS = "in_progress", "In progress"
+    AUTOMATIC_RETRY = "automatic_retry", "Automatic retry"
+    RECONCILING = "reconciling", "Reconciling"
+    MANUAL_REQUIRED = "manual_required", "Manual required"
+    STOPPED = "stopped", "Stopped"
+
+
 class CollectionRun(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    correlation_id = models.UUIDField(default=uuid.uuid4, editable=False, db_index=True)
     display_id = models.CharField(max_length=32, unique=True)
     topic_code = models.CharField(max_length=40, db_index=True)
     trigger = models.CharField(max_length=20, default="manual")
@@ -33,6 +43,16 @@ class CollectionRun(models.Model):
     state = models.CharField(max_length=32, choices=RunState.choices, default=RunState.QUEUED, db_index=True)
     counters = models.JSONField(default=dict)
     error_summary = models.JSONField(null=True, blank=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    terminal_impact = models.JSONField(default=dict)
+    recovery_state = models.CharField(
+        max_length=32,
+        choices=RecoveryState.choices,
+        default=RecoveryState.IN_PROGRESS,
+        db_index=True,
+    )
+    next_recovery_at = models.DateTimeField(null=True, blank=True)
     stop_requested_at = models.DateTimeField(null=True, blank=True)
     requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -106,6 +126,8 @@ class RunStep(models.Model):
     run = models.ForeignKey(CollectionRun, on_delete=models.CASCADE, related_name="steps")
     name = models.CharField(max_length=64)
     attempt_no = models.PositiveIntegerField(default=1)
+    correlation_id = models.UUIDField(editable=False, db_index=True)
+    worker_task_id = models.CharField(max_length=255, null=True, blank=True)
     state = models.CharField(max_length=20, default="queued")
     input_count = models.PositiveIntegerField(default=0)
     output_count = models.PositiveIntegerField(default=0)
@@ -114,6 +136,35 @@ class RunStep(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
     fanout_completed_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    retry_at = models.DateTimeField(null=True, blank=True)
+    terminal_impact = models.JSONField(default=dict)
+    recovery_state = models.CharField(
+        max_length=32,
+        choices=RecoveryState.choices,
+        default=RecoveryState.IN_PROGRESS,
+        db_index=True,
+    )
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["run", "name", "attempt_no"], name="uq_run_step_attempt")]
+
+    def save(self, *args, **kwargs):
+        if self.run_id:
+            run = self._state.fields_cache.get("run")
+            if run is None or run.pk != self.run_id:
+                database = kwargs.get("using") or self._state.db
+                run = CollectionRun.objects.using(database).only(
+                    "correlation_id"
+                ).get(
+                    pk=self.run_id
+                )
+            if self.correlation_id != run.correlation_id:
+                self.correlation_id = run.correlation_id
+                update_fields = kwargs.get("update_fields")
+                if update_fields is not None:
+                    kwargs["update_fields"] = tuple(
+                        {*update_fields, "correlation_id"}
+                    )
+        return super().save(*args, **kwargs)

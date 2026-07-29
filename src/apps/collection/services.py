@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import uuid
 from datetime import datetime
 
 from django.db import transaction
@@ -11,8 +12,21 @@ from django.utils import timezone
 from adapters.sources import build_source_adapter
 from apps.topics.services import current_registry
 from wisdome_writer.infrastructure.outbox import enqueue_event
+from wisdome_writer.observability import (
+    current_correlation_uuid,
+    current_task_id,
+    elapsed_milliseconds,
+)
 
-from .models import CollectionRun, RunSourceItem, RunState, RunStep, SourceCollectionAttempt, SourceItem
+from .models import (
+    CollectionRun,
+    RecoveryState,
+    RunSourceItem,
+    RunState,
+    RunStep,
+    SourceCollectionAttempt,
+    SourceItem,
+)
 
 
 def _hash(value) -> str:
@@ -20,9 +34,135 @@ def _hash(value) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _bounded_count(value: int) -> int:
+    return min(max(int(value), 0), 2147483647)
+
+
+def _terminal_impact(
+    *,
+    scope: str,
+    stage: str,
+    final_state: str,
+    affected_count: int,
+    error_code: str | None,
+) -> dict:
+    return {
+        "scope": scope,
+        "stage": str(stage)[:64],
+        "final_state": str(final_state)[:32],
+        "affected_count": _bounded_count(affected_count),
+        "error_code": (
+            str(error_code)[:100]
+            if error_code
+            else None
+        ),
+    }
+
+
+def begin_step_observation(
+    step: RunStep,
+    run: CollectionRun,
+    *,
+    started_at,
+) -> None:
+    step.correlation_id = run.correlation_id
+    task_id = current_task_id()
+    if task_id:
+        step.worker_task_id = str(task_id)[:255]
+    step.retry_count = max(
+        step.retry_count,
+        max(step.attempt_no - 1, 0),
+    )
+    step.started_at = step.started_at or started_at
+    step.finished_at = None
+    step.duration_ms = None
+    step.retry_at = None
+    step.terminal_impact = {}
+    step.recovery_state = (
+        RecoveryState.AUTOMATIC_RETRY
+        if step.retry_count
+        else RecoveryState.IN_PROGRESS
+    )
+
+
+def project_step_terminal_observation(
+    step: RunStep,
+    run: CollectionRun,
+    *,
+    finished_at,
+    final_state: str,
+    affected_count: int = 0,
+    error_code: str | None = None,
+    recovery_state: str = RecoveryState.NOT_REQUIRED,
+) -> None:
+    step.correlation_id = run.correlation_id
+    task_id = current_task_id()
+    if task_id:
+        step.worker_task_id = str(task_id)[:255]
+    step.retry_count = max(
+        step.retry_count,
+        max(step.attempt_no - 1, 0),
+    )
+    step.finished_at = step.finished_at or finished_at
+    step.duration_ms = elapsed_milliseconds(
+        step.started_at,
+        step.finished_at,
+    )
+    step.retry_at = None
+    step.terminal_impact = _terminal_impact(
+        scope="step",
+        stage=step.name,
+        final_state=final_state,
+        affected_count=affected_count,
+        error_code=error_code,
+    )
+    step.recovery_state = recovery_state
+
+
+def project_run_terminal_observation(
+    run: CollectionRun,
+    *,
+    finished_at,
+    stage: str,
+    final_state: str,
+    affected_count: int = 0,
+    error_code: str | None = None,
+    recovery_state: str = RecoveryState.NOT_REQUIRED,
+) -> None:
+    run.completed_at = run.completed_at or finished_at
+    run.duration_ms = elapsed_milliseconds(
+        run.started_at,
+        run.completed_at,
+    )
+    run.terminal_impact = _terminal_impact(
+        scope="run",
+        stage=stage,
+        final_state=final_state,
+        affected_count=affected_count,
+        error_code=error_code,
+    )
+    run.recovery_state = recovery_state
+    run.next_recovery_at = None
+
+
 @transaction.atomic
-def create_run(*, topic_code: str, window_start: datetime, window_end: datetime, user=None, trigger="manual"):
+def create_run(
+    *,
+    topic_code: str,
+    window_start: datetime,
+    window_end: datetime,
+    user=None,
+    trigger="manual",
+    correlation_id=None,
+    retry_count: int = 0,
+):
     registry = current_registry(topic_code)
+    resolved_correlation_id = (
+        uuid.UUID(str(correlation_id))
+        if correlation_id is not None
+        else current_correlation_uuid()
+    )
+    resolved_retry_count = _bounded_count(retry_count)
     fingerprint = _hash(
         {
             "topic": topic_code,
@@ -36,6 +176,7 @@ def create_run(*, topic_code: str, window_start: datetime, window_end: datetime,
     run, created = CollectionRun.objects.get_or_create(
         request_fingerprint=fingerprint,
         defaults={
+            "correlation_id": resolved_correlation_id,
             "display_id": f"RUN-{timezone.now():%Y%m%d}-{secrets.token_hex(3).upper()}",
             "topic_code": topic_code,
             "trigger": trigger,
@@ -44,6 +185,7 @@ def create_run(*, topic_code: str, window_start: datetime, window_end: datetime,
             "source_registry": registry,
             "registry_manifest_hash": registry.manifest_hash,
             "requested_by": user,
+            "retry_count": resolved_retry_count,
         },
     )
     return run, created
@@ -98,33 +240,88 @@ def collect_run(run: CollectionRun) -> CollectionRun:
                 name="collect",
                 attempt_no=1,
             )
+            now = timezone.now()
             step.state = "stopped"
             step.error_code = "stop_requested"
             step.error_detail_redacted = "collection stopped by request"
-            step.finished_at = step.finished_at or timezone.now()
+            project_step_terminal_observation(
+                step,
+                run,
+                finished_at=now,
+                final_state=step.state,
+                affected_count=step.input_count,
+                error_code=step.error_code,
+                recovery_state=RecoveryState.STOPPED,
+            )
             step.save(
                 update_fields=(
+                    "correlation_id",
+                    "worker_task_id",
                     "state",
                     "error_code",
                     "error_detail_redacted",
                     "finished_at",
+                    "duration_ms",
+                    "retry_count",
+                    "retry_at",
+                    "terminal_impact",
+                    "recovery_state",
                 )
             )
             run.state = RunState.STOPPED
-            run.completed_at = run.completed_at or timezone.now()
-            run.save(update_fields=["state", "completed_at"])
+            project_run_terminal_observation(
+                run,
+                finished_at=now,
+                stage="collect",
+                final_state=run.state,
+                error_code="stop_requested",
+                recovery_state=RecoveryState.STOPPED,
+            )
+            run.save(
+                update_fields=[
+                    "state",
+                    "completed_at",
+                    "duration_ms",
+                    "terminal_impact",
+                    "recovery_state",
+                    "next_recovery_at",
+                ]
+            )
             return run
+        now = timezone.now()
         run.state = RunState.COLLECTING
-        run.started_at = run.started_at or timezone.now()
-        run.save(update_fields=["state", "started_at"])
+        run.started_at = run.started_at or now
+        run.recovery_state = RecoveryState.IN_PROGRESS
+        run.next_recovery_at = None
+        run.save(
+            update_fields=[
+                "state",
+                "started_at",
+                "recovery_state",
+                "next_recovery_at",
+            ]
+        )
         step, _ = RunStep.objects.select_for_update().get_or_create(
             run=run,
             name="collect",
             attempt_no=1,
         )
         step.state = "running"
-        step.started_at = timezone.now()
-        step.save(update_fields=["state", "started_at"])
+        begin_step_observation(step, run, started_at=now)
+        step.save(
+            update_fields=[
+                "correlation_id",
+                "worker_task_id",
+                "state",
+                "started_at",
+                "finished_at",
+                "duration_ms",
+                "retry_count",
+                "retry_at",
+                "terminal_impact",
+                "recovery_state",
+            ]
+        )
     collected = 0
     failed = 0
     memberships = run.source_registry.memberships.select_related("source_snapshot__source").filter(enabled=True)
@@ -181,39 +378,94 @@ def collect_run(run: CollectionRun) -> CollectionRun:
             failed += 1
             attempt.state = "failed"
             attempt.error_code = exc.__class__.__name__
-            attempt.error_detail_redacted = str(exc)[:500]
+            attempt.error_detail_redacted = "source collection failed"
         attempt.finished_at = timezone.now()
         attempt.save()
     with transaction.atomic():
         run = CollectionRun.objects.select_for_update().get(pk=run.pk)
         step = RunStep.objects.select_for_update().get(pk=step.pk)
+        now = timezone.now()
+        source_count = memberships.count()
         if run.stop_requested_at:
             run.state = RunState.STOPPED
-            run.completed_at = timezone.now()
+            project_run_terminal_observation(
+                run,
+                finished_at=now,
+                stage="collect",
+                final_state=run.state,
+                affected_count=failed,
+                error_code="stop_requested",
+                recovery_state=RecoveryState.STOPPED,
+            )
         else:
             run.state = RunState.EXTRACTING
         run.counters = {
             **run.counters,
-            "sources": memberships.count(),
+            "sources": source_count,
             "items": collected,
             "sourceFailures": failed,
         }
-        run.save(update_fields=["state", "completed_at", "counters"])
+        run.save(
+            update_fields=[
+                "state",
+                "completed_at",
+                "counters",
+                "duration_ms",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
+            ]
+        )
         if run.state == RunState.STOPPED:
             step.state = "stopped"
             step.error_code = "stop_requested"
             step.error_detail_redacted = "collection stopped by request"
         else:
-            step.state = "succeeded" if failed < memberships.count() else "failed"
+            step.state = "succeeded" if failed < source_count else "failed"
+            if step.state == "failed":
+                step.error_code = (
+                    "no_enabled_sources"
+                    if source_count == 0
+                    else "all_sources_failed"
+                )
+                step.error_detail_redacted = (
+                    "collection did not produce a successful source result"
+                )
         step.output_count = collected
-        step.finished_at = timezone.now()
+        impact_error_code = step.error_code
+        if step.state == "succeeded" and failed:
+            impact_error_code = "partial_source_failure"
+        project_step_terminal_observation(
+            step,
+            run,
+            finished_at=now,
+            final_state=step.state,
+            affected_count=failed,
+            error_code=impact_error_code,
+            recovery_state=(
+                RecoveryState.MANUAL_REQUIRED
+                if step.state == "failed"
+                else (
+                    RecoveryState.STOPPED
+                    if step.state == "stopped"
+                    else RecoveryState.NOT_REQUIRED
+                )
+            ),
+        )
         step.save(
             update_fields=[
+                "correlation_id",
+                "worker_task_id",
                 "state",
                 "output_count",
                 "error_code",
                 "error_detail_redacted",
                 "finished_at",
+                "duration_ms",
+                "retry_count",
+                "retry_at",
+                "terminal_impact",
+                "recovery_state",
             ]
         )
         if run.state == RunState.EXTRACTING:
@@ -224,5 +476,6 @@ def collect_run(run: CollectionRun) -> CollectionRun:
                 job_id=run.id,
                 dedupe_key=f"run.evidence_requested:{run.id}",
                 payload={"run_id": str(run.id)},
+                correlation_id=run.correlation_id,
             )
     return run

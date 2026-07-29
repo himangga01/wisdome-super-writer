@@ -1,6 +1,7 @@
 from celery import shared_task
 
 from apps.audit.services import AuditContext
+from wisdome_writer.observability import current_correlation_uuid
 
 from .services import dispatch_due_schedules, release_queued_dispatch
 
@@ -8,7 +9,9 @@ from .services import dispatch_due_schedules, release_queued_dispatch
 @shared_task
 def dispatch_due_schedules_task():
     audit_context = AuditContext.for_system(
-        correlation_id=dispatch_due_schedules_task.request.id,
+        correlation_id=current_correlation_uuid(
+            fallback=dispatch_due_schedules_task.request.id
+        ),
         operation_key="schedule-due-scan",
         reason_code="scheduled due scan",
     )
@@ -19,7 +22,9 @@ def dispatch_due_schedules_task():
 @shared_task
 def dispatch_queued_schedule(schedule_id: str):
     audit_context = AuditContext.for_system(
-        correlation_id=dispatch_queued_schedule.request.id,
+        correlation_id=current_correlation_uuid(
+            fallback=dispatch_queued_schedule.request.id
+        ),
         operation_key="schedule-queued-release",
         reason_code="queued schedule release",
     )

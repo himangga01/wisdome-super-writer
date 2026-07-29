@@ -31,7 +31,17 @@ from adapters.extractors.spreadsheet import SpreadsheetExtractor
 from adapters.extractors.structured import StructuredDataExtractor
 from adapters.storage import ObjectInfo, S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
-from apps.collection.models import CollectionRun, RunState, RunStep
+from apps.collection.models import (
+    CollectionRun,
+    RecoveryState,
+    RunState,
+    RunStep,
+)
+from apps.collection.services import (
+    begin_step_observation,
+    project_run_terminal_observation,
+    project_step_terminal_observation,
+)
 from wisdome_writer.infrastructure.http_safety import (
     HttpSafetyError,
     OutboundResponseTooLarge,
@@ -73,6 +83,42 @@ from .services import (
 )
 
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
+
+
+def _begin_domain_step_observation(
+    step: RunStep,
+    run: CollectionRun,
+    *,
+    started_at,
+) -> None:
+    begin_step_observation(
+        step,
+        run,
+        started_at=started_at,
+    )
+    step.retry_count = max(step.attempt_no - 1, 0)
+
+
+def _project_domain_step_terminal(
+    step: RunStep,
+    run: CollectionRun,
+    *,
+    finished_at,
+    final_state: str,
+    affected_count: int = 0,
+    error_code: str | None = None,
+    recovery_state: str = RecoveryState.NOT_REQUIRED,
+) -> None:
+    project_step_terminal_observation(
+        step,
+        run,
+        finished_at=finished_at,
+        final_state=final_state,
+        affected_count=affected_count,
+        error_code=error_code,
+        recovery_state=recovery_state,
+    )
+    step.retry_count = max(step.attempt_no - 1, 0)
 
 
 def _document_input_fingerprint(
@@ -839,7 +885,6 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                 aggregate_type="DocumentExtraction",
                 aggregate_id=document.id,
                 message_key=f"evidence.document_ready:{document.id}:{document.selected_evidence_manifest_hash}",
-                correlation_id=document.run_source_item.run_id,
                 payload={
                     "run_id": str(document.run_source_item.run_id),
                     "run_source_item_id": str(document.run_source_item_id),
@@ -1078,7 +1123,6 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 aggregate_type="GenericExtractionAttempt",
                 aggregate_id=attempt.id,
                 message_key=f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}",
-                correlation_id=attempt.run_source_item.run_id,
                 payload={
                     "run_id": str(attempt.run_source_item.run_id),
                     "run_source_item_id": str(attempt.run_source_item_id),
@@ -1562,14 +1606,29 @@ def finalize_run_evidence(run_id: str):
                 "Selected successful extraction run has no evidence assets"
             )
             step.state = "failed"
-            step.finished_at = now
+            _project_domain_step_terminal(
+                step,
+                run,
+                finished_at=now,
+                final_state=step.state,
+                affected_count=max(failure_count, 1),
+                error_code=error_code,
+                recovery_state=RecoveryState.MANUAL_REQUIRED,
+            )
             step.save(
                 update_fields=(
+                    "correlation_id",
+                    "worker_task_id",
                     "output_count",
                     "error_code",
                     "error_detail_redacted",
                     "state",
                     "finished_at",
+                    "duration_ms",
+                    "retry_count",
+                    "retry_at",
+                    "terminal_impact",
+                    "recovery_state",
                 )
             )
             run.state = RunState.FAILED
@@ -1583,12 +1642,25 @@ def finalize_run_evidence(run_id: str):
                 "evidence": evidence_count,
                 "extractionFailures": failure_count,
             }
+            project_run_terminal_observation(
+                run,
+                finished_at=now,
+                stage="extract",
+                final_state=run.state,
+                affected_count=max(failure_count, 1),
+                error_code=error_code,
+                recovery_state=RecoveryState.MANUAL_REQUIRED,
+            )
             run.save(
                 update_fields=(
                     "state",
                     "error_summary",
                     "completed_at",
                     "counters",
+                    "duration_ms",
+                    "terminal_impact",
+                    "recovery_state",
+                    "next_recovery_at",
                 )
             )
             return {
@@ -1604,15 +1676,56 @@ def finalize_run_evidence(run_id: str):
             f"failed document/generic attempts: {failure_count}" if failure_count else None
         )
         step.state = "failed" if evidence_count == 0 else "succeeded"
-        step.finished_at = timezone.now()
-        step.save()
+        finished_at = timezone.now()
+        _project_domain_step_terminal(
+            step,
+            run,
+            finished_at=finished_at,
+            final_state=step.state,
+            affected_count=(
+                max(failure_count, step.input_count)
+                if step.state == "failed"
+                else failure_count
+            ),
+            error_code=step.error_code,
+            recovery_state=(
+                RecoveryState.MANUAL_REQUIRED
+                if step.state == "failed"
+                else RecoveryState.NOT_REQUIRED
+            ),
+        )
+        step.save(
+            update_fields=(
+                "correlation_id",
+                "worker_task_id",
+                "output_count",
+                "error_code",
+                "error_detail_redacted",
+                "state",
+                "finished_at",
+                "duration_ms",
+                "retry_count",
+                "retry_at",
+                "terminal_impact",
+                "recovery_state",
+            )
+        )
         run.state = RunState.VALIDATING
+        run.recovery_state = RecoveryState.IN_PROGRESS
+        run.next_recovery_at = None
         run.counters = {
             **run.counters,
             "evidence": evidence_count,
             "extractionFailures": failure_count,
         }
-        run.save(update_fields=("state", "counters"))
+        run.save(
+            update_fields=(
+                "state",
+                "counters",
+                "recovery_state",
+                "next_recovery_at",
+            )
+        )
         enqueue_event(
             event_type="run.draft_requested",
             aggregate_type="collection_run",
@@ -1648,13 +1761,32 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
         step.state = "stopped" if stopped else "failed"
         step.error_code = redacted_code
         step.error_detail_redacted = "evidence fan-out delivery exhausted"
-        step.finished_at = now
+        _project_domain_step_terminal(
+            step,
+            run,
+            finished_at=now,
+            final_state=step.state,
+            affected_count=step.input_count,
+            error_code=step.error_code,
+            recovery_state=(
+                RecoveryState.STOPPED
+                if stopped
+                else RecoveryState.MANUAL_REQUIRED
+            ),
+        )
         step.save(
             update_fields=(
+                "correlation_id",
+                "worker_task_id",
                 "state",
                 "error_code",
                 "error_detail_redacted",
                 "finished_at",
+                "duration_ms",
+                "retry_count",
+                "retry_at",
+                "terminal_impact",
+                "recovery_state",
             )
         )
         if stopped:
@@ -1666,12 +1798,28 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
                 "stage": "extract",
                 "code": redacted_code,
             }
-        run.completed_at = now
+        project_run_terminal_observation(
+            run,
+            finished_at=now,
+            stage="extract",
+            final_state=run.state,
+            affected_count=step.input_count,
+            error_code=redacted_code,
+            recovery_state=(
+                RecoveryState.STOPPED
+                if stopped
+                else RecoveryState.MANUAL_REQUIRED
+            ),
+        )
         run.save(
             update_fields=(
                 "state",
                 "error_summary",
                 "completed_at",
+                "duration_ms",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
             )
         )
         return {
@@ -1693,24 +1841,57 @@ def _stop_run_evidence_locked(
         step.output_count = output_count
     step.error_code = "stop_requested"
     step.error_detail_redacted = "evidence fan-out stopped by request"
-    step.finished_at = now
+    _project_domain_step_terminal(
+        step,
+        run,
+        finished_at=now,
+        final_state=step.state,
+        affected_count=max(
+            step.input_count - step.output_count,
+            0,
+        ),
+        error_code=step.error_code,
+        recovery_state=RecoveryState.STOPPED,
+    )
     step.save(
         update_fields=(
+            "correlation_id",
+            "worker_task_id",
             "state",
             "output_count",
             "error_code",
             "error_detail_redacted",
             "finished_at",
+            "duration_ms",
+            "retry_count",
+            "retry_at",
+            "terminal_impact",
+            "recovery_state",
         )
     )
     run.state = RunState.STOPPED
     run.error_summary = None
-    run.completed_at = now
+    project_run_terminal_observation(
+        run,
+        finished_at=now,
+        stage="extract",
+        final_state=run.state,
+        affected_count=max(
+            step.input_count - step.output_count,
+            0,
+        ),
+        error_code="stop_requested",
+        recovery_state=RecoveryState.STOPPED,
+    )
     run.save(
         update_fields=(
             "state",
             "error_summary",
             "completed_at",
+            "duration_ms",
+            "terminal_impact",
+            "recovery_state",
+            "next_recovery_at",
         )
     )
     return {"runId": str(run.id), "state": run.state}
@@ -1803,13 +1984,28 @@ def _finalize_run_evidence_wake_failure_locked(
     step.error_detail_redacted = (
         "evidence finalizer delivery exhausted before completion"
     )
-    step.finished_at = step.finished_at or now
+    _project_domain_step_terminal(
+        step,
+        run,
+        finished_at=now,
+        final_state=step.state,
+        affected_count=step.input_count,
+        error_code=step.error_code,
+        recovery_state=RecoveryState.MANUAL_REQUIRED,
+    )
     step.save(
         update_fields=(
+            "correlation_id",
+            "worker_task_id",
             "state",
             "error_code",
             "error_detail_redacted",
             "finished_at",
+            "duration_ms",
+            "retry_count",
+            "retry_at",
+            "terminal_impact",
+            "recovery_state",
         )
     )
     run.state = RunState.FAILED
@@ -1817,12 +2013,24 @@ def _finalize_run_evidence_wake_failure_locked(
         "stage": "extract",
         "code": redacted_code,
     }
-    run.completed_at = run.completed_at or now
+    project_run_terminal_observation(
+        run,
+        finished_at=now,
+        stage="extract",
+        final_state=run.state,
+        affected_count=step.input_count,
+        error_code=redacted_code,
+        recovery_state=RecoveryState.MANUAL_REQUIRED,
+    )
     run.save(
         update_fields=(
             "state",
             "error_summary",
             "completed_at",
+            "duration_ms",
+            "terminal_impact",
+            "recovery_state",
+            "next_recovery_at",
         )
     )
     return {
@@ -1934,9 +2142,28 @@ def process_run_evidence(run_id: str):
                 "fanoutComplete": True,
             }
         step.state = "running"
-        step.started_at = step.started_at or timezone.now()
+        started_at = timezone.now()
+        _begin_domain_step_observation(
+            step,
+            run,
+            started_at=started_at,
+        )
         step.input_count = run.run_source_items.count()
-        step.save(update_fields=("state", "started_at", "input_count"))
+        step.save(
+            update_fields=(
+                "correlation_id",
+                "worker_task_id",
+                "state",
+                "started_at",
+                "finished_at",
+                "input_count",
+                "duration_ms",
+                "retry_count",
+                "retry_at",
+                "terminal_impact",
+                "recovery_state",
+            )
+        )
 
     output_count = 0
     failures: list[dict[str, str]] = []

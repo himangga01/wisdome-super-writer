@@ -2,8 +2,12 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from .models import CollectionRun, RunState, RunStep
-from .services import collect_run
+from .models import CollectionRun, RecoveryState, RunState, RunStep
+from .services import (
+    collect_run,
+    project_run_terminal_observation,
+    project_step_terminal_observation,
+)
 
 
 @shared_task(name="apps.collection.tasks.execute_collection_run")
@@ -84,13 +88,28 @@ def _finalize_collection_run_delivery_failure(
                 step.error_detail_redacted = (
                     "collection delivery stopped by request"
                 )
-                step.finished_at = step.finished_at or now
+                project_step_terminal_observation(
+                    step,
+                    run,
+                    finished_at=now,
+                    final_state=step.state,
+                    affected_count=step.input_count,
+                    error_code=step.error_code,
+                    recovery_state=RecoveryState.STOPPED,
+                )
                 step.save(
                     update_fields=(
+                        "correlation_id",
+                        "worker_task_id",
                         "state",
                         "error_code",
                         "error_detail_redacted",
                         "finished_at",
+                        "duration_ms",
+                        "retry_count",
+                        "retry_at",
+                        "terminal_impact",
+                        "recovery_state",
                     )
                 )
             run.state = RunState.STOPPED
@@ -106,21 +125,55 @@ def _finalize_collection_run_delivery_failure(
                 "stage": "collect",
                 "code": redacted_code,
             }
-            step.finished_at = step.finished_at or now
+            project_step_terminal_observation(
+                step,
+                run,
+                finished_at=now,
+                final_state=step.state,
+                affected_count=step.input_count,
+                error_code=step.error_code,
+                recovery_state=RecoveryState.MANUAL_REQUIRED,
+            )
             step.save(
                 update_fields=(
+                    "correlation_id",
+                    "worker_task_id",
                     "state",
                     "error_code",
                     "error_detail_redacted",
                     "finished_at",
+                    "duration_ms",
+                    "retry_count",
+                    "retry_at",
+                    "terminal_impact",
+                    "recovery_state",
                 )
             )
-        run.completed_at = run.completed_at or now
+        project_run_terminal_observation(
+            run,
+            finished_at=now,
+            stage="collect",
+            final_state=run.state,
+            error_code=(
+                "stop_requested"
+                if stopping
+                else redacted_code
+            ),
+            recovery_state=(
+                RecoveryState.STOPPED
+                if stopping
+                else RecoveryState.MANUAL_REQUIRED
+            ),
+        )
         run.save(
             update_fields=(
                 "state",
                 "error_summary",
                 "completed_at",
+                "duration_ms",
+                "terminal_impact",
+                "recovery_state",
+                "next_recovery_at",
             )
         )
         return {
