@@ -566,7 +566,7 @@ def enqueue_event(
 
 
 @transaction.atomic
-def claim_events(
+def claim_exhausted_events(
     *,
     limit: int = 100,
     lease_seconds: int = 60,
@@ -576,20 +576,47 @@ def claim_events(
     claimable = Q(status=OutboxMessage.Status.PENDING) | Q(
         status=OutboxMessage.Status.DISPATCHING, claimed_until__lte=now
     )
-    exhausted = (
+    messages = list(
         OutboxMessage.objects.select_for_update(skip_locked=True)
-        .filter(claimable, attempts__gte=F("max_attempts"))
+        .filter(
+            claimable,
+            available_at__lte=now,
+            attempts__gte=F("max_attempts"),
+        )
         .filter(Q(claimed_until__isnull=True) | Q(claimed_until__lte=now))
+        .order_by("available_at", "created_at", "id")[: max(1, limit)]
     )
-    exhausted.update(
-        status=OutboxMessage.Status.DEAD_LETTER,
-        dead_lettered_at=now,
-        last_error_at=now,
-        last_error_code="dispatch_attempts_exhausted",
-        lease_owner="",
-        lease_token=None,
-        claimed_at=None,
-        claimed_until=None,
+    lease_until = now + timedelta(seconds=max(1, lease_seconds))
+    for message in messages:
+        message.status = OutboxMessage.Status.DISPATCHING
+        message.claimed_at = now
+        message.claimed_until = lease_until
+        message.lease_owner = lease_owner[:160]
+        message.lease_token = uuid.uuid4()
+        message.lease_generation += 1
+        message.save(
+            update_fields=(
+                "status",
+                "claimed_at",
+                "claimed_until",
+                "lease_owner",
+                "lease_token",
+                "lease_generation",
+            )
+        )
+    return messages
+
+
+@transaction.atomic
+def claim_events(
+    *,
+    limit: int = 100,
+    lease_seconds: int = 60,
+    lease_owner: str = "outbox-dispatcher",
+) -> list[OutboxMessage]:
+    now = timezone.now()
+    claimable = Q(status=OutboxMessage.Status.PENDING) | Q(
+        status=OutboxMessage.Status.DISPATCHING, claimed_until__lte=now
     )
     messages = list(
         OutboxMessage.objects.select_for_update(skip_locked=True)
@@ -674,40 +701,149 @@ def dead_letter_consumer_event(
     *,
     consumer_name: str,
     error_code: str,
+    terminal_handler: Callable[..., Any] | None = None,
+    terminal_argument_keys: tuple[str, ...] = (),
+    increment_attempt: bool = True,
+    expected_dispatch_lease_token: uuid.UUID | str | None = None,
+    expected_dispatch_lease_generation: int | None = None,
+    expected_consumer_lease_token: uuid.UUID | str | None = None,
+    expected_consumer_lease_generation: int | None = None,
 ) -> dict[str, Any]:
     now = timezone.now()
     event = OutboxMessage.objects.select_for_update().get(pk=event_id)
-    receipt, _ = OutboxConsumerReceipt.objects.select_for_update().get_or_create(
+    receipt, receipt_created = (
+        OutboxConsumerReceipt.objects.select_for_update().get_or_create(
         event=event,
         consumer_name=consumer_name,
+        )
     )
-    if (
+    dispatch_fenced = expected_dispatch_lease_token is not None
+    if dispatch_fenced and (
+        event.status != OutboxMessage.Status.DISPATCHING
+        or event.lease_token != _uuid(expected_dispatch_lease_token)
+        or event.lease_generation != expected_dispatch_lease_generation
+        or event.claimed_until is None
+        or event.claimed_until <= now
+    ):
+        return {"state": "stale_fenced", "attempt": receipt.attempts}
+    succeeded = (
         receipt.state == OutboxConsumerReceipt.State.SUCCEEDED
         or event.consumer_receipts.filter(
             state=OutboxConsumerReceipt.State.SUCCEEDED
         ).exists()
+    )
+    if dispatch_fenced and (
+        succeeded
+        or (
+            not receipt_created
+            and receipt.state
+            in {
+                OutboxConsumerReceipt.State.PROCESSING,
+                OutboxConsumerReceipt.State.RETRY,
+            }
+        )
     ):
+        event.status = OutboxMessage.Status.PUBLISHED
+        event.published_at = event.published_at or now
+        event.claimed_at = None
+        event.claimed_until = None
+        event.lease_owner = ""
+        event.lease_token = None
+        event.last_error_code = None
+        event.last_error_at = None
+        event.save(
+            update_fields=(
+                "status",
+                "published_at",
+                "claimed_at",
+                "claimed_until",
+                "lease_owner",
+                "lease_token",
+                "last_error_code",
+                "last_error_at",
+            )
+        )
+        return {"state": "accepted", "attempt": receipt.attempts}
+    if succeeded:
         return {"state": "duplicate", "attempt": receipt.attempts}
     if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
+        if event.status != OutboxMessage.Status.DEAD_LETTER:
+            event.status = OutboxMessage.Status.DEAD_LETTER
+            event.dead_lettered_at = receipt.dead_lettered_at or now
+            event.last_error_at = now
+            event.last_error_code = (
+                receipt.last_error_code or error_code[:120]
+            )
+            event.claimed_at = None
+            event.claimed_until = None
+            event.lease_owner = ""
+            event.lease_token = None
+            event.save(
+                update_fields=(
+                    "status",
+                    "dead_lettered_at",
+                    "last_error_at",
+                    "last_error_code",
+                    "claimed_at",
+                    "claimed_until",
+                    "lease_owner",
+                    "lease_token",
+                )
+            )
         return {"state": "dead_letter", "attempt": receipt.attempts}
+    if expected_consumer_lease_token is not None and (
+        receipt.state != OutboxConsumerReceipt.State.PROCESSING
+        or receipt.lease_token != _uuid(expected_consumer_lease_token)
+        or receipt.lease_generation != expected_consumer_lease_generation
+    ):
+        return {"state": "stale_fenced", "attempt": receipt.attempts}
+    if terminal_handler is not None:
+        if len(terminal_argument_keys) == 1:
+            terminal_args = [str(event.aggregate_id)]
+        else:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            terminal_args = [payload[key] for key in terminal_argument_keys]
+        with event_context(event_envelope(event)):
+            terminal_handler(*terminal_args, error_code[:120])
     receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
-    receipt.attempts += 1
+    if increment_attempt:
+        receipt.attempts += 1
     receipt.last_error_code = error_code[:120]
     receipt.dead_lettered_at = now
+    receipt.next_retry_at = None
     receipt.claimed_at = None
     receipt.claimed_until = None
     receipt.lease_token = None
-    receipt.save()
+    receipt.save(
+        update_fields=(
+            "state",
+            "attempts",
+            "last_error_code",
+            "dead_lettered_at",
+            "next_retry_at",
+            "claimed_at",
+            "claimed_until",
+            "lease_token",
+        )
+    )
     event.status = OutboxMessage.Status.DEAD_LETTER
     event.dead_lettered_at = now
     event.last_error_at = now
     event.last_error_code = error_code[:120]
+    event.claimed_at = None
+    event.claimed_until = None
+    event.lease_owner = ""
+    event.lease_token = None
     event.save(
         update_fields=(
             "status",
             "dead_lettered_at",
             "last_error_at",
             "last_error_code",
+            "claimed_at",
+            "claimed_until",
+            "lease_owner",
+            "lease_token",
         )
     )
     return {"state": "dead_letter", "attempt": receipt.attempts}
@@ -774,6 +910,29 @@ def mark_failed(
         )
     if _lease_filter(message).update(**updates) != 1:
         raise LostOutboxLease("stale dispatcher cannot NACK this event")
+
+
+def mark_terminal_retry(
+    message: OutboxMessage,
+    *,
+    error_code: str,
+) -> None:
+    now = timezone.now()
+    updates = {
+        "status": OutboxMessage.Status.PENDING,
+        "available_at": now
+        + timedelta(seconds=_backoff_seconds(message.id, message.attempts)),
+        "last_error_code": error_code[:120],
+        "last_error_at": now,
+        "claimed_at": None,
+        "claimed_until": None,
+        "lease_owner": "",
+        "lease_token": None,
+    }
+    if _lease_filter(message).update(**updates) != 1:
+        raise LostOutboxLease(
+            "stale dispatcher cannot release failed terminalization"
+        )
 
 
 def _verify_received_envelope(event: OutboxMessage, envelope: dict[str, Any]) -> None:
@@ -864,6 +1023,18 @@ def consume_event(
             return {"state": "duplicate", "attempt": receipt.attempts}
         if receipt.state == OutboxConsumerReceipt.State.DEAD_LETTER:
             return {"state": "dead_letter", "attempt": receipt.attempts}
+        if event.status == OutboxMessage.Status.DEAD_LETTER:
+            return dead_letter_consumer_event(
+                event_id,
+                consumer_name=consumer_name,
+                error_code=(
+                    event.last_error_code
+                    or "persisted_event_dead_letter"
+                ),
+                terminal_handler=terminal_handler,
+                terminal_argument_keys=terminal_argument_keys,
+                increment_attempt=False,
+            )
         if (
             receipt.state == OutboxConsumerReceipt.State.PROCESSING
             and infrastructure_lease_token is not None
@@ -882,39 +1053,15 @@ def consume_event(
             _verify_received_envelope(event, envelope)
             validate_persisted_event(event)
         except (ForbiddenEventPayload, OutboxConflict) as exc:
-            receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
-            receipt.attempts += 1
-            receipt.last_error_code = str(
-                getattr(exc, "code", exc.__class__.__name__)
-            )[:120]
-            receipt.dead_lettered_at = now
-            receipt.claimed_at = None
-            receipt.claimed_until = None
-            receipt.lease_token = None
-            receipt.save(
-                update_fields=(
-                    "state",
-                    "attempts",
-                    "last_error_code",
-                    "dead_lettered_at",
-                    "claimed_at",
-                    "claimed_until",
-                    "lease_token",
-                )
+            return dead_letter_consumer_event(
+                event_id,
+                consumer_name=consumer_name,
+                error_code=str(
+                    getattr(exc, "code", exc.__class__.__name__)
+                ),
+                terminal_handler=terminal_handler,
+                terminal_argument_keys=terminal_argument_keys,
             )
-            event.status = OutboxMessage.Status.DEAD_LETTER
-            event.dead_lettered_at = now
-            event.last_error_at = now
-            event.last_error_code = receipt.last_error_code
-            event.save(
-                update_fields=(
-                    "status",
-                    "dead_lettered_at",
-                    "last_error_at",
-                    "last_error_code",
-                )
-            )
-            return {"state": "dead_letter", "attempt": receipt.attempts}
         if (
             receipt.state == OutboxConsumerReceipt.State.PROCESSING
             and receipt.claimed_until
@@ -936,44 +1083,14 @@ def consume_event(
                 "retry_at": receipt.next_retry_at.isoformat(),
             }
         if receipt.attempts >= consumer_attempt_limit:
-            error_code = "consumer_attempts_exhausted"
-            if terminal_handler is not None:
-                terminal_args = [
-                    event.payload[key] for key in terminal_argument_keys
-                ]
-                with event_context(envelope):
-                    terminal_handler(*terminal_args, error_code)
-            receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
-            receipt.last_error_code = error_code
-            receipt.dead_lettered_at = now
-            receipt.next_retry_at = None
-            receipt.claimed_at = None
-            receipt.claimed_until = None
-            receipt.lease_token = None
-            receipt.save(
-                update_fields=(
-                    "state",
-                    "last_error_code",
-                    "dead_lettered_at",
-                    "next_retry_at",
-                    "claimed_at",
-                    "claimed_until",
-                    "lease_token",
-                )
+            return dead_letter_consumer_event(
+                event_id,
+                consumer_name=consumer_name,
+                error_code="consumer_attempts_exhausted",
+                terminal_handler=terminal_handler,
+                terminal_argument_keys=terminal_argument_keys,
+                increment_attempt=False,
             )
-            event.status = OutboxMessage.Status.DEAD_LETTER
-            event.dead_lettered_at = now
-            event.last_error_at = now
-            event.last_error_code = error_code
-            event.save(
-                update_fields=(
-                    "status",
-                    "dead_lettered_at",
-                    "last_error_at",
-                    "last_error_code",
-                )
-            )
-            return {"state": "dead_letter", "attempt": receipt.attempts}
         receipt.state = OutboxConsumerReceipt.State.PROCESSING
         receipt.attempts += 1
         receipt.started_at = now
@@ -1048,52 +1165,16 @@ def consume_event(
         args = [payload[key] for key in argument_keys]
     except KeyError as exc:
         try:
-            with transaction.atomic():
-                receipt = _lock_owned_consumer_receipt(
-                    event_id=event_id,
-                    consumer_name=consumer_name,
-                    lease_token=lease_token,
-                    lease_generation=lease_generation,
-                )
-                if receipt is None:
-                    return {"state": "stale_fenced", "attempt": None}
-                receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
-                receipt.last_error_code = (
-                    f"missing_payload_{exc.args[0]}"[:120]
-                )
-                receipt.dead_lettered_at = timezone.now()
-                receipt.claimed_at = None
-                receipt.claimed_until = None
-                receipt.lease_token = None
-                receipt.save(
-                    update_fields=(
-                        "state",
-                        "last_error_code",
-                        "dead_lettered_at",
-                        "claimed_at",
-                        "claimed_until",
-                        "lease_token",
-                    )
-                )
-                event = OutboxMessage.objects.select_for_update().get(
-                    pk=event_id
-                )
-                event.status = OutboxMessage.Status.DEAD_LETTER
-                event.dead_lettered_at = timezone.now()
-                event.last_error_at = timezone.now()
-                event.last_error_code = receipt.last_error_code
-                event.save(
-                    update_fields=(
-                        "status",
-                        "dead_lettered_at",
-                        "last_error_at",
-                        "last_error_code",
-                    )
-                )
-                return {
-                    "state": "dead_letter",
-                    "attempt": receipt.attempts,
-                }
+            return dead_letter_consumer_event(
+                event_id,
+                consumer_name=consumer_name,
+                error_code=f"missing_payload_{exc.args[0]}",
+                terminal_handler=terminal_handler,
+                terminal_argument_keys=terminal_argument_keys,
+                increment_attempt=False,
+                expected_consumer_lease_token=lease_token,
+                expected_consumer_lease_generation=lease_generation,
+            )
         except DatabaseError as settlement_exc:
             raise consumer_infrastructure_error(
                 settlement_exc
@@ -1127,47 +1208,33 @@ def consume_event(
                 error_code = str(
                     getattr(exc, "code", exc.__class__.__name__)
                 )[:120]
-                if terminal and terminal_handler is not None:
-                    terminal_args = [
-                        event.payload[key]
-                        for key in terminal_argument_keys
-                    ]
-                    with event_context(envelope):
-                        terminal_handler(*terminal_args, error_code)
+                if terminal:
+                    return dead_letter_consumer_event(
+                        event_id,
+                        consumer_name=consumer_name,
+                        error_code=error_code,
+                        terminal_handler=terminal_handler,
+                        terminal_argument_keys=terminal_argument_keys,
+                        increment_attempt=False,
+                        expected_consumer_lease_token=lease_token,
+                        expected_consumer_lease_generation=lease_generation,
+                    )
                 receipt.state = (
-                    OutboxConsumerReceipt.State.DEAD_LETTER
-                    if terminal
-                    else OutboxConsumerReceipt.State.RETRY
+                    OutboxConsumerReceipt.State.RETRY
                 )
                 receipt.last_error_code = error_code
-                if terminal:
-                    receipt.dead_lettered_at = timezone.now()
-                    receipt.next_retry_at = None
-                    event.status = OutboxMessage.Status.DEAD_LETTER
-                    event.dead_lettered_at = timezone.now()
-                    event.last_error_at = timezone.now()
-                    event.last_error_code = error_code
-                    event.save(
-                        update_fields=(
-                            "status",
-                            "dead_lettered_at",
-                            "last_error_at",
-                            "last_error_code",
-                        )
+                retry_after = getattr(
+                    exc,
+                    "retry_after_seconds",
+                    None,
+                )
+                receipt.next_retry_at = timezone.now() + timedelta(
+                    seconds=_backoff_seconds(
+                        event_id,
+                        receipt.attempts,
+                        retry_after,
                     )
-                else:
-                    retry_after = getattr(
-                        exc,
-                        "retry_after_seconds",
-                        None,
-                    )
-                    receipt.next_retry_at = timezone.now() + timedelta(
-                        seconds=_backoff_seconds(
-                            event_id,
-                            receipt.attempts,
-                            retry_after,
-                        )
-                    )
+                )
                 receipt.claimed_at = None
                 receipt.claimed_until = None
                 receipt.lease_token = None

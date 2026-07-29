@@ -12,6 +12,7 @@ import httpx
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
 from django.db import DatabaseError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from adapters.extractors.base import (
@@ -28,7 +29,7 @@ from adapters.extractors.native_pdf import NativePdfExtractor
 from adapters.extractors.paddleocr import PaddleOCRExtractor
 from adapters.extractors.spreadsheet import SpreadsheetExtractor
 from adapters.extractors.structured import StructuredDataExtractor
-from adapters.storage import S3ObjectStorage
+from adapters.storage import ObjectInfo, S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
 from apps.collection.models import CollectionRun, RunState, RunStep
 from wisdome_writer.infrastructure.http_safety import (
@@ -86,6 +87,24 @@ def _document_input_fingerprint(
             "run_source_item_id": str(run_source_item_id),
             "input_kind": input_kind,
             "input_checksum": input_checksum,
+        }
+    )
+
+
+def _raw_input_fingerprint(
+    *,
+    run_source_item_id: Any,
+    source_item_id: Any,
+    input_kind: str,
+    input_hash: str,
+) -> str:
+    return canonical_hash(
+        {
+            "schema": "raw-input-v1",
+            "run_source_item_id": str(run_source_item_id),
+            "source_item_id": str(source_item_id),
+            "input_kind": input_kind,
+            "input_hash": input_hash,
         }
     )
 
@@ -366,37 +385,58 @@ def _verify_profile(profile: ExtractionProfileSnapshot) -> None:
 def _create_raw_evidence(run_source_item) -> EvidenceAsset:
     item = run_source_item.source_item
     content_hash = evidence_content_hash(text=item.body_text, structured_data=item.metadata, checksum=None)
-    existing = EvidenceAsset.objects.filter(
-        source_item=item,
-        origin_run_source_item=run_source_item,
-        derivation_type=EvidenceDerivationType.RAW,
-        kind=EvidenceKind.TEXT,
-        evidence_content_hash=content_hash,
-    ).first()
-    if existing:
-        return existing
-    rights = _rights(run_source_item)
-    evidence = EvidenceAsset.objects.create(
-        source_item=item,
-        origin_run_source_item=run_source_item,
-        derivation_type=EvidenceDerivationType.RAW,
-        kind=EvidenceKind.TEXT,
-        locator_type=LocatorType.STRUCTURED_PATH,
-        locator={"locator_type": "structured_path", "path_type": "record_key", "path": "body_text"},
-        extracted_text=item.body_text,
-        structured_data=item.metadata,
-        extraction_method="source_record",
-        extractor_version="v1",
-        evidence_content_hash=content_hash,
-        review_subject_hash="0" * 64,
-        review_state=ReviewState.PASSED,
-        **rights,
+    fingerprint = _raw_input_fingerprint(
+        run_source_item_id=run_source_item.id,
+        source_item_id=item.id,
+        input_kind="source_record",
+        input_hash=content_hash,
     )
-    evidence.review_subject_hash = calculate_review_subject_hash(evidence)
-    evidence.publishable = calculate_publishable(evidence)
-    evidence.full_clean()
-    evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
-    return evidence
+    rights = _rights(run_source_item)
+    with transaction.atomic():
+        evidence, created = EvidenceAsset.objects.get_or_create(
+            raw_input_fingerprint=fingerprint,
+            defaults={
+                "source_item": item,
+                "origin_run_source_item": run_source_item,
+                "derivation_type": EvidenceDerivationType.RAW,
+                "kind": EvidenceKind.TEXT,
+                "locator_type": LocatorType.STRUCTURED_PATH,
+                "locator": {
+                    "locator_type": "structured_path",
+                    "path_type": "record_key",
+                    "path": "body_text",
+                },
+                "extracted_text": item.body_text,
+                "structured_data": item.metadata,
+                "extraction_method": "source_record",
+                "extractor_version": "v1",
+                "evidence_content_hash": content_hash,
+                "review_subject_hash": "0" * 64,
+                "review_state": ReviewState.PASSED,
+                **rights,
+            },
+        )
+        if not created:
+            if (
+                evidence.source_item_id != item.id
+                or evidence.origin_run_source_item_id != run_source_item.id
+                or evidence.derivation_type != EvidenceDerivationType.RAW
+                or evidence.kind != EvidenceKind.TEXT
+                or evidence.evidence_content_hash != content_hash
+            ):
+                raise PermanentEventError("raw_input_identity_conflict")
+            return evidence
+        evidence.review_subject_hash = calculate_review_subject_hash(evidence)
+        evidence.publishable = calculate_publishable(evidence)
+        evidence.full_clean()
+        evidence.save(
+            update_fields=(
+                "review_subject_hash",
+                "publishable",
+                "updated_at",
+            )
+        )
+        return evidence
 
 
 def _download_attachment(run_source_item, attachment: Mapping[str, Any]) -> tuple[bytes, str, str]:
@@ -454,40 +494,85 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
     )
     rights = _rights(run_source_item)
     content_hash = evidence_content_hash(text=None, structured_data={"title": attachment.get("title")}, checksum=checksum)
-    evidence = EvidenceAsset.objects.filter(
-        source_item=run_source_item.source_item,
-        origin_run_source_item=run_source_item,
-        derivation_type=EvidenceDerivationType.RAW,
-        checksum=checksum,
-    ).first()
-    if evidence:
-        return evidence, info
-    evidence = EvidenceAsset.objects.create(
-        source_item=run_source_item.source_item,
-        origin_run_source_item=run_source_item,
-        derivation_type=EvidenceDerivationType.RAW,
-        kind=EvidenceKind.ATTACHMENT,
-        locator_type=LocatorType.STRUCTURED_PATH,
-        locator={"locator_type": "structured_path", "path_type": "record_key", "path": "attachments"},
-        object_key=info.key,
-        object_version=info.version_id or info.etag or checksum,
-        mime_type=info.content_type,
-        byte_size=info.size,
-        checksum=checksum,
-        structured_data={
-            "title": attachment.get("title"),
-            "source_url": redact_url(str(attachment.get("url", ""))),
-        },
-        evidence_content_hash=content_hash,
-        review_subject_hash="0" * 64,
-        review_state=ReviewState.PASSED,
-        **rights,
+    fingerprint = _raw_input_fingerprint(
+        run_source_item_id=run_source_item.id,
+        source_item_id=run_source_item.source_item_id,
+        input_kind="attachment",
+        input_hash=checksum,
     )
-    evidence.review_subject_hash = calculate_review_subject_hash(evidence)
-    evidence.publishable = calculate_publishable(evidence)
-    evidence.full_clean()
-    evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
-    return evidence, info
+    with transaction.atomic():
+        evidence, created = EvidenceAsset.objects.get_or_create(
+            raw_input_fingerprint=fingerprint,
+            defaults={
+                "source_item": run_source_item.source_item,
+                "origin_run_source_item": run_source_item,
+                "derivation_type": EvidenceDerivationType.RAW,
+                "kind": EvidenceKind.ATTACHMENT,
+                "locator_type": LocatorType.STRUCTURED_PATH,
+                "locator": {
+                    "locator_type": "structured_path",
+                    "path_type": "record_key",
+                    "path": "attachments",
+                },
+                "object_key": info.key,
+                "object_version": (
+                    info.version_id or info.etag or checksum
+                ),
+                "mime_type": info.content_type,
+                "byte_size": info.size,
+                "checksum": checksum,
+                "structured_data": {
+                    "title": attachment.get("title"),
+                    "source_url": redact_url(
+                        str(attachment.get("url", ""))
+                    ),
+                },
+                "evidence_content_hash": content_hash,
+                "review_subject_hash": "0" * 64,
+                "review_state": ReviewState.PASSED,
+                **rights,
+            },
+        )
+        if not created:
+            if (
+                evidence.source_item_id
+                != run_source_item.source_item_id
+                or evidence.origin_run_source_item_id
+                != run_source_item.id
+                or evidence.derivation_type != EvidenceDerivationType.RAW
+                or evidence.kind != EvidenceKind.ATTACHMENT
+                or evidence.checksum != checksum
+                or not evidence.object_key
+                or not evidence.object_key.startswith(
+                    f"evidence/raw/{checksum[:2]}/{checksum}/"
+                )
+                or not evidence.object_version
+                or evidence.byte_size is None
+                or evidence.byte_size != len(data)
+                or not evidence.mime_type
+                or info.checksum_sha256 != checksum
+            ):
+                raise PermanentEventError("raw_input_identity_conflict")
+            canonical_info = ObjectInfo(
+                key=evidence.object_key,
+                version_id=evidence.object_version,
+                checksum_sha256=checksum,
+                size=evidence.byte_size,
+                content_type=evidence.mime_type,
+                etag=None,
+            )
+            return evidence, canonical_info
+        evidence.review_subject_hash = calculate_review_subject_hash(evidence)
+        evidence.publishable = calculate_publishable(evidence)
+        evidence.full_clean()
+        evidence.save(
+            update_fields=(
+                "review_subject_hash",
+                "publishable",
+                "updated_at",
+            )
+        )
+        return evidence, info
 
 
 def _store_result(namespace: str, aggregate_id: Any, output: Mapping[str, Any]):
@@ -569,8 +654,15 @@ def _make_document_evidence(document, run, output, run_source_item) -> list[Evid
 
 def _run_document_extraction(document_id: Any) -> DocumentExtraction:
     document = DocumentExtraction.objects.select_related(
-        "run_source_item__run", "run_source_item__source_snapshot__source", "source_item", "input_asset"
+        "run_source_item__run",
+        "run_source_item__source_snapshot__source",
+        "source_item",
+        "input_asset__generic_extraction_attempt__input_asset",
+        "input_asset__producing_generic_attempt__input_asset",
+        "input_asset__parent_asset",
     ).get(pk=document_id)
+    if _is_audit_only_document(document):
+        return document
     data = _storage().get_bytes(key=document.input_object_key, version_id=document.input_object_version or None)
     if hashlib.sha256(data).hexdigest() != document.input_checksum:
         raise ExtractorError("input_checksum_mismatch", "Downloaded input checksum differs from provenance")
@@ -729,11 +821,72 @@ def _generic_extractor(profile: ExtractionProfileSnapshot):
         raise ExtractorError("generic_engine_unsupported", f"No local adapter for {profile.engine}") from exc
 
 
+def _is_quarantined_generic_attempt(
+    attempt: GenericExtractionAttempt,
+) -> bool:
+    input_asset = attempt.input_asset
+    return bool(
+        input_asset is not None
+        and (
+            (
+                input_asset.derivation_type == EvidenceDerivationType.RAW
+                and input_asset.raw_input_fingerprint is None
+            )
+            or (
+                input_asset.parent_asset_id is not None
+                and input_asset.parent_asset.derivation_type
+                == EvidenceDerivationType.RAW
+                and input_asset.parent_asset.raw_input_fingerprint is None
+            )
+        )
+    )
+
+
+def _is_audit_only_document(
+    document: DocumentExtraction,
+) -> bool:
+    if document.input_fingerprint is None:
+        return True
+    input_asset = document.input_asset
+    if (
+        input_asset is not None
+        and input_asset.derivation_type == EvidenceDerivationType.RAW
+        and input_asset.raw_input_fingerprint is None
+    ):
+        return True
+    if (
+        input_asset is not None
+        and input_asset.parent_asset_id is not None
+        and input_asset.parent_asset.derivation_type
+        == EvidenceDerivationType.RAW
+        and input_asset.parent_asset.raw_input_fingerprint is None
+    ):
+        return True
+    if input_asset is None:
+        return False
+    attempts = []
+    if input_asset.generic_extraction_attempt_id is not None:
+        attempts.append(input_asset.generic_extraction_attempt)
+    producing_attempt = getattr(
+        input_asset,
+        "producing_generic_attempt",
+        None,
+    )
+    if producing_attempt is not None:
+        attempts.append(producing_attempt)
+    return any(
+        _is_quarantined_generic_attempt(attempt)
+        for attempt in attempts
+    )
+
+
 def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
     attempt = GenericExtractionAttempt.objects.select_related(
         "run_source_item__run", "run_source_item__source_snapshot__source", "source_item",
-        "input_asset", "evidence_asset", "extraction_profile_snapshot",
+        "input_asset__parent_asset", "evidence_asset", "extraction_profile_snapshot",
     ).get(pk=attempt_id)
+    if _is_quarantined_generic_attempt(attempt):
+        return attempt
     if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
         return _ensure_legacy_hwp_document(attempt.id)
     profile = attempt.extraction_profile_snapshot
@@ -792,9 +945,11 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 "run_source_item__run",
                 "run_source_item__source_snapshot__source",
                 "source_item",
-                "input_asset",
+                "input_asset__parent_asset",
                 "extraction_profile_snapshot",
             ).get(pk=attempt_id)
+            if _is_quarantined_generic_attempt(attempt):
+                return attempt
             if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
                 return _converge_legacy_hwp_document_locked(attempt)
             attempt.state = (
@@ -993,7 +1148,30 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
 
 
 def _queue_document_retry(document_id: str, exc: Exception) -> None:
-    DocumentExtraction.objects.filter(pk=document_id).update(
+    DocumentExtraction.objects.filter(
+        pk=document_id,
+        input_fingerprint__isnull=False,
+    ).exclude(
+        input_asset__derivation_type=EvidenceDerivationType.RAW,
+        input_asset__raw_input_fingerprint__isnull=True,
+    ).exclude(
+        input_asset__parent_asset__derivation_type=EvidenceDerivationType.RAW,
+        input_asset__parent_asset__raw_input_fingerprint__isnull=True,
+    ).exclude(
+        input_asset__generic_extraction_attempt__input_asset__derivation_type=(
+            EvidenceDerivationType.RAW
+        ),
+        input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
+            True
+        ),
+    ).exclude(
+        input_asset__producing_generic_attempt__input_asset__derivation_type=(
+            EvidenceDerivationType.RAW
+        ),
+        input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
+            True
+        ),
+    ).update(
         state=ExtractionState.QUEUED,
         document_complete=False,
         error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
@@ -1005,7 +1183,13 @@ def _queue_document_retry(document_id: str, exc: Exception) -> None:
 
 
 def _queue_generic_retry(attempt_id: str, exc: Exception) -> None:
-    GenericExtractionAttempt.objects.filter(pk=attempt_id).update(
+    GenericExtractionAttempt.objects.filter(pk=attempt_id).exclude(
+        input_asset__derivation_type=EvidenceDerivationType.RAW,
+        input_asset__raw_input_fingerprint__isnull=True,
+    ).exclude(
+        input_asset__parent_asset__derivation_type=EvidenceDerivationType.RAW,
+        input_asset__parent_asset__raw_input_fingerprint__isnull=True,
+    ).update(
         state=ExtractionState.QUEUED,
         error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
         error_detail_redacted=str(
@@ -1020,9 +1204,19 @@ def finalize_document_extraction_failure(document_id: str, error_code: str):
     with transaction.atomic():
         document = (
             DocumentExtraction.objects.select_for_update()
-            .select_related("run_source_item")
+            .select_related(
+                "run_source_item",
+                "input_asset__generic_extraction_attempt__input_asset",
+                "input_asset__producing_generic_attempt__input_asset",
+                "input_asset__parent_asset",
+            )
             .get(pk=document_id)
         )
+        if _is_audit_only_document(document):
+            return {
+                "documentExtractionId": str(document.id),
+                "state": "legacy_duplicate_audit_only",
+            }
         if document.state in {
             ExtractionState.SUCCEEDED,
             ExtractionState.LOW_CONFIDENCE,
@@ -1053,9 +1247,14 @@ def finalize_generic_extraction_failure(attempt_id: str, error_code: str):
     with transaction.atomic():
         attempt = (
             GenericExtractionAttempt.objects.select_for_update()
-            .select_related("run_source_item")
+            .select_related("run_source_item", "input_asset__parent_asset")
             .get(pk=attempt_id)
         )
+        if _is_quarantined_generic_attempt(attempt):
+            return {
+                "genericExtractionAttemptId": str(attempt.id),
+                "state": "legacy_duplicate_audit_only",
+            }
         if attempt.state in {
             ExtractionState.SUCCEEDED,
             ExtractionState.LOW_CONFIDENCE,
@@ -1118,6 +1317,19 @@ def process_generic_extraction(attempt_id: str):
 def finalize_run_evidence(run_id: str):
     with transaction.atomic():
         run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        if run.state in {
+            RunState.COMPLETED,
+            RunState.FAILED,
+            RunState.STOPPED,
+        }:
+            return {"runId": str(run.id), "state": run.state}
+        if run.stop_requested_at:
+            step, _ = RunStep.objects.select_for_update().get_or_create(
+                run=run,
+                name="extract",
+                attempt_no=1,
+            )
+            return _stop_run_evidence_locked(run, step)
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
         step = (
@@ -1134,20 +1346,148 @@ def finalize_run_evidence(run_id: str):
             }
         pending_documents = DocumentExtraction.objects.filter(
             run_source_item__run=run,
+            input_fingerprint__isnull=False,
             state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+        ).exclude(
+            input_asset__derivation_type=EvidenceDerivationType.RAW,
+            input_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__parent_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__generic_extraction_attempt__input_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
+                True
+            ),
+        ).exclude(
+            input_asset__producing_generic_attempt__input_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
+                True
+            ),
         ).exists()
         pending_generic = GenericExtractionAttempt.objects.filter(
             run_source_item__run=run,
             state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+        ).exclude(
+            input_asset__derivation_type=EvidenceDerivationType.RAW,
+            input_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__parent_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
         ).exists()
         if pending_documents or pending_generic:
             return {"runId": str(run.id), "state": run.state, "pending": True}
-        evidence_count = EvidenceAsset.objects.filter(origin_run_source_item__run=run).count()
+        evidence_count = (
+            EvidenceAsset.objects.filter(origin_run_source_item__run=run)
+            .exclude(
+                derivation_type=EvidenceDerivationType.RAW,
+                raw_input_fingerprint__isnull=True,
+            )
+            .exclude(
+                generic_extraction_attempt__input_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .exclude(
+                parent_asset__derivation_type=EvidenceDerivationType.RAW,
+                parent_asset__raw_input_fingerprint__isnull=True,
+            )
+            .exclude(
+                producing_generic_attempt__input_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .exclude(
+                document_extraction__input_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                document_extraction__input_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .exclude(
+                document_extraction__input_asset__generic_extraction_attempt__input_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                document_extraction__input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .exclude(
+                document_extraction__input_asset__parent_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                document_extraction__input_asset__parent_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .exclude(
+                document_extraction__input_asset__producing_generic_attempt__input_asset__derivation_type=(
+                    EvidenceDerivationType.RAW
+                ),
+                document_extraction__input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
+                    True
+                ),
+            )
+            .filter(
+                Q(document_extraction__isnull=True)
+                | Q(
+                    document_extraction__input_fingerprint__isnull=False
+                )
+            )
+            .count()
+        )
         document_failures = DocumentExtraction.objects.filter(
-            run_source_item__run=run, state=ExtractionState.FAILED
+            run_source_item__run=run,
+            input_fingerprint__isnull=False,
+            state=ExtractionState.FAILED,
+        ).exclude(
+            input_asset__derivation_type=EvidenceDerivationType.RAW,
+            input_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__parent_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__generic_extraction_attempt__input_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
+                True
+            ),
+        ).exclude(
+            input_asset__producing_generic_attempt__input_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
+                True
+            ),
         ).count()
         generic_failures = GenericExtractionAttempt.objects.filter(
             run_source_item__run=run, state=ExtractionState.FAILED
+        ).exclude(
+            input_asset__derivation_type=EvidenceDerivationType.RAW,
+            input_asset__raw_input_fingerprint__isnull=True,
+        ).exclude(
+            input_asset__parent_asset__derivation_type=(
+                EvidenceDerivationType.RAW
+            ),
+            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
         ).count()
         failure_count = document_failures + generic_failures
         step.output_count = evidence_count
@@ -1187,14 +1527,16 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
         run = CollectionRun.objects.select_for_update().filter(pk=run_id).first()
         if run is None:
             return {"runId": run_id, "state": "missing"}
-        if run.state != RunState.EXTRACTING:
-            return {"runId": str(run.id), "state": run.state}
         step, _ = RunStep.objects.select_for_update().get_or_create(
             run=run,
             name="extract",
             attempt_no=1,
         )
         stopped = run.stop_requested_at is not None
+        if stopped:
+            return _stop_run_evidence_locked(run, step)
+        if run.state != RunState.EXTRACTING:
+            return {"runId": str(run.id), "state": run.state}
         step.state = "stopped" if stopped else "failed"
         step.error_code = redacted_code
         step.error_detail_redacted = "evidence fan-out delivery exhausted"
@@ -1231,17 +1573,54 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
         }
 
 
+def _stop_run_evidence_locked(
+    run: CollectionRun,
+    step: RunStep,
+    *,
+    output_count: int | None = None,
+) -> dict[str, str]:
+    now = timezone.now()
+    step.state = "stopped"
+    if output_count is not None:
+        step.output_count = output_count
+    step.error_code = "stop_requested"
+    step.error_detail_redacted = "evidence fan-out stopped by request"
+    step.finished_at = now
+    step.save(
+        update_fields=(
+            "state",
+            "output_count",
+            "error_code",
+            "error_detail_redacted",
+            "finished_at",
+        )
+    )
+    run.state = RunState.STOPPED
+    run.error_summary = None
+    run.completed_at = now
+    run.save(
+        update_fields=(
+            "state",
+            "error_summary",
+            "completed_at",
+        )
+    )
+    return {"runId": str(run.id), "state": run.state}
+
+
 @shared_task(name="apps.evidence.tasks.process_run_evidence")
 def process_run_evidence(run_id: str):
     with transaction.atomic():
         run = CollectionRun.objects.select_for_update().get(pk=run_id)
-        if run.state != RunState.EXTRACTING:
-            return {"runId": str(run.id), "state": run.state}
         step, _ = RunStep.objects.select_for_update().get_or_create(
             run=run,
             name="extract",
             attempt_no=1,
         )
+        if run.stop_requested_at:
+            return _stop_run_evidence_locked(run, step, output_count=0)
+        if run.state != RunState.EXTRACTING:
+            return {"runId": str(run.id), "state": run.state}
         if step.fanout_completed_at is not None:
             return {
                 "runId": str(run.id),
@@ -1259,7 +1638,10 @@ def process_run_evidence(run_id: str):
         "source_item", "source_snapshot__source"
     ).order_by("id")
     for run_source_item in items:
-        if run.stop_requested_at:
+        if CollectionRun.objects.filter(
+            pk=run_id,
+            stop_requested_at__isnull=False,
+        ).exists():
             break
         try:
             _create_raw_evidence(run_source_item)
@@ -1290,10 +1672,11 @@ def process_run_evidence(run_id: str):
             attempt_no=1,
         )
         if run.stop_requested_at:
-            run.state = RunState.STOPPED
-            run.completed_at = timezone.now()
-            run.save(update_fields=("state", "completed_at"))
-            return {"runId": str(run.id), "state": run.state}
+            return _stop_run_evidence_locked(
+                run,
+                step,
+                output_count=output_count,
+            )
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
         if step.fanout_completed_at is not None:

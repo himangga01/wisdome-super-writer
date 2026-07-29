@@ -253,7 +253,72 @@ def _approved_current_decision(evidence: EvidenceAsset) -> bool:
     )
 
 
+def _uses_audit_only_raw_input(evidence: EvidenceAsset | None) -> bool:
+    if evidence is None:
+        return False
+    if (
+        evidence.derivation_type == EvidenceDerivationType.RAW
+        and evidence.raw_input_fingerprint is None
+    ):
+        return True
+    if (
+        evidence.parent_asset_id is not None
+        and evidence.parent_asset.derivation_type
+        == EvidenceDerivationType.RAW
+        and evidence.parent_asset.raw_input_fingerprint is None
+    ):
+        return True
+    attempts = []
+    if evidence.generic_extraction_attempt_id is not None:
+        attempts.append(evidence.generic_extraction_attempt)
+    producing_attempt = getattr(
+        evidence,
+        "producing_generic_attempt",
+        None,
+    )
+    if producing_attempt is not None:
+        attempts.append(producing_attempt)
+    return any(
+        attempt.input_asset is not None
+        and (
+            (
+                attempt.input_asset.derivation_type
+                == EvidenceDerivationType.RAW
+                and attempt.input_asset.raw_input_fingerprint is None
+            )
+            or (
+                attempt.input_asset.parent_asset_id is not None
+                and attempt.input_asset.parent_asset.derivation_type
+                == EvidenceDerivationType.RAW
+                and attempt.input_asset.parent_asset.raw_input_fingerprint
+                is None
+            )
+        )
+        for attempt in attempts
+    )
+
+
 def calculate_publishable(evidence: EvidenceAsset, *, document_complete: bool | None = None) -> bool:
+    if (
+        evidence.derivation_type == EvidenceDerivationType.RAW
+        and evidence.raw_input_fingerprint is None
+    ):
+        return False
+    if (
+        evidence.derivation_type == EvidenceDerivationType.DOCUMENT
+        and evidence.document_extraction is not None
+    ):
+        document = evidence.document_extraction
+        if document.input_fingerprint is None:
+            return False
+        input_asset = document.input_asset
+        if _uses_audit_only_raw_input(input_asset):
+            return False
+    if (
+        evidence.derivation_type == EvidenceDerivationType.OTHER
+    ):
+        if _uses_audit_only_raw_input(evidence):
+            return False
     if evidence.rights_status not in (RightsStatus.ALLOWED, RightsStatus.ATTRIBUTION_REQUIRED):
         return False
     if not evidence.rights_basis_url:
@@ -298,7 +363,22 @@ def _selected_runs(document: DocumentExtraction) -> dict[int, ExtractionRun]:
 
 @transaction.atomic
 def aggregate_document_extraction(document_id: Any) -> DocumentExtraction:
-    document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+    document = (
+        DocumentExtraction.objects.select_for_update()
+        .select_related(
+            "input_asset__generic_extraction_attempt__input_asset",
+            "input_asset__producing_generic_attempt__input_asset",
+            "input_asset__parent_asset",
+        )
+        .get(pk=document_id)
+    )
+    input_asset = document.input_asset
+    duplicate_input = _uses_audit_only_raw_input(input_asset)
+    if (
+        document.input_fingerprint is None
+        or duplicate_input
+    ):
+        return document
     try:
         selected = _selected_runs(document)
     except EvidenceInvariantError as exc:

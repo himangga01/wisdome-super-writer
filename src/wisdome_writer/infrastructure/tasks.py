@@ -15,12 +15,14 @@ from .models import OutboxMessage
 from .outbox import (
     ForbiddenEventPayload,
     OutboxConflict,
+    claim_exhausted_events,
     claim_events,
     consume_event,
     dead_letter_consumer_event,
     event_envelope,
     mark_failed,
     mark_published,
+    mark_terminal_retry,
     validate_persisted_event,
 )
 
@@ -30,6 +32,49 @@ logger = logging.getLogger(__name__)
 @shared_task(name="wisdome_writer.infrastructure.tasks.acknowledge_domain_event")
 def acknowledge_domain_event():
     return {"state": "acknowledged"}
+
+
+def _registered_task(task_name: str):
+    task = current_app.tasks.get(task_name)
+    if task is None:
+        raise LookupError(f"event handler task is not registered: {task_name}")
+    return task
+
+
+def _terminal_handler_for(route):
+    if route.terminal_task_name is None:
+        return None
+
+    def terminal_handler(*args):
+        return _registered_task(route.terminal_task_name)(*args)
+
+    return terminal_handler
+
+
+def _terminalize_routed_dispatch(message, route, error_code: str):
+    try:
+        result = dead_letter_consumer_event(
+            message.id,
+            consumer_name=route.consumer_name,
+            error_code=error_code,
+            terminal_handler=_terminal_handler_for(route),
+            terminal_argument_keys=route.terminal_argument_keys,
+            expected_dispatch_lease_token=message.lease_token,
+            expected_dispatch_lease_generation=message.lease_generation,
+        )
+    except Exception as exc:
+        mark_terminal_retry(
+            message,
+            error_code=(
+                f"terminal_callback_{getattr(exc, 'code', exc.__class__.__name__)}"
+            ),
+        )
+        logger.exception(
+            "routed outbox terminal callback failed; event returned to terminal retry",
+            exc_info=exc,
+        )
+        return False
+    return result["state"] in {"accepted", "duplicate", "dead_letter"}
 
 
 @shared_task(name="wisdome_writer.infrastructure.tasks.dispatch_outbox", acks_late=True)
@@ -45,7 +90,27 @@ def dispatch_outbox(limit: int = 100):
 
     owner = f"{socket.gethostname()}:{dispatch_outbox.request.id or 'manual'}"
     dispatched = dead_lettered = failed = 0
-    for message in claim_events(limit=limit, lease_owner=owner):
+    exhausted = claim_exhausted_events(limit=limit, lease_owner=owner)
+    for message in exhausted:
+        route = route_for(message.topic, message.event_version)
+        if route is None:
+            mark_failed(
+                message,
+                error_code="dispatch_attempts_exhausted",
+                permanent=True,
+            )
+            dead_lettered += 1
+        elif _terminalize_routed_dispatch(
+            message,
+            route,
+            "dispatch_attempts_exhausted",
+        ):
+            dead_lettered += 1
+        else:
+            failed += 1
+
+    remaining = max(limit - len(exhausted), 0)
+    for message in claim_events(limit=remaining, lease_owner=owner) if remaining else ():
         envelope = event_envelope(message)
         route = route_for(message.topic, message.event_version)
         if route is None:
@@ -61,18 +126,27 @@ def dispatch_outbox(limit: int = 100):
                 task_id=f"outbox:{message.id}:{message.attempts}",
             )
         except Exception as exc:
-            mark_failed(
-                message,
-                error_code=str(getattr(exc, "code", exc.__class__.__name__)),
-                retry_after=getattr(exc, "retry_after_seconds", None),
-                permanent=isinstance(
-                    exc,
-                    (ForbiddenEventPayload, OutboxConflict, EventRoutingError),
-                ),
-            )
-            if isinstance(exc, (ForbiddenEventPayload, OutboxConflict, EventRoutingError)):
-                dead_lettered += 1
+            terminal = isinstance(
+                exc,
+                (ForbiddenEventPayload, OutboxConflict, EventRoutingError),
+            ) or message.attempts >= message.max_attempts
+            if terminal:
+                if _terminalize_routed_dispatch(
+                    message,
+                    route,
+                    str(getattr(exc, "code", exc.__class__.__name__)),
+                ):
+                    dead_lettered += 1
+                else:
+                    failed += 1
             else:
+                mark_failed(
+                    message,
+                    error_code=str(
+                        getattr(exc, "code", exc.__class__.__name__)
+                    ),
+                    retry_after=getattr(exc, "retry_after_seconds", None),
+                )
                 failed += 1
         else:
             mark_published(message)
@@ -172,22 +246,11 @@ def consume_outbox_event(
             return retry_infrastructure(exc)
 
     def handler(*args):
-        task = current_app.tasks.get(route.task_name)
-        if task is None:
-            raise LookupError(f"event handler task is not registered: {route.task_name}")
         # Direct Task.__call__ pushes the handler's own Celery request context
         # without publishing another broker message.
-        return task(*args)
+        return _registered_task(route.task_name)(*args)
 
-    def terminal_handler(*args):
-        if route.terminal_task_name is None:
-            return None
-        task = current_app.tasks.get(route.terminal_task_name)
-        if task is None:
-            raise LookupError(
-                f"terminal event handler task is not registered: {route.terminal_task_name}"
-            )
-        return task(*args)
+    terminal_handler = _terminal_handler_for(route)
 
     try:
         result = consume_event(
@@ -195,7 +258,7 @@ def consume_outbox_event(
             consumer_name=route.consumer_name,
             handler=handler,
             argument_keys=route.argument_keys,
-            terminal_handler=terminal_handler if route.terminal_task_name else None,
+            terminal_handler=terminal_handler,
             terminal_argument_keys=route.terminal_argument_keys,
             max_attempts=route.max_attempts,
             infrastructure_lease_token=infrastructure_lease_token,

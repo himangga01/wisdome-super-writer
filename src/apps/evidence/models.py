@@ -408,6 +408,13 @@ class EvidenceAsset(UUIDModel):
         related_name="originated_evidence_assets",
     )
     derivation_type = models.CharField(max_length=32, choices=EvidenceDerivationType.choices)
+    raw_input_fingerprint = models.CharField(
+        max_length=64,
+        unique=True,
+        null=True,
+        blank=True,
+        validators=[sha256_validator],
+    )
     document_extraction = models.ForeignKey(
         DocumentExtraction, null=True, blank=True, on_delete=models.SET_NULL, related_name="evidence_assets"
     )

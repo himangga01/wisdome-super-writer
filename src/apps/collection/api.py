@@ -81,12 +81,64 @@ def run_detail(request, run_id):
 @login_required
 @require_http_methods(["POST"])
 def stop_run(request, run_id):
-    run = get_object_or_404(CollectionRun, id=run_id)
-    if run.state not in {RunState.COMPLETED, RunState.FAILED, RunState.STOPPED}:
-        run.state = RunState.STOPPING
-        run.stop_requested_at = timezone.now()
-        run.save(update_fields=["state", "stop_requested_at"])
-    return JsonResponse(_run_payload(run))
+    response_status = 200
+    with transaction.atomic():
+        run = get_object_or_404(
+            CollectionRun.objects.select_for_update(),
+            id=run_id,
+        )
+        if run.state not in {
+            RunState.COMPLETED,
+            RunState.FAILED,
+            RunState.STOPPED,
+        }:
+            previous_state = run.state
+            if previous_state in {
+                RunState.QUEUED,
+                RunState.AWAITING_APPROVAL,
+            }:
+                run.stop_requested_at = (
+                    run.stop_requested_at or timezone.now()
+                )
+                run.state = RunState.STOPPED
+                run.completed_at = run.completed_at or timezone.now()
+                run.save(
+                    update_fields=[
+                        "state",
+                        "stop_requested_at",
+                        "completed_at",
+                    ]
+                )
+            elif previous_state == RunState.COLLECTING:
+                run.stop_requested_at = (
+                    run.stop_requested_at or timezone.now()
+                )
+                run.state = RunState.STOPPING
+                run.save(update_fields=["state", "stop_requested_at"])
+            elif previous_state == RunState.EXTRACTING:
+                run.stop_requested_at = (
+                    run.stop_requested_at or timezone.now()
+                )
+                run.state = RunState.STOPPING
+                run.save(update_fields=["state", "stop_requested_at"])
+                enqueue_event(
+                    event_type="evidence.finalize_requested",
+                    aggregate_type="collection_run",
+                    aggregate_id=run.id,
+                    job_id=run.id,
+                    dedupe_key=(
+                        f"evidence.finalize_requested:stop:{run.id}"
+                    ),
+                    payload={"run_id": str(run.id)},
+                )
+            elif previous_state == RunState.STOPPING:
+                pass
+            else:
+                response_status = 409
+    payload = _run_payload(run)
+    if response_status == 409:
+        payload["error"] = "stop_not_supported_for_active_phase"
+    return JsonResponse(payload, status=response_status)
 
 
 @login_required

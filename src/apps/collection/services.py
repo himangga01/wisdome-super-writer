@@ -90,18 +90,49 @@ def _persist_record(run, attempt, snapshot, record):
 
 
 def collect_run(run: CollectionRun) -> CollectionRun:
-    run.state = RunState.COLLECTING
-    run.started_at = run.started_at or timezone.now()
-    run.save(update_fields=["state", "started_at"])
-    step, _ = RunStep.objects.get_or_create(run=run, name="collect", attempt_no=1)
-    step.state = "running"
-    step.started_at = timezone.now()
-    step.save(update_fields=["state", "started_at"])
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run.pk)
+        if run.stop_requested_at:
+            step, _ = RunStep.objects.select_for_update().get_or_create(
+                run=run,
+                name="collect",
+                attempt_no=1,
+            )
+            step.state = "stopped"
+            step.error_code = "stop_requested"
+            step.error_detail_redacted = "collection stopped by request"
+            step.finished_at = step.finished_at or timezone.now()
+            step.save(
+                update_fields=(
+                    "state",
+                    "error_code",
+                    "error_detail_redacted",
+                    "finished_at",
+                )
+            )
+            run.state = RunState.STOPPED
+            run.completed_at = run.completed_at or timezone.now()
+            run.save(update_fields=["state", "completed_at"])
+            return run
+        run.state = RunState.COLLECTING
+        run.started_at = run.started_at or timezone.now()
+        run.save(update_fields=["state", "started_at"])
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run,
+            name="collect",
+            attempt_no=1,
+        )
+        step.state = "running"
+        step.started_at = timezone.now()
+        step.save(update_fields=["state", "started_at"])
     collected = 0
     failed = 0
     memberships = run.source_registry.memberships.select_related("source_snapshot__source").filter(enabled=True)
     for membership in memberships:
-        if run.stop_requested_at:
+        if CollectionRun.objects.filter(
+            pk=run.pk,
+            stop_requested_at__isnull=False,
+        ).exists():
             break
         snapshot = membership.source_snapshot
         attempt, _ = SourceCollectionAttempt.objects.get_or_create(
@@ -114,10 +145,36 @@ def collect_run(run: CollectionRun) -> CollectionRun:
         attempt.save(update_fields=["state", "started_at"])
         try:
             records = build_source_adapter(snapshot).collect(since=run.window_start, until=run.window_end)
-            for record in records:
-                _, created = _persist_record(run, attempt, snapshot, record)
-                collected += int(created)
-            attempt.state = "succeeded"
+            if CollectionRun.objects.filter(
+                pk=run.pk,
+                stop_requested_at__isnull=False,
+            ).exists():
+                attempt.state = "stopped"
+                attempt.error_code = "stop_requested"
+                attempt.error_detail_redacted = (
+                    "collection stopped after the active source request"
+                )
+            else:
+                for record in records:
+                    if CollectionRun.objects.filter(
+                        pk=run.pk,
+                        stop_requested_at__isnull=False,
+                    ).exists():
+                        attempt.state = "stopped"
+                        attempt.error_code = "stop_requested"
+                        attempt.error_detail_redacted = (
+                            "collection stopped while persisting source records"
+                        )
+                        break
+                    _, created = _persist_record(
+                        run,
+                        attempt,
+                        snapshot,
+                        record,
+                    )
+                    collected += int(created)
+            if attempt.state != "stopped":
+                attempt.state = "succeeded"
             attempt.response_count = len(records)
             attempt.response_checksum = _hash([record.content_hash for record in records])
         except Exception as exc:  # source isolation is intentional; details remain redacted
@@ -142,10 +199,23 @@ def collect_run(run: CollectionRun) -> CollectionRun:
             "sourceFailures": failed,
         }
         run.save(update_fields=["state", "completed_at", "counters"])
-        step.state = "succeeded" if failed < memberships.count() else "failed"
+        if run.state == RunState.STOPPED:
+            step.state = "stopped"
+            step.error_code = "stop_requested"
+            step.error_detail_redacted = "collection stopped by request"
+        else:
+            step.state = "succeeded" if failed < memberships.count() else "failed"
         step.output_count = collected
         step.finished_at = timezone.now()
-        step.save(update_fields=["state", "output_count", "finished_at"])
+        step.save(
+            update_fields=[
+                "state",
+                "output_count",
+                "error_code",
+                "error_detail_redacted",
+                "finished_at",
+            ]
+        )
         if run.state == RunState.EXTRACTING:
             enqueue_event(
                 event_type="run.evidence_requested",
