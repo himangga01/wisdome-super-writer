@@ -5,9 +5,9 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 from django.utils.text import slugify
@@ -16,6 +16,7 @@ from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
 from apps.audit.services import (
     AuditContext,
+    audit_event_id,
     record_audit_event,
     require_audit_replay,
 )
@@ -93,7 +94,11 @@ _SECRET_QUERY_KEYS = frozenset(
         "password",
         "secret",
         "session",
+        "sig",
+        "signature",
         "token",
+        "x_amz_signature",
+        "x_goog_signature",
     }
 )
 _SOURCE_CONTRACT_FIELDS = (
@@ -138,6 +143,17 @@ def _hash(material: Any) -> str:
         raise InvalidInput("Canonical source material is invalid.") from exc
 
 
+def source_registry_audit_request_key(request_key: str) -> str:
+    """Bind an arbitrary contract-valid request key to a safe audit key."""
+
+    return _hash(
+        {
+            "schemaVersion": "source-registry-audit-request-key-v1",
+            "requestKey": request_key,
+        }
+    )
+
+
 def _id(value: Any) -> str | None:
     return str(value) if value is not None else None
 
@@ -152,12 +168,52 @@ def _require_admin_context(
     if (
         audit_context.actor_type != AuditEvent.ActorType.ADMIN
         or _id(audit_context.actor_id) != _id(admin.pk)
-        or audit_context.request_key != request_key
+        or audit_context.request_key
+        != source_registry_audit_request_key(request_key)
         or audit_context.reason_code != reason
     ):
         raise ValueError(
             "Audit provenance does not match the source registry administrator."
         )
+
+
+def _require_admin_audit_replay(
+    *,
+    context: AuditContext,
+    action: str,
+    entity: Any,
+    identity_key: str,
+    request_hash: str,
+    admin: Any,
+) -> None:
+    normalized_identity_key = source_registry_audit_request_key(
+        identity_key
+    )
+    expected_event_id = audit_event_id(
+        action=action,
+        entity=entity,
+        identity_key=normalized_identity_key,
+    )
+    stored = (
+        AuditEvent.objects.using(context.database_alias)
+        .only("actor_type", "actor_id")
+        .filter(pk=expected_event_id)
+        .first()
+    )
+    if stored is not None and (
+        stored.actor_type != AuditEvent.ActorType.ADMIN
+        or stored.actor_id != admin.pk
+    ):
+        raise RequestKeyConflict(
+            "The request key belongs to another administrator."
+        )
+    require_audit_replay(
+        context=context,
+        action=action,
+        entity=entity,
+        identity_key=normalized_identity_key,
+        request_hash=request_hash,
+    )
 
 
 def _require_request_hash(request_hash: str) -> str:
@@ -189,19 +245,37 @@ def _validate_public_url(
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or any(ord(character) < 32 for character in value)
+        or parsed.fragment
     ):
         raise InvalidInput(
             f"{field_name} must not contain credentials or an invalid target."
         )
+    decoded_value = unquote(value)
+    if any(ord(character) < 32 for character in decoded_value) or any(
+        pattern.search(decoded_value)
+        for pattern in _SECRET_VALUE_PATTERNS
+    ):
+        raise InvalidInput(
+            f"{field_name} must not contain credential material."
+        )
     del port
-    for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+    for key, query_value in parse_qsl(
+        parsed.query,
+        keep_blank_values=True,
+    ):
         normalized_key = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
         if normalized_key in _SECRET_QUERY_KEYS or _SECRET_KEY_PATTERN.search(
             normalized_key
         ):
             raise InvalidInput(
                 f"{field_name} must not contain credential query parameters."
+            )
+        if any(
+            pattern.search(query_value)
+            for pattern in _SECRET_VALUE_PATTERNS
+        ):
+            raise InvalidInput(
+                f"{field_name} must not contain credential query values."
             )
     return value
 
@@ -380,6 +454,23 @@ def _normalize_source_material(
         not isinstance(item, str) for item in entrypoints
     ):
         raise InvalidInput("externalConfig.entrypoints must be a URL array.")
+    normalized_entrypoints: list[str] = []
+    base_host = (urlsplit(base_url).hostname or "").rstrip(".").lower()
+    for index, entrypoint in enumerate(entrypoints):
+        normalized_entrypoint = _validate_public_url(
+            entrypoint,
+            field_name=f"externalConfig.entrypoints[{index}]",
+        )
+        entrypoint_host = (
+            urlsplit(normalized_entrypoint).hostname or ""
+        ).rstrip(".").lower()
+        if entrypoint_host != base_host:
+            raise InvalidInput(
+                "externalConfig URL hosts must match the approved baseUrl host."
+            )
+        normalized_entrypoints.append(normalized_entrypoint)
+    if "entrypoints" in external_config:
+        external_config["entrypoints"] = normalized_entrypoints
     material["externalConfig"] = external_config
     material["secretRef"] = _validate_secret_ref(material["secretRef"])
 
@@ -568,6 +659,35 @@ def _retire_current_draft(
         )
 
 
+def _source_creation_replay(
+    *,
+    request_key: str,
+    request_hash: str,
+    admin: Any,
+    audit_context: AuditContext,
+) -> SourceDefinition | None:
+    existing = SourceDefinition.objects.using(
+        audit_context.database_alias
+    ).filter(
+        creation_request_key=request_key
+    ).first()
+    if existing is None:
+        return None
+    require_idempotent_match(
+        stored_hash=existing.creation_request_hash or "",
+        expected_hash=request_hash,
+    )
+    _require_admin_audit_replay(
+        context=audit_context,
+        action="source_definition.created",
+        entity=existing,
+        identity_key=request_key,
+        request_hash=request_hash,
+        admin=admin,
+    )
+    return existing
+
+
 def create_source_definition(
     data: Mapping[str, Any],
     *,
@@ -584,43 +704,27 @@ def create_source_definition(
         reason=reason,
     )
     request_hash = _require_request_hash(request_hash)
-    material = _normalize_source_material(data)
     alias = audit_context.database_alias
 
-    existing = SourceDefinition.objects.using(alias).filter(
-        creation_request_key=request_key
-    ).first()
+    existing = _source_creation_replay(
+        request_key=request_key,
+        request_hash=request_hash,
+        admin=admin,
+        audit_context=audit_context,
+    )
     if existing is not None:
-        require_idempotent_match(
-            stored_hash=existing.creation_request_hash or "",
-            expected_hash=request_hash,
-        )
-        require_audit_replay(
-            context=audit_context,
-            action="source_definition.created",
-            entity=existing,
-            identity_key=request_key,
-            request_hash=request_hash,
-        )
         return existing, False
 
+    material = _normalize_source_material(data)
     with transaction.atomic(using=alias):
         _lock_topic_head(material["topic"], using=alias)
-        existing = SourceDefinition.objects.using(alias).filter(
-            creation_request_key=request_key
-        ).first()
+        existing = _source_creation_replay(
+            request_key=request_key,
+            request_hash=request_hash,
+            admin=admin,
+            audit_context=audit_context,
+        )
         if existing is not None:
-            require_idempotent_match(
-                stored_hash=existing.creation_request_hash or "",
-                expected_hash=request_hash,
-            )
-            require_audit_replay(
-                context=audit_context,
-                action="source_definition.created",
-                entity=existing,
-                identity_key=request_key,
-                request_hash=request_hash,
-            )
             return existing, False
 
         source_id = uuid.uuid4()
@@ -634,7 +738,19 @@ def create_source_definition(
             creation_request_hash=request_hash,
         )
         _apply_source_projection(source, material)
-        source.save(using=alias)
+        try:
+            with transaction.atomic(using=alias):
+                source.save(using=alias)
+        except IntegrityError:
+            existing = _source_creation_replay(
+                request_key=request_key,
+                request_hash=request_hash,
+                admin=admin,
+                audit_context=audit_context,
+            )
+            if existing is None:
+                raise
+            return existing, False
         snapshot = _create_draft_snapshot(
             source=source,
             material=material,
@@ -661,7 +777,9 @@ def create_source_definition(
             context=audit_context,
             action="source_definition.created",
             entity=source,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=SOURCE_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             after_material=_source_audit_material(source),
@@ -712,12 +830,13 @@ def update_source_definition(
                 stored_hash=existing.request_hash or "",
                 expected_hash=request_hash,
             )
-            require_audit_replay(
+            _require_admin_audit_replay(
                 context=audit_context,
                 action="source_definition.updated",
                 entity=source,
                 identity_key=request_key,
                 request_hash=request_hash,
+                admin=admin,
             )
             return source
 
@@ -749,7 +868,9 @@ def update_source_definition(
             context=audit_context,
             action="source_definition.updated",
             entity=source,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=SOURCE_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             before_material=before_material,
@@ -924,12 +1045,13 @@ def create_registry_draft(
             stored_hash=existing.draft_request_hash or "",
             expected_hash=request_hash,
         )
-        require_audit_replay(
+        _require_admin_audit_replay(
             context=audit_context,
             action="source_registry.draft_created",
             entity=existing,
             identity_key=request_key,
             request_hash=request_hash,
+            admin=admin,
         )
         return existing, False
 
@@ -944,12 +1066,13 @@ def create_registry_draft(
                 stored_hash=existing.draft_request_hash or "",
                 expected_hash=request_hash,
             )
-            require_audit_replay(
+            _require_admin_audit_replay(
                 context=audit_context,
                 action="source_registry.draft_created",
                 entity=existing,
                 identity_key=request_key,
                 request_hash=request_hash,
+                admin=admin,
             )
             return existing, False
 
@@ -1017,7 +1140,9 @@ def create_registry_draft(
             context=audit_context,
             action="source_registry.draft_created",
             entity=registry,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=REGISTRY_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             after_material=_registry_audit_material(registry),
@@ -1065,12 +1190,13 @@ def update_registry_membership(
         registry = SourceRegistrySnapshot.objects.using(alias).get(
             pk=registry_id
         )
-        require_audit_replay(
+        _require_admin_audit_replay(
             context=audit_context,
             action="source_registry.membership_updated",
             entity=registry,
             identity_key=request_key,
             request_hash=request_hash,
+            admin=admin,
         )
         return registry, False
 
@@ -1089,12 +1215,13 @@ def update_registry_membership(
                 stored_hash=existing.request_hash,
                 expected_hash=request_hash,
             )
-            require_audit_replay(
+            _require_admin_audit_replay(
                 context=audit_context,
                 action="source_registry.membership_updated",
                 entity=registry,
                 identity_key=request_key,
                 request_hash=request_hash,
+                admin=admin,
             )
             return registry, False
         if registry.state != SourceRegistrySnapshot.State.DRAFT:
@@ -1187,7 +1314,9 @@ def update_registry_membership(
             context=audit_context,
             action="source_registry.membership_updated",
             entity=registry,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=REGISTRY_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             before_material=before_material,
@@ -1234,6 +1363,98 @@ def _verify_registry_manifest(
     return memberships
 
 
+def _lock_and_validate_approval_sources(
+    memberships: Iterable[SourceRegistryMembership],
+    *,
+    topic_code: str,
+    using: str,
+) -> tuple[
+    dict[Any, SourceDefinition],
+    dict[Any, SourceDefinitionSnapshot],
+]:
+    enabled_memberships = [
+        membership for membership in memberships if membership.enabled
+    ]
+    source_ids = sorted(
+        {
+            membership.source_definition_id
+            for membership in enabled_memberships
+        },
+        key=str,
+    )
+    snapshot_ids = sorted(
+        {
+            membership.source_snapshot_id
+            for membership in enabled_memberships
+        },
+        key=str,
+    )
+    locked_sources = {
+        source.id: source
+        for source in SourceDefinition.objects.using(using)
+        .select_for_update()
+        .filter(id__in=source_ids)
+        .order_by("id")
+    }
+    locked_snapshots = {
+        snapshot.id: snapshot
+        for snapshot in SourceDefinitionSnapshot.objects.using(using)
+        .select_for_update()
+        .filter(id__in=snapshot_ids)
+        .order_by("id")
+    }
+    if (
+        len(locked_sources) != len(source_ids)
+        or len(locked_snapshots) != len(snapshot_ids)
+    ):
+        raise Conflict(
+            "The source registry membership target no longer exists."
+        )
+
+    for member in enabled_memberships:
+        source = locked_sources[member.source_definition_id]
+        snapshot = locked_snapshots[member.source_snapshot_id]
+        if (
+            source.topic_code != topic_code
+            or snapshot.topic_code != topic_code
+            or snapshot.source_id != source.id
+        ):
+            raise Conflict(
+                "The locked source registry membership identity is inconsistent."
+            )
+        if snapshot.state == SourceDefinitionSnapshot.State.RETIRED:
+            raise StateConflict(
+                "A retired source snapshot cannot be approved."
+            )
+        if (
+            snapshot.state == SourceDefinitionSnapshot.State.DRAFT
+            and source.latest_draft_snapshot_id != snapshot.id
+        ):
+            raise StaleVersion(
+                "A selected source draft is no longer current."
+            )
+        if snapshot.state not in {
+            SourceDefinitionSnapshot.State.DRAFT,
+            SourceDefinitionSnapshot.State.APPROVED,
+        }:
+            raise StateConflict(
+                "The selected source snapshot state is invalid."
+            )
+        if not bool(snapshot.config.get("enabled", True)):
+            raise InvalidInput(
+                "An enabled membership selected a disabled source snapshot."
+            )
+        if (
+            snapshot.config.get("schemaVersion")
+            != SOURCE_SNAPSHOT_SCHEMA_V2
+            or _hash(snapshot.config) != snapshot.config_hash
+        ):
+            raise Conflict(
+                "A selected source snapshot is not a verifiable v2 snapshot."
+            )
+    return locked_sources, locked_snapshots
+
+
 def decide_source_registry(
     registry_id: Any,
     data: Mapping[str, Any],
@@ -1271,7 +1492,9 @@ def decide_source_registry(
             context=audit_context,
             action=f"source_registry.{existing.decision}",
             entity=existing.registry,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             request_hash=request_hash,
         )
         return existing, False
@@ -1289,7 +1512,6 @@ def decide_source_registry(
         registry = (
             SourceRegistrySnapshot.objects.using(alias)
             .select_for_update()
-            .select_related("latest_decision")
             .get(pk=registry_id)
         )
         existing = SourceRegistryDecision.objects.using(alias).filter(
@@ -1309,7 +1531,9 @@ def decide_source_registry(
                 context=audit_context,
                 action=f"source_registry.{existing.decision}",
                 entity=registry,
-                identity_key=request_key,
+                identity_key=source_registry_audit_request_key(
+                    request_key
+                ),
                 request_hash=request_hash,
             )
             return existing, False
@@ -1329,6 +1553,13 @@ def decide_source_registry(
             raise StaleVersion(
                 "The source registry decision projection changed."
             )
+        latest_decision = (
+            SourceRegistryDecision.objects.using(alias).get(
+                pk=registry.latest_decision_id
+            )
+            if registry.latest_decision_id
+            else None
+        )
 
         decision_value = data["decision"]
         if decision_value not in SourceRegistryDecision.Decision.values:
@@ -1336,6 +1567,8 @@ def decide_source_registry(
         memberships = _verify_registry_manifest(registry, using=alias)
         before_material = _registry_audit_material(registry)
         prior_head: SourceRegistrySnapshot | None = None
+        locked_sources: dict[Any, SourceDefinition] = {}
+        locked_snapshots: dict[Any, SourceDefinitionSnapshot] = {}
 
         if decision_value == SourceRegistryDecision.Decision.APPROVED:
             if registry.state != SourceRegistrySnapshot.State.DRAFT:
@@ -1358,32 +1591,6 @@ def decide_source_registry(
                 raise InvalidInput(
                     "An approved registry requires an enabled source."
                 )
-            for member in enabled_memberships:
-                snapshot = member.source_snapshot
-                source = member.source_definition
-                if snapshot.state == SourceDefinitionSnapshot.State.RETIRED:
-                    raise StateConflict(
-                        "A retired source snapshot cannot be approved."
-                    )
-                if (
-                    snapshot.state == SourceDefinitionSnapshot.State.DRAFT
-                    and source.latest_draft_snapshot_id != snapshot.id
-                ):
-                    raise StaleVersion(
-                        "A selected source draft is no longer current."
-                    )
-                if not bool(snapshot.config.get("enabled", True)):
-                    raise InvalidInput(
-                        "An enabled membership selected a disabled source snapshot."
-                    )
-                if (
-                    snapshot.config.get("schemaVersion")
-                    != SOURCE_SNAPSHOT_SCHEMA_V2
-                    or _hash(snapshot.config) != snapshot.config_hash
-                ):
-                    raise Conflict(
-                        "A selected source snapshot is not a verifiable v2 snapshot."
-                    )
             if head.current_approved_registry_id is not None:
                 prior_head = (
                     SourceRegistrySnapshot.objects.using(alias)
@@ -1412,6 +1619,14 @@ def decide_source_registry(
                     .exclude(pk=registry.pk)
                     .first()
                 )
+            (
+                locked_sources,
+                locked_snapshots,
+            ) = _lock_and_validate_approval_sources(
+                enabled_memberships,
+                topic_code=registry.topic_code,
+                using=alias,
+            )
         else:
             if (
                 registry.state != SourceRegistrySnapshot.State.APPROVED
@@ -1430,8 +1645,8 @@ def decide_source_registry(
         )
         now = timezone.now()
         version = (
-            registry.latest_decision.version + 1
-            if registry.latest_decision_id
+            latest_decision.version + 1
+            if latest_decision is not None
             else 1
         )
         decision_id = uuid.uuid4()
@@ -1459,7 +1674,7 @@ def decide_source_registry(
                 "requestKey": request_key,
                 "requestHash": request_hash,
                 "decidedBy": str(admin.pk),
-                "decidedAt": now,
+                "decidedAt": now.isoformat(),
                 "reason": reason,
             }
         )
@@ -1479,7 +1694,7 @@ def decide_source_registry(
             expected_current_head_manifest_hash=data.get(
                 "expectedCurrentHeadManifestHash"
             ),
-            supersedes_decision=registry.latest_decision,
+            supersedes_decision=latest_decision,
             request_key=request_key,
             request_hash=request_hash,
             decision_hash=decision_hash,
@@ -1491,33 +1706,6 @@ def decide_source_registry(
         decision.save(using=alias)
 
         if decision_value == SourceRegistryDecision.Decision.APPROVED:
-            source_ids = sorted(
-                {
-                    member.source_definition_id
-                    for member in memberships
-                    if member.enabled
-                },
-                key=str,
-            )
-            locked_sources = {
-                source.id: source
-                for source in SourceDefinition.objects.using(alias)
-                .select_for_update()
-                .filter(id__in=source_ids)
-                .order_by("id")
-            }
-            selected_snapshot_ids = [
-                member.source_snapshot_id
-                for member in memberships
-                if member.enabled
-            ]
-            locked_snapshots = {
-                snapshot.id: snapshot
-                for snapshot in SourceDefinitionSnapshot.objects.using(alias)
-                .select_for_update()
-                .filter(id__in=selected_snapshot_ids)
-                .order_by("id")
-            }
             for member in memberships:
                 if not member.enabled:
                     continue
@@ -1640,7 +1828,9 @@ def decide_source_registry(
             context=audit_context,
             action=f"source_registry.{decision_value}",
             entity=registry,
-            identity_key=request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=REGISTRY_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             before_material=before_material,
@@ -1663,7 +1853,7 @@ def decide_source_registry(
         return decision, True
 
 
-def _normalized_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     for raw in data["sources"]:
         material = _normalize_source_material(
@@ -1735,7 +1925,7 @@ def import_registry_manifest(
     import json
 
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    normalized = _normalized_registry_import(data)
+    normalized = normalize_registry_import(data)
     topic_code = normalized["topic_code"]
     if topic_code not in TopicCode.values:
         raise InvalidInput("Unsupported registry topic.")
@@ -1963,17 +2153,18 @@ def request_source_check(
     source_id: Any,
     *,
     admin: Any,
+    request_key: str,
     audit_context: AuditContext,
 ) -> Any:
     from wisdome_writer.infrastructure.outbox import enqueue_event
 
-    if not audit_context.request_key:
+    if not request_key:
         raise ValueError("A source check request key is required.")
     reason = "source access check"
     _require_admin_context(
         audit_context=audit_context,
         admin=admin,
-        request_key=audit_context.request_key,
+        request_key=request_key,
         reason=reason,
     )
     alias = audit_context.database_alias
@@ -2005,7 +2196,9 @@ def request_source_check(
             context=audit_context,
             action="source_definition.check_requested",
             entity=source,
-            identity_key=audit_context.request_key,
+            identity_key=source_registry_audit_request_key(
+                request_key
+            ),
             material_schema_version=SOURCE_AUDIT_SCHEMA_V2,
             metadata_schema_version="2",
             before_material=_source_audit_material(source),
@@ -2064,19 +2257,39 @@ def record_source_check_result(
         return result
 
 
-def current_registry(topic_code: str) -> SourceRegistrySnapshot:
+def current_registry(
+    topic_code: str,
+    *,
+    for_update: bool = False,
+) -> SourceRegistrySnapshot:
+    if (
+        for_update
+        and not transaction.get_connection().in_atomic_block
+    ):
+        raise RuntimeError(
+            "A locked registry lookup requires an active transaction."
+        )
+    head_queryset = TopicRegistryHead.objects
+    if for_update:
+        head_queryset = head_queryset.select_for_update()
     try:
-        head = TopicRegistryHead.objects.select_related(
-            "current_approved_registry"
-        ).get(topic_code=topic_code)
+        head = head_queryset.get(topic_code=topic_code)
     except TopicRegistryHead.DoesNotExist as exc:
         raise StateConflict(
             "No approved source registry head exists for this topic."
         ) from exc
-    registry = head.current_approved_registry
+    if head.current_approved_registry_id is None:
+        raise StateConflict(
+            "No consistent approved source registry exists for this topic."
+        )
+    registry_queryset = SourceRegistrySnapshot.objects
+    if for_update:
+        registry_queryset = registry_queryset.select_for_update()
+    registry = registry_queryset.get(
+        pk=head.current_approved_registry_id
+    )
     if (
-        registry is None
-        or registry.state != SourceRegistrySnapshot.State.APPROVED
+        registry.state != SourceRegistrySnapshot.State.APPROVED
         or registry.version != head.current_approved_version
         or registry.manifest_hash
         != head.current_approved_manifest_hash

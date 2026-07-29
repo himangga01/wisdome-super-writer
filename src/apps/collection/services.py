@@ -160,7 +160,7 @@ def create_run(
     correlation_id=None,
     retry_count: int = 0,
 ):
-    registry = current_registry(topic_code)
+    registry = current_registry(topic_code, for_update=True)
     resolved_correlation_id = (
         uuid.UUID(str(correlation_id))
         if correlation_id is not None

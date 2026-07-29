@@ -7,12 +7,16 @@ from django.core.management.base import BaseCommand, CommandError
 from apps.topics.models import (
     SourceDefinitionSnapshot,
     SourceRegistrySnapshot,
+    TopicCode,
     TopicRegistryHead,
 )
 from apps.topics.services import (
     SOURCE_SNAPSHOT_SCHEMA_V2,
+    normalize_registry_import,
     registry_manifest_hash,
+    source_snapshot_hash,
 )
+from wisdome_writer.domain.errors import DomainError
 from wisdome_writer.domain.hashing import (
     CANONICAL_HASH_SCHEMA_V1,
     canonical_hash,
@@ -40,14 +44,18 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         del args
         root = Path(options["root"])
-        configured: dict[str, set[str]] = {}
+        configured: dict[str, dict] = {}
         for path in sorted(root.glob("*.json")):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                configured[str(payload["topicCode"])] = {
-                    str(source["key"]) for source in payload["sources"]
-                }
-            except (KeyError, TypeError, ValueError) as exc:
+                normalized = normalize_registry_import(payload)
+                topic_code = str(normalized["topic_code"])
+                if topic_code in configured:
+                    raise CommandError(
+                        f"Duplicate source registry topic: {topic_code}"
+                    )
+                configured[topic_code] = normalized
+            except (DomainError, KeyError, TypeError, ValueError) as exc:
                 raise CommandError(
                     f"Invalid source registry manifest: {path.name}"
                 ) from exc
@@ -55,7 +63,15 @@ class Command(BaseCommand):
             raise CommandError("No source registry manifests were found.")
 
         failures: list[str] = []
-        for topic_code, configured_keys in configured.items():
+        if options["require_approved_mvp"]:
+            missing_topics = sorted(
+                set(TopicCode.values) - set(configured)
+            )
+            for topic_code in missing_topics:
+                failures.append(
+                    f"{topic_code}: repository manifest missing"
+                )
+        for topic_code, configured_topic in configured.items():
             head = (
                 TopicRegistryHead.objects.select_related(
                     "current_approved_registry"
@@ -87,6 +103,19 @@ class Command(BaseCommand):
                     "source_snapshot",
                 )
             )
+            expected_sources = {
+                item["key"]: {
+                    "config_hash": source_snapshot_hash(
+                        item["material"]
+                    ),
+                    "enabled": bool(item["material"]["enabled"]),
+                    "display_order": display_order,
+                }
+                for display_order, item in enumerate(
+                    configured_topic["sources"]
+                )
+            }
+            configured_keys = set(expected_sources)
             actual_keys = {
                 member.source_definition.key for member in members
             }
@@ -96,6 +125,7 @@ class Command(BaseCommand):
                 )
             for member in members:
                 snapshot = member.source_snapshot
+                key = member.source_definition.key
                 if (
                     member.source_definition_id != snapshot.source_id
                     or snapshot.topic_code != topic_code
@@ -109,6 +139,21 @@ class Command(BaseCommand):
                 ):
                     failures.append(
                         f"{topic_code}: enabled snapshot is not approved"
+                    )
+                expected = expected_sources.get(key)
+                if expected is None:
+                    continue
+                if snapshot.config_hash != expected["config_hash"]:
+                    failures.append(
+                        f"{topic_code}/{key}: repository material hash mismatch"
+                    )
+                if member.enabled != expected["enabled"]:
+                    failures.append(
+                        f"{topic_code}/{key}: repository enabled flag mismatch"
+                    )
+                if member.display_order != expected["display_order"]:
+                    failures.append(
+                        f"{topic_code}/{key}: repository display order mismatch"
                     )
                 if (
                     snapshot.config.get("schemaVersion")

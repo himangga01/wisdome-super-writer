@@ -8,8 +8,10 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
-from apps.audit.services import AuditContext
+from apps.audit.services import AuditContext, AuditContextError
+from apps.audit.redaction import AuditRedactionError
 from wisdome_writer.api.openapi import openapi_operation, openapi_operations
+from wisdome_writer.domain.errors import Forbidden, InvalidInput
 
 from .models import (
     SourceDefinition,
@@ -22,6 +24,7 @@ from .services import (
     create_source_definition,
     decide_source_registry,
     request_source_check,
+    source_registry_audit_request_key,
     update_registry_membership,
     update_source_definition,
 )
@@ -162,11 +165,20 @@ def _admin_audit_context(
     reason: str,
     request_key: str,
 ) -> AuditContext:
-    return AuditContext.for_admin(
-        request=request,
-        reason_code=reason,
-        request_key=request_key,
-    )
+    if not getattr(request.user, "is_staff", False):
+        raise Forbidden("A staff administrator is required.")
+    try:
+        return AuditContext.for_admin(
+            request=request,
+            reason_code=reason,
+            request_key=source_registry_audit_request_key(
+                request_key
+            ),
+        )
+    except (AuditContextError, AuditRedactionError) as exc:
+        raise InvalidInput(
+            "The audit request key or reason is invalid."
+        ) from exc
 
 
 @login_required
@@ -276,6 +288,7 @@ def source_check(request, source_id):
     event = request_source_check(
         request.openapi_path["sourceId"],
         admin=request.user,
+        request_key=request_key,
         audit_context=_admin_audit_context(
             request,
             reason="source access check",

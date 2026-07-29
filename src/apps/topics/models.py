@@ -302,7 +302,69 @@ class SourceDefinitionSnapshot(models.Model):
                 raise ValidationError(
                     "Source definition snapshot material is immutable."
                 )
+            transition = (original.state, self.state)
+            if transition not in {
+                (self.State.DRAFT, self.State.DRAFT),
+                (self.State.DRAFT, self.State.APPROVED),
+                (self.State.DRAFT, self.State.RETIRED),
+                (self.State.APPROVED, self.State.APPROVED),
+                (self.State.APPROVED, self.State.RETIRED),
+                (self.State.RETIRED, self.State.RETIRED),
+            }:
+                raise ValidationError(
+                    "Source definition snapshot state cannot move backward."
+                )
+            lifecycle_fields = (
+                "approved_by_id",
+                "approved_at",
+                "retired_at",
+            )
+            if original.state == self.State.RETIRED and any(
+                getattr(self, field) != getattr(original, field)
+                for field in ("state", *lifecycle_fields)
+            ):
+                raise ValidationError(
+                    "A retired source definition snapshot is terminal."
+                )
+            if original.state == self.state and any(
+                getattr(self, field) != getattr(original, field)
+                for field in lifecycle_fields
+            ):
+                raise ValidationError(
+                    "Snapshot lifecycle metadata is immutable without a state transition."
+                )
+            if (
+                transition == (self.State.DRAFT, self.State.APPROVED)
+                and (
+                    self.approved_by_id is None
+                    or self.approved_at is None
+                    or self.retired_at is not None
+                )
+            ):
+                raise ValidationError(
+                    "Approving a source snapshot requires approval provenance."
+                )
+            if (
+                transition == (self.State.DRAFT, self.State.RETIRED)
+                and (
+                    self.approved_by_id != original.approved_by_id
+                    or self.approved_at != original.approved_at
+                )
+            ):
+                raise ValidationError(
+                    "Retiring a draft cannot add approval provenance."
+                )
+            if (
+                self.state == self.State.RETIRED
+                and self.retired_at is None
+            ):
+                raise ValidationError(
+                    "Retiring a source snapshot requires retired_at."
+                )
         return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("SourceDefinitionSnapshot is immutable and cannot be deleted")
 
 
 class SourceRegistrySnapshot(models.Model):
@@ -418,6 +480,121 @@ class SourceRegistrySnapshot(models.Model):
         ]
         ordering = ["topic_code", "-version"]
 
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            alias = kwargs.get("using") or self._state.db or "default"
+            original = type(self).objects.using(alias).get(pk=self.pk)
+            immutable_fields = (
+                "topic_code",
+                "version",
+                "base_approved_registry_id",
+                "base_approved_version",
+                "base_approved_manifest_hash",
+                "draft_request_key",
+                "draft_request_hash",
+                "created_at",
+            )
+            if any(
+                getattr(self, field) != getattr(original, field)
+                for field in immutable_fields
+            ):
+                raise ValidationError(
+                    "Source registry snapshot identity and base material are immutable."
+                )
+            transition = (original.state, self.state)
+            if transition not in {
+                (self.State.DRAFT, self.State.DRAFT),
+                (self.State.DRAFT, self.State.APPROVED),
+                (self.State.APPROVED, self.State.APPROVED),
+                (self.State.APPROVED, self.State.RETIRED),
+                (self.State.RETIRED, self.State.RETIRED),
+            }:
+                raise ValidationError(
+                    "Source registry snapshot state cannot move backward."
+                )
+
+            lifecycle_fields = (
+                "latest_decision_id",
+                "approved_by_id",
+                "approved_at",
+                "retired_at",
+            )
+            if original.state == self.State.RETIRED and any(
+                getattr(self, field) != getattr(original, field)
+                for field in (
+                    "state",
+                    "manifest_hash",
+                    "row_version",
+                    *lifecycle_fields,
+                )
+            ):
+                raise ValidationError(
+                    "A retired source registry snapshot is terminal."
+                )
+            if transition == (self.State.DRAFT, self.State.DRAFT):
+                manifest_changed = (
+                    self.manifest_hash != original.manifest_hash
+                )
+                row_changed = self.row_version != original.row_version
+                if manifest_changed != row_changed or (
+                    row_changed
+                    and self.row_version != original.row_version + 1
+                ):
+                    raise ValidationError(
+                        "Draft manifest and row version must advance together."
+                    )
+                if any(
+                    getattr(self, field) != getattr(original, field)
+                    for field in lifecycle_fields
+                ):
+                    raise ValidationError(
+                        "Draft registry lifecycle metadata is immutable."
+                    )
+            elif transition == (
+                self.State.DRAFT,
+                self.State.APPROVED,
+            ):
+                if (
+                    self.manifest_hash != original.manifest_hash
+                    or self.row_version != original.row_version + 1
+                    or self.latest_decision_id is None
+                    or self.approved_by_id is None
+                    or self.approved_at is None
+                    or self.retired_at is not None
+                ):
+                    raise ValidationError(
+                        "Registry approval requires an exact manifest and approval provenance."
+                    )
+            elif transition == (
+                self.State.APPROVED,
+                self.State.RETIRED,
+            ):
+                if (
+                    self.manifest_hash != original.manifest_hash
+                    or self.row_version != original.row_version + 1
+                    or self.approved_by_id != original.approved_by_id
+                    or self.approved_at != original.approved_at
+                    or self.retired_at is None
+                ):
+                    raise ValidationError(
+                        "Registry retirement must preserve approved material."
+                    )
+            elif original.state == self.state and any(
+                getattr(self, field) != getattr(original, field)
+                for field in (
+                    "manifest_hash",
+                    "row_version",
+                    *lifecycle_fields,
+                )
+            ):
+                raise ValidationError(
+                    "Approved registry material is immutable."
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("SourceRegistrySnapshot is immutable and cannot be deleted")
+
 
 class TopicRegistryHead(models.Model):
     topic_code = models.CharField(
@@ -527,14 +704,28 @@ class SourceRegistryMembership(models.Model):
                 )
 
     def save(self, *args, **kwargs):
-        if self.registry.state != SourceRegistrySnapshot.State.DRAFT:
+        alias = kwargs.get("using") or self._state.db or "default"
+        registry_state = (
+            SourceRegistrySnapshot.objects.using(alias)
+            .only("state")
+            .get(pk=self.registry_id)
+            .state
+        )
+        if registry_state != SourceRegistrySnapshot.State.DRAFT:
             raise ValidationError(
                 "Only draft registry memberships can be changed."
             )
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        if self.registry.state != SourceRegistrySnapshot.State.DRAFT:
+        alias = kwargs.get("using") or self._state.db or "default"
+        registry_state = (
+            SourceRegistrySnapshot.objects.using(alias)
+            .only("state")
+            .get(pk=self.registry_id)
+            .state
+        )
+        if registry_state != SourceRegistrySnapshot.State.DRAFT:
             raise ValidationError(
                 "Only draft registry memberships can be deleted."
             )
