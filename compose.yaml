@@ -189,6 +189,16 @@ services:
       - object-storage
       - publishing-egress
 
+  worker-source-check:
+    <<: *app
+    environment:
+      <<: *runtime-environment
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=outbox.dispatch,source.check"]
+    networks:
+      - database
+      - broker
+      - collection-egress
+
   worker-collect:
     <<: *app
     environment:

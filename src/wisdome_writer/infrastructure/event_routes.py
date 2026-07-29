@@ -72,7 +72,7 @@ EXTRACTION_ENGINE_VALUES = frozenset(
 EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ("source.check_requested", 1): EventRoute(
         "source-check",
-        "maintenance",
+        "source.check",
         "apps.topics.tasks.check_source_snapshot",
         (
             "source_id",
@@ -527,6 +527,14 @@ def _channel_queue(channel: str) -> str:
     raise EventRoutingError("unsupported_publication_channel")
 
 
+def _collection_queue(topic_code: str) -> str:
+    if topic_code == "semiconductor_news":
+        return "collect.semiconductor"
+    if topic_code == "housing_subscription":
+        return "collect.housing"
+    raise EventRoutingError("unsupported_collection_topic")
+
+
 def queue_for(route: EventRoute, envelope: dict[str, Any]) -> str:
     event_type = envelope["event_type"]
     payload = envelope["payload"]
@@ -537,11 +545,7 @@ def queue_for(route: EventRoute, envelope: dict[str, Any]) -> str:
             topic_code = CollectionRun.objects.values_list("topic_code", flat=True).get(
                 id=payload["run_id"]
             )
-            if topic_code == "semiconductor_news":
-                return "collect.semiconductor"
-            if topic_code == "housing_subscription":
-                return "collect.housing"
-            raise EventRoutingError("unsupported_collection_topic")
+            return _collection_queue(topic_code)
         if event_type == "publication.preflight_requested":
             from apps.publishing.models import PublicationTarget
 

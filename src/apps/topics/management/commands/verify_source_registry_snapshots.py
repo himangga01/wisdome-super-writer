@@ -8,6 +8,7 @@ from apps.topics.models import (
     SourceDefinitionSnapshot,
     SourceRegistrySnapshot,
     TopicCode,
+    TopicPolicy,
     TopicRegistryHead,
 )
 from apps.topics.services import (
@@ -72,6 +73,31 @@ class Command(BaseCommand):
                     f"{topic_code}: repository manifest missing"
                 )
         for topic_code, configured_topic in configured.items():
+            policy = TopicPolicy.objects.filter(
+                code=topic_code,
+                version=configured_topic["policy_version"],
+            ).first()
+            expected_policy_hash = canonical_hash(
+                configured_topic["policy"],
+                schema_version=CANONICAL_HASH_SCHEMA_V1,
+            )
+            if policy is None:
+                failures.append(
+                    f"{topic_code}: repository topic policy missing"
+                )
+            elif any(
+                (
+                    not policy.active,
+                    policy.title != configured_topic["title"],
+                    policy.freshness_minutes
+                    != configured_topic["freshness_minutes"],
+                    policy.policy != configured_topic["policy"],
+                    policy.policy_hash != expected_policy_hash,
+                )
+            ):
+                failures.append(
+                    f"{topic_code}: repository topic policy mismatch"
+                )
             head = (
                 TopicRegistryHead.objects.select_related(
                     "current_approved_registry"
@@ -156,7 +182,7 @@ class Command(BaseCommand):
                         f"{topic_code}/{key}: repository display order mismatch"
                     )
                 if (
-                    snapshot.config.get("schemaVersion")
+                    snapshot.frozen_config.get("schemaVersion")
                     != SOURCE_SNAPSHOT_SCHEMA_V2
                 ):
                     failures.append(
@@ -164,10 +190,14 @@ class Command(BaseCommand):
                     )
                     continue
                 actual_hash = canonical_hash(
-                    snapshot.config,
+                    snapshot.frozen_config,
                     schema_version=CANONICAL_HASH_SCHEMA_V1,
                 )
-                if actual_hash != snapshot.config_hash:
+                if (
+                    actual_hash != snapshot.frozen_config_hash
+                    or snapshot.frozen_config_hash
+                    != snapshot.config_hash
+                ):
                     failures.append(
                         f"{topic_code}: source snapshot hash mismatch"
                     )

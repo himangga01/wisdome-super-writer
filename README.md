@@ -272,6 +272,8 @@ in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
 
 | 큐 | 담당 작업 |
 |---|---|
+| `outbox.dispatch` | due outbox lease·전달 |
+| `source.check` | 승인 전 출처 외부 접근·파싱 점검 |
 | `collect.housing` | 부동산 청약 출처 수집 |
 | `collect.semiconductor` | 반도체 출처 수집 |
 | `extract.fanout` | 외부 첨부 다운로드, 객체 저장 및 추출 fan-out |
@@ -283,21 +285,25 @@ in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
 | `publish.wordpress` | WordPress preflight, canary와 발행 |
 | `publish.blogger` | Blogger preflight, canary와 발행 |
 | `reconcile` | 채널별 원격 결과 조정 |
-| `maintenance` | outbox dispatch, 감사·보존 등 제어 작업 |
+| `maintenance` | 감사·보존·일정 등 일반 제어 작업 |
 
-`extract.fanout`은 `collection-egress`와 object storage에 접근하는 `worker-collect`가
-처리합니다. `worker-extract`는 외부 egress 없이 저장된 객체만 읽습니다. Beat는 한 인스턴스만
-실행하고 5초마다 outbox dispatcher를 호출하며, dispatcher가 due schedule scan과 versioned
+`worker-source-check`는 `outbox.dispatch`와 `source.check`만 소비하며
+`collection-egress`를 통해 승인 전 출처 점검을 격리 실행합니다. `extract.fanout`은
+`collection-egress`와 object storage에 접근하는 `worker-collect`가 처리합니다.
+`worker-extract`는 외부 egress 없이 저장된 객체만 읽습니다. Beat는 한 인스턴스만 실행하고
+5초마다 전용 큐의 outbox dispatcher를 호출하며, dispatcher가 due schedule scan과 versioned
 event 전달을 수행합니다.
 
 ### Celery queue contract (English)
 
-`extract.fanout` is consumed by `worker-collect`, which has collection egress and object
-storage access for external attachment download and durable fan-out. `worker-extract`
-remains without external egress and only reads stored objects from `extract.document` and
-`extract.generic`. Beat invokes the outbox dispatcher every five seconds; the dispatcher
-runs the due-schedule scan and routes versioned events to the topic- or channel-specific
-queues listed above.
+`worker-source-check` consumes only `outbox.dispatch` and `source.check`, with collection
+egress for isolated pre-approval probes. `extract.fanout` is consumed by
+`worker-collect`, which has collection egress and object storage access for external
+attachment download and durable fan-out. `worker-extract` remains without external
+egress and only reads stored objects from `extract.document` and `extract.generic`.
+Beat invokes the outbox dispatcher on its dedicated queue every five seconds; the
+dispatcher runs the due-schedule scan and routes versioned events to the topic- or
+channel-specific queues listed above.
 
 ## 프로젝트 구조
 

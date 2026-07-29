@@ -269,7 +269,6 @@ _REGISTRY_KEYS = (
 _REGISTRY_V2_KEYS = _REGISTRY_KEYS + (
     "after_manifest_hash",
     "before_manifest_hash",
-    "decision_id",
     "membership_count",
     "mutation_id",
     "prior_head_registry_id",

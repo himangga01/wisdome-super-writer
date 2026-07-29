@@ -129,9 +129,14 @@ version을 DB에서 재조회한다. enable 경합 중 이미 시작된 호출�
 ### SourceDefinitionSnapshot
 
 실행 재현을 위한 개별 출처의 불변 JSON 스냅샷이다. `id`, `source_definition_id`,
-`topic_code`, `snapshot_version`, `config_json`, `config_hash`, `independence_group_id`,
-`owner_name`, `editorial_control_name`, `status: draft/approved/retired`, `request_key`,
-`request_hash`, `created_at`, `approved_at`을 가진다.
+`topic_code`, `snapshot_version`, `config_json`, `config_hash`, `frozen_config_json`,
+`frozen_config_hash`, `independence_group_id`, `owner_name`, `editorial_control_name`,
+`status: draft/approved/retired`, `request_key`, `request_hash`, `created_at`, `approved_at`을
+가진다. `config_json/config_hash`는 기존 registry와 run이 참조한 역사적 identity material을
+보존한다. adapter는 mutable SourceDefinition이나 이 역사 필드를 다시 조합하지 않고,
+별도로 정규화·해시한 `frozen_config_json/frozen_config_hash`만 실행 입력으로 사용한다.
+신규 v2 snapshot은 두 material/hash가 같고, legacy snapshot은 역사 hash를 바꾸지 않은 채
+당시 실행에 필요한 legacy wrapper만 frozen material로 분리한다.
 `topic_code`는 SourceDefinition과 같고 `(source_definition_id, snapshot_version)`이 고유하다.
 SourceDefinition create/PATCH는 definition projection과 immutable draft snapshot을 한
 트랜잭션으로 만들며 `(source_definition_id, request_key)`가 멱등이다. 응답은 draft snapshot
@@ -157,6 +162,10 @@ snapshot ID, enabled, order 순으로 정규화한 전체 집합의 NFC+RFC 8785
 한 source만 변경해 새 registry version을 승인해도 변경되지 않은 모든 활성 source의 직전
 snapshot membership을 원자적으로 carry-forward한다. disabled/retired source도 해당 과거
 registry manifest에는 그대로 남아 과거 실행을 재현한다.
+저장소 seed는 같은 draft를 재실행하면 기존 draft를, 현재 approved head와 source/policy
+material이 모두 같으면 그 approved registry를 반환하며 새 snapshot이나 registry를 만들지
+않는다. head retire 뒤 같은 seed를 실행하면 retired registry를 재생하지 않고 새 draft를
+만들되 재사용 가능한 승인 source snapshot은 carry-forward한다.
 
 draft membership 변경은 registry 행의 `expected_row_version`과 manifest hash를 CAS로 검사하고
 변경·전체 carry-forward manifest 재계산·AuditEvent를 원자 처리한다. approved/retired registry는
@@ -1463,3 +1472,19 @@ PublicDeliveryAsset 삭제를 보류한다. raw 원문 purge는 snapshot 생성�
   Allocation atomically projects attempt/publication to reconciling. Terminal route
   callbacks and source-event or receipt DLQ complete the bound generation, manualize the
   attempt/publication, and make replay a no-op.
+
+## English — T009 Source Registry Lineage Addendum
+
+- `SourceDefinitionSnapshot.config/config_hash` is the immutable historical identity
+  used by registry manifests and collection runs. Runtime adapters consume only
+  `frozen_config/frozen_config_hash`. New v2 snapshots have identical historical and
+  frozen hashes. Migration `0003` restores the original legacy config and hash changed
+  by the v2 wrapper migration, then stores that wrapper under its own frozen hash.
+- Repository import reuses an exact draft, returns an exact approved head without
+  creating rows, and creates a new generation after head retirement instead of
+  replaying a retired registry. A changed import creates snapshots only for changed
+  source material and carries reusable approved or current draft memberships forward.
+- Request-key replay prevents the operation from being applied twice and returns the
+  same stable resource. The OpenAPI resource response is a current projection, while
+  registry decisions and mutations remain immutable operation records; the contract
+  does not promise a byte-for-byte historical response body.

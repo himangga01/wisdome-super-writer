@@ -14,6 +14,7 @@ from django.utils.text import slugify
 
 from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
+from apps.audit.redaction import AuditRedactionError, sanitize_audit_key
 from apps.audit.services import (
     AuditContext,
     audit_event_id,
@@ -61,6 +62,17 @@ SUPPORTED_ADAPTER_KEYS = frozenset(
         "rss",
     }
 )
+_ADAPTER_ACCESS_METHODS = {
+    "housing_applyhome": frozenset({"public_html"}),
+    "housing_lh": frozenset({"public_html"}),
+    "open_data_json": frozenset({"open_data_api", "public_api"}),
+    "public_html": frozenset({"public_file", "public_html"}),
+    "rss": frozenset({"rss_atom"}),
+}
+_ADAPTER_CONFIG_KEYS = {
+    adapter_key: frozenset({"entrypoints"})
+    for adapter_key in SUPPORTED_ADAPTER_KEYS
+}
 _ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9_.-]+$")
 _SECRET_KEY_PATTERN = re.compile(
     r"(?:authorization|cookie|token|password|passwd|secret|api.?key|"
@@ -86,6 +98,7 @@ _SECRET_QUERY_KEYS = frozenset(
         "access_token",
         "api_key",
         "apikey",
+        "auth",
         "authorization",
         "client_secret",
         "cookie",
@@ -93,13 +106,22 @@ _SECRET_QUERY_KEYS = frozenset(
         "key",
         "password",
         "secret",
+        "service_key",
+        "servicekey",
         "session",
         "sig",
         "signature",
+        "subscription_key",
+        "subscriptionkey",
         "token",
+        "x_auth",
         "x_amz_signature",
         "x_goog_signature",
     }
+)
+_SECRET_COMPACT_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]+", "", key)
+    for key in _SECRET_QUERY_KEYS
 )
 _SOURCE_CONTRACT_FIELDS = (
     "topic",
@@ -144,14 +166,20 @@ def _hash(material: Any) -> str:
 
 
 def source_registry_audit_request_key(request_key: str) -> str:
-    """Bind an arbitrary contract-valid request key to a safe audit key."""
+    """Preserve legacy-safe keys and hash only contract-valid unsafe keys."""
 
-    return _hash(
-        {
-            "schemaVersion": "source-registry-audit-request-key-v1",
-            "requestKey": request_key,
-        }
-    )
+    try:
+        return sanitize_audit_key(
+            request_key,
+            field_name="source registry request key",
+        )
+    except AuditRedactionError:
+        return _hash(
+            {
+                "schemaVersion": "source-registry-audit-request-key-v1",
+                "requestKey": request_key,
+            }
+        )
 
 
 def _id(value: Any) -> str | None:
@@ -301,7 +329,10 @@ def _validate_external_config(
                 "",
                 key.lower(),
             )
-            if _SECRET_KEY_PATTERN.search(normalized_key):
+            if (
+                normalized_key in _SECRET_COMPACT_KEYS
+                or _SECRET_KEY_PATTERN.search(normalized_key)
+            ):
                 raise InvalidInput(
                     "externalConfig must not contain credential fields."
                 )
@@ -449,6 +480,17 @@ def _normalize_source_material(
     )
     if not isinstance(external_config, dict):
         raise InvalidInput("externalConfig must be an object.")
+    if material["accessMethod"] not in _ADAPTER_ACCESS_METHODS[adapter_key]:
+        raise InvalidInput(
+            "accessMethod is incompatible with adapterKey."
+        )
+    unknown_config_keys = (
+        set(external_config) - _ADAPTER_CONFIG_KEYS[adapter_key]
+    )
+    if unknown_config_keys:
+        raise InvalidInput(
+            "externalConfig contains fields unsupported by adapterKey."
+        )
     entrypoints = external_config.get("entrypoints", [])
     if not isinstance(entrypoints, list) or any(
         not isinstance(item, str) for item in entrypoints
@@ -469,6 +511,14 @@ def _normalize_source_material(
                 "externalConfig URL hosts must match the approved baseUrl host."
             )
         normalized_entrypoints.append(normalized_entrypoint)
+    if len(set(normalized_entrypoints)) != len(normalized_entrypoints):
+        raise InvalidInput(
+            "externalConfig.entrypoints must not contain duplicates."
+        )
+    if material["enabled"] is True and not normalized_entrypoints:
+        raise InvalidInput(
+            "An enabled source requires a probe entrypoint."
+        )
     if "entrypoints" in external_config:
         external_config["entrypoints"] = normalized_entrypoints
     material["externalConfig"] = external_config
@@ -552,6 +602,25 @@ def source_snapshot_hash(source_material: Mapping[str, Any]) -> str:
     return _hash(source_snapshot_material(source_material))
 
 
+def _is_verifiable_v2_source_snapshot(
+    snapshot: SourceDefinitionSnapshot,
+    *,
+    expected_config_hash: str | None = None,
+) -> bool:
+    return (
+        isinstance(snapshot.frozen_config, dict)
+        and snapshot.frozen_config.get("schemaVersion")
+        == SOURCE_SNAPSHOT_SCHEMA_V2
+        and (
+            expected_config_hash is None
+            or snapshot.config_hash == expected_config_hash
+        )
+        and _hash(snapshot.frozen_config)
+        == snapshot.frozen_config_hash
+        and snapshot.frozen_config_hash == snapshot.config_hash
+    )
+
+
 def _apply_source_projection(
     source: SourceDefinition,
     material: Mapping[str, Any],
@@ -620,13 +689,17 @@ def _create_draft_snapshot(
     request_hash: str | None,
     using: str,
 ) -> SourceDefinitionSnapshot:
+    frozen_config = source_snapshot_material(material)
+    frozen_config_hash = source_snapshot_hash(material)
     snapshot = SourceDefinitionSnapshot(
         source=source,
         topic_code=source.topic_code,
         version=version,
         state=SourceDefinitionSnapshot.State.DRAFT,
-        config=source_snapshot_material(material),
-        config_hash=source_snapshot_hash(material),
+        config=frozen_config,
+        config_hash=frozen_config_hash,
+        frozen_config=frozen_config,
+        frozen_config_hash=frozen_config_hash,
         independence_group=material["independenceGroupId"],
         owner_name=material["ownerName"],
         editorial_control_name=material["editorialControlName"],
@@ -1265,7 +1338,9 @@ def update_registry_membership(
             raise StaleVersion(
                 "The selected source draft is no longer current."
             )
-        if data["enabled"] and not bool(snapshot.config.get("enabled", True)):
+        if data["enabled"] and not bool(
+            snapshot.frozen_config.get("enabled", True)
+        ):
             raise InvalidInput(
                 "A disabled source snapshot cannot be enabled in a registry."
             )
@@ -1440,15 +1515,11 @@ def _lock_and_validate_approval_sources(
             raise StateConflict(
                 "The selected source snapshot state is invalid."
             )
-        if not bool(snapshot.config.get("enabled", True)):
+        if not bool(snapshot.frozen_config.get("enabled", True)):
             raise InvalidInput(
                 "An enabled membership selected a disabled source snapshot."
             )
-        if (
-            snapshot.config.get("schemaVersion")
-            != SOURCE_SNAPSHOT_SCHEMA_V2
-            or _hash(snapshot.config) != snapshot.config_hash
-        ):
+        if not _is_verifiable_v2_source_snapshot(snapshot):
             raise Conflict(
                 "A selected source snapshot is not a verifiable v2 snapshot."
             )
@@ -1839,7 +1910,6 @@ def decide_source_registry(
                 "request_hash": request_hash,
                 "result": "decided",
                 "decision": decision_value,
-                "decision_id": str(decision.id),
                 "decision_hash": decision.decision_hash,
                 "registry_id": str(registry.id),
                 "manifest_hash": registry.manifest_hash,
@@ -1856,6 +1926,19 @@ def decide_source_registry(
 def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     for raw in data["sources"]:
+        if not isinstance(raw, Mapping):
+            raise InvalidInput(
+                "Repository sources must be objects."
+            )
+        source_key = raw.get("key")
+        if (
+            not isinstance(source_key, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", source_key)
+            is None
+        ):
+            raise InvalidInput(
+                "Repository source keys must be lowercase slugs."
+            )
         material = _normalize_source_material(
             {
                 "topic": data["topicCode"],
@@ -1902,7 +1985,12 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
                 "enabled": raw.get("enabled", True),
             }
         )
-        sources.append({"key": raw["key"], "material": material})
+        sources.append({"key": source_key, "material": material})
+    source_keys = [item["key"] for item in sources]
+    if len(set(source_keys)) != len(source_keys):
+        raise InvalidInput(
+            "Repository source keys must be unique within one topic."
+        )
     return {
         "topic_code": data["topicCode"],
         "title": data["title"],
@@ -1911,6 +1999,96 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
         "policy": data.get("policy", {}),
         "sources": sources,
     }
+
+
+def _approved_registry_matches_import(
+    registry: SourceRegistrySnapshot,
+    normalized: Mapping[str, Any],
+    *,
+    using: str,
+) -> bool:
+    if (
+        registry.state != SourceRegistrySnapshot.State.APPROVED
+        or registry.topic_code != normalized["topic_code"]
+    ):
+        return False
+    memberships = list(
+        SourceRegistryMembership.objects.using(using)
+        .select_related("source_definition", "source_snapshot")
+        .filter(registry=registry)
+        .order_by("source_definition_id")
+    )
+    if (
+        registry_manifest_hash_for_memberships(memberships)
+        != registry.manifest_hash
+    ):
+        return False
+    expected = {
+        item["key"]: {
+            "config_hash": source_snapshot_hash(item["material"]),
+            "enabled": bool(item["material"]["enabled"]),
+            "display_order": display_order,
+        }
+        for display_order, item in enumerate(normalized["sources"])
+    }
+    if len(expected) != len(normalized["sources"]):
+        raise InvalidInput(
+            "Repository source keys must be unique within one topic."
+        )
+    if {
+        membership.source_definition.key
+        for membership in memberships
+    } != set(expected):
+        return False
+    for membership in memberships:
+        source = membership.source_definition
+        snapshot = membership.source_snapshot
+        target = expected[source.key]
+        if (
+            source.topic_code != registry.topic_code
+            or snapshot.source_id != source.id
+            or snapshot.topic_code != registry.topic_code
+            or (
+                membership.enabled
+                and snapshot.state
+                != SourceDefinitionSnapshot.State.APPROVED
+            )
+            or membership.enabled != target["enabled"]
+            or membership.display_order != target["display_order"]
+            or not _is_verifiable_v2_source_snapshot(
+                snapshot,
+                expected_config_hash=target["config_hash"],
+            )
+        ):
+            return False
+    return True
+
+
+def _topic_policy_matches_import(
+    normalized: Mapping[str, Any],
+    *,
+    using: str,
+) -> bool:
+    policy = (
+        TopicPolicy.objects.using(using)
+        .select_for_update()
+        .filter(
+            code=normalized["topic_code"],
+            version=normalized["policy_version"],
+        )
+        .first()
+    )
+    expected_hash = _hash(normalized["policy"])
+    return policy is not None and all(
+        (
+            policy.active,
+            policy.title == normalized["title"],
+            policy.freshness_minutes
+            == normalized["freshness_minutes"],
+            policy.policy == normalized["policy"],
+            policy.policy_hash == expected_hash,
+        )
+    )
 
 
 def import_registry_manifest(
@@ -1938,6 +2116,32 @@ def import_registry_manifest(
 
     with transaction.atomic(using=alias):
         head = _lock_topic_head(topic_code, using=alias)
+        if head.current_approved_registry_id is not None:
+            current = (
+                SourceRegistrySnapshot.objects.using(alias)
+                .select_for_update()
+                .get(pk=head.current_approved_registry_id)
+            )
+            if (
+                current.version == head.current_approved_version
+                and current.manifest_hash
+                == head.current_approved_manifest_hash
+                and _approved_registry_matches_import(
+                    current,
+                    normalized,
+                    using=alias,
+                )
+                and _topic_policy_matches_import(
+                    normalized,
+                    using=alias,
+                )
+            ):
+                return RegistryImportResult(
+                    topic_code=topic_code,
+                    registry_id=str(current.id),
+                    source_count=len(normalized["sources"]),
+                    created=False,
+                )
         request_hash = _hash(
             {
                 **request_material,
@@ -1950,10 +2154,23 @@ def import_registry_manifest(
                 ),
             }
         )
-        request_key = f"seed:{request_hash}"
+        legacy_request_key = f"seed:{request_hash}"
+        request_key = "seed:" + _hash(
+            {
+                "schemaVersion": (
+                    "source-registry-import-generation-v1"
+                ),
+                "requestHash": request_hash,
+                "headRowVersion": head.row_version,
+            }
+        )
         existing = SourceRegistrySnapshot.objects.using(alias).filter(
             topic_code=topic_code,
-            draft_request_key=request_key,
+            state=SourceRegistrySnapshot.State.DRAFT,
+            draft_request_key__in=(
+                request_key,
+                legacy_request_key,
+            ),
         ).first()
         if existing is not None:
             require_idempotent_match(
@@ -1964,7 +2181,7 @@ def import_registry_manifest(
                 context=audit_context,
                 action="source_registry.imported",
                 entity=existing,
-                identity_key=request_key,
+                identity_key=existing.draft_request_key,
                 request_hash=request_hash,
             )
             return RegistryImportResult(
@@ -1988,6 +2205,7 @@ def import_registry_manifest(
         )
         if not policy_created and any(
             (
+                not policy.active,
                 policy.title != normalized["title"],
                 policy.freshness_minutes
                 != normalized["freshness_minutes"],
@@ -2017,6 +2235,7 @@ def import_registry_manifest(
                 _apply_source_projection(source, item["material"])
                 source.save(using=alias)
             target_hash = source_snapshot_hash(item["material"])
+            snapshot = None
             if (
                 source.latest_draft_snapshot_id
                 and source.latest_draft_config_hash == target_hash
@@ -2026,10 +2245,35 @@ def import_registry_manifest(
                     .select_for_update()
                     .get(pk=source.latest_draft_snapshot_id)
                 )
-                if snapshot.state != SourceDefinitionSnapshot.State.DRAFT:
+                if (
+                    snapshot.state
+                    != SourceDefinitionSnapshot.State.DRAFT
+                    or not _is_verifiable_v2_source_snapshot(
+                        snapshot,
+                        expected_config_hash=target_hash,
+                    )
+                ):
                     snapshot = None
-            else:
-                snapshot = None
+            if snapshot is None:
+                snapshot = (
+                    SourceDefinitionSnapshot.objects.using(alias)
+                    .select_for_update()
+                    .filter(
+                        source=source,
+                        state=SourceDefinitionSnapshot.State.APPROVED,
+                        config_hash=target_hash,
+                    )
+                    .order_by("-version")
+                    .first()
+                )
+                if (
+                    snapshot is not None
+                    and not _is_verifiable_v2_source_snapshot(
+                        snapshot,
+                        expected_config_hash=target_hash,
+                    )
+                ):
+                    snapshot = None
             if snapshot is None:
                 _retire_current_draft(source, using=alias)
                 version = _next_source_snapshot_version(
@@ -2044,11 +2288,18 @@ def import_registry_manifest(
                     request_hash=None,
                     using=alias,
                 )
+            elif snapshot.state == SourceDefinitionSnapshot.State.APPROVED:
+                _retire_current_draft(source, using=alias)
             _apply_source_projection(source, item["material"])
             source.current_snapshot_version = snapshot.version
-            source.latest_draft_snapshot = snapshot
-            source.latest_draft_snapshot_version = snapshot.version
-            source.latest_draft_config_hash = snapshot.config_hash
+            if snapshot.state == SourceDefinitionSnapshot.State.DRAFT:
+                source.latest_draft_snapshot = snapshot
+                source.latest_draft_snapshot_version = snapshot.version
+                source.latest_draft_config_hash = snapshot.config_hash
+            else:
+                source.latest_draft_snapshot = None
+                source.latest_draft_snapshot_version = None
+                source.latest_draft_config_hash = None
             source.save(using=alias)
             selected.append(
                 (
@@ -2307,9 +2558,7 @@ def current_registry(
         snapshot = member.source_snapshot
         if (
             snapshot.state != SourceDefinitionSnapshot.State.APPROVED
-            or snapshot.config.get("schemaVersion")
-            != SOURCE_SNAPSHOT_SCHEMA_V2
-            or _hash(snapshot.config) != snapshot.config_hash
+            or not _is_verifiable_v2_source_snapshot(snapshot)
         ):
             raise Conflict(
                 "An approved source registry contains an unverifiable snapshot."

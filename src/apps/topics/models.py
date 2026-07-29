@@ -219,10 +219,18 @@ class SourceDefinitionSnapshot(models.Model):
         choices=State.choices,
         default=State.DRAFT,
     )
-    # Full immutable execution material. Adapters must not read mutable source
-    # projection fields when executing a snapshot.
+    # Immutable historical identity material used by registry and run lineage.
+    # Runtime execution uses the separately verified frozen material below.
     config = models.JSONField(default=dict)
     config_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+    # Legacy evidence keeps its original config/config_hash for historical
+    # registry and run lineage. Runtime adapters read only this separately
+    # hashed, migration-frozen execution material.
+    frozen_config = models.JSONField()
+    frozen_config_hash = models.CharField(
         max_length=64,
         validators=[sha256_validator],
     )
@@ -289,6 +297,8 @@ class SourceDefinitionSnapshot(models.Model):
                 "version",
                 "config",
                 "config_hash",
+                "frozen_config",
+                "frozen_config_hash",
                 "independence_group",
                 "owner_name",
                 "editorial_control_name",
@@ -353,6 +363,17 @@ class SourceDefinitionSnapshot(models.Model):
             ):
                 raise ValidationError(
                     "Retiring a draft cannot add approval provenance."
+                )
+            if (
+                transition
+                == (self.State.APPROVED, self.State.RETIRED)
+                and (
+                    self.approved_by_id != original.approved_by_id
+                    or self.approved_at != original.approved_at
+                )
+            ):
+                raise ValidationError(
+                    "Retiring an approved snapshot must preserve approval provenance."
                 )
             if (
                 self.state == self.State.RETIRED
@@ -536,12 +557,15 @@ class SourceRegistrySnapshot(models.Model):
                     self.manifest_hash != original.manifest_hash
                 )
                 row_changed = self.row_version != original.row_version
-                if manifest_changed != row_changed or (
+                if (
+                    manifest_changed
+                    and not row_changed
+                ) or (
                     row_changed
                     and self.row_version != original.row_version + 1
                 ):
                     raise ValidationError(
-                        "Draft manifest and row version must advance together."
+                        "A draft manifest change requires one row-version advance."
                     )
                 if any(
                     getattr(self, field) != getattr(original, field)

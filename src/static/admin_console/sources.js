@@ -7,7 +7,7 @@
     {code: "semiconductor_news", name: "반도체 뉴스"},
   ];
   const SECRET_KEY_PATTERN =
-    /(^|[_-])(authorization|cookie|credential|password|passwd|secret|token|api[_-]?key|private[_-]?key)($|[_-])/i;
+    /(^|[_-])(auth|authorization|cookie|credential|password|passwd|secret|token|key|api[_-]?key|private[_-]?key|service[_-]?key|subscription[_-]?key|sig|signature|x[_-]?auth)($|[_-])/i;
   const SECRET_VALUE_PATTERNS = [
     /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/i,
     /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i,
@@ -45,6 +45,7 @@
     registryDecision: document.querySelector("#registry-decision"),
     decisionReason: document.querySelector("#decision-reason"),
     decisionPassword: document.querySelector("#decision-password"),
+    decisionMfa: document.querySelector("#decision-mfa"),
     approveRegistry: document.querySelector("#approve-registry"),
     retireRegistry: document.querySelector("#retire-registry"),
   };
@@ -797,7 +798,9 @@
     if (!registry) return;
     const reason = elements.decisionReason.value.trim();
     let currentPassword = elements.decisionPassword.value;
+    let mfaCode = elements.decisionMfa.value.trim() || null;
     elements.decisionPassword.value = "";
+    elements.decisionMfa.value = "";
     if (reason.length < 3) {
       currentPassword = "";
       setMessage("결정 사유를 3자 이상 입력하세요.", "error");
@@ -814,6 +817,7 @@
         : "현재 헤드를 폐기하면 승인 헤드가 없어집니다. 계속하시겠습니까?";
     if (!window.confirm(warning)) {
       currentPassword = "";
+      mfaCode = null;
       return;
     }
     const button =
@@ -827,10 +831,12 @@
         method: "POST",
         body: JSON.stringify({
           currentPassword,
+          mfaCode,
           actionScopes: ["registry_decision"],
         }),
       });
       currentPassword = "";
+      mfaCode = null;
       const head = state.head;
       await api(
         `/source-registries/${encodeURIComponent(registry.id)}/decisions`,
@@ -862,7 +868,9 @@
       setMessage(error.message, "error");
     } finally {
       currentPassword = "";
+      mfaCode = null;
       elements.decisionPassword.value = "";
+      elements.decisionMfa.value = "";
       button.disabled = false;
     }
   }

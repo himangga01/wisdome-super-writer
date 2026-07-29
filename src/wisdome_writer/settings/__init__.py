@@ -359,6 +359,8 @@ CELERY_TASK_CREATE_MISSING_QUEUES = False
 CELERY_TASK_QUEUES = tuple(
     Queue(name)
     for name in (
+        "outbox.dispatch",
+        "source.check",
         "collect.housing",
         "collect.semiconductor",
         "extract.fanout",
@@ -377,13 +379,13 @@ CELERY_BEAT_SCHEDULE = {
     "dispatch-outbox": {
         "task": "wisdome_writer.infrastructure.tasks.dispatch_outbox",
         "schedule": 5.0,
-        "options": {"queue": "maintenance"},
+        "options": {"queue": "outbox.dispatch"},
     }
 }
 CELERY_TASK_ROUTES = {
     "apps.evidence.tasks.process_paddleocr_document": {"queue": "extract.ocr.paddle"},
     "apps.evidence.tasks.process_run_evidence": {"queue": "extract.fanout"},
-    "wisdome_writer.infrastructure.tasks.dispatch_outbox": {"queue": "maintenance"},
+    "wisdome_writer.infrastructure.tasks.dispatch_outbox": {"queue": "outbox.dispatch"},
     "apps.collection.*": {"queue": "collect.housing"},
     "apps.evidence.*": {"queue": "extract.generic"},
     "apps.editorial.*": {"queue": "editorial"},

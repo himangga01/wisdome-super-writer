@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 
+from wisdome_writer.domain.hashing import (
+    CANONICAL_HASH_SCHEMA_V1,
+    canonical_hash,
+)
+
 
 @dataclass(frozen=True)
 class SourceAttachment:
@@ -58,70 +63,78 @@ class FrozenSourceDefinition:
     enabled: bool
 
 
-def source_adapter_key(source_snapshot) -> str:
-    config = source_snapshot.config
-    return str(config.get("adapterKey") or config.get("adapter") or "public_html")
-
-
-def _snapshot_adapter_input(source_snapshot) -> tuple[FrozenSourceDefinition, dict[str, Any]]:
-    material = source_snapshot.config
-    if material.get("schemaVersion") in {
+_FROZEN_SOURCE_SCHEMA_VERSIONS = frozenset(
+    {
         "source-definition-snapshot-v2",
         "source-definition-snapshot-legacy-v1",
-    }:
-        frozen_source = FrozenSourceDefinition(
-            id=source_snapshot.source_id,
-            topic_code=str(material["topic"]),
-            display_name=str(material["name"]),
-            publisher=str(material["publisher"]),
-            owner_name=str(material["ownerName"]),
-            editorial_control_name=str(material["editorialControlName"]),
-            base_url=str(material["baseUrl"]),
-            authority_tier=str(material["authorityTier"]),
-            access_method=str(material["accessMethod"]),
-            independence_group=str(material["independenceGroupId"]),
-            enabled=bool(material["enabled"]),
-        )
-        adapter_config = dict(material.get("externalConfig") or {})
-        adapter_config.update(
-            {
-                "adapter": material["adapterKey"],
-                "adapterKey": material["adapterKey"],
-                "allowedContentTypes": list(material.get("allowedMimeTypes") or []),
-                "rightsStatus": material.get("defaultRightsStatus"),
-                "termsUrl": material.get("termsUrl"),
-                "robotsUrl": material.get("robotsUrl"),
-                "licenseUrl": material.get("licenseUrl"),
-                "pollIntervalSeconds": material.get("pollIntervalSeconds"),
-                "rateLimitPolicy": dict(material.get("rateLimitPolicy") or {}),
-                "secretRef": material.get("secretRef"),
-            }
-        )
-        return frozen_source, adapter_config
+    }
+)
 
-    # This branch only supports a database that has not yet applied the T009
-    # migration. The migration freezes these values into every legacy snapshot.
-    source = source_snapshot.source
-    return (
-        FrozenSourceDefinition(
-            id=source.id,
-            topic_code=source.topic_code,
-            display_name=source.display_name,
-            publisher=getattr(source, "publisher", source.owner_name),
-            owner_name=source.owner_name,
-            editorial_control_name=getattr(
-                source,
-                "editorial_control_name",
-                source.owner_name,
-            ),
-            base_url=source.base_url,
-            authority_tier=source.authority_tier,
-            access_method=source.access_method,
-            independence_group=source.independence_group,
-            enabled=source.enabled,
-        ),
-        dict(material),
+
+def _frozen_snapshot_material(source_snapshot) -> dict[str, Any]:
+    material = source_snapshot.frozen_config
+    if (
+        not isinstance(material, dict)
+        or material.get("schemaVersion")
+        not in _FROZEN_SOURCE_SCHEMA_VERSIONS
+    ):
+        raise ValueError(
+            "Source adapters require a frozen source snapshot schema."
+        )
+    actual_hash = canonical_hash(
+        material,
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
     )
+    if actual_hash != source_snapshot.frozen_config_hash:
+        raise ValueError(
+            "Frozen source snapshot hash is inconsistent."
+        )
+    return material
+
+
+def source_adapter_key(source_snapshot) -> str:
+    material = _frozen_snapshot_material(source_snapshot)
+    adapter_key = material.get("adapterKey")
+    if not isinstance(adapter_key, str) or not adapter_key:
+        raise ValueError(
+            "Frozen source snapshot has no adapter key."
+        )
+    return adapter_key
+
+
+def _snapshot_adapter_input(
+    source_snapshot,
+) -> tuple[FrozenSourceDefinition, dict[str, Any]]:
+    material = _frozen_snapshot_material(source_snapshot)
+    frozen_source = FrozenSourceDefinition(
+        id=source_snapshot.source_id,
+        topic_code=str(material["topic"]),
+        display_name=str(material["name"]),
+        publisher=str(material["publisher"]),
+        owner_name=str(material["ownerName"]),
+        editorial_control_name=str(material["editorialControlName"]),
+        base_url=str(material["baseUrl"]),
+        authority_tier=str(material["authorityTier"]),
+        access_method=str(material["accessMethod"]),
+        independence_group=str(material["independenceGroupId"]),
+        enabled=bool(material["enabled"]),
+    )
+    adapter_config = dict(material.get("externalConfig") or {})
+    adapter_config.update(
+        {
+            "adapter": material["adapterKey"],
+            "adapterKey": material["adapterKey"],
+            "allowedContentTypes": list(material.get("allowedMimeTypes") or []),
+            "rightsStatus": material.get("defaultRightsStatus"),
+            "termsUrl": material.get("termsUrl"),
+            "robotsUrl": material.get("robotsUrl"),
+            "licenseUrl": material.get("licenseUrl"),
+            "pollIntervalSeconds": material.get("pollIntervalSeconds"),
+            "rateLimitPolicy": dict(material.get("rateLimitPolicy") or {}),
+            "secretRef": material.get("secretRef"),
+        }
+    )
+    return frozen_source, adapter_config
 
 
 def build_source_adapter(source_snapshot) -> SourceAdapter:

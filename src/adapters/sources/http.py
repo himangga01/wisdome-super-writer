@@ -76,7 +76,23 @@ class HttpSourceAdapter:
     def __init__(self, *, source, config):
         self.source = source
         self.config = config
-        self.allowed_hosts = {host for host in (urlparse(source.base_url).hostname,) if host}
+        entrypoints = config.get("entrypoints")
+        if (
+            not isinstance(entrypoints, list)
+            or not entrypoints
+            or any(
+                not isinstance(entrypoint, str) or not entrypoint
+                for entrypoint in entrypoints
+            )
+        ):
+            raise ValueError(
+                "Source adapter requires a probe entrypoint."
+            )
+        self.allowed_hosts = {
+            host
+            for host in (urlparse(source.base_url).hostname,)
+            if host
+        }
         self.timeout = httpx.Timeout(20, connect=10)
 
     def _get(self, url: str) -> httpx.Response:

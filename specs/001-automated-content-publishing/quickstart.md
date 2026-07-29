@@ -112,18 +112,21 @@ uv sync --all-groups
 docker compose up -d postgres redis object-storage
 uv run python src/manage.py migrate
 uv run python src/manage.py createsuperuser
-uv run python src/manage.py seed_source_registry --version initial
+uv run python src/manage.py seed_source_registry
 uv run python src/manage.py import_extraction_profiles --root config/extraction-profiles
-docker compose up -d web
+docker compose up -d web worker-source-check beat
 ```
 
-관리자 화면에서 2.1의 최소 profile과 두 주제의 draft source registry membership을 검토·
-승인한 다음에만 worker와 scheduler를 시작한다. seed/import 명령은 직접 승인할 수 없다.
+`worker-source-check`는 `outbox.dispatch`와 `source.check` 전용 큐만 소비한다. 따라서 승인
+전에도 source-check outbox를 전달하고 외부 접근·파싱 점검을 수행하되 일반 수집·편집·발행
+작업은 실행하지 않는다. 이 단계에서는 `GLOBAL_KILL_SWITCH=true`를 유지한다. 관리자 화면에서
+2.1의 최소 profile과 두 주제의 draft source registry membership을 검토·승인한 다음에만
+나머지 파이프라인 worker를 시작한다. seed/import 명령은 직접 승인할 수 없다.
 
 ```powershell
 uv run python src/manage.py verify_extraction_profile_snapshots --require-approved-mvp
 uv run python src/manage.py verify_source_registry_snapshots --require-approved-mvp
-docker compose up -d worker-collect worker-extract worker-extract-ocr worker-editorial worker-publish scheduler
+docker compose up -d worker-collect worker-extract ocr-worker worker-editorial worker-publish worker-publish-blogger worker-reconcile beat
 ```
 
 필수 확인:
