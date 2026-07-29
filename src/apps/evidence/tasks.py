@@ -663,6 +663,11 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
     ).get(pk=document_id)
     if _is_audit_only_document(document):
         return document
+    if document.state in (
+        ExtractionState.SUCCEEDED,
+        ExtractionState.LOW_CONFIDENCE,
+    ):
+        return document
     data = _storage().get_bytes(key=document.input_object_key, version_id=document.input_object_version or None)
     if hashlib.sha256(data).hexdigest() != document.input_checksum:
         raise ExtractorError("input_checksum_mismatch", "Downloaded input checksum differs from provenance")
@@ -688,10 +693,34 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
             document.expected_page_indices = [0]
             from .services import PageRoute
             routes = [PageRoute(0, ExtractionEngine.PADDLEOCR, "standalone_image")]
-        document.state = ExtractionState.RUNNING
-        document.started_at = document.started_at or timezone.now()
-        document.full_clean()
-        document.save()
+        input_page_count = document.input_page_count
+        input_frame_count = document.input_frame_count
+        expected_page_indices = document.expected_page_indices
+        with transaction.atomic():
+            document = (
+                DocumentExtraction.objects.select_for_update()
+                .select_related(
+                    "run_source_item__run",
+                    "run_source_item__source_snapshot__source",
+                    "source_item",
+                    "input_asset__generic_extraction_attempt__input_asset",
+                    "input_asset__producing_generic_attempt__input_asset",
+                    "input_asset__parent_asset",
+                )
+                .get(pk=document_id)
+            )
+            if document.state not in (
+                ExtractionState.QUEUED,
+                ExtractionState.RUNNING,
+            ):
+                return document
+            document.input_page_count = input_page_count
+            document.input_frame_count = input_frame_count
+            document.expected_page_indices = expected_page_indices
+            document.state = ExtractionState.RUNNING
+            document.started_at = document.started_at or timezone.now()
+            document.full_clean()
+            document.save()
 
         selected_by_engine: dict[str, ExtractionRun] = {}
         for engine, pages in group_routes(routes).items():
@@ -1177,6 +1206,10 @@ def _queue_document_retry(document_id: str, exc: Exception) -> None:
     DocumentExtraction.objects.filter(
         pk=document_id,
         input_fingerprint__isnull=False,
+        state__in=(
+            ExtractionState.QUEUED,
+            ExtractionState.RUNNING,
+        ),
     ).exclude(
         input_asset__derivation_type=EvidenceDerivationType.RAW,
         input_asset__raw_input_fingerprint__isnull=True,

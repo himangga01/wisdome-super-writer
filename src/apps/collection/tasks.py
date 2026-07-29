@@ -58,13 +58,14 @@ def _finalize_collection_run_delivery_failure(
                     run=run,
                     name="collect",
                     attempt_no=1,
-                    state="running",
                 )
                 .first()
             )
-            if step is None:
-                return {"runId": str(run.id), "state": run.state}
             stopping = True
+            update_stopping_step = (
+                step is not None
+                and step.state in {"queued", "running"}
+            )
         elif active:
             step, _ = RunStep.objects.select_for_update().get_or_create(
                 run=run,
@@ -72,15 +73,26 @@ def _finalize_collection_run_delivery_failure(
                 attempt_no=1,
             )
             stopping = run.stop_requested_at is not None
+            update_stopping_step = stopping
         else:
             return {"runId": str(run.id), "state": run.state}
 
         if stopping:
-            step.state = "stopped"
-            step.error_code = "stop_requested"
-            step.error_detail_redacted = (
-                "collection delivery stopped by request"
-            )
+            if update_stopping_step:
+                step.state = "stopped"
+                step.error_code = "stop_requested"
+                step.error_detail_redacted = (
+                    "collection delivery stopped by request"
+                )
+                step.finished_at = step.finished_at or now
+                step.save(
+                    update_fields=(
+                        "state",
+                        "error_code",
+                        "error_detail_redacted",
+                        "finished_at",
+                    )
+                )
             run.state = RunState.STOPPED
             run.error_summary = None
         else:
@@ -94,15 +106,15 @@ def _finalize_collection_run_delivery_failure(
                 "stage": "collect",
                 "code": redacted_code,
             }
-        step.finished_at = step.finished_at or now
-        step.save(
-            update_fields=(
-                "state",
-                "error_code",
-                "error_detail_redacted",
-                "finished_at",
+            step.finished_at = step.finished_at or now
+            step.save(
+                update_fields=(
+                    "state",
+                    "error_code",
+                    "error_detail_redacted",
+                    "finished_at",
+                )
             )
-        )
         run.completed_at = run.completed_at or now
         run.save(
             update_fields=(
@@ -114,7 +126,11 @@ def _finalize_collection_run_delivery_failure(
         return {
             "runId": str(run.id),
             "state": run.state,
-            "code": step.error_code,
+            "code": (
+                step.error_code
+                if step is not None
+                else "stop_requested"
+            ),
         }
 
 

@@ -22,8 +22,16 @@ $WorkerServices = @(
 )
 $IngressServices = @("web", "beat")
 $ApplicationServices = @($IngressServices + $WorkerServices)
-$LegacyQueues = @("collect", "default", "generate", "publish")
+$LegacyQueues = @(
+    "collect",
+    "default",
+    "extract.generic",
+    "generate",
+    "publish"
+)
 $LegacyPollSeconds = 5
+$ComposeProjectName = "wisdome-super-writer"
+$CollectionEgressNetworkName = $null
 
 $ComposeServices = @(& docker compose config --services)
 if ($LASTEXITCODE -ne 0) {
@@ -53,11 +61,6 @@ if ($UntrackedConsumers.Count -gt 0 -or $MissingServices.Count -gt 0) {
     )
 }
 
-& docker compose build
-if ($LASTEXITCODE -ne 0) {
-    throw "docker compose build failed"
-}
-
 $ExistingWorkerContainerIds = @(
     foreach ($Service in $WorkerServices) {
         $ContainerIds = @(& docker compose ps -a -q $Service)
@@ -67,6 +70,13 @@ $ExistingWorkerContainerIds = @(
         $ContainerIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     }
 )
+$LegacyExtractWorkerContainerIds = @(
+    & docker compose ps -a -q worker-extract |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+)
+if ($LASTEXITCODE -ne 0) {
+    throw "failed to inspect existing extract worker containers"
+}
 
 function Get-LegacyQueueLengths {
     $Lengths = @{}
@@ -166,80 +176,164 @@ function Stop-ExistingWorkers {
     }
 }
 
-& docker compose stop --timeout 120 @IngressServices
-if ($LASTEXITCODE -ne 0) {
-    throw "failed to stop web and beat before legacy queue drain"
-}
-
-& docker compose up -d postgres redis minio minio-bootstrap
-if ($LASTEXITCODE -ne 0) {
-    throw "failed to start infrastructure services"
-}
-
-& docker compose up -d --wait --wait-timeout 120 postgres redis minio
-if ($LASTEXITCODE -ne 0) {
-    throw "infrastructure services did not become healthy before legacy queue drain"
-}
-
-Start-ExistingWorkers
-if (-not (Wait-LegacyQueueDrain `
-    -TimeoutSeconds $LegacyDrainTimeoutSeconds `
-    -Phase "initial drain")) {
-    Stop-ExistingWorkers
-    throw (
-        "legacy queue drain timed out before migration; " +
-        "web, beat, and existing workers remain stopped"
+function Get-CollectionEgressNetworkName {
+    $NetworkNames = @(
+        & docker network ls `
+            --filter "label=com.docker.compose.project=$ComposeProjectName" `
+            --filter "label=com.docker.compose.network=collection-egress" `
+            --format "{{.Name}}"
     )
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to inspect the collection-egress network"
+    }
+    $NetworkNames = @(
+        $NetworkNames |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($NetworkNames.Count -ne 1) {
+        throw "expected exactly one collection-egress network for legacy drain"
+    }
+    return $NetworkNames[0]
 }
 
-Stop-ExistingWorkers
-$PostStopLengths = Get-LegacyQueueLengths
-[long]$PostStopTotal = 0
-foreach ($Length in $PostStopLengths.Values) {
-    $PostStopTotal += [long]$Length
-}
-$PostStopUnacked = Get-BrokerUnackedCount
-if ($PostStopUnacked -gt 0) {
-    throw (
-        "Redis still contains unacknowledged Celery deliveries after worker stop; " +
-        "migration was not started and web, beat, and existing workers remain stopped"
+function Connect-LegacyExtractEgress {
+    if ($LegacyExtractWorkerContainerIds.Count -eq 0) {
+        return
+    }
+    $script:CollectionEgressNetworkName = (
+        Get-CollectionEgressNetworkName
     )
+    foreach ($ContainerId in $LegacyExtractWorkerContainerIds) {
+        $AttachedNetworks = @(
+            & docker inspect `
+                --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' `
+                $ContainerId
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to inspect legacy extract worker networks"
+        }
+        if ($CollectionEgressNetworkName -notin $AttachedNetworks) {
+            $null = & docker network connect `
+                $CollectionEgressNetworkName $ContainerId
+            if ($LASTEXITCODE -ne 0) {
+                throw "failed to attach legacy extract worker to collection egress"
+            }
+        }
+    }
 }
-if ($PostStopTotal -gt 0) {
-    Write-Host (
-        "Legacy messages reappeared after graceful worker stop; " +
-        "restarting the same worker containers for one bounded re-drain."
-    )
+
+function Disconnect-LegacyExtractEgress {
+    if (
+        $LegacyExtractWorkerContainerIds.Count -eq 0 -or
+        [string]::IsNullOrWhiteSpace($CollectionEgressNetworkName)
+    ) {
+        return
+    }
+    foreach ($ContainerId in $LegacyExtractWorkerContainerIds) {
+        $AttachedNetworks = @(
+            & docker inspect `
+                --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' `
+                $ContainerId
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to inspect stopped legacy extract worker networks"
+        }
+        if ($CollectionEgressNetworkName -in $AttachedNetworks) {
+            $null = & docker network disconnect `
+                $CollectionEgressNetworkName $ContainerId
+            if ($LASTEXITCODE -ne 0) {
+                throw "failed to remove temporary legacy extract egress"
+            }
+        }
+    }
+    $script:CollectionEgressNetworkName = $null
+}
+
+try {
+    Connect-LegacyExtractEgress
+
+    & docker compose stop --timeout 120 @IngressServices
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to stop web and beat before legacy queue drain"
+    }
+
+    & docker compose build
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose build failed"
+    }
+
+    & docker compose up -d postgres redis minio minio-bootstrap
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to start infrastructure services"
+    }
+
+    & docker compose up -d --wait --wait-timeout 120 postgres redis minio
+    if ($LASTEXITCODE -ne 0) {
+        throw "infrastructure services did not become healthy before legacy queue drain"
+    }
+
     Start-ExistingWorkers
     if (-not (Wait-LegacyQueueDrain `
         -TimeoutSeconds $LegacyDrainTimeoutSeconds `
-        -Phase "post-stop re-drain")) {
+        -Phase "initial drain")) {
         Stop-ExistingWorkers
         throw (
-            "legacy queue re-drain timed out before migration; " +
+            "legacy queue drain timed out before migration; " +
             "web, beat, and existing workers remain stopped"
         )
     }
+
     Stop-ExistingWorkers
-    $PostRedrainUnacked = Get-BrokerUnackedCount
-    if ($PostRedrainUnacked -gt 0) {
+    $PostStopLengths = Get-LegacyQueueLengths
+    [long]$PostStopTotal = 0
+    foreach ($Length in $PostStopLengths.Values) {
+        $PostStopTotal += [long]$Length
+    }
+    $PostStopUnacked = Get-BrokerUnackedCount
+    if ($PostStopUnacked -gt 0) {
         throw (
-            "Redis still contains unacknowledged Celery deliveries after re-drain; " +
+            "Redis still contains unacknowledged Celery deliveries after worker stop; " +
             "migration was not started and web, beat, and existing workers remain stopped"
         )
     }
-}
+    if ($PostStopTotal -gt 0) {
+        Write-Host (
+            "Legacy messages reappeared after graceful worker stop; " +
+            "restarting the same worker containers for one bounded re-drain."
+        )
+        Start-ExistingWorkers
+        if (-not (Wait-LegacyQueueDrain `
+            -TimeoutSeconds $LegacyDrainTimeoutSeconds `
+            -Phase "post-stop re-drain")) {
+            Stop-ExistingWorkers
+            throw (
+                "legacy queue re-drain timed out before migration; " +
+                "web, beat, and existing workers remain stopped"
+            )
+        }
+        Stop-ExistingWorkers
+        $PostRedrainUnacked = Get-BrokerUnackedCount
+        if ($PostRedrainUnacked -gt 0) {
+            throw (
+                "Redis still contains unacknowledged Celery deliveries after re-drain; " +
+                "migration was not started and web, beat, and existing workers remain stopped"
+            )
+        }
+    }
 
-$FinalLegacyLengths = Get-LegacyQueueLengths
-[long]$FinalLegacyTotal = 0
-foreach ($Length in $FinalLegacyLengths.Values) {
-    $FinalLegacyTotal += [long]$Length
-}
-if ($FinalLegacyTotal -gt 0) {
-    throw (
-        "legacy queues are not empty after the final worker stop; " +
-        "migration was not started and web, beat, and existing workers remain stopped"
-    )
+    $FinalLegacyLengths = Get-LegacyQueueLengths
+    [long]$FinalLegacyTotal = 0
+    foreach ($Length in $FinalLegacyLengths.Values) {
+        $FinalLegacyTotal += [long]$Length
+    }
+    if ($FinalLegacyTotal -gt 0) {
+        throw (
+            "legacy queues are not empty after the final worker stop; " +
+            "migration was not started and web, beat, and existing workers remain stopped"
+        )
+    }
+} finally {
+    Disconnect-LegacyExtractEgress
 }
 
 & docker compose up -d --wait --wait-timeout 120 postgres

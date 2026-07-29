@@ -85,14 +85,18 @@ docker compose run --rm web python src/manage.py import_extraction_profiles --ro
 
 초기 실행과 이후 업그레이드는 항상 `deploy/compose-deploy.ps1`을 사용합니다.
 이 스크립트는 Compose에 등록된 모든 worker 서비스가 관리 목록에 포함됐는지 먼저 검사합니다.
-새 이미지를 빌드한 뒤 `web`과 beat를 먼저 중지해 새로운 HTTP 요청과 예약 생산을 차단하고,
-아직 실행 중인 구버전 worker가 legacy `collect`, `default`, `generate`, `publish` Redis 큐를
-비우도록 `LLEN`을 제한 시간 동안 확인합니다. 큐가 비면 구버전 worker를 최대 40분 동안
-graceful stop하고, stop 과정에서 예약·미확인 메시지가 legacy 큐로 돌아왔는지 다시 확인합니다.
-메시지가 돌아오면 같은 구버전 worker 컨테이너를 한 번 다시 시작해 제한 시간 동안 재-drain한
-뒤 다시 중지합니다. worker 중지 뒤 Redis broker의 `unacked` hash와 `unacked_index`도 모두
-비었는지 확인하므로, 강제 종료로 visibility timeout 안에 숨은 메시지가 있으면 migration 전에
-중단합니다.
+기존 worker와 전환용 network를 확인한 뒤 `web`과 beat를 먼저 중지해 새로운 HTTP 요청과
+예약 생산을 차단하고 새 이미지를 빌드합니다. 아직 실행 중인 구버전 worker가 legacy
+`collect`, `default`, `extract.generic`, `generate`, `publish` Redis 큐를 비우도록 `LLEN`을
+제한 시간 동안 확인합니다. 이 drain 동안에만 기존 `worker-extract`
+컨테이너를 `collection-egress`에 연결해 외부 첨부 다운로드가 실패 상태로 확정되지 않게 하고,
+worker를 중지한 뒤 연결을 제거합니다.
+
+큐가 비면 구버전 worker를 최대 40분 동안 graceful stop하고, stop 과정에서 예약·미확인
+메시지가 legacy 큐로 돌아왔는지 다시 확인합니다. 메시지가 돌아오면 같은 구버전 worker
+컨테이너를 한 번 다시 시작해 제한 시간 동안 재-drain한 뒤 다시 중지합니다. worker 중지 뒤
+Redis broker의 `unacked` hash와 `unacked_index`도 모두 비었는지 확인하므로, 강제 종료로
+visibility timeout 안에 숨은 메시지가 있으면 migration 전에 중단합니다.
 
 legacy 큐를 완전히 비우지 못하면 migration을 시작하지 않고 `web`, beat, 구버전 worker를
 중지된 상태로 남깁니다. 운영자는 큐와 worker 오류를 복구한 뒤 같은 스크립트를 다시 실행해야
@@ -116,16 +120,22 @@ migration을 우회 실행하지 않습니다.
 ### Safe Compose deployment contract (English)
 
 Use `deploy/compose-deploy.ps1` for both first boot and every upgrade. The script verifies
-that its inventory covers every configured worker. After building the new images, it stops
-web and beat first so no new HTTP or scheduled work is produced. Existing old worker
-containers remain available while the script polls Redis `LLEN` for the legacy `collect`,
-`default`, `generate`, and `publish` queues. It then gracefully stops those workers and
-checks the queues again. Messages restored during shutdown cause the same old containers
-to be restarted for one bounded re-drain and stopped again. After every worker stop, the
-script also requires the Redis broker's `unacked` hash and `unacked_index` to be empty, so
-a delivery hidden by a forced stop and its visibility timeout blocks migration.
+that its inventory covers every configured worker. It checks the existing workers and
+transition network, stops web and beat so no new HTTP or scheduled work is produced, and
+then builds the new images. Existing old worker containers remain available while the
+script polls Redis `LLEN` for the legacy `collect`,
+`default`, `extract.generic`, `generate`, and `publish` queues. For this drain only, the
+existing old `worker-extract` containers are attached to `collection-egress`, preventing
+legacy fan-out deliveries from finalizing attachment download failures. The temporary
+network attachment is removed after the workers stop.
 
-Migration does not start unless all four legacy queues remain empty after the final stop.
+The script then gracefully stops those workers and checks the queues again. Messages
+restored during shutdown cause the same old containers to be restarted for one bounded
+re-drain and stopped again. After every worker stop, the script also requires the Redis
+broker's `unacked` hash and `unacked_index` to be empty, so a delivery hidden by a forced
+stop and its visibility timeout blocks migration.
+
+Migration does not start unless all five legacy queues remain empty after the final stop.
 A drain timeout aborts with web, beat, and old workers stopped. Migration failure also
 leaves all application processes stopped. Only a successful drain and migration starts
 the new web, beat, and worker services. Redis credentials are not printed by the drain
