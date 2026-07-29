@@ -47,7 +47,7 @@
 | `run.requested` | `run_id` | 실행이 `queued`일 때 수집 시작 |
 | `run.stop_requested` | `run_id`, `reason_code` | 새 하위 작업을 만들지 않고 안전 지점에서 중지 |
 | `source.collect_requested` | `source_collection_attempt_id` | DB의 run/source snapshot/window와 adapter name/version/implementation/config manifest를 재조회해 조건부 수집 |
-| `source.item_changed` | `source_collection_attempt_id`, `run_id`, `run_source_item_id`, `source_item_id`, `change_kind=new_version/corrected/retracted/unavailable/restored` | succeeded attempt의 adapter/response provenance와 RunSourceItem 계보·kind/status 매핑을 검증; new/corrected/restored는 추출·검증, retracted/unavailable은 정정·철회 영향 평가; unchanged에는 이벤트 없음 |
+| `source.item_changed` | `source_collection_attempt_id`, `run_id`, `run_source_item_id`, `source_item_id`, `change_kind=new_version/corrected/retracted/unavailable/restored` | succeeded attempt의 adapter/response provenance와 불변 RunSourceItem 계보·활성 registry membership·kind/status 매핑을 검증; new/corrected/restored는 추출·검증, retracted/unavailable/restored는 전체 계보 기반 정정·철회·복원 영향 평가; unchanged에는 이벤트 없음 |
 | `evidence.document_extract_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `input_kind`, `document_extraction_id`, `extraction_run_id`, `retry_of_run_id?`, `profile_snapshot_id`, `profile_material_hash`, `profile_key`, `profile_version`, `page_set_hash`, `fingerprint_schema_version` | PDF 또는 가상 1페이지 독립 이미지의 결정적 child run; run/source 계보와 snapshot ID/material hash로 DB의 승인 profile 재조회 |
 | `evidence.document_ready` | `run_id`, `run_source_item_id`, `source_item_id`, `document_extraction_id`, `input_page_count`, `coverage_manifest_hash`, `selected_evidence_manifest_hash`, `document_complete=true` | run/source 계보와 상위 ID로 routing manifest와 선택 child/EvidenceAsset 전체를 DB에서 조회해 page coverage·권리·신뢰·중복을 재확인; 단일 child ID를 완료 대표로 사용하지 않음 |
 | `evidence.other_extract_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `generic_extraction_attempt_id`, `profile_snapshot_id`, `profile_material_hash`, `engine`, `extractor_version`, `config_hash`, `validation_mode`, `calibration_profile_key?`, `calibration_profile_version?`, `calibration_profile_hash?`, `fingerprint_schema_version`, `extraction_fingerprint` | run/source 계보, queued attempt와 승인 profile snapshot/material hash를 재조회한 뒤 비문서 파생 실행 |
@@ -346,6 +346,14 @@ The implementation does not overload `evidence.document_extract_requested` with 
 parent-document payload, and it does not overload `article.draft_requested` with a
 run payload. The former remains the child `ExtractionRun` contract; the latter remains
 the pre-created `GenerationAttempt` contract.
+
+### T010 source-change lineage
+
+`source.item_changed@1` validates the succeeded attempt, immutable RunSourceItem chain,
+enabled run-registry membership, and exact change-kind/status mapping. New, corrected,
+and restored observations enter extraction. Retracted, unavailable, and restored
+observations also walk the full prior lineage to converge article correction,
+withdrawal, unavailability, or restoration impact. Unchanged observations emit no event.
 
 ### Redelivery state machine
 

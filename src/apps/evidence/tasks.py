@@ -29,6 +29,10 @@ from adapters.extractors.native_pdf import NativePdfExtractor
 from adapters.extractors.paddleocr import PaddleOCRExtractor
 from adapters.extractors.spreadsheet import SpreadsheetExtractor
 from adapters.extractors.structured import StructuredDataExtractor
+from adapters.sources import (
+    source_attachment_content_types,
+    source_record_hosts,
+)
 from adapters.storage import ObjectInfo, S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
 from apps.collection.models import (
@@ -36,6 +40,7 @@ from apps.collection.models import (
     RecoveryState,
     RunState,
     RunStep,
+    SourceDiscoveryKind,
 )
 from apps.collection.services import (
     begin_step_observation,
@@ -83,6 +88,19 @@ from .services import (
 )
 
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
+_GENERIC_BINARY_MIME_TYPES = frozenset(
+    {"application/octet-stream", "binary/octet-stream"}
+)
+_ATTACHMENT_MIME_ALIASES = {
+    "application/vnd.hancom.hwpx": "application/hwp+zip",
+    "application/x-hwp": "application/haansofthwp",
+    "application/vnd.hancom.hwp": "application/haansofthwp",
+}
+EXTRACTABLE_SOURCE_DISCOVERY_KINDS = (
+    SourceDiscoveryKind.NEW_VERSION,
+    SourceDiscoveryKind.CORRECTED,
+    SourceDiscoveryKind.RESTORED,
+)
 
 
 def _begin_domain_step_observation(
@@ -486,9 +504,9 @@ def _create_raw_evidence(run_source_item) -> EvidenceAsset:
 def _download_attachment(run_source_item, attachment: Mapping[str, Any]) -> tuple[bytes, str, str]:
     url = str(attachment.get("url", ""))
     parsed = urlparse(url)
-    source = run_source_item.source_snapshot.source
-    allowed_hosts = {urlparse(source.base_url).hostname}
-    allowed_hosts.update(run_source_item.source_snapshot.config.get("allowedAttachmentHosts", []))
+    allowed_hosts = source_record_hosts(
+        run_source_item.source_snapshot
+    )
     try:
         response = safe_get(
             url,
@@ -521,6 +539,50 @@ def _download_attachment(run_source_item, attachment: Mapping[str, Any]) -> tupl
     )
     filename = Path(parsed.path).name or "attachment.bin"
     return response.content, mime_type, filename
+
+
+def _normalized_attachment_mime(value: str) -> str:
+    normalized = str(value).split(";", 1)[0].strip().lower()
+    return _ATTACHMENT_MIME_ALIASES.get(normalized, normalized)
+
+
+def _approved_attachment_mime(
+    run_source_item,
+    *,
+    declared_mime: str,
+    sniffed_mime: str,
+) -> str:
+    approved = {
+        _normalized_attachment_mime(value)
+        for value in source_attachment_content_types(
+            run_source_item.source_snapshot
+        )
+    }
+    declared = _normalized_attachment_mime(declared_mime)
+    sniffed = _normalized_attachment_mime(sniffed_mime)
+    declared_is_generic = declared in _GENERIC_BINARY_MIME_TYPES
+    sniffed_is_generic = sniffed in _GENERIC_BINARY_MIME_TYPES
+    if (
+        not declared_is_generic
+        and not sniffed_is_generic
+        and declared != sniffed
+    ):
+        raise ExtractorError(
+            "attachment_mime_conflict",
+            "Attachment declared and detected MIME types conflict",
+        )
+    effective = declared if sniffed_is_generic else sniffed
+    if effective not in approved:
+        raise ExtractorError(
+            "attachment_mime_not_allowed",
+            "Attachment MIME type is outside the frozen source contract",
+        )
+    if not declared_is_generic and declared not in approved:
+        raise ExtractorError(
+            "attachment_declared_mime_not_allowed",
+            "Attachment declared MIME type is outside the frozen source contract",
+        )
+    return effective
 
 
 def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: bytes, mime_type: str, filename: str):
@@ -1163,7 +1225,11 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         temp_path = Path(temp_dir) / filename
         temp_path.write_bytes(data)
         sniffed = sniff_mime(temp_path)
-    mime_type = sniffed if sniffed != "application/octet-stream" else declared_mime
+    mime_type = _approved_attachment_mime(
+        run_source_item,
+        declared_mime=declared_mime,
+        sniffed_mime=sniffed,
+    )
     raw_asset, info = _persist_attachment(run_source_item, attachment, data, mime_type, filename)
     suffix = Path(filename).suffix.lower()
     if mime_type == "application/pdf":
@@ -1201,15 +1267,43 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         return
     engine = None
     preferred = None
-    if suffix == ".hwpx":
+    if suffix == ".hwpx" and mime_type == "application/hwp+zip":
         engine, preferred = ExtractionEngine.HWPX, "hwpx-deterministic-v1"
-    elif suffix == ".hwp":
+    elif (
+        suffix == ".hwp"
+        and mime_type == "application/haansofthwp"
+    ):
         engine, preferred = ExtractionEngine.LEGACY_HWP, "legacy-hwp-v1"
-    elif suffix in {".xlsx", ".xlsm", ".csv", ".tsv"}:
+    elif (
+        suffix in {".xlsx", ".xlsm"}
+        and mime_type
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ) or (
+        suffix == ".xls"
+        and mime_type == "application/vnd.ms-excel"
+    ) or (
+        suffix in {".csv", ".tsv"}
+        and mime_type in {"text/csv", "text/tab-separated-values"}
+    ):
         engine, preferred = ExtractionEngine.SPREADSHEET, "spreadsheet-deterministic-v1"
-    elif suffix in {".html", ".htm"}:
+    elif (
+        suffix in {".html", ".htm"}
+        and mime_type in {"text/html", "application/xhtml+xml"}
+    ):
         engine, preferred = ExtractionEngine.HTML, "html-deterministic-v1"
-    elif suffix in {".json", ".jsonld", ".xml", ".rss", ".atom"}:
+    elif (
+        suffix in {".json", ".jsonld"}
+        and mime_type in {"application/json", "application/ld+json"}
+    ) or (
+        suffix in {".xml", ".rss", ".atom"}
+        and mime_type
+        in {
+            "application/xml",
+            "text/xml",
+            "application/rss+xml",
+            "application/atom+xml",
+        }
+    ):
         engine, preferred = ExtractionEngine.STRUCTURED, "structured-deterministic-v1"
     if not engine:
         return
@@ -1595,6 +1689,73 @@ def finalize_run_evidence(run_id: str):
             input_asset__parent_asset__raw_input_fingerprint__isnull=True,
         ).count()
         failure_count = document_failures + generic_failures
+        if step.input_count == 0:
+            finished_at = timezone.now()
+            step.output_count = 0
+            step.error_code = None
+            step.error_detail_redacted = None
+            step.state = "succeeded"
+            _project_domain_step_terminal(
+                step,
+                run,
+                finished_at=finished_at,
+                final_state=step.state,
+                affected_count=0,
+                error_code=None,
+                recovery_state=RecoveryState.NOT_REQUIRED,
+            )
+            step.save(
+                update_fields=(
+                    "correlation_id",
+                    "worker_task_id",
+                    "output_count",
+                    "error_code",
+                    "error_detail_redacted",
+                    "state",
+                    "finished_at",
+                    "duration_ms",
+                    "retry_count",
+                    "retry_at",
+                    "terminal_impact",
+                    "recovery_state",
+                )
+            )
+            run.state = RunState.COMPLETED
+            run.completed_at = finished_at
+            run.error_summary = None
+            run.counters = {
+                **run.counters,
+                "evidence": 0,
+                "extractionFailures": 0,
+            }
+            project_run_terminal_observation(
+                run,
+                finished_at=finished_at,
+                stage="extract",
+                final_state=run.state,
+                affected_count=0,
+                error_code=None,
+                recovery_state=RecoveryState.NOT_REQUIRED,
+            )
+            run.save(
+                update_fields=(
+                    "state",
+                    "completed_at",
+                    "error_summary",
+                    "counters",
+                    "duration_ms",
+                    "terminal_impact",
+                    "recovery_state",
+                    "next_recovery_at",
+                )
+            )
+            return {
+                "runId": str(run.id),
+                "state": run.state,
+                "evidence": 0,
+                "failures": 0,
+                "noSourceChanges": True,
+            }
         if missing_selected_evidence:
             now = timezone.now()
             error_code = "selected_run_evidence_missing"
@@ -2146,7 +2307,10 @@ def process_run_evidence(run_id: str):
             run,
             started_at=started_at,
         )
-        step.input_count = run.run_source_items.count()
+        step.input_count = run.run_source_items.filter(
+            discovery_kind__in=EXTRACTABLE_SOURCE_DISCOVERY_KINDS,
+            collection_attempt__state="succeeded",
+        ).count()
         step.save(
             update_fields=(
                 "correlation_id",
@@ -2167,6 +2331,9 @@ def process_run_evidence(run_id: str):
     failures: list[dict[str, str]] = []
     items = run.run_source_items.select_related(
         "source_item", "source_snapshot__source"
+    ).filter(
+        discovery_kind__in=EXTRACTABLE_SOURCE_DISCOVERY_KINDS,
+        collection_attempt__state="succeeded",
     ).order_by("id")
     for run_source_item in items:
         if CollectionRun.objects.filter(

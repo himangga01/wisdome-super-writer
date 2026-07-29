@@ -107,32 +107,58 @@ T045~T057 완료 ─────────────────────
 
 ### T045 — 실제 주제별 수집기와 변경 상태
 
-**상태**: 부분 구현. RSS 시간창 필터 외 핵심 실수집은 미구현.
+**상태**: 부분 구현. T010 주택 수집·상태 계보는 구현됐고 T011 반도체 실수집이 남아 있다.
 
 현재 문제:
 
-- [`src/adapters/sources/housing/__init__.py`](../../src/adapters/sources/housing/__init__.py)의
-  ApplyHome/LH adapter는 빈 `PublicHtmlAdapter` subclass다.
-- `PublicHtmlAdapter.collect()`는 목록 page 전체를 SourceItem 하나로 저장하고 상세, pagination,
-  `since/until`을 처리하지 않는다.
-- `OpenDataJsonAdapter`는 첫 payload의 `items`만 읽고 pagination, 기간, API secret ref가 없다.
-- `SourceItem` status는 항상 `active`, discovery는 `new_version|unchanged`뿐이다.
+- ApplyHome은 ODCloud 상세 목록을 page/기간 조건으로, LH는 목록→상세→공급을 공고별로
+  수집하고 두 출처의 공식 상세 HTML에서도 첨부 link를 찾는다.
+- 공공데이터 service key는 정확한 HTTPS host/path와
+  `env://DATA_GO_KR_SERVICE_KEY`에 목적 결합되어 요청 직전에만 해석된다.
+- `OpenDataJsonAdapter`는 ODCloud/data.go.kr envelope, bounded pagination, 기간과 stable ID를
+  처리한다.
+- SourceItem append-only 상태와 RunSourceItem 직전 관측 계보가
+  `new_version/unchanged/corrected/retracted/unavailable/restored`를 보존한다.
+- source snapshot v3는 adapter version과 실제 구현 파일 checksum을 고정하고, source attempt
+  성공·관측·변경 event를 한 transaction에 커밋한다.
+- `unchanged/retracted/unavailable`은 신규 evidence로 보내지 않고 terminal 상태는 기존
+  게시물 영향 평가로 분기한다.
+- legacy 호환 첫 관측은 현재 hash schema 기준 행을 append하되 `unchanged`로 전환하고,
+  SourceItem/RunSourceItem 불변성과 활성 registry membership·성공 previous lineage를
+  ORM/PostgreSQL에서 강제한다.
+- 실제 redirect/IP HTTP 시도가 frozen budget을 소비하며, payload credential redaction,
+  frozen 첨부 MIME 검증, 공식 file ID 보존과 해석 불가 scripted download 실패 폐쇄를
+  적용한다.
+- 동시 수집 replay는 성공 response checksum을 재검증하고 run 상태를 후퇴시키지 않는다.
+  연속 terminal/restored 영향은 전체 관측 lineage에서 게시물을 찾아 correction case를
+  수렴시킨다.
+- 일반 `PublicHtmlAdapter`와 아래 반도체 출처는 아직 목록 page 단위다.
 - MOTIE/KRX/SIA도 일반 목록 page 단위이며 Samsung/SK hynix RSS만 item 단위다.
 
 남은 구현:
 
-1. ApplyHome, LH, MOTIE, KRX, SIA별 목록→상세→첨부 parser를 구현한다.
-2. 안정적인 external ID/canonical URL, 게시·수정 시각, pagination/cursor, 기간 필터,
-   early stop/max pages와 구조 변경 감지를 추가한다.
-3. PDF/HWP/HWPX/XLS(X)/이미지/차트/표의 content type, URL, 권리 metadata를 evidence 단계로 전달한다.
-4. `corrected`, `retracted`, `unavailable`, `restored` 상태와 append-only source version lineage를 구현한다.
-5. 출처별 고정 fixture와 parse failure 격리를 준비한다.
+1. T011에서 MOTIE, KRX, SIA별 목록→상세→첨부 parser와 안정 ID, pagination/cursor,
+   기간·구조 변경 감지를 구현한다.
+2. 반도체 PDF/XLS(X)/이미지/차트/표의 content type, URL, 권리 metadata를 evidence 단계로 전달한다.
+3. 출처별 고정 fixture와 parse failure 격리를 계속 확장한다.
 
 완료 조건:
 
 - 모든 enabled source가 목록 item별 상세 record를 만든다.
-- window 밖 자료는 0건이며 두 page 이상을 안정적으로 순회한다.
+- 신규 identity는 window 밖에서 0건이다. 과거 성공 관측 identity만 승인된 reconciliation
+  기간 안에서 상태 확인용으로 재조회하며 두 page 이상을 안정적으로 순회한다.
 - 같은 자료 재수집은 `unchanged`, 본문 변경은 새 version, 철회/복원은 정확한 상태가 된다.
+
+#### English — T045 implementation state
+
+T010 housing collection is implemented. ApplyHome and LH use exact purpose-bound HTTPS
+profiles, bounded total-count pagination, official detail-page attachment discovery,
+observed-lineage reconciliation, immutable source-version schema cutover, and atomic
+attempt/change-event persistence. Current-schema cutover baselines, immutable registry-bound
+observations, physical request budgets, response credential redaction, frozen attachment
+MIME enforcement, concurrency-safe replay, and full-lineage terminal/restoration impact
+are included. Unchanged and terminal observations do not start fresh evidence extraction.
+T011 remains responsible for the semiconductor source-specific collectors and attachments.
 
 ### T047 — 중복·충돌·글 identity·반도체 속보 검증
 

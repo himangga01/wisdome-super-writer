@@ -12,7 +12,9 @@ $ErrorActionPreference = "Stop"
 # 한국어: web/beat를 먼저 차단하고 구버전 worker로 legacy 큐를 비운 뒤 migration한다.
 # English: Stop web/beat first, drain legacy queues with old workers, then migrate.
 $WorkerServices = @(
+    "worker-source-check",
     "worker-collect",
+    "worker-evidence-fanout",
     "worker-extract",
     "worker-editorial",
     "worker-publish",
@@ -345,6 +347,17 @@ if ($LASTEXITCODE -ne 0) {
     --abort-on-container-exit --exit-code-from migrate migrate
 if ($LASTEXITCODE -ne 0) {
     throw "migration failed; web, beat, and workers remain stopped"
+}
+
+# 현재 코드와 일치하는 승인된 v3 소스 snapshot이 없으면 수집 worker를 시작하지 않는다.
+# English: Do not start collection workers without approved v3 source snapshots matching this build.
+& docker compose run --rm --no-deps migrate `
+    python src/manage.py verify_source_registry_snapshots --require-approved-mvp
+if ($LASTEXITCODE -ne 0) {
+    throw (
+        "source registry snapshot verification failed; " +
+        "web, beat, and workers remain stopped"
+    )
 }
 
 & docker compose up -d @ApplicationServices

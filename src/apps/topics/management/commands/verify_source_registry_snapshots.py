@@ -12,7 +12,7 @@ from apps.topics.models import (
     TopicRegistryHead,
 )
 from apps.topics.services import (
-    SOURCE_SNAPSHOT_SCHEMA_V2,
+    SOURCE_SNAPSHOT_SCHEMA_V3,
     normalize_registry_import,
     registry_manifest_hash,
     source_snapshot_hash,
@@ -183,7 +183,7 @@ class Command(BaseCommand):
                     )
                 if (
                     snapshot.frozen_config.get("schemaVersion")
-                    != SOURCE_SNAPSHOT_SCHEMA_V2
+                    != SOURCE_SNAPSHOT_SCHEMA_V3
                 ):
                     failures.append(
                         f"{topic_code}: legacy snapshot cannot be current"

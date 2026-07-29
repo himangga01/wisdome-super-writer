@@ -1473,13 +1473,31 @@ PublicDeliveryAsset 삭제를 보류한다. raw 원문 purge는 snapshot 생성�
   callbacks and source-event or receipt DLQ complete the bound generation, manualize the
   attempt/publication, and make replay a no-op.
 
+## T009 출처 레지스트리 계보 보강
+
+`SourceDefinitionSnapshot.config/config_hash`는 레지스트리와 실행이 참조하는 역사적
+identity이고, runtime adapter는 별도로 hash를 검증한 `frozen_config/frozen_config_hash`만
+사용한다. 과거 v2와 legacy snapshot은 감사·재현을 위해 보존하지만 새 실행에 선택하는
+snapshot v3는 adapter version, adapter·보안·secret·canonical hash 구현 파일 checksum과
+Python 및 직접 runtime dependency version까지 함께 고정한다. 배포 구현 manifest가 다르면
+기존 snapshot을 현재 코드로 재해석하지 않고 새 draft 승인 전 수집을 차단한다. Compose
+배포도 migration 뒤 승인된 v3 snapshot 검증이 통과해야 application 서비스를 시작한다.
+
+repository import는 같은 draft와 정확히 같은 approved head를 재사용하고, retired head는
+재사용하지 않는다. 변경된 source만 새 snapshot을 만들며 나머지 membership은 직전 승인
+snapshot을 carry-forward한다. request key의 동일 payload replay는 같은 결과를 반환하고 다른
+payload는 충돌로 처리한다.
+
 ## English — T009 Source Registry Lineage Addendum
 
 - `SourceDefinitionSnapshot.config/config_hash` is the immutable historical identity
   used by registry manifests and collection runs. Runtime adapters consume only
-  `frozen_config/frozen_config_hash`. New v2 snapshots have identical historical and
-  frozen hashes. Migration `0003` restores the original legacy config and hash changed
-  by the v2 wrapper migration, then stores that wrapper under its own frozen hash.
+  `frozen_config/frozen_config_hash`. Historical v2 and legacy snapshots remain preserved,
+  while executable v3 snapshots also bind the adapter version, adapter/security/secret/
+  canonical-hash implementation files, Python runtime, and direct dependency versions.
+  Migration `0003` restores the original legacy config and hash changed by the v2 wrapper
+  migration, then stores that wrapper under its own frozen hash. Deployment gates
+  application startup on an approved v3 snapshot matching the new build.
 - Repository import reuses an exact draft, returns an exact approved head without
   creating rows, and creates a new generation after head retirement instead of
   replaying a retired registry. A changed import creates snapshots only for changed
@@ -1488,3 +1506,99 @@ PublicDeliveryAsset 삭제를 보류한다. raw 원문 purge는 snapshot 생성�
   same stable resource. The OpenAPI resource response is a current projection, while
   registry decisions and mutations remain immutable operation records; the contract
   does not promise a byte-for-byte historical response body.
+
+## T010 주택 출처 관측 계보 보강
+
+`CollectedSourceRecord`는 공고별 stable external ID, canonical URL, 게시·수정 시각,
+`active/corrected/retracted/unavailable` 상태, 결정적 raw checksum, 허용된 HTTP metadata와
+첨부의 공식 file ID·MIME·크기·checksum·권리 상태를 전달한다. `restored`는 출처가 보내는
+상태가 아니라 영속화 시 직전 관측과 비교해 계산하는 `RunSourceItem.discovery_kind`다.
+
+청약홈 external ID는
+`applyhome:{category}:{HOUSE_MANAGE_NO}:{PBLANC_NO}`, LH external ID는
+`lh:{CCR_CNNT_SYS_DS_CD}:{PAN_ID}:{UPP_AIS_TP_CD}:{AIS_TP_CD}`다. query 전체를 제거하는
+로그 redaction URL은 identity로 사용하지 않는다. canonical URL은 userinfo, fragment,
+credential, session·tracking parameter를 제거하되 출처별 allowlist에 있는 공식 ID/file
+parameter를 정렬해 보존한다.
+
+`source_version_hash`는 NFC+RFC 8785 SHA-256으로 stable ID, canonical URL, title, publisher,
+게시·수정 시각, language, status, content hash, 공고별 raw checksum과 ETag/Last-Modified/MIME을
+묶는다. 새 hash일 때만 SourceItem과 `supersedes_id`를 만들고 동일 hash는 기존 SourceItem을
+재사용한다. 모든 후속 관측은 같은 출처·external ID의 직전 RunSourceItem을
+`previous_run_source_item_id`로 가리킨다. 분류 순서는 terminal 상태 뒤 active면 `restored`,
+동일 SourceItem이면 `unchanged`, 현재 상태가 corrected/retracted/unavailable이면 같은 이름,
+그 밖의 active 새 버전은 `new_version`이다.
+
+`source_version_schema`는 배포 전 `legacy-source-item-version-v0`와
+`nfc-rfc8785-source-item-version-v1`을 구분한다. 새 수집은 현재 schema hash를 먼저 찾고,
+동일한 기존 content·게시 시각·active 상태의 legacy hash가 정확히 일치할 때만 과거 행을
+호환 기준으로 인정한다. 이때 legacy 행을 계속 재사용하지 않고 현재 schema의 기준 SourceItem을
+append하되 첫 관측만 `unchanged`로 기록한다. 따라서 배포 직후 거짓 변경 이벤트는 만들지
+않으면서 이후 raw checksum, HTTP validator, 첨부 공식 ID·checksum만 바뀐 변경도 숨기지 않는다.
+SourceItem과 RunSourceItem의 update/delete, 다른 source 또는 external ID로 향하는
+`supersedes/previous`는 ORM과 PostgreSQL trigger에서 거부한다. RunSourceItem은 실행 registry에
+활성화된 source snapshot, 같은 attempt/run/source, 성공한 과거 관측만 가리킬 수 있다.
+
+출처별 목록 순회는 승인된 page 크기와 page 상한 안에서만 실행하며 반복 page, 중복 identity,
+필수 identity/date/detail 구조 누락, total count 미달, page·request·elapsed 상한 소진을
+source schema 실패로 처리한다.
+timeout, 5xx, parsing 실패 또는 한 번의 목록 누락은 `unavailable`로 바꾸지 않는다.
+요청 시간창 밖에서는 성공한 과거 관측의 stable ID만 승인된 reconciliation 기간 안에서
+재조회한다. ID 후보 자체도 그 기간 안에 성공적으로 관측된 행으로 제한하므로 누적 identity가
+영구 실패를 만들지 않는다. request budget은 redirect와 다중 IP 재시도를 포함한 실제 HTTP
+시도마다 차감한다. API의 첨부 필드뿐 아니라 공식 상세 HTML page의 link도 수집하고 공식
+file ID를 URL과 분리해 보존한다. 실행형 handler에서 공개 URL을 결정할 수 없으면 실패
+폐쇄한다. evidence 다운로드는 frozen `recordHosts`와 `attachmentContentTypes`를 함께
+검사하고, 선언 MIME과 sniff MIME의 충돌 또는 확장자 기반 extractor 위장을 거부한다.
+
+공공데이터 서비스 키는 `env://DATA_GO_KR_SERVICE_KEY`로 목적이 고정되고 인증 요청은
+adapter별 정확한 HTTPS host/path에서만 가능하다. 실제 값은 source-check와 collection
+worker가 요청 직전에 해석한다. adapter version, 구현 파일 manifest, frozen config와 시간창을
+묶은 요청 지문, 응답 checksum, SourceItem/RunSourceItem 및 `source.item_changed` outbox는
+source 단위 transaction에서 attempt 성공과 함께 커밋된다. 응답 payload의 credential 계열
+field/value는 본문·metadata 생성 전에 마스킹한다. 동시 worker는 성공 attempt의 response
+checksum을 재검증하고 이미 다음 단계로 간 run을 이전 상태로 되돌리지 않는다.
+`unchanged`에는 변경 이벤트와 신규 evidence가 없고 `new_version/corrected/restored`만
+추출한다. `retracted/unavailable/restored` 영향 평가는 전체 previous 관측 lineage에서 실제
+evidence를 사용한 글을 찾고, 복원은 미적용 terminal case를 닫은 뒤 restoration case를 만든다.
+
+## English — T010 Housing Source Observation Lineage
+
+Each normalized housing record carries a provider-stable identity, identity-preserving
+canonical URL, publication and modification timestamps, explicit source status,
+deterministic per-notice raw checksum, bounded HTTP metadata, and attachment provenance.
+ApplyHome uses `applyhome:{category}:{HOUSE_MANAGE_NO}:{PBLANC_NO}` and LH uses
+`lh:{CCR_CNNT_SYS_DS_CD}:{PAN_ID}:{UPP_AIS_TP_CD}:{AIS_TP_CD}`.
+
+The canonical source-version hash binds identity, content, semantic timestamps and status,
+raw checksum, and meaningful HTTP validators. A new hash appends a SourceItem and
+`supersedes` edge; an exact historical hash reuses the immutable row. Every later
+RunSourceItem points to the prior observation. Persistence derives restored only for a
+terminal-to-active transition, then unchanged for the exact same item, explicit terminal
+or corrected kinds from provider state, and otherwise new_version.
+
+`source_version_schema` distinguishes historical legacy hashes from the NFC/RFC 8785 v1
+material. An exact compatible legacy row causes a current-schema baseline SourceItem to
+be appended while its first observation is classified unchanged. This avoids a false
+cutover event without permanently hiding later raw-validator or attachment-only changes.
+SourceItem and RunSourceItem are append-only. ORM and PostgreSQL guards require an enabled
+run-registry membership, matching attempt/run/source provenance, and a succeeded prior
+observation in the same stable lineage.
+
+Pagination is bounded, cycle-checked, and total-count complete under source-wide request
+and elapsed budgets. Only already observed identities are rechecked outside the requested
+window within the approved reconciliation horizon, and the candidate identity set is
+itself limited to successful observations in that horizon. Physical redirect/IP attempts
+consume the frozen request budget. Attachments retain official file IDs; unresolved
+script-only downloads fail closed. Downloads enforce both frozen record hosts and the
+declared/sniffed attachment MIME contract before extension-specific extraction.
+
+The data.go.kr credential is purpose-bound to its exact adapter HTTPS host/path and is
+resolved from `env://DATA_GO_KR_SERVICE_KEY` only at request time inside isolated
+source-check and collection workers. Attempt provenance, observations, success, and change
+events commit atomically. Credential-like response fields are redacted before persistence.
+Concurrent replay must match the succeeded response checksum and cannot regress a run
+that entered its next stage. Unchanged and terminal observations create no new evidence.
+Terminal and restored impact evaluation walks the immutable lineage to the evidence-bearing
+article and converges pending terminal cases. Network and schema failures never imply
+unavailable.

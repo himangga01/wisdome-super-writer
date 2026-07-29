@@ -100,8 +100,9 @@ visibility timeout 안에 숨은 메시지가 있으면 migration 전에 중단�
 
 legacy 큐를 완전히 비우지 못하면 migration을 시작하지 않고 `web`, beat, 구버전 worker를
 중지된 상태로 남깁니다. 운영자는 큐와 worker 오류를 복구한 뒤 같은 스크립트를 다시 실행해야
-합니다. 모든 drain과 migration이 성공한 경우에만 새 web, beat, worker를 시작합니다. Redis
-비밀번호는 drain 명령 출력에 기록하지 않습니다.
+합니다. 모든 drain과 migration이 성공한 뒤에도 현재 빌드의 adapter 구현과 일치하는 승인된
+source snapshot v3가 있는지 검증합니다. 이 gate까지 통과한 경우에만 새 web, beat, worker를
+시작합니다. Redis 비밀번호는 drain 명령 출력에 기록하지 않습니다.
 
 `web` entrypoint는 migration을 자동 실행하지 않습니다. Compose의 web, beat, 모든 일반 worker와
 OCR worker는 `migrate` 서비스의 성공 완료를 시작 조건으로 사용합니다. 따라서 임의로
@@ -137,11 +138,11 @@ stop and its visibility timeout blocks migration.
 
 Migration does not start unless all five legacy queues remain empty after the final stop.
 A drain timeout aborts with web, beat, and old workers stopped. Migration failure also
-leaves all application processes stopped. Only a successful drain and migration starts
-the new web, beat, and worker services. Redis credentials are not printed by the drain
-commands. The web entrypoint does not run migrations, and all Compose application
-consumers depend on successful migration completion. Do not bypass this path with an
-ad-hoc migration while workers are running.
+leaves all application processes stopped. After migration, deployment verifies that an
+approved source snapshot v3 matches the adapter implementation in the new build. Web,
+beat, and workers start only after that gate passes. Redis credentials are not printed by
+the drain commands. The web entrypoint does not run migrations. Do not bypass this path
+with an ad-hoc migration while workers are running.
 
 접속 주소:
 
@@ -276,6 +277,7 @@ in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
 | `source.check` | 승인 전 출처 외부 접근·파싱 점검 |
 | `collect.housing` | 부동산 청약 출처 수집 |
 | `collect.semiconductor` | 반도체 출처 수집 |
+| `source.change` | 정정·철회·접근 불가 영향 평가 |
 | `extract.fanout` | 외부 첨부 다운로드, 객체 저장 및 추출 fan-out |
 | `extract.document` | 문서 완료 집계와 evidence finalizer |
 | `extract.generic` | 저장된 객체의 native PDF, HTML, HWP/HWPX, spreadsheet 추출 |
@@ -289,7 +291,8 @@ in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
 
 `worker-source-check`는 `outbox.dispatch`와 `source.check`만 소비하며
 `collection-egress`를 통해 승인 전 출처 점검을 격리 실행합니다. `extract.fanout`은
-`collection-egress`와 object storage에 접근하는 `worker-collect`가 처리합니다.
+서비스 키가 없는 `worker-evidence-fanout`이 `collection-egress`와 object storage에 접근해
+처리합니다. `worker-collect`는 수집 큐만 소비하고, `source.change`는 편집 worker가 처리합니다.
 `worker-extract`는 외부 egress 없이 저장된 객체만 읽습니다. Beat는 한 인스턴스만 실행하고
 5초마다 전용 큐의 outbox dispatcher를 호출하며, dispatcher가 due schedule scan과 versioned
 event 전달을 수행합니다.
@@ -298,12 +301,71 @@ event 전달을 수행합니다.
 
 `worker-source-check` consumes only `outbox.dispatch` and `source.check`, with collection
 egress for isolated pre-approval probes. `extract.fanout` is consumed by
-`worker-collect`, which has collection egress and object storage access for external
-attachment download and durable fan-out. `worker-extract` remains without external
+`worker-evidence-fanout`, which has collection egress and object storage access but no
+public-data service key. `worker-collect` consumes collection queues only, and
+`source.change` is handled by the editorial worker. `worker-extract` remains without external
 egress and only reads stored objects from `extract.document` and `extract.generic`.
 Beat invokes the outbox dispatcher on its dedicated queue every five seconds; the
 dispatcher runs the due-schedule scan and routes versioned events to the topic- or
 channel-specific queues listed above.
+
+## 주택 공고 수집
+
+청약홈은 [한국부동산원 청약홈 분양정보 API](https://www.data.go.kr/data/15098547/openapi.do),
+LH는 공공데이터포털의
+[공고 목록](https://www.data.go.kr/data/15058530/openapi.do)·
+[공고 상세](https://www.data.go.kr/data/15057999/openapi.do)·
+[공급 정보](https://www.data.go.kr/data/15056765/openapi.do) API를 사용한다.
+`DATA_GO_KR_SERVICE_KEY`는 `worker-source-check`와 `worker-collect`에만 전달되며,
+레지스트리에는 `env://DATA_GO_KR_SERVICE_KEY` 참조만 저장된다. 인증 요청은 HTTPS의
+고정된 공식 host/path에서만 가능하고 다른 환경 변수·DB credential reference는 거부된다.
+
+수집기는 기간 조건과 page 상한을 적용하고 목록 page 반복, 중복 공식 ID, 필수 구조 누락을
+실패로 처리한다. 전체 건수가 남았는데 빈 page가 오거나 request/elapsed budget을 소진해도
+부분 성공으로 저장하지 않는다. 청약홈은 `applyhome:{category}:{houseManageNo}:{pblancNo}`, LH는
+`lh:{CCR_CNNT_SYS_DS_CD}:{PAN_ID}:{UPP_AIS_TP_CD}:{AIS_TP_CD}`를 lineage key로 쓴다.
+요청 시간창 밖에서는 이미 관측한 ID만 승인된 reconciliation 기간 안에서 다시 조회해 오래된
+공고의 정정·철회·복원을 찾는다. 공식 상세 페이지의 HTML 링크와 API 상세·공급 응답에서
+첨부 원문을 찾고, frozen `recordHosts`만 evidence 다운로드에 사용한다.
+정정·철회·접근 불가 상태는 공식 응답이 명시할 때만 저장하며, 네트워크 장애를 자료 철회로
+추정하지 않는다. 동일 버전은 SourceItem을 재사용하고 각 실행의 RunSourceItem은 직전 관측을
+가리켜 `unchanged`, `corrected`, `retracted`, `unavailable`, `restored` 전이를 보존한다.
+새 snapshot은 adapter version과 실제 구현 파일 checksum manifest를 함께 고정한다.
+`unchanged`와 terminal 상태는 신규 evidence를 만들지 않고, terminal 상태는 기존 글의 영향
+평가로 분기한다.
+
+레거시 hash와 내용이 정확히 맞는 첫 관측은 현재 hash schema의 기준 SourceItem을 새로
+기록하되 `unchanged`로 분류한다. 이후 raw bytes, HTTP validator 또는 첨부 checksum만
+달라져도 새 버전으로 감지한다. SourceItem과 RunSourceItem은 모두 append-only이며,
+RunSourceItem은 실행 registry에 활성화된 snapshot과 성공한 직전 관측만 가리킬 수 있다.
+동시 worker의 응답은 성공 attempt의 checksum과 다시 대조하고 이미 다음 단계로 간 run을
+되돌리지 않는다.
+
+응답 payload의 credential 계열 필드는 저장 전에 마스킹한다. request budget은 adapter 함수
+호출 수가 아니라 redirect와 다중 IP 재시도를 포함한 실제 HTTP 시도 수를 센다. 첨부는 frozen
+`attachmentContentTypes`와 선언·sniff MIME이 일치해야 저장되며, 공식 file ID를 보존한다.
+실행형 HTML handler에서 공개 URL을 안전하게 해석할 수 없으면 첨부를 누락하지 않고 source
+실패로 닫는다. 연속 terminal 전이와 복원은 전체 관측 lineage에서 영향받은 글을 찾아
+철회·접근 불가·복원 correction case로 연결한다.
+
+### Housing collection contract (English)
+
+ApplyHome and LH collection uses their official public-data APIs with bounded pagination,
+stable provider identifiers, deterministic per-notice checksums, detail/supply enrichment,
+and official-page attachment discovery. Credentials are resolved only inside the isolated
+source-check and collection workers, and authenticated requests are bound to exact HTTPS
+host/path and credential profiles. Frozen record hosts, implementation-file checksums,
+request/elapsed budgets, total-count coverage, and observed-lineage reconciliation all
+fail closed. Unchanged and terminal observations do not start fresh extraction; terminal
+changes are routed to published-article impact evaluation. Transport failures remain
+attempt failures; only an explicit provider signal can create corrected, retracted, or
+unavailable source state. Legacy cutover writes a current-schema baseline while
+classifying the first compatible observation as unchanged, so later raw, validator, and
+attachment-only changes remain visible. SourceItem and RunSourceItem are append-only and
+registry-bound. Physical HTTP attempts consume the frozen request budget, credential-like
+payload fields are redacted, and attachment downloads enforce the frozen declared/sniffed
+MIME contract. Consecutive terminal and restored observations resolve article impact
+through the full immutable lineage.
 
 ## 프로젝트 구조
 

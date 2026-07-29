@@ -68,6 +68,15 @@ EXTRACTION_ENGINE_VALUES = frozenset(
         "manual_entry",
     }
 )
+SOURCE_CHANGE_VALUES = frozenset(
+    {
+        "new_version",
+        "corrected",
+        "retracted",
+        "unavailable",
+        "restored",
+    }
+)
 
 EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ("source.check_requested", 1): EventRoute(
@@ -92,6 +101,19 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
             "finalize_collection_run_delivery_failure"
         ),
         ("run_id",),
+        max_attempts=4,
+    ),
+    ("source.item_changed", 1): EventRoute(
+        "source-item-change",
+        "source.change",
+        "apps.collection.tasks.route_source_item_change",
+        (
+            "source_collection_attempt_id",
+            "run_id",
+            "run_source_item_id",
+            "source_item_id",
+            "change_kind",
+        ),
         max_attempts=4,
     ),
     ("run.evidence_requested", 1): EventRoute(
@@ -254,6 +276,22 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
     ("run.requested", 1): _schema(
         {"run_id": STR},
         formats={"run_id": UUID_FORMAT},
+    ),
+    ("source.item_changed", 1): _schema(
+        {
+            "source_collection_attempt_id": STR,
+            "run_id": STR,
+            "run_source_item_id": STR,
+            "source_item_id": STR,
+            "change_kind": STR,
+        },
+        formats={
+            "source_collection_attempt_id": UUID_FORMAT,
+            "run_id": UUID_FORMAT,
+            "run_source_item_id": UUID_FORMAT,
+            "source_item_id": UUID_FORMAT,
+        },
+        choices={"change_kind": SOURCE_CHANGE_VALUES},
     ),
     ("run.evidence_requested", 1): _schema(
         {"run_id": STR},

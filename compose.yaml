@@ -29,6 +29,9 @@ x-runtime-environment: &runtime-environment
   SECRET_PROVIDER_CLASSES: ${SECRET_PROVIDER_CLASSES:-{}}
   TZ: ${TZ:-Asia/Seoul}
 
+x-collection-environment: &collection-environment
+  DATA_GO_KR_SERVICE_KEY: ${DATA_GO_KR_SERVICE_KEY:-}
+
 x-blogger-environment: &blogger-environment
   BLOGGER_OAUTH_CLIENT_ID_REF: ${BLOGGER_OAUTH_CLIENT_ID_REF:-}
   BLOGGER_OAUTH_CLIENT_SECRET_REF: ${BLOGGER_OAUTH_CLIENT_SECRET_REF:-}
@@ -192,7 +195,7 @@ services:
   worker-source-check:
     <<: *app
     environment:
-      <<: *runtime-environment
+      <<: [*runtime-environment, *collection-environment]
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=outbox.dispatch,source.check"]
     networks:
       - database
@@ -202,8 +205,19 @@ services:
   worker-collect:
     <<: *app
     environment:
+      <<: [*runtime-environment, *collection-environment]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect.housing,collect.semiconductor"]
+    networks:
+      - database
+      - broker
+      - object-storage
+      - collection-egress
+
+  worker-evidence-fanout:
+    <<: *app
+    environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=collect.housing,collect.semiconductor,extract.fanout"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.fanout"]
     networks:
       - database
       - broker
@@ -224,7 +238,7 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=editorial,maintenance"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=editorial,maintenance,source.change"]
     networks:
       - database
       - broker

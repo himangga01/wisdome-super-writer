@@ -2,7 +2,17 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from .models import CollectionRun, RecoveryState, RunState, RunStep
+from wisdome_writer.infrastructure.outbox import PermanentEventError
+
+from .models import (
+    CollectionRun,
+    RecoveryState,
+    RunSourceItem,
+    RunState,
+    RunStep,
+    SourceDiscoveryKind,
+    SourceItemStatus,
+)
 from .services import (
     collect_run,
     project_run_terminal_observation,
@@ -25,6 +35,74 @@ def execute_collection_run(run_id: str):
         return {"runId": str(run.id), "state": run.state}
     run = collect_run(run)
     return {"runId": str(run.id), "state": run.state}
+
+
+@shared_task(name="apps.collection.tasks.route_source_item_change")
+def route_source_item_change(
+    source_collection_attempt_id: str,
+    run_id: str,
+    run_source_item_id: str,
+    source_item_id: str,
+    change_kind: str,
+):
+    observation = (
+        RunSourceItem.objects.select_related(
+            "collection_attempt",
+            "source_item",
+            "previous_run_source_item__source_item",
+        )
+        .filter(pk=run_source_item_id)
+        .first()
+    )
+    if observation is None:
+        raise PermanentEventError(
+            "source_observation_missing",
+            "source change observation does not exist",
+        )
+    if (
+        str(observation.run_id) != str(run_id)
+        or str(observation.collection_attempt_id)
+        != str(source_collection_attempt_id)
+        or str(observation.source_item_id) != str(source_item_id)
+        or observation.discovery_kind != change_kind
+        or observation.collection_attempt.state != "succeeded"
+        or change_kind == SourceDiscoveryKind.UNCHANGED
+    ):
+        raise PermanentEventError(
+            "source_change_provenance_mismatch",
+            "source change event does not match durable provenance",
+        )
+    expected_status = {
+        SourceDiscoveryKind.NEW_VERSION: SourceItemStatus.ACTIVE,
+        SourceDiscoveryKind.CORRECTED: SourceItemStatus.CORRECTED,
+        SourceDiscoveryKind.RETRACTED: SourceItemStatus.RETRACTED,
+        SourceDiscoveryKind.UNAVAILABLE: SourceItemStatus.UNAVAILABLE,
+        SourceDiscoveryKind.RESTORED: SourceItemStatus.ACTIVE,
+    }[change_kind]
+    if observation.source_item.status != expected_status:
+        raise PermanentEventError(
+            "source_change_status_mismatch",
+            "source change kind does not match the source item status",
+        )
+
+    correction_case_count = 0
+    if change_kind in {
+        SourceDiscoveryKind.RETRACTED,
+        SourceDiscoveryKind.UNAVAILABLE,
+        SourceDiscoveryKind.RESTORED,
+    }:
+        from apps.editorial.corrections import (
+            detect_correction_cases_for_observation,
+        )
+
+        correction_case_count = len(
+            detect_correction_cases_for_observation(observation)
+        )
+    return {
+        "runSourceItemId": str(observation.id),
+        "changeKind": change_kind,
+        "correctionCases": correction_case_count,
+    }
 
 
 def _finalize_collection_run_delivery_failure(

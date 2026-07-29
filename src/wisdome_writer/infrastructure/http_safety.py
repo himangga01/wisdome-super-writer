@@ -4,7 +4,7 @@ import ipaddress
 import re
 import socket
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
@@ -92,6 +92,8 @@ def safe_get(
     headers: Mapping[str, str] | None = None,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
     max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
+    https_only: bool = False,
+    before_request: Callable[[], None] | None = None,
 ) -> httpx.Response:
     """GET a public HTTP(S) resource with DNS pinning, redirect checks, and bounded streaming."""
 
@@ -113,13 +115,18 @@ def safe_get(
 
     for redirect_count in range(max_redirects + 1):
         _remaining_seconds(deadline, current_url)
-        target = _validate_target(current_url, normalized_allowed_hosts)
+        target = _validate_target(
+            current_url,
+            normalized_allowed_hosts,
+            https_only=https_only,
+        )
         response = _request_pinned(
             target,
             max_bytes=max_bytes,
             headers=request_headers,
             timeout=timeout,
             deadline=deadline,
+            before_request=before_request,
         )
         location = response.headers.get("location")
         if response.status_code not in _REDIRECT_STATUSES or not location:
@@ -136,6 +143,8 @@ def safe_get(
 def _validate_target(
     url: str,
     allowed_hosts: frozenset[str] | None,
+    *,
+    https_only: bool = False,
 ) -> _ValidatedTarget:
     try:
         parsed = urlsplit(url)
@@ -148,6 +157,10 @@ def _validate_target(
     if scheme not in {"http", "https"} or not hostname:
         raise UnsafeOutboundUrl(
             f"Outbound URL must use HTTP or HTTPS: {redact_url(url)}"
+        )
+    if https_only and scheme != "https":
+        raise UnsafeOutboundUrl(
+            f"Outbound URL must use HTTPS: {redact_url(url)}"
         )
     if parsed.username is not None or parsed.password is not None:
         raise UnsafeOutboundUrl(
@@ -236,6 +249,7 @@ def _request_pinned(
     headers: Mapping[str, str],
     timeout: httpx.Timeout | float,
     deadline: float,
+    before_request: Callable[[], None] | None,
 ) -> httpx.Response:
     last_failure: str | None = None
     for address in target.addresses:
@@ -244,6 +258,8 @@ def _request_pinned(
         request_headers["Host"] = _host_header(target)
         try:
             remaining = _remaining_seconds(deadline, target.logical_url)
+            if before_request is not None:
+                before_request()
             with httpx.Client(
                 timeout=_bounded_timeout(timeout, remaining),
                 follow_redirects=False,

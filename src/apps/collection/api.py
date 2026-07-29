@@ -96,7 +96,16 @@ def run_detail(request, run_id):
             "id": str(link.source_item_id),
             "title": link.source_item.title,
             "url": link.source_item.canonical_url,
+            "status": link.source_item.status,
+            "sourceVersionSchema": (
+                link.source_item.source_version_schema
+            ),
             "discoveryKind": link.discovery_kind,
+            "previousRunSourceItemId": (
+                str(link.previous_run_source_item_id)
+                if link.previous_run_source_item_id
+                else None
+            ),
         }
         for link in run.run_source_items.select_related("source_item")
     ]

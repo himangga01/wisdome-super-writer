@@ -53,7 +53,7 @@ PUBLIC_ASSET_BASE_URL=
 EXTRACTION_PROFILE_DIR=config/extraction-profiles
 PADDLEOCR_MODEL_ROOT=/models/paddleocr
 PADDLEOCR_DEVICE=cpu
-DATA_GO_KR_SERVICE_KEY_REF=
+DATA_GO_KR_SERVICE_KEY=
 SEC_USER_AGENT=
 DEFAULT_TIMEZONE=Asia/Seoul
 GLOBAL_KILL_SWITCH=true
@@ -62,6 +62,9 @@ GLOBAL_KILL_SWITCH=true
 WordPress 평문 비밀번호, Blogger refresh token, 로그인 쿠키 또는 채널 편집기 내부
 endpoint 설정은 존재해서는 안 된다. 위 `*_REF` 값은 비밀 자체가 아니라 운영 비밀
 저장소의 참조 키다.
+`DATA_GO_KR_SERVICE_KEY`는 예외적으로 `env://DATA_GO_KR_SERVICE_KEY` 참조가 가리키는
+수집 worker 전용 환경 변수다. 값은 `worker-source-check`와 `worker-collect`에만 전달하고
+web, 편집, evidence fan-out, 추출, 발행 worker에는 전달하지 않는다.
 
 ### 2.1 추출 프로필 최초 등록
 
@@ -220,6 +223,84 @@ CAS는 409여야 한다. approved registry membership은 직접 수정할 수 �
 수집 fixture는 SourceCollectionAttempt에 adapter name/version/implementation/config manifest와
 response checksum을 고정해야 한다. 배포 adapter manifest 불일치, 다른 attempt의 RunSourceItem
 연결과 승인 validation의 source-adapter manifest 불일치는 추출 전에 차단한다.
+
+### 5.1 청약홈·LH 공공데이터 수집
+
+`config/source-registry/housing_subscription.json`은 청약홈의 한국부동산원 ODCloud API와
+LH 목록·상세·공급 API의 실제 요청 origin, page 상한, page 크기와
+`env://DATA_GO_KR_SERVICE_KEY`, 공식 record host, request/elapsed budget, API·상세·첨부 MIME
+계약만 고정한다. 인증 요청은 HTTPS의 adapter별 정확한 host/path에서만 실행하고 다른
+환경 변수나 DB credential reference는 거부한다. 서비스 키 값, 임의 query/header 이름,
+JSONPath, selector 또는 실행 가능한 식은 레지스트리에 저장하지 않는다.
+
+청약홈은 API operation별 `category + HOUSE_MANAGE_NO + PBLANC_NO`, LH는
+`CCR_CNNT_SYS_DS_CD + PAN_ID + UPP_AIS_TP_CD + AIS_TP_CD`를 stable identity로 사용한다.
+목록 제목, page URL, ETag 또는 응답 순서는 lineage identity가 아니다. 목록 page가 반복되거나
+필수 identity/date/detail 구조가 사라지거나 page 상한 안에 전체 범위를 소진하지 못하면
+0건 성공이 아니라 source 실패다. `totalCount/ALL_CNT`보다 적게 받은 채 빈 page가 오거나
+request/elapsed budget을 소진해도 부분 성공을 남기지 않는다.
+
+기간 판정은 수정 시각을 우선하고 없으면 게시 시각을 사용한다. 같은 실행에서 같은 stable
+identity가 두 번 나오면 병합하지 않고 실패한다. 정정·취소·접근 불가는 출처의 명시적
+상태/flag만 사용하며 timeout, 5xx, JSON 구조 변경 또는 목록 일시 누락을
+`unavailable`로 추론하지 않는다. 시간창 밖에서는 과거에 성공적으로 관측한 ID만 승인된
+reconciliation 기간 안에서 재조회하여 정정·철회·복원을 찾는다. API 응답과 공식 상세
+페이지에서 발견한 첨부는 frozen `recordHosts` 안의 canonical URL, file ID, MIME, 크기,
+checksum과 권리 상태를 SourceItem에 전달한다. 직접 `href`나 안전하게 해석 가능한 handler
+URL이 없는 scripted download 표시는 누락하지 않고 source check/collection을 실패시킨다.
+첨부 다운로드는 frozen `attachmentContentTypes`와 선언·sniff MIME을 모두 검사한 뒤에만
+확장자별 extractor로 보낸다.
+
+source snapshot v3는 adapter version, frozen config hash, adapter·HTTP 보안·secret·canonical
+hash 구현 파일 checksum과 Python/direct dependency version을 함께 고정한다.
+SourceCollectionAttempt의 요청 지문·응답 checksum과 SourceItem/RunSourceItem은 한 source
+transaction에서 성공 상태와 함께 커밋된다. 실제 HTTP redirect/IP 시도마다 request budget을
+차감하며 응답의 credential 계열 field는 저장 전에 마스킹한다. 동시 delivery는 성공 checksum이
+같을 때만 replay로 인정하고 다음 단계로 간 run을 수집 상태로 되돌리지 않는다.
+
+legacy 호환 첫 관측은 현재 schema 기준 SourceItem을 append하고 `unchanged`로 표시한다.
+SourceItem과 RunSourceItem은 ORM/PostgreSQL guard에서 update/delete가 거부되며,
+RunSourceItem은 활성 registry membership과 성공한 직전 관측만 가리킨다. `unchanged`는 변경
+이벤트와 신규 evidence가 0건이며, `new_version/corrected/restored`만 추출한다.
+`retracted/unavailable/restored`는 전체 관측 lineage에서 기존 게시물 영향을 평가한다.
+복원은 적용 전 terminal case를 닫고 별도 restoration case를 만든다.
+
+로컬에서 source check 또는 주택 수집 worker를 실행하기 전에 실제 값을 `.env`에만 둔다.
+
+```dotenv
+DATA_GO_KR_SERVICE_KEY=발급받은_서비스_키
+```
+
+### 5.1 Housing collection contract (English)
+
+The housing registry freezes approved HTTPS API targets, exact record hosts, request and
+elapsed budgets, split API/detail/attachment MIME contracts, and the
+`env://DATA_GO_KR_SERVICE_KEY` reference. The reference is purpose-bound to the exact
+adapter host/path profile. Its value is resolved immediately before the request inside
+source-check or collection workers and is never copied into frozen configuration,
+canonical URLs, metadata, errors, or audit records.
+
+ApplyHome identity is `category + HOUSE_MANAGE_NO + PBLANC_NO`; LH identity is
+`CCR_CNNT_SYS_DS_CD + PAN_ID + UPP_AIS_TP_CD + AIS_TP_CD`. Repeated pages, duplicate
+identities, missing required dates/identity/detail shapes, and an exhausted page cap fail
+closed, including short coverage against `totalCount/ALL_CNT`. Only previously observed
+identities are scanned outside the requested window within a bounded reconciliation
+horizon, and the candidate set is limited to successful observations inside that horizon.
+API and official detail-page attachments retain official file IDs and frozen-host
+provenance. Unresolvable script-only downloads fail closed. Declared and sniffed MIME
+must satisfy the frozen attachment contract before extension-specific extraction.
+
+Snapshot v3 binds the adapter version, adapter/security/secret/canonical-hash files,
+Python runtime, and direct dependency versions. Physical HTTP attempts consume the
+request budget and credential-like response fields are redacted before persistence.
+Source persistence, attempt success, and change events commit atomically. A compatible
+legacy observation appends a current-schema baseline but is classified unchanged.
+SourceItem and RunSourceItem are append-only and registry-bound. Concurrent replay must
+match the succeeded response checksum and cannot regress the run stage. Unchanged and
+terminal observations create no fresh evidence; new/corrected/restored observations enter
+extraction. Terminal/restored impact walks the full lineage and creates or converges
+article correction cases. Only explicit provider state creates corrected, retracted, or
+unavailable records; transport and schema failures remain collection failures.
 
 ## 6. PaddleOCR PDF 인식 검증
 

@@ -12,6 +12,10 @@ from django.db.models import Max
 from django.utils import timezone
 from django.utils.text import slugify
 
+from adapters.sources.manifests import (
+    adapter_execution_manifest,
+    adapter_execution_manifest_hash,
+)
 from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
 from apps.audit.redaction import AuditRedactionError, sanitize_audit_key
@@ -49,6 +53,7 @@ from .models import (
 
 
 SOURCE_SNAPSHOT_SCHEMA_V2 = "source-definition-snapshot-v2"
+SOURCE_SNAPSHOT_SCHEMA_V3 = "source-definition-snapshot-v3"
 SOURCE_REGISTRY_MANIFEST_SCHEMA_V2 = "source-registry-manifest-v2"
 SOURCE_AUDIT_SCHEMA_V2 = "source-definition-audit-v2"
 REGISTRY_AUDIT_SCHEMA_V2 = "source-registry-audit-v2"
@@ -63,15 +68,119 @@ SUPPORTED_ADAPTER_KEYS = frozenset(
     }
 )
 _ADAPTER_ACCESS_METHODS = {
-    "housing_applyhome": frozenset({"public_html"}),
-    "housing_lh": frozenset({"public_html"}),
+    "housing_applyhome": frozenset(
+        {"open_data_api", "public_api", "public_html"}
+    ),
+    "housing_lh": frozenset(
+        {"open_data_api", "public_api", "public_html"}
+    ),
     "open_data_json": frozenset({"open_data_api", "public_api"}),
     "public_html": frozenset({"public_file", "public_html"}),
     "rss": frozenset({"rss_atom"}),
 }
 _ADAPTER_CONFIG_KEYS = {
-    adapter_key: frozenset({"entrypoints"})
-    for adapter_key in SUPPORTED_ADAPTER_KEYS
+    "housing_applyhome": frozenset(
+        {
+            "entrypoints",
+            "maxPages",
+            "pageSize",
+            "recordHosts",
+            "reconciliationDays",
+            "maxRequests",
+            "maxElapsedSeconds",
+            "sourceCheckDays",
+            "apiContentTypes",
+            "detailContentTypes",
+            "attachmentContentTypes",
+        }
+    ),
+    "housing_lh": frozenset(
+        {
+            "entrypoints",
+            "maxPages",
+            "pageSize",
+            "detailEntrypoint",
+            "supplyEntrypoint",
+            "recordHosts",
+            "reconciliationDays",
+            "maxRequests",
+            "maxElapsedSeconds",
+            "sourceCheckDays",
+            "apiContentTypes",
+            "detailContentTypes",
+            "attachmentContentTypes",
+        }
+    ),
+    "open_data_json": frozenset(
+        {
+            "entrypoints",
+            "maxPages",
+            "pageSize",
+            "recordHosts",
+            "maxRequests",
+            "maxElapsedSeconds",
+            "sourceCheckDays",
+            "apiContentTypes",
+            "attachmentContentTypes",
+        }
+    ),
+    "public_html": frozenset({"entrypoints"}),
+    "rss": frozenset({"entrypoints"}),
+}
+_AUTHENTICATED_ADAPTER_PROFILES = {
+    "housing_applyhome": {
+        "secretRef": "env://DATA_GO_KR_SERVICE_KEY",
+        "host": "api.odcloud.kr",
+        "paths": frozenset(
+            {
+                "/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail",
+                "/api/ApplyhomeInfoDetailSvc/v1/getUrbtyOfctlLttotPblancDetail",
+                "/api/ApplyhomeInfoDetailSvc/v1/getRemndrLttotPblancDetail",
+                "/api/ApplyhomeInfoDetailSvc/v1/getPblPvtRentLttotPblancDetail",
+                "/api/ApplyhomeInfoDetailSvc/v1/getOPTLttotPblancDetail",
+            }
+        ),
+        "recordHosts": frozenset(
+            {
+                "api.odcloud.kr",
+                "applyhome.co.kr",
+                "www.applyhome.co.kr",
+            }
+        ),
+    },
+    "housing_lh": {
+        "secretRef": "env://DATA_GO_KR_SERVICE_KEY",
+        "host": "apis.data.go.kr",
+        "paths": frozenset(
+            {
+                "/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1",
+                "/B552555/lhLeaseNoticeDtlInfo1/getLeaseNoticeDtlInfo1",
+                "/B552555/lhLeaseNoticeSplInfo1/getLeaseNoticeSplInfo1",
+            }
+        ),
+        "recordHosts": frozenset(
+            {
+                "apis.data.go.kr",
+                "apply.lh.or.kr",
+            }
+        ),
+    },
+    "open_data_json": {
+        "secretRef": "env://DATA_GO_KR_SERVICE_KEY",
+        "host": "api.odcloud.kr",
+        "paths": frozenset(
+            {
+                "/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail",
+            }
+        ),
+        "recordHosts": frozenset(
+            {
+                "api.odcloud.kr",
+                "applyhome.co.kr",
+                "www.applyhome.co.kr",
+            }
+        ),
+    },
 }
 _ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9_.-]+$")
 _SECRET_KEY_PATTERN = re.compile(
@@ -396,6 +505,127 @@ def _validate_secret_ref(value: Any) -> str | None:
     return value
 
 
+def _normalize_hostname_list(
+    value: Any,
+    *,
+    field_name: str,
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise InvalidInput(f"{field_name} must be a non-empty hostname array.")
+    normalized: list[str] = []
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 253
+            or item != item.strip()
+            or item.endswith(".")
+        ):
+            raise InvalidInput(f"{field_name} contains an invalid hostname.")
+        hostname = item.encode("idna").decode("ascii").lower()
+        labels = hostname.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?",
+                label,
+            )
+            is None
+            for label in labels
+        ):
+            raise InvalidInput(f"{field_name} contains an invalid hostname.")
+        normalized.append(hostname)
+    if len(set(normalized)) != len(normalized):
+        raise InvalidInput(f"{field_name} must not contain duplicates.")
+    return sorted(normalized)
+
+
+def _normalize_mime_type_list(
+    value: Any,
+    *,
+    field_name: str,
+) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > 100:
+        raise InvalidInput(f"{field_name} must be a non-empty MIME array.")
+    normalized: list[str] = []
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 160
+            or re.fullmatch(
+                r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+",
+                item.lower(),
+            )
+            is None
+        ):
+            raise InvalidInput(f"{field_name} contains an invalid MIME type.")
+        normalized.append(item.lower())
+    return sorted(set(normalized))
+
+
+def _validate_authenticated_adapter_profile(
+    *,
+    adapter_key: str,
+    access_method: str,
+    base_url: str,
+    external_config: Mapping[str, Any],
+    secret_ref: str | None,
+) -> None:
+    profile = _AUTHENTICATED_ADAPTER_PROFILES.get(adapter_key)
+    if (
+        profile is None
+        or access_method not in {"open_data_api", "public_api"}
+    ):
+        return
+    parsed_base = urlsplit(base_url)
+    expected_host = str(profile["host"])
+    if (
+        parsed_base.scheme.lower() != "https"
+        or (parsed_base.hostname or "").rstrip(".").lower()
+        != expected_host
+        or parsed_base.port not in {None, 443}
+        or parsed_base.path not in {"", "/"}
+        or parsed_base.query
+    ):
+        raise InvalidInput(
+            "Authenticated source baseUrl is outside its approved HTTPS profile."
+        )
+    if secret_ref is not None and secret_ref != profile["secretRef"]:
+        raise InvalidInput(
+            "secretRef is not bound to the selected source adapter."
+        )
+
+    endpoint_values = list(external_config.get("entrypoints", []))
+    endpoint_values.extend(
+        external_config[field_name]
+        for field_name in ("detailEntrypoint", "supplyEntrypoint")
+        if external_config.get(field_name)
+    )
+    approved_paths = profile["paths"]
+    for endpoint in endpoint_values:
+        parsed = urlsplit(str(endpoint))
+        if (
+            parsed.scheme.lower() != "https"
+            or (parsed.hostname or "").rstrip(".").lower()
+            != expected_host
+            or parsed.port not in {None, 443}
+            or parsed.path not in approved_paths
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise InvalidInput(
+                "Authenticated source endpoint is outside its approved HTTPS profile."
+            )
+
+    record_hosts = set(external_config.get("recordHosts", []))
+    if record_hosts != set(profile["recordHosts"]):
+        raise InvalidInput(
+            "recordHosts must exactly match the adapter security profile."
+        )
+
+
 def _source_projection_material(source: SourceDefinition) -> dict[str, Any]:
     return {
         "topic": source.topic_code,
@@ -521,8 +751,90 @@ def _normalize_source_material(
         )
     if "entrypoints" in external_config:
         external_config["entrypoints"] = normalized_entrypoints
+    if "recordHosts" in external_config:
+        external_config["recordHosts"] = _normalize_hostname_list(
+            external_config["recordHosts"],
+            field_name="externalConfig.recordHosts",
+        )
+    for field_name, maximum in (
+        ("maxPages", 100),
+        ("pageSize", 1000),
+        ("reconciliationDays", 3650),
+        ("maxRequests", 20000),
+        ("maxElapsedSeconds", 3600),
+        ("sourceCheckDays", 365),
+    ):
+        value = external_config.get(field_name)
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            or value > maximum
+        ):
+            raise InvalidInput(
+                f"externalConfig.{field_name} must be an integer "
+                f"between 1 and {maximum}."
+            )
+    if adapter_key == "housing_lh":
+        for field_name in ("detailEntrypoint", "supplyEntrypoint"):
+            value = external_config.get(field_name)
+            if value is None:
+                continue
+            normalized_endpoint = _validate_public_url(
+                value,
+                field_name=f"externalConfig.{field_name}",
+            )
+            endpoint_host = (
+                urlsplit(normalized_endpoint).hostname or ""
+            ).rstrip(".").lower()
+            if endpoint_host != base_host:
+                raise InvalidInput(
+                    "externalConfig URL hosts must match the approved baseUrl host."
+                )
+            external_config[field_name] = normalized_endpoint
+        if (
+            material["enabled"] is True
+            and material["accessMethod"]
+            in {"open_data_api", "public_api"}
+            and (
+                not external_config.get("detailEntrypoint")
+                or not external_config.get("supplyEntrypoint")
+            )
+        ):
+            raise InvalidInput(
+                "Enabled housing_lh API sources require detail and "
+                "supply entrypoints."
+            )
+    for field_name in (
+        "apiContentTypes",
+        "detailContentTypes",
+        "attachmentContentTypes",
+    ):
+        if field_name in external_config:
+            external_config[field_name] = _normalize_mime_type_list(
+                external_config[field_name],
+                field_name=f"externalConfig.{field_name}",
+            )
     material["externalConfig"] = external_config
     material["secretRef"] = _validate_secret_ref(material["secretRef"])
+    if (
+        material["enabled"] is True
+        and adapter_key in {"housing_applyhome", "housing_lh"}
+        and material["accessMethod"] in {"open_data_api", "public_api"}
+        and material["secretRef"] is None
+    ):
+        raise InvalidInput(
+            "Enabled authenticated source API requires secretRef."
+        )
+    _validate_authenticated_adapter_profile(
+        adapter_key=adapter_key,
+        access_method=material["accessMethod"],
+        base_url=base_url,
+        external_config=external_config,
+        secret_ref=material["secretRef"],
+    )
 
     allowed_mime_types = material["allowedMimeTypes"]
     if (
@@ -538,6 +850,32 @@ def _normalize_source_material(
     ):
         raise InvalidInput("allowedMimeTypes is invalid.")
     material["allowedMimeTypes"] = sorted(set(allowed_mime_types))
+    if (
+        adapter_key
+        in {"housing_applyhome", "housing_lh", "open_data_json"}
+        and material["accessMethod"]
+        in {"open_data_api", "public_api"}
+    ):
+        required_mime_fields = {
+            "apiContentTypes",
+            "attachmentContentTypes",
+        }
+        if adapter_key in {"housing_applyhome", "housing_lh"}:
+            required_mime_fields.add("detailContentTypes")
+        if not required_mime_fields.issubset(external_config):
+            raise InvalidInput(
+                "Authenticated source MIME contracts are incomplete."
+            )
+        approved_mime_types = set(material["allowedMimeTypes"])
+        if any(
+            not set(external_config[field_name]).issubset(
+                approved_mime_types
+            )
+            for field_name in required_mime_fields
+        ):
+            raise InvalidInput(
+                "External MIME contracts must be included in allowedMimeTypes."
+            )
 
     if material["authorityTier"] not in SourceDefinition.AuthorityTier.values:
         raise InvalidInput("authorityTier is invalid.")
@@ -592,9 +930,17 @@ def _normalize_source_material(
 def source_snapshot_material(
     source_material: Mapping[str, Any],
 ) -> dict[str, Any]:
+    implementation_manifest = adapter_execution_manifest(
+        str(source_material["adapterKey"]),
+        access_method=str(source_material["accessMethod"]),
+    )
     return {
-        "schemaVersion": SOURCE_SNAPSHOT_SCHEMA_V2,
+        "schemaVersion": SOURCE_SNAPSHOT_SCHEMA_V3,
         **{field: source_material[field] for field in _SOURCE_CONTRACT_FIELDS},
+        "adapterVersion": implementation_manifest["adapterVersion"],
+        "adapterImplementationManifestHash": (
+            adapter_execution_manifest_hash(implementation_manifest)
+        ),
     }
 
 
@@ -602,7 +948,7 @@ def source_snapshot_hash(source_material: Mapping[str, Any]) -> str:
     return _hash(source_snapshot_material(source_material))
 
 
-def _is_verifiable_v2_source_snapshot(
+def _is_verifiable_source_snapshot(
     snapshot: SourceDefinitionSnapshot,
     *,
     expected_config_hash: str | None = None,
@@ -610,7 +956,17 @@ def _is_verifiable_v2_source_snapshot(
     return (
         isinstance(snapshot.frozen_config, dict)
         and snapshot.frozen_config.get("schemaVersion")
-        == SOURCE_SNAPSHOT_SCHEMA_V2
+        == SOURCE_SNAPSHOT_SCHEMA_V3
+        and isinstance(
+            snapshot.frozen_config.get("adapterVersion"),
+            str,
+        )
+        and isinstance(
+            snapshot.frozen_config.get(
+                "adapterImplementationManifestHash"
+            ),
+            str,
+        )
         and (
             expected_config_hash is None
             or snapshot.config_hash == expected_config_hash
@@ -1519,9 +1875,9 @@ def _lock_and_validate_approval_sources(
             raise InvalidInput(
                 "An enabled membership selected a disabled source snapshot."
             )
-        if not _is_verifiable_v2_source_snapshot(snapshot):
+        if not _is_verifiable_source_snapshot(snapshot):
             raise Conflict(
-                "A selected source snapshot is not a verifiable v2 snapshot."
+                "A selected source snapshot is not a current verifiable snapshot."
             )
     return locked_sources, locked_snapshots
 
@@ -1956,6 +2312,24 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
                 "adapterKey": raw.get("adapter", "public_html"),
                 "externalConfig": {
                     "entrypoints": raw.get("entrypoints", []),
+                    **{
+                        field_name: raw[field_name]
+                        for field_name in (
+                            "maxPages",
+                            "pageSize",
+                            "detailEntrypoint",
+                            "supplyEntrypoint",
+                            "recordHosts",
+                            "reconciliationDays",
+                            "maxRequests",
+                            "maxElapsedSeconds",
+                            "sourceCheckDays",
+                            "apiContentTypes",
+                            "detailContentTypes",
+                            "attachmentContentTypes",
+                        )
+                        if field_name in raw
+                    },
                 },
                 "secretRef": raw.get("secretRef"),
                 "allowedMimeTypes": raw.get(
@@ -2055,7 +2429,7 @@ def _approved_registry_matches_import(
             )
             or membership.enabled != target["enabled"]
             or membership.display_order != target["display_order"]
-            or not _is_verifiable_v2_source_snapshot(
+            or not _is_verifiable_source_snapshot(
                 snapshot,
                 expected_config_hash=target["config_hash"],
             )
@@ -2248,7 +2622,7 @@ def import_registry_manifest(
                 if (
                     snapshot.state
                     != SourceDefinitionSnapshot.State.DRAFT
-                    or not _is_verifiable_v2_source_snapshot(
+                    or not _is_verifiable_source_snapshot(
                         snapshot,
                         expected_config_hash=target_hash,
                     )
@@ -2268,7 +2642,7 @@ def import_registry_manifest(
                 )
                 if (
                     snapshot is not None
-                    and not _is_verifiable_v2_source_snapshot(
+                    and not _is_verifiable_source_snapshot(
                         snapshot,
                         expected_config_hash=target_hash,
                     )
@@ -2558,7 +2932,7 @@ def current_registry(
         snapshot = member.source_snapshot
         if (
             snapshot.state != SourceDefinitionSnapshot.State.APPROVED
-            or not _is_verifiable_v2_source_snapshot(snapshot)
+            or not _is_verifiable_source_snapshot(snapshot)
         ):
             raise Conflict(
                 "An approved source registry contains an unverifiable snapshot."

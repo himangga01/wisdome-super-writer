@@ -33,10 +33,27 @@ def check_source_snapshot(
 
     now = timezone.now()
     try:
-        records = build_source_adapter(snapshot).collect(
-            since=now - timedelta(minutes=5),
+        adapter = build_source_adapter(
+            snapshot,
+            runtime_mode="source_check",
+        )
+        external_config = snapshot.frozen_config.get(
+            "externalConfig",
+            {},
+        )
+        source_check_days = int(
+            external_config.get("sourceCheckDays", 1)
+        )
+        if source_check_days < 1 or source_check_days > 365:
+            raise ValueError("sourceCheckDays is outside its approved range.")
+        records = adapter.collect(
+            since=now - timedelta(days=source_check_days),
             until=now,
         )
+        if not records:
+            raise ValueError(
+                "Source check returned no contract-valid records."
+            )
     except Exception as exc:
         return record_source_check_result(
             source_id=source_id,
