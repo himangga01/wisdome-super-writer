@@ -1748,7 +1748,12 @@ def finalize_document_ready_wake_failure(
     with transaction.atomic():
         document = (
             DocumentExtraction.objects.select_for_update()
-            .select_related("run_source_item")
+            .select_related(
+                "run_source_item",
+                "input_asset__generic_extraction_attempt__input_asset__parent_asset",
+                "input_asset__producing_generic_attempt__input_asset__parent_asset",
+                "input_asset__parent_asset",
+            )
             .filter(pk=document_id)
             .first()
         )
@@ -1756,6 +1761,11 @@ def finalize_document_ready_wake_failure(
             return {
                 "documentExtractionId": document_id,
                 "state": "missing",
+            }
+        if _is_audit_only_document(document):
+            return {
+                "documentExtractionId": str(document.id),
+                "state": "legacy_duplicate_audit_only",
             }
         return _finalize_run_evidence_wake_failure_locked(
             str(document.run_source_item.run_id),
@@ -1773,7 +1783,10 @@ def finalize_other_ready_wake_failure(
     with transaction.atomic():
         attempt = (
             GenericExtractionAttempt.objects.select_for_update()
-            .select_related("run_source_item")
+            .select_related(
+                "run_source_item",
+                "input_asset__parent_asset",
+            )
             .filter(pk=attempt_id)
             .first()
         )
@@ -1781,6 +1794,11 @@ def finalize_other_ready_wake_failure(
             return {
                 "genericExtractionAttemptId": attempt_id,
                 "state": "missing",
+            }
+        if _is_quarantined_generic_attempt(attempt):
+            return {
+                "genericExtractionAttemptId": str(attempt.id),
+                "state": "legacy_duplicate_audit_only",
             }
         return _finalize_run_evidence_wake_failure_locked(
             str(attempt.run_source_item.run_id),
