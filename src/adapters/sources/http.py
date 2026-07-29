@@ -31,6 +31,7 @@ from wisdome_writer.infrastructure.http_safety import (
     redact_url,
     redact_urls_in_text,
     safe_get,
+    safe_post_form,
 )
 from wisdome_writer.infrastructure.secrets import SecretResolver
 
@@ -760,6 +761,55 @@ class HttpSourceAdapter:
                 "Source elapsed-time budget was exhausted."
             )
         self._request_count += 1
+
+    def _post_form(
+        self,
+        url: str,
+        *,
+        data: Mapping[str, Any],
+        expected_content_types: Collection[str] | None = None,
+    ) -> httpx.Response:
+        remaining = self._request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise SourceSchemaError("Source elapsed-time budget was exhausted.")
+        response = safe_post_form(
+            self._request_url(
+                url,
+                params=None,
+                authenticated=False,
+                credential_parameter=None,
+            ),
+            data=data,
+            max_bytes=MAX_RESPONSE_BYTES,
+            timeout=self.timeout,
+            allowed_hosts=self.allowed_hosts,
+            headers={
+                "User-Agent": (
+                    "WisdomeSuperWriter/0.1 "
+                    "(+admin-managed research bot)"
+                )
+            },
+            max_elapsed_seconds=min(20.0, remaining),
+            before_request=self._consume_request_budget,
+        )
+        response.raise_for_status()
+        if expected_content_types is not None:
+            allowed = {
+                str(value).split(";", 1)[0].strip().lower()
+                for value in expected_content_types
+            }
+            actual = (
+                response.headers.get("Content-Type", "")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+            if actual not in allowed:
+                raise SourceSchemaError(
+                    "Source response MIME type is outside the approved "
+                    "request contract."
+                )
+        return response
 
     def _request_url(
         self,

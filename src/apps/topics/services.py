@@ -65,9 +65,19 @@ SUPPORTED_ADAPTER_KEYS = frozenset(
         "open_data_json",
         "public_html",
         "rss",
+        "semiconductor_motir",
+        "semiconductor_krx_kind",
+        "semiconductor_samsung_newsroom",
+        "semiconductor_skhynix_newsroom",
+        "semiconductor_sia_latest",
     }
 )
 _ADAPTER_ACCESS_METHODS = {
+    "semiconductor_motir": frozenset({"public_html"}),
+    "semiconductor_krx_kind": frozenset({"public_html"}),
+    "semiconductor_samsung_newsroom": frozenset({"rss_atom"}),
+    "semiconductor_skhynix_newsroom": frozenset({"rss_atom"}),
+    "semiconductor_sia_latest": frozenset({"public_html"}),
     "housing_applyhome": frozenset(
         {"open_data_api", "public_api", "public_html"}
     ),
@@ -79,6 +89,34 @@ _ADAPTER_ACCESS_METHODS = {
     "rss": frozenset({"rss_atom"}),
 }
 _ADAPTER_CONFIG_KEYS = {
+    **{
+        key: frozenset(
+            {
+                "entrypoints",
+                "identityNamespace",
+                "maxPages",
+                "pageSize",
+                "recordHosts",
+                "reconciliationDays",
+                "maxRequests",
+                "maxElapsedSeconds",
+                "sourceCheckDays",
+                "feedContentTypes",
+                "listContentTypes",
+                "detailContentTypes",
+                "attachmentContentTypes",
+                "mediaDownloadPolicy",
+                *(("issuerCodes",) if key == "semiconductor_krx_kind" else ()),
+            }
+        )
+        for key in (
+            "semiconductor_motir",
+            "semiconductor_krx_kind",
+            "semiconductor_samsung_newsroom",
+            "semiconductor_skhynix_newsroom",
+            "semiconductor_sia_latest",
+        )
+    },
     "housing_applyhome": frozenset(
         {
             "entrypoints",
@@ -777,6 +815,18 @@ def _normalize_source_material(
                 f"externalConfig.{field_name} must be an integer "
                 f"between 1 and {maximum}."
             )
+    if adapter_key == "semiconductor_krx_kind" and external_config.get(
+        "issuerCodes"
+    ) != ["A005930", "A000660"]:
+        raise InvalidInput(
+            "KRX issuerCodes must exactly match the approved issuer scope."
+        )
+    if adapter_key.startswith("semiconductor_") and external_config.get(
+        "mediaDownloadPolicy"
+    ) != "metadata_only":
+        raise InvalidInput(
+            "Semiconductor mediaDownloadPolicy must be metadata_only."
+        )
     if adapter_key == "housing_lh":
         for field_name in ("detailEntrypoint", "supplyEntrypoint"):
             value = external_config.get(field_name)
@@ -809,6 +859,8 @@ def _normalize_source_material(
             )
     for field_name in (
         "apiContentTypes",
+        "feedContentTypes",
+        "listContentTypes",
         "detailContentTypes",
         "attachmentContentTypes",
     ):
@@ -877,7 +929,11 @@ def _normalize_source_material(
                 "External MIME contracts must be included in allowedMimeTypes."
             )
 
-    if material["authorityTier"] not in SourceDefinition.AuthorityTier.values:
+    if material["authorityTier"] not in {
+        *SourceDefinition.AuthorityTier.values,
+        "primary_regulatory",
+        "trusted_industry",
+    }:
         raise InvalidInput("authorityTier is invalid.")
     if material["accessMethod"] not in SourceDefinition.AccessMethod.values:
         raise InvalidInput("accessMethod is invalid.")
@@ -2327,6 +2383,11 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
                             "apiContentTypes",
                             "detailContentTypes",
                             "attachmentContentTypes",
+                            "feedContentTypes",
+                            "listContentTypes",
+                            "identityNamespace",
+                            "mediaDownloadPolicy",
+                            "issuerCodes",
                         )
                         if field_name in raw
                     },

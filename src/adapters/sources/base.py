@@ -300,6 +300,7 @@ def build_source_adapter(
 ) -> SourceAdapter:
     from .http import OpenDataJsonAdapter, PublicHtmlAdapter, RssAdapter
     from .housing import ApplyHomeAdapter, LhApplyAdapter
+    from .semiconductor import ADAPTERS as SEMICONDUCTOR_ADAPTERS
 
     if runtime_mode not in {"collection", "source_check"}:
         raise ValueError("Unsupported source adapter runtime mode.")
@@ -317,6 +318,7 @@ def build_source_adapter(
         "open_data_json": OpenDataJsonAdapter,
         "rss": RssAdapter,
         "public_html": PublicHtmlAdapter,
+        **SEMICONDUCTOR_ADAPTERS,
     }
     try:
         return adapters[adapter_name](**kwargs)

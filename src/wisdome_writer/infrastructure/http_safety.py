@@ -96,6 +96,63 @@ def safe_get(
     before_request: Callable[[], None] | None = None,
 ) -> httpx.Response:
     """GET a public HTTP(S) resource with DNS pinning, redirect checks, and bounded streaming."""
+    return _safe_request(
+        "GET",
+        url,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        allowed_hosts=allowed_hosts,
+        headers=headers,
+        max_redirects=max_redirects,
+        max_elapsed_seconds=max_elapsed_seconds,
+        https_only=https_only,
+        before_request=before_request,
+    )
+
+
+def safe_post_form(
+    url: str,
+    *,
+    data: Mapping[str, Any],
+    max_bytes: int,
+    timeout: httpx.Timeout | float,
+    allowed_hosts: Collection[str | None] | None = None,
+    headers: Mapping[str, str] | None = None,
+    max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
+    https_only: bool = False,
+    before_request: Callable[[], None] | None = None,
+) -> httpx.Response:
+    """POST an encoded form through the same pinned, bounded path as ``safe_get``."""
+    return _safe_request(
+        "POST",
+        url,
+        form_data=data,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        allowed_hosts=allowed_hosts,
+        headers=headers,
+        max_redirects=max_redirects,
+        max_elapsed_seconds=max_elapsed_seconds,
+        https_only=https_only,
+        before_request=before_request,
+    )
+
+
+def _safe_request(
+    method: str,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout: httpx.Timeout | float,
+    allowed_hosts: Collection[str | None] | None,
+    headers: Mapping[str, str] | None,
+    max_redirects: int,
+    max_elapsed_seconds: float,
+    https_only: bool,
+    before_request: Callable[[], None] | None,
+    form_data: Mapping[str, Any] | None = None,
+) -> httpx.Response:
 
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
@@ -111,6 +168,8 @@ def safe_get(
     )
     request_headers = dict(headers or {})
     current_url = str(url)
+    current_method = method
+    current_form = form_data
     deadline = time.monotonic() + max_elapsed_seconds
 
     for redirect_count in range(max_redirects + 1):
@@ -122,6 +181,8 @@ def safe_get(
         )
         response = _request_pinned(
             target,
+            method=current_method,
+            form_data=current_form,
             max_bytes=max_bytes,
             headers=request_headers,
             timeout=timeout,
@@ -136,6 +197,9 @@ def safe_get(
                 f"Outbound redirect limit exceeded for {redact_url(current_url)}"
             )
         current_url = urljoin(current_url, location)
+        if response.status_code in {301, 302, 303}:
+            current_method = "GET"
+            current_form = None
 
     raise RuntimeError("unreachable")
 
@@ -245,6 +309,8 @@ def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
 def _request_pinned(
     target: _ValidatedTarget,
     *,
+    method: str,
+    form_data: Mapping[str, Any] | None,
     max_bytes: int,
     headers: Mapping[str, str],
     timeout: httpx.Timeout | float,
@@ -266,9 +332,10 @@ def _request_pinned(
                 trust_env=False,
             ) as client:
                 with client.stream(
-                    "GET",
+                    method,
                     pinned_url,
                     headers=request_headers,
+                    data=form_data,
                     extensions={"sni_hostname": target.hostname},
                 ) as streamed:
                     content = (
@@ -281,7 +348,7 @@ def _request_pinned(
                             deadline,
                         )
                     )
-                    safe_request = httpx.Request("GET", redact_url(target.logical_url))
+                    safe_request = httpx.Request(method, redact_url(target.logical_url))
                     return httpx.Response(
                         streamed.status_code,
                         headers=streamed.headers,

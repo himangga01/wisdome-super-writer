@@ -18,6 +18,26 @@ ADAPTER_IMPLEMENTATION_MANIFEST_SCHEMA_V1 = (
 )
 
 _ADAPTER_EXECUTIONS: dict[str, tuple[str, str]] = {
+    "semiconductor_motir": (
+        "v1",
+        "adapters.sources.semiconductor.adapters.MotirAdapter",
+    ),
+    "semiconductor_krx_kind": (
+        "v1",
+        "adapters.sources.semiconductor.adapters.KrxKindAdapter",
+    ),
+    "semiconductor_samsung_newsroom": (
+        "v1",
+        "adapters.sources.semiconductor.adapters.SamsungNewsroomAdapter",
+    ),
+    "semiconductor_skhynix_newsroom": (
+        "v1",
+        "adapters.sources.semiconductor.adapters.SkHynixNewsroomAdapter",
+    ),
+    "semiconductor_sia_latest": (
+        "v1",
+        "adapters.sources.semiconductor.adapters.SiaLatestAdapter",
+    ),
     "housing_applyhome": (
         "v2",
         "adapters.sources.housing.applyhome.ApplyHomeAdapter",
@@ -51,6 +71,21 @@ _HTTP_IMPLEMENTATION_FILES = (
     "wisdome_writer/infrastructure/secrets.py",
 )
 _ADAPTER_IMPLEMENTATION_FILES = {
+    **{
+        key: (
+            *_HTTP_IMPLEMENTATION_FILES,
+            "adapters/sources/semiconductor/__init__.py",
+            "adapters/sources/semiconductor/common.py",
+            "adapters/sources/semiconductor/adapters.py",
+        )
+        for key in (
+            "semiconductor_motir",
+            "semiconductor_krx_kind",
+            "semiconductor_samsung_newsroom",
+            "semiconductor_skhynix_newsroom",
+            "semiconductor_sia_latest",
+        )
+    },
     "housing_applyhome": (
         *_HTTP_IMPLEMENTATION_FILES,
         "adapters/sources/housing/__init__.py",
