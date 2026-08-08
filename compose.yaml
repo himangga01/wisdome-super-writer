@@ -253,6 +253,31 @@ services:
       - broker
       - object-storage
 
+  hwp-volume-bootstrap:
+    build:
+      context: .
+      dockerfile: deploy/containers/hwp-worker/Dockerfile
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown 0:0 /run/wisdome-hwp /input
+        chmod 0700 /run/wisdome-hwp /input
+    network_mode: none
+    read_only: true
+    user: "0:0"
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 8
+    mem_limit: 32m
+    memswap_limit: 32m
+    cpus: "0.1"
+    volumes:
+      - hwp-sandbox-socket:/run/wisdome-hwp
+      - hwp-sandbox-input:/input
+    restart: "no"
+
   hwp-converter:
     build:
       context: .
@@ -271,13 +296,13 @@ services:
       HWP_RLIMIT_NPROC: "32"
       HWP_CHILD_UID: "65533"
       HWP_CHILD_GID: "65533"
-      HWP_VALIDATOR_UID: "65534"
-      HWP_VALIDATOR_GID: "65534"
+      HWP_VALIDATOR_UID: "65531"
+      HWP_VALIDATOR_GID: "65531"
     network_mode: none
     read_only: true
-    user: "65532:65532"
+    user: "0:0"
     cap_drop: ["ALL"]
-    cap_add: ["SETUID", "SETGID"]
+    cap_add: ["CHOWN", "KILL", "SETUID", "SETGID"]
     security_opt:
       - no-new-privileges:true
     pids_limit: 32
@@ -289,7 +314,10 @@ services:
       - hwp-sandbox-socket:/run/wisdome-hwp
       - hwp-sandbox-input:/input:ro
     tmpfs:
-      - /work:rw,noexec,nosuid,nodev,size=768m,uid=65532,gid=65532,mode=0700
+      - /work:rw,noexec,nosuid,nodev,size=768m,uid=0,gid=0,mode=0700
+    depends_on:
+      hwp-volume-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/usr/local/bin/wisdome-hwp-sandbox", "probe", "--socket", "/run/wisdome-hwp/converter.sock", "--manifest", "/opt/wisdome/manifest/converter-manifest.json"]
       interval: 10s
@@ -300,6 +328,9 @@ services:
 
   profile-admin:
     <<: *app
+    build:
+      context: .
+      dockerfile: deploy/containers/profile-admin/Dockerfile
     profiles: ["admin"]
     environment:
       <<: *runtime-environment

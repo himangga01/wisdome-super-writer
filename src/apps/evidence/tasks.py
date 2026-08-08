@@ -20,6 +20,7 @@ from adapters.extractors.base import (
     ExtractorError,
     GenericExtractionOutput,
     canonical_bytes,
+    sha256_file,
     sha256_bytes,
     sniff_mime,
 )
@@ -121,6 +122,22 @@ def _legacy_hwp_failure_marker(failures: list[Mapping[str, Any]]) -> dict[str, A
         "legacyHwpRequiredFailures": len(required),
         "legacyHwpRequiredFailureCodes": codes,
     }
+
+
+def _quarantine_legacy_hwp_raw_input(evidence: EvidenceAsset | None) -> None:
+    if evidence is None or evidence.derivation_type != EvidenceDerivationType.RAW:
+        return
+    evidence.review_state = ReviewState.MANUAL_REQUIRED
+    evidence.manual_review_required = True
+    evidence.publishable = False
+    evidence.save(
+        update_fields=(
+            "review_state",
+            "manual_review_required",
+            "publishable",
+            "updated_at",
+        )
+    )
 
 
 def _begin_domain_step_observation(
@@ -363,7 +380,11 @@ def _verified_legacy_hwp_record_material(
     return page_count
 
 
-def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
+def _has_complete_legacy_hwp_pdf(
+    evidence: EvidenceAsset | None,
+    *,
+    expected_attempt: GenericExtractionAttempt,
+) -> bool:
     if evidence is None:
         return False
     checksum = evidence.checksum
@@ -379,8 +400,29 @@ def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
         page_count = _verified_legacy_hwp_page_count(evidence.structured_data)
         record = evidence.structured_data["records"][0]
         locator = record["locator"]
+        report = record["structured_data"]["conversion_report"]
+        input_asset = expected_attempt.input_asset
+        profile = expected_attempt.extraction_profile_snapshot
         if (
-            locator.get("output_pdf_checksum") != evidence.checksum
+            evidence.generic_extraction_attempt_id != expected_attempt.id
+            or evidence.origin_run_source_item_id
+            != expected_attempt.run_source_item_id
+            or evidence.source_item_id != expected_attempt.source_item_id
+            or evidence.parent_asset_id != expected_attempt.input_asset_id
+            or evidence.mime_type != "application/pdf"
+            or evidence.locator_type != LocatorType.HWP_CONVERSION
+            or evidence.derivation_type != EvidenceDerivationType.OTHER
+            or locator.get("attempt_id") != str(expected_attempt.id)
+            or report.get("attempt_id") != str(expected_attempt.id)
+            or locator.get("input_checksum") != input_asset.checksum
+            or report.get("input_checksum_sha256") != input_asset.checksum
+            or locator.get("input_byte_size") != input_asset.byte_size
+            or report.get("input_byte_size") != input_asset.byte_size
+            or locator.get("converter_manifest_hash")
+            != profile.config.get("converter_manifest_hash")
+            or report.get("converter_manifest_hash")
+            != profile.config.get("converter_manifest_hash")
+            or locator.get("output_pdf_checksum") != evidence.checksum
             or locator.get("output_pdf_byte_size") != evidence.byte_size
             or locator.get("page_count") != page_count
         ):
@@ -438,7 +480,10 @@ def _converge_legacy_hwp_document_locked(
         return attempt
 
     evidence = attempt.evidence_asset
-    if not _has_complete_legacy_hwp_pdf(evidence):
+    if not _has_complete_legacy_hwp_pdf(
+        evidence,
+        expected_attempt=attempt,
+    ):
         recoverable = list(
             attempt.derived_evidence_assets.filter(
                 origin_run_source_item_id=attempt.run_source_item_id,
@@ -451,7 +496,8 @@ def _converge_legacy_hwp_document_locked(
             .order_by("created_at", "id")[:2]
         )
         if len(recoverable) == 1 and _has_complete_legacy_hwp_pdf(
-            recoverable[0]
+            recoverable[0],
+            expected_attempt=attempt,
         ):
             evidence = recoverable[0]
             attempt.evidence_asset = evidence
@@ -493,7 +539,9 @@ def _ensure_legacy_hwp_document(
             .select_related(
                 "run_source_item",
                 "source_item",
+                "input_asset",
                 "evidence_asset",
+                "extraction_profile_snapshot",
             )
             .get(pk=attempt_id)
         )
@@ -1434,16 +1482,47 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
     _verify_profile(profile)
     if attempt.input_asset is None or not attempt.input_asset.object_key:
         raise ExtractorError("generic_input_missing", "Generic extraction input object is missing")
-    data = _storage().get_bytes(
-        key=attempt.input_asset.object_key,
-        version_id=attempt.input_asset.object_version or None,
-    )
-    if attempt.input_asset.checksum and hashlib.sha256(data).hexdigest() != attempt.input_asset.checksum:
-        raise ExtractorError("input_checksum_mismatch", "Downloaded input checksum differs from provenance")
     suffix = Path(str((attempt.input_asset.structured_data or {}).get("source_url", "input.bin"))).suffix
     with tempfile.TemporaryDirectory(prefix="wisdome-generic-") as temp_dir:
         path = Path(temp_dir) / f"input{suffix or '.bin'}"
-        path.write_bytes(data)
+        if profile.engine == ExtractionEngine.LEGACY_HWP:
+            if (
+                not attempt.input_asset.checksum
+                or not isinstance(attempt.input_asset.byte_size, int)
+                or attempt.input_asset.byte_size < 1
+            ):
+                raise ExtractorError(
+                    "generic_input_missing",
+                    "Legacy HWP input provenance is incomplete",
+                )
+            try:
+                _storage().get_file(
+                    key=attempt.input_asset.object_key,
+                    version_id=attempt.input_asset.object_version or None,
+                    destination=path,
+                    expected_checksum_sha256=attempt.input_asset.checksum,
+                    expected_size=attempt.input_asset.byte_size,
+                )
+            except (OSError, ValueError) as exc:
+                raise ExtractorError(
+                    "input_checksum_mismatch",
+                    "Downloaded legacy HWP input differs from provenance",
+                ) from exc
+        else:
+            data = _storage().get_bytes(
+                key=attempt.input_asset.object_key,
+                version_id=attempt.input_asset.object_version or None,
+            )
+            if (
+                attempt.input_asset.checksum
+                and hashlib.sha256(data).hexdigest()
+                != attempt.input_asset.checksum
+            ):
+                raise ExtractorError(
+                    "input_checksum_mismatch",
+                    "Downloaded input checksum differs from provenance",
+                )
+            path.write_bytes(data)
         with transaction.atomic():
             GenericExtractionAttempt.objects.select_for_update().filter(pk=attempt.id).update(
                 state=ExtractionState.RUNNING,
@@ -1478,24 +1557,45 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             converted_path = Path(first.object_path or "")
             if not converted_path.is_file():
                 raise ExtractorError("legacy_hwp_output_invalid", "Converted PDF disappeared before storage")
-            converted_data = converted_path.read_bytes()
-            converted_page_count = _verified_legacy_hwp_record_material(
-                first.as_dict(), converted_data
-            )
-            converted_checksum = hashlib.sha256(converted_data).hexdigest()
-            info = _storage().put_bytes(
+            converted_size = converted_path.stat().st_size
+            converted_checksum = sha256_file(converted_path)
+            first_record = first.as_dict()
+            converted_page_count = _verified_legacy_hwp_record_material(first_record)
+            locator = first_record["locator"]
+            report = first_record["structured_data"]["conversion_report"]
+            if (
+                locator.get("output_pdf_checksum") != converted_checksum
+                or locator.get("output_pdf_byte_size") != converted_size
+                or report.get("output_pdf_checksum_sha256") != converted_checksum
+                or report.get("output_pdf_byte_size") != converted_size
+            ):
+                raise ExtractorError(
+                    "legacy_hwp_output_invalid",
+                    "Converted PDF changed before storage",
+                )
+            info = _storage().put_file(
                 key=content_addressed_key(
                     namespace="evidence/converted", checksum_sha256=converted_checksum, filename="converted.pdf"
                 ),
-                data=converted_data,
+                path=converted_path,
                 content_type="application/pdf",
                 checksum_sha256=converted_checksum,
+                expected_size=converted_size,
                 metadata={"generic_attempt_id": str(attempt.id)},
             )
+            if (
+                info.checksum_sha256 != converted_checksum
+                or info.size != converted_size
+                or info.content_type != "application/pdf"
+            ):
+                raise ExtractorError(
+                    "legacy_hwp_output_invalid",
+                    "Stored PDF identity differs from the verified conversion",
+                )
             legacy_info = (
                 info,
                 converted_checksum,
-                len(converted_data),
+                converted_size,
                 converted_page_count,
             )
 
@@ -1712,7 +1812,12 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         engine, preferred = ExtractionEngine.STRUCTURED, "structured-deterministic-v1"
     if not engine:
         return
-    profile = _profile(engine, preferred_key=preferred)
+    try:
+        profile = _profile(engine, preferred_key=preferred)
+    except ExtractorError:
+        if engine == ExtractionEngine.LEGACY_HWP:
+            _quarantine_legacy_hwp_raw_input(raw_asset)
+        raise
     fingerprint = generic_extraction_fingerprint(
         run_source_item_id=run_source_item.id,
         source_item_id=run_source_item.source_item_id,
@@ -1863,6 +1968,8 @@ def finalize_generic_extraction_failure(attempt_id: str, error_code: str):
         attempt.state = ExtractionState.FAILED
         attempt.error_code = error_code[:120]
         attempt.finished_at = timezone.now()
+        if attempt.engine == ExtractionEngine.LEGACY_HWP:
+            _quarantine_legacy_hwp_raw_input(attempt.input_asset)
         attempt.save(
             update_fields=("state", "error_code", "finished_at", "updated_at")
         )
@@ -2093,12 +2200,19 @@ def finalize_run_evidence(run_id: str):
             ),
             input_asset__parent_asset__raw_input_fingerprint__isnull=True,
         )
+        pre_attempt_legacy_hwp_failures = int(
+            (run.counters or {}).get("legacyHwpRequiredFailures", 0)
+        )
         required_legacy_hwp_failure = (
-            int((run.counters or {}).get("legacyHwpRequiredFailures", 0)) > 0
+            pre_attempt_legacy_hwp_failures > 0
             or generic_failure_attempts.filter(engine=ExtractionEngine.LEGACY_HWP).exists()
         )
         generic_failures = generic_failure_attempts.count()
-        failure_count = document_failures + generic_failures
+        failure_count = (
+            document_failures
+            + generic_failures
+            + pre_attempt_legacy_hwp_failures
+        )
         if step.input_count == 0:
             finished_at = timezone.now()
             step.output_count = 0

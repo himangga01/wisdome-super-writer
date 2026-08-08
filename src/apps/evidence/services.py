@@ -13,6 +13,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from adapters.extractors.base import canonical_bytes
 from adapters.storage import S3ObjectStorage
 from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
@@ -619,18 +620,12 @@ def _validate_profile_report(
 ) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise ValidationError("The profile verification report is invalid")
-    core = {
-        key: value
-        for key, value in report.items()
-        if key not in {"reportObjectKey", "reportObjectVersion", "reportHash"}
-    }
     valid = (
-        canonical_hash(core) == profile.verification_report_hash
-        and report.get("reportHash") == profile.verification_report_hash
-        and report.get("reportObjectKey")
-        == profile.verification_report_object_key
-        and report.get("reportObjectVersion")
-        == profile.verification_report_object_version
+        not any(
+            key in report
+            for key in {"reportObjectKey", "reportObjectVersion", "reportHash"}
+        )
+        and canonical_hash(report) == profile.verification_report_hash
         and report.get("subjectId") == str(profile.id)
         and report.get("subjectMaterialHash")
         == profile.profile_material_hash
@@ -653,6 +648,53 @@ def _validate_profile_report(
     return report
 
 
+def _validate_profile_report_bytes(
+    profile: ExtractionProfileSnapshot,
+    raw: bytes,
+) -> dict[str, Any]:
+    try:
+        report = json.loads(raw)
+        if canonical_bytes(report) != raw:
+            raise ValueError("report bytes are not the canonical core object")
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(
+            "The profile verification report bytes are not canonical"
+        ) from exc
+    return _validate_profile_report(profile, report)
+
+
+def _profile_report_envelope(
+    profile: ExtractionProfileSnapshot,
+) -> tuple[str, str, str]:
+    projection = (
+        profile.verification_report_object_key,
+        profile.verification_report_object_version,
+        profile.verification_report_hash,
+    )
+    if not all(projection):
+        raise ValidationError("The profile report envelope is incomplete")
+    if profile.approval_state in {
+        ProfileApprovalState.APPROVED,
+        ProfileApprovalState.RETIRED,
+    }:
+        decision = profile.latest_decision
+        expected_decision = (
+            ExtractionProfileDecision.Decision.APPROVED
+            if profile.approval_state == ProfileApprovalState.APPROVED
+            else ExtractionProfileDecision.Decision.RETIRED
+        )
+        frozen = (
+            decision.verification_report_object_key if decision else None,
+            decision.verification_report_object_version if decision else None,
+            decision.verification_report_hash if decision else None,
+        )
+        if decision is None or decision.decision != expected_decision or frozen != projection:
+            raise ValidationError(
+                "The profile projection differs from its frozen decision report envelope"
+            )
+    return projection  # type: ignore[return-value]
+
+
 def _verified_profile_report(
     profile: ExtractionProfileSnapshot,
 ) -> dict[str, Any]:
@@ -663,14 +705,19 @@ def _verified_profile_report(
     ):
         raise ValidationError("A hash-verified profile report is required before approval")
     try:
+        stored_version = profile.verification_report_object_version
         raw = S3ObjectStorage().get_bytes(
             key=profile.verification_report_object_key,
-            version_id=profile.verification_report_object_version,
+            version_id=(
+                None
+                if stored_version.startswith("etag:")
+                else stored_version
+            ),
         )
-        report = json.loads(raw)
+        report = _validate_profile_report_bytes(profile, raw)
     except Exception as exc:
         raise ValidationError("The profile verification report is unavailable") from exc
-    return _validate_profile_report(profile, report)
+    return report
 
 
 def decide_extraction_profile(
@@ -807,11 +854,13 @@ def decide_extraction_profile(
                     "Only a draft extraction profile can be approved"
                 )
             next_state = ProfileApprovalState.APPROVED
+            report_envelope = locked_report_fence[1:]
         else:
             if profile.approval_state != ProfileApprovalState.APPROVED:
                 raise EvidenceConflict(
                     "Only an approved extraction profile can be retired"
                 )
+            report_envelope = _profile_report_envelope(profile)
             next_state = ProfileApprovalState.RETIRED
 
         before_material = _profile_audit_material(profile)
@@ -831,6 +880,11 @@ def decide_extraction_profile(
                 "version": version,
                 "decided_by": str(admin.pk),
                 "decided_at": now,
+                "verification_report": {
+                    "object_key": report_envelope[0],
+                    "object_version": report_envelope[1],
+                    "sha256": report_envelope[2],
+                },
             }
         )
         record = ExtractionProfileDecision(
@@ -842,6 +896,9 @@ def decide_extraction_profile(
             request_key=request_key,
             request_hash=request_hash,
             decision_hash=decision_hash,
+            verification_report_object_key=report_envelope[0],
+            verification_report_object_version=report_envelope[1],
+            verification_report_hash=report_envelope[2],
             decided_by=admin,
             decided_at=now,
             reason=reason,
@@ -871,6 +928,9 @@ def decide_extraction_profile(
                 "decision_id": str(record.id),
                 "profile_id": str(profile.id),
                 "profile_material_hash": profile.profile_material_hash,
+                "verification_report_object_key": report_envelope[0],
+                "verification_report_object_version": report_envelope[1],
+                "verification_report_hash": report_envelope[2],
                 "result": "decided",
                 "version": version,
                 "reauth_proof_id": str(reauth_proof_id),

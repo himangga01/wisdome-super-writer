@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
@@ -24,7 +25,28 @@ class ObjectStorage(Protocol):
         metadata: dict[str, str] | None = None,
     ) -> ObjectInfo: ...
 
+    def put_file(
+        self,
+        *,
+        key: str,
+        path: Path,
+        content_type: str,
+        checksum_sha256: str,
+        expected_size: int,
+        metadata: dict[str, str] | None = None,
+    ) -> ObjectInfo: ...
+
     def get_bytes(self, *, key: str, version_id: str | None = None) -> bytes: ...
+
+    def get_file(
+        self,
+        *,
+        key: str,
+        version_id: str | None,
+        destination: Path,
+        expected_checksum_sha256: str,
+        expected_size: int,
+    ) -> ObjectInfo: ...
 
     def head(self, *, key: str, version_id: str | None = None) -> ObjectInfo: ...
 

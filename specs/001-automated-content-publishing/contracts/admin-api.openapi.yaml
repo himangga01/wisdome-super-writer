@@ -2103,7 +2103,7 @@ components:
     ExtractionProfileDecision:
       type: object
       additionalProperties: false
-      required: [id, profileSnapshotId, version, decision, expectedMaterialHash, supersedesDecisionId, requestKey, decisionHash, decidedBy, decidedAt, reason]
+      required: [id, profileSnapshotId, version, decision, expectedMaterialHash, supersedesDecisionId, requestKey, decisionHash, verificationReportObjectKey, verificationReportObjectVersion, verificationReportHash, decidedBy, decidedAt, reason]
       properties:
         id: { type: string, format: uuid }
         profileSnapshotId: { type: string, format: uuid }
@@ -2113,6 +2113,9 @@ components:
         supersedesDecisionId: { type: [string, 'null'], format: uuid }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        verificationReportObjectKey: { type: string, minLength: 1, maxLength: 1024 }
+        verificationReportObjectVersion: { type: string, minLength: 1, maxLength: 256 }
+        verificationReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         decidedBy: { type: string, format: uuid }
         decidedAt: { type: string, format: date-time }
         reason: { type: string, minLength: 3, maxLength: 500 }

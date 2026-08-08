@@ -11,7 +11,10 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 
 from adapters.extractors.base import ExtractorError, sha256_file
-from adapters.extractors.legacy_hwp import probe_legacy_hwp_sandbox
+from adapters.extractors.legacy_hwp import (
+    probe_legacy_hwp_sandbox,
+    validate_legacy_hwp_activation_config,
+)
 
 from .models import ExtractionEngine, ExtractionProfileSnapshot
 from .services import canonical_hash
@@ -58,7 +61,10 @@ LEGACY_HWP_CONVERTER = {
     "cargo_locked": True,
 }
 LEGACY_HWP_REQUIRED_MANIFEST_ROLES = frozenset(
-    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
+    {
+        "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+        "library", "license", "lockfile", "build-metadata",
+    }
 )
 
 
@@ -96,6 +102,16 @@ def _resolve_deployment_material(document: dict[str, Any]) -> dict[str, Any]:
 
     config = document.get("config")
     if document.get("engine") == "legacy_hwp_converter" and isinstance(config, dict):
+        if (
+            config.get("golden_corpus_approved") is True
+            and not validate_legacy_hwp_activation_config(config)
+        ) or (
+            config.get("golden_corpus_approved") is not True
+            and config.get("golden_corpus_acceptance") is not None
+        ):
+            raise ValidationError(
+                "Legacy HWP activation requires an immutable all-pass T032 acceptance artifact"
+            )
         manifest_path = str(config.get("converter_manifest_path", ""))
         path, manifest = _load_json_file(manifest_path, label="Legacy HWP converter manifest")
         expected_hash = str(config.get("converter_manifest_hash", ""))
@@ -407,8 +423,8 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
         )
         stage(
             "hwp.golden_corpus",
-            profile.config.get("golden_corpus_approved") is True,
-            "T032 must approve the golden corpus before this profile is activated",
+            validate_legacy_hwp_activation_config(profile.config),
+            "T032 immutable acceptance, image digest, manifest hash, schema and all-pass are required",
         )
     sample_hash = canonical_hash({"profile": str(profile.id), "material": profile.profile_material_hash})
     overall = all(item["result"] == "passed" for item in stages)

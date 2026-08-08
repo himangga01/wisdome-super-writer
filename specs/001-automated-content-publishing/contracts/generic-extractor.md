@@ -79,16 +79,21 @@ checksum/byte size와 resource bounds를 final report가 exact echo한다. 이 g
 호환 identity일 뿐 DB stale-result fence가 아니며, 영속 generation/lease/fencing은 T016 범위다.
 
 sidecar는 DB·Redis·MinIO 환경변수/credential이 없고 read-only rootfs/input/manifest, private
-bounded tmpfs, non-root UID, `cap_drop: ALL`, no-new-privileges, PID/memory/CPU/time/file-size/
+bounded tmpfs, root 신뢰 supervisor와 `cap_drop: ALL` 뒤 CHOWN/KILL/SETUID/SETGID만 재부여,
+no-new-privileges, PID/memory/CPU/time/file-size/
 open-file/process 제한을 함께 적용한다. basename만 `O_NOFOLLOW`로 열어 regular file,
 single hardlink, size와 hash를 검사한 뒤 private tmpfs로 복사한다. 기본 Compose는 gVisor를
 강제하지 않으며 지원 Linux 운영환경에서만 선택적 override를 둘 수 있다.
 
-UDS supervisor는 UID/GID 65532로 유지하고 SETUID/SETGID만 허용한다. untrusted exact-CLI child는
-supplementary group/capability 없이 65533으로, qpdf validator는 65534로 내린다. socket/input root와
-supervisor trusted directory는 child가 traverse할 수 없다. 정상·오류 종료 모두 child process
-group을 TERM→KILL→wait 정리한 뒤 untrusted PDF를 streaming hash-copy로 supervisor 소유 새 inode에
-snapshot한다. validator는 그 snapshot의 read-only FD만 상속하며 supervisor만 final report를 만든다.
+UDS supervisor는 UID/GID 0이며 startup에서 UID/GID, NoNewPrivs와 exact effective/permitted capability
+mask, zero inheritable/ambient를 확인한다. untrusted exact-CLI child는 supplementary group과 모든
+capability 없이 65533으로, qpdf validator는 65531로 내리고 exec 이후 identity probe로 다시 확인한다.
+socket/input root는 supervisor만 접근한다. supervisor-owned input directory는 child group read-only,
+child-owned output directory는 write-only trust 영역으로 분리한다. PR_SET_CHILD_SUBREAPER와 descendant
+sweep으로 setsid escape까지 TERM→KILL→reap하고 zero descendant를 확인한 뒤, untrusted PDF를 새
+supervisor inode로 streaming snapshot한다. validator는 root:validator 0440 snapshot path만 reopen하며
+supervisor만 final report를 만든다. one-shot bootstrap은 named socket/input volume을 root:root 0700으로
+초기화한다.
 
 stdout/stderr는 pipe를 동시에 drain해 합계 1 MiB를 넘는 즉시 전체 job group을 종료한다. request는
 client `SHUT_WR` 뒤 exact EOF여야 하고 response는 header/report/PDF를 64 KiB 이하 chunk로 보낸다.
@@ -103,8 +108,8 @@ library bytes를 manifest에 포함해 PDF 구조와 실제 page count를 검증
 기본 `--text-as-paths`를 금지한다. 승인 font bytes만 쓰며 warning, missing-font,
 font substitution 또는 fallback 징후는 terminal 실패다.
 
-manifest schema v1은 rhwp/qpdf/Python interpreter와 runtime loaded library/font/fontconfig/
-wrapper/policy config의 normalized absolute
+manifest schema v1은 rhwp/qpdf/Python interpreter와 runtime loaded library/font/fixed fontconfig,
+rhwp LICENSE/Cargo.lock/build metadata/Compose security policy/wrapper config의 normalized absolute
 path, SHA-256과 byte size를 기록한다. expected manifest SHA-256은 release/deploy 외부 입력이고
 profile loader가 read-only manifest bytes와 exact compare한다. image 내부 runtime material로
 expected hash를 덮어쓰는 self-approval은 금지한다.
@@ -112,11 +117,20 @@ expected hash를 덮어쓰는 self-approval은 금지한다.
 JSON duplicate key/NaN/unknown field/bool-as-int, 잘못된 magic/version/length/trailing bytes,
 identity·manifest·policy·checksum·size·MIME·qpdf page count 불일치는 fail closed한다. socket/
 daemon 단절만 retryable이다. unsupported/warning/missing-font, exit 20/21/22 또는 tamper는
-permanent `failed`이며 EvidenceAsset, `evidence.other_ready`, DocumentExtraction을 0건 만든다.
-run은 `manual_required` recovery로 넘긴다. `legacy-hwp-v1@1.1.0`은 immutable
+permanent `failed`이며 converted/derived EvidenceAsset, `evidence.other_ready`, DocumentExtraction을
+0건 만든다. raw input은 감사용으로 보존하되 `manual_required/publishable=false`로 격리한다.
+run은 typed counter와 failure count를 보존하고 `manual_required` recovery로 넘긴다.
+`legacy-hwp-v1@1.1.0`은 immutable
 `golden_corpus_approved=false` draft다. T032가 acceptance artifact와 새
-`legacy-hwp-v1@1.2.0(golden_corpus_approved=true)`을 만든 뒤 1.1.0을 retire하기 전까지 운영
-비활성이다.
+`legacy-hwp-v1@1.2.0(golden_corpus_approved=true)`을 만들고 승인한 뒤에도 1.1.0은 retire하지 않고
+immutable superseded draft로 보존한다. golden=true profile은 acceptance object key/version/SHA-256,
+target OCI digest, converter manifest hash, schema와 all-pass를 모두 결속해야 한다. 실제 artifact
+fetch/signature trust root, hermetic vendored/offline build, pinned source/vendor/deb/SBOM과 signed release
+attestation은 T032/release material blocker다. 현재 activation gate는 reference 형식과 runtime
+self-report가 그럴듯해도 항상 false다. T032가 exact versioned object bytes를 fetch하여
+SHA-256·schema·subject·OCI·manifest·all-results를 검증하고 외부 trust root로 release signature를
+검증하는 구현을 제공하기 전에는 golden=true profile import/verify/converter construction을 모두
+거절한다. runtime self-report와 hard-coded policy는 admission 증거가 아니다.
 
 ## 멱등성과 상태
 
@@ -136,6 +150,10 @@ validation mode, calibration profile hash의 null 표현까지 Unicode NFC 후 R
 저신뢰 결과의 review subject v1은 attempt ID/fingerprint, result checksum, reason hash와
 calibration profile hash를 포함하고 mutable 게시·검토 projection은 제외한다. 관리자
 결정은 Admin API의 subject version/hash 및 expected latest decision CAS를 통과해야 한다.
+profile 승인/retire 결정은 검증 보고서 object key/version/hash를 decision hash와 audit metadata에
+동결한다. approved/retired report API는 latest decision envelope와 profile projection을 exact
+비교하고 불일치하면 409다. 기존 결정은 migration 시 현재 projection으로 backfill하며, projection이
+불완전하면 migration을 중단하고 당시 envelope를 복원했다고 주장하지 않는다.
 
 워커는 발행 자격 증명에 접근하지 않고, 허용된 객체와 parser/capture capability만 가진다.
 매크로·실행 파일, 로그인·유료벽·CAPTCHA 우회와 임의 외부 URL fetch는 금지한다. 원문,
@@ -196,10 +214,10 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
   CPU, wall-time, file-size, descriptor, and process limits are bounded at container and process
   boundaries. Base Compose does not mandate gVisor; a supported Linux deployment may add it as
   an override.
-- The UID 65532 supervisor uses only SETUID/SETGID to launch a no-group/no-capability converter
-  child as 65533 and qpdf validator as 65534. It always cleans the child process group, streams
-  untrusted output into a new supervisor-owned inode, and gives qpdf only a read-only inherited
-  PDF descriptor. Requests require client SHUT_WR/exact EOF; logs and response chunks are hard
+- The trusted UID 0 supervisor has exactly CHOWN/KILL/SETUID/SETGID. Parser 65533 and validator
+  65531 clear all capability sets and are verified after exec. A child subreaper sweeps escaped
+  descendants, input/output directories are separated, and qpdf reopens only a validator-readable
+  supervisor snapshot. Requests require client SHUT_WR/exact EOF; logs and response chunks are hard
   bounded. Default extract-worker concurrency is one for one converter.
 - Converter material is `rhwp 0.8.2` commit
   `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1, locked Cargo, pinned qpdf, approved
@@ -213,7 +231,17 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
   page count. Follow-up engines are native PDF or PaddleOCR only; stdout/partial text is never
   evidence.
 - Only UDS infrastructure disconnect is retryable. Unsupported input, warnings, missing fonts,
-  fallback, exact exits 20/21/22, or tamper is permanent and produces zero EvidenceAsset,
-  `evidence.other_ready`, or DocumentExtraction. Recovery is manual-required. Profile 1.1.0 is
-  an immutable inactive draft. T032 creates the acceptance artifact and profile 1.2.0 with
-  `golden_corpus_approved=true`, then retires 1.1.0.
+  fallback, exact exits 20/21/22, or tamper is permanent and produces zero converted/derived
+  EvidenceAsset, `evidence.other_ready`, or DocumentExtraction. Raw input remains quarantined and
+  non-publishable. Profile 1.1.0 remains an immutable superseded draft after T032 approves 1.2.0.
+  Golden activation requires the immutable acceptance object, target OCI and converter manifest
+  digests, schema, and all-pass. Artifact signature trust and hermetic signed build inputs remain
+  mandatory T032/release blockers. The activation gate remains unconditionally false until T032
+  implements exact versioned artifact-byte/schema/subject/result verification and release-signature
+  verification against an external trust root. Runtime self-report and hard-coded policy are not
+  admission evidence.
+- Profile approve/retire decisions freeze the report object key/version/hash in the decision hash
+  and audit metadata. The approved/retired report API returns 409 if the latest decision envelope
+  differs from the profile projection. Migration 0004 backfills legacy chains only from the
+  available current projection and aborts on incomplete material; it does not claim unavailable
+  historical reconstruction.

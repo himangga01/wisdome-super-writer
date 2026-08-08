@@ -327,3 +327,33 @@ deploy/
 필요한 구조적 예외가 없다. WordPress 선발행과 Blogger 후속 발행의 의존 순서는 대표
 원문 URL과 부분 성공 복구를 보장하기 위한 도메인 규칙이며 별도 서비스 도입을 요구하지
 않는다.
+
+## T015 2차 격리 결정
+
+- dedicated UID 0 supervisor만 CHOWN/KILL/SETUID/SETGID를 보유하고 startup proc status를
+  exact 검증한다. parser 65533과 validator 65531은 exec 전후 capability 0을 증명한다.
+- one-shot volume bootstrap, supervisor-owned read-only input, child-owned output, supervisor
+  streaming snapshot, validator-readable trusted PDF, child subreaper/descendant zero 검증을 사용한다.
+- 한 요청은 하나의 absolute deadline을 공유한다. client budget은 sidecar deadline과 bounded
+  response margin을 합한 값이다.
+- golden=true는 immutable T032 acceptance object key/version/SHA-256, target OCI digest,
+  converter manifest hash, schema/all-pass 없이는 활성화할 수 없다. 1.1.0은 1.2.0 승인 후에도
+  retire하지 않고 immutable superseded draft로 유지한다.
+- 현재 activation gate는 reference 형식이 올바르더라도 무조건 false다. T032가 exact versioned
+  object bytes fetch, byte hash/schema/subject/OCI/manifest/all-results 대조와 외부 trust root 기반
+  release signature 검증을 구현한 뒤에만 gate 구현을 교체할 수 있다. 그 전까지 golden=true
+  import/verify/converter construction은 모두 fail closed다.
+- 현재 network build/runtime self-report는 hermetic 또는 정책 증거가 아니다. T032/release가
+  signed trust root, vendored/offline source·crate·deb checksum·SBOM·attestation을 제공하기 전
+  production activation을 차단한다.
+
+## English / AI-readable — T015 second hardening plan
+
+Use a trusted UID 0 supervisor with exactly CHOWN/KILL/SETUID/SETGID, zero-capability parser 65533
+and validator 65531, a child subreaper, split input/output directories, and a supervisor-owned
+streaming snapshot. One request has one absolute deadline. Golden activation requires immutable
+T032 artifact and release digest bindings. Profile 1.1.0 remains an immutable superseded draft;
+signed hermetic build and artifact trust material remain mandatory T032/release blockers. The
+activation gate remains unconditionally false until T032 implements exact artifact-byte and
+release-signature verification against an external trust root; runtime self-report is never
+admission evidence.

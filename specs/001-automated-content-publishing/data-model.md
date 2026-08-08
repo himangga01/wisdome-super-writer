@@ -531,7 +531,16 @@ profile 전이는 `draft→approved→retired`만 허용하며 retired→approve
 
 `ExtractionProfileDecision`은 `id`, `profile_snapshot_id`, `version`,
 `decision: approved/retired`, `expected_material_hash`, `supersedes_decision_id`, `request_key`,
-`request_hash`, `decision_hash`, `decided_by`, `decided_at`, `reason`을 가진다.
+`request_hash`, `decision_hash`, `verification_report_object_key`,
+`verification_report_object_version`, `verification_report_hash`, `decided_by`, `decided_at`,
+`reason`을 가진다. migration 호환을 위해 세 report 필드는 DB에서 nullable이지만 새 approved
+결정에는 모두 필수이며 profile projection과 정확히 일치해야 한다. retired 결정은 직전 approved
+결정의 frozen report envelope를 그대로 복사한다. envelope는 decision hash와 AuditEvent metadata에도
+포함되어 이후 profile projection 변경으로 감사 근거가 바뀌지 않는다.
+0004 migration은 기존 decision chain에 현재 profile projection의 key/version/hash를 backfill한다.
+기존 행에 당시 envelope가 따로 저장되지 않았으므로 이것이 복원 가능한 유일한 호환 경계다.
+projection이 없거나 불완전하면 임의 추정하지 않고 migration을 중단한다. 따라서 기존 서비스는
+retire/API 검증을 계속할 수 있지만, backfill 값이 결정 당시 값이었다고 새로 주장하지 않는다.
 `(profile_snapshot_id, version)`과 `(profile_snapshot_id, request_key)`가 고유하다. profile projection 행을 잠그고
 `expected_latest_decision_id`와 material hash를 CAS로 확인하며 최근 재인증이 필수다. 같은
 request key/payload는 기존 결정을 반환하고 stale/different payload는 409다. decision,
@@ -543,6 +552,9 @@ object key/version/report hash, 비민감 sample ID/hash와 expected/observed ou
 threshold, stage 결과, overall result와 생성·검증 시각만 노출한다. 원문·토큰·개인정보는
 포함하지 않는다. object version/hash 또는 subject material hash가 DB 기준과 다르거나 보고서
 일부를 로드하지 못하면 응답과 approve/passed 결정을 모두 거절한다.
+approved/retired profile API는 latest decision에 동결된 envelope를 source of truth로 사용하며,
+mutable profile projection과 하나라도 다르면 409를 반환한다. 승인 후 report command는 기존
+versioned core bytes와 DB/decision envelope를 재검증만 하고 새 object/version으로 덮어쓰지 않는다.
 
 ### DocumentExtraction
 
@@ -1750,3 +1762,17 @@ reason, and cluster snapshot hash. Reusing an existing article or revision never
 those memberships. Model/queryset guards and PostgreSQL/SQLite triggers reject later
 updates or deletes, and inserts must bind the verification's own cluster and exact frozen
 evidence-manifest hash.
+
+## English — T015 Profile Verification Envelope
+
+ExtractionProfileDecision stores the verification report object key, immutable version, and
+SHA-256. The columns remain nullable only for migration compatibility; every newly approved
+decision must carry all three and exactly match the profile projection. A retired decision copies
+the immediately preceding approved envelope. The envelope is included in the decision hash and
+audit metadata. For approved or retired profiles, the report API uses the latest decision's frozen
+envelope and returns 409 if the mutable projection differs. Report verification may write a new
+core object only while the profile is draft; afterward it can only revalidate the exact existing
+core bytes and envelope. Migration 0004 backfills historical decision chains from the current
+profile projection and aborts when that projection is incomplete. Because older rows did not store
+the contemporaneous envelope, this preserves runtime compatibility without claiming historical
+reconstruction beyond the available frozen projection.

@@ -70,7 +70,7 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 - [X] T012 [US1] robots·이용약관·license·허용 MIME·poll/rate limit·Retry-After·freshness·authority와 수집 실패 분류를 실제 요청 경로에서 강제하고 권리 근거 fallback을 제거하도록 `src/apps/topics/services.py`, `src/apps/collection/services.py`, `src/adapters/sources/http.py`, `config/source-registry/`를 정비 (depends on T001, T009, T010, T011)
 - [X] T013 [US1] `EventClusterItem`, `EventClusterVerification`과 공고·사건 canonical identity, duplicate/conflict/exclusion decision, 독립 출처 검증, 청약 신규·정정 공고별 글 및 반도체 일일 요약·중요 속보 분기를 `src/apps/collection/`, `src/apps/editorial/models.py`, `src/apps/editorial/services.py`에 구현 (depends on T002, T009, T010, T011, T012)
 - [X] T014 [P] [US1] 모든 extraction profile이 web·worker에서 동일하게 import되도록 PaddleOCR model manifest root·실제 checksum·S3 object version·runtime-network 차단·worker 시작 gate를 `config/extraction-profiles/`, `src/apps/evidence/profiles.py`, `src/apps/evidence/management/commands/`, `deploy/containers/paddleocr-worker/`, `compose.yaml`에 구현 (depends on T002, T003)
-- [ ] T015 [US1] 승인된 converter manifest를 실제 Python/rhwp/qpdf/library/font/fontconfig bytes와 대조하고, supervisor 65532·untrusted child 65533·validator 65534 분리, process-group/log/streaming snapshot, exact UDS EOF/report/object/page 결속, concurrency 1·profile-admin을 갖는 no-network legacy HWP sandbox를 `src/adapters/extractors/legacy_hwp.py`, `src/apps/evidence/profiles.py`, `src/apps/evidence/tasks.py`, `config/extraction-profiles/generic/legacy-hwp-v1.json`, `deploy/containers/`, `compose.yaml`에 구현한다. 1.1.0은 immutable golden=false draft로 유지하고 profile-before-attempt 영구 실패도 typed counter와 manual recovery로 보존한다. (depends on T001, T003, T014)
+- [ ] T015 [US1] 승인된 converter manifest를 실제 Python/rhwp/qpdf/library/font/fontconfig/LICENSE/Cargo.lock/build/Compose bytes와 대조하고, exact CHOWN/KILL/SETUID/SETGID만 가진 root supervisor·zero-cap child 65533·validator 65531, subreaper descendant cleanup, split input/output, streaming snapshot, exact UDS EOF/report/object/page 결속, absolute deadline, concurrency 1·전용 OCR profile-admin·volume bootstrap을 갖는 no-network legacy HWP sandbox를 `src/adapters/extractors/legacy_hwp.py`, `src/apps/evidence/profiles.py`, `src/apps/evidence/tasks.py`, `config/extraction-profiles/generic/legacy-hwp-v1.json`, `deploy/containers/`, `compose.yaml`에 구현한다. 1.1.0은 immutable golden=false draft로 유지하고 profile-before-attempt 영구 실패도 raw quarantine, typed counter/failure count와 manual recovery로 보존한다. (depends on T001, T003, T014)
 - [ ] T016 [US1] DocumentExtraction·ExtractionRun·GenericExtractionAttempt의 uniqueness, row lock, generation fencing, retry/finalizer 순서, 예상 밖 예외 terminal 처리, stop hook와 outbox 전이를 `src/apps/evidence/models.py`, `src/apps/evidence/services.py`, `src/apps/evidence/tasks.py`에 구현 (depends on T005, T014, T015)
 - [ ] T017 [US1] browser/media/manual profile을 실제 routing에 연결하거나 계약에서 제거하고 XML parser fail-closed, PDF/image dimension·decompression·S3 read 제한, locator·confidence 필수 보존을 `src/apps/evidence/tasks.py`, `src/adapters/extractors/`, `src/adapters/storage/s3.py`에 구현 (depends on T001, T014, T015, T016)
 - [ ] T018 [US1] immutable editorial policy를 적용해 사실·기업주장·해석·전망을 분리하고 고위험 값·독립성·출처 freshness·권리·인용 길이·가독성·중복·과장 gate와 수동 개정 재검증, 주장·근거·제외 자료 관리자 화면을 `src/apps/editorial/`, `src/adapters/generators/`, `config/editorial-policies/`, `src/templates/admin_console/`, `src/static/admin_console/`에 구현 (depends on T002, T013, T016, T017)
@@ -128,7 +128,7 @@ unknown outcome을 안전하게 복구할 수 있다.
 
 **목적**: 구현 완료를 체크박스가 아니라 자동화된 계약·통합·E2E와 SC 측정 결과로 증명한다.
 
-- [ ] T032 수집·권리·중복·citation, PDF/HWP/locator, 승인·멱등·fencing·reconcile, 일정 locking·중지·정정·보존, 재인증·CSRF·SSRF·비밀 redaction, outbox·audit와 전체 관리자 여정을 `tests/unit/`, `tests/contract/test_evidence_extractor.py`, `tests/contract/test_publishers.py`, `tests/integration/test_collection_pipeline.py`, `tests/integration/test_scheduling_operations.py`, `tests/integration/test_security_audit.py`, `tests/e2e/test_admin_journey.py`에 구현하고 `spec.md`의 SC-001~SC-012 및 PDF/HWP golden 결과를 기록한다. Legacy HWP acceptance artifact는 지원 corpus와 unsupported/warning/missing-font/exit20/21/22/tamper의 zero-output/manual recovery를 증명하고, 이를 결속한 새 1.2.0 golden=true profile을 승인한 뒤 1.1.0을 retire한다. (depends on T001-T031)
+- [ ] T032 수집·권리·중복·citation, PDF/HWP/locator, 승인·멱등·fencing·reconcile, 일정 locking·중지·정정·보존, 재인증·CSRF·SSRF·비밀 redaction, outbox·audit와 전체 관리자 여정을 `tests/unit/`, `tests/contract/test_evidence_extractor.py`, `tests/contract/test_publishers.py`, `tests/integration/test_collection_pipeline.py`, `tests/integration/test_scheduling_operations.py`, `tests/integration/test_security_audit.py`, `tests/e2e/test_admin_journey.py`에 구현하고 `spec.md`의 SC-001~SC-012 및 PDF/HWP golden 결과를 기록한다. Legacy HWP acceptance artifact는 immutable object key/version/SHA-256, target OCI digest, converter manifest hash, schema/all-pass와 지원 corpus 및 unsupported/warning/missing-font/exit20/21/22/tamper의 zero-derived-output/raw-quarantine/manual recovery를 증명한다. 현재 hard-false activation gate를 열기 전에 exact versioned artifact bytes fetch, SHA-256/schema/subject/OCI/manifest/all-results 검증과 외부 signed-release trust root 검증을 반드시 구현한다. 형식상 올바른 reference나 runtime self-report/hard-coded policy는 admission 증거로 인정하지 않는다. hermetic vendored/offline source·crate·deb·SBOM와 signed release attestation도 필수 구현한다. 이를 결속한 새 1.2.0 golden=true profile을 승인하되 1.1.0은 immutable superseded draft로 보존한다. (depends on T001-T031)
 - [ ] T033 실제 구현·자동 검증 결과와 운영 절차를 기준으로 `README.md`, `specs/001-automated-content-publishing/tasks.md`, `specs/001-automated-content-publishing/quickstart.md`, `specs/001-automated-content-publishing/contracts/`, 운영 runbook을 갱신하고 더 이상 부분 구현을 완료로 표시하지 않도록 문서 추적성을 정리 (depends on T032)
 
 ---
@@ -174,9 +174,12 @@ unknown outcome을 안전하게 복구할 수 있다.
 
 ## AI Execution Metadata (English)
 
-T015 keeps legacy-HWP profile 1.1.0 immutable and inactive while enforcing split supervisor,
-child, and validator identities plus exact streamed provenance. T032 owns the acceptance
-artifact, creation/approval of golden profile 1.2.0, and retirement of 1.1.0.
+T015 keeps legacy-HWP profile 1.1.0 immutable and inactive while enforcing the exact-capability
+root supervisor, zero-capability child/validator, subreaper cleanup, and exact streamed provenance.
+T032 owns immutable artifact/signature validation, hermetic signed release material, and approval
+of golden profile 1.2.0. It must replace the deliberately hard-false gate only with exact
+versioned artifact-byte and external-trust-root signature verification. Version 1.1.0 remains an
+immutable superseded draft and is not retired.
 
 ```yaml
 schema_version: "1.0"

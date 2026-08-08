@@ -78,7 +78,7 @@ PaddleOCR 모델 준비를 먼저 완료한 다음 서비스를 시작합니다.
 .\deploy\compose-deploy.ps1
 docker compose run --rm web python src/manage.py createsuperuser
 docker compose run --rm web python src/manage.py seed_source_registry
-docker compose run --rm web python src/manage.py import_extraction_profiles --root config/extraction-profiles
+docker compose --profile admin run --rm profile-admin
 ```
 
 ### 안전한 Compose 배포 절차
@@ -221,17 +221,29 @@ docker compose --profile admin run --rm profile-admin
 
 `legacy-hwp-v1@1.1.0`은 `golden_corpus_approved=false`인 불변 draft입니다. T032가 지원/미지원,
 warning, missing-font, tamper와 exit 20/21/22를 포함한 승인 artifact를 만든 뒤에만 새
-`legacy-hwp-v1@1.2.0`(`golden_corpus_approved=true`)을 만들고 1.1.0을 retire합니다. 1.1.0을
+`legacy-hwp-v1@1.2.0`(`golden_corpus_approved=true`)을 만들고 승인합니다. 1.1.0은 retire하지 않고
+불변 `superseded draft`로 보존합니다. 1.1.0을
 제자리 수정하거나 image 내부 manifest hash로 자기 승인하면 안 됩니다.
 
-기본 Compose는 converter supervisor(UID 65532), untrusted 변환 child(65533), qpdf validator
-(65534)를 분리합니다. worker-extract는 sidecar 하나에 맞춰 `--concurrency=1`이며, scale-out은
+기본 Compose는 정확한 CHOWN/KILL/SETUID/SETGID capability만 가진 신뢰 supervisor(UID 0),
+capability가 0인 untrusted 변환 child(65533), qpdf validator(65531)를 분리합니다. one-shot
+`hwp-volume-bootstrap`이 socket/input volume을 root:root 0700으로 초기화합니다.
+worker-extract는 sidecar 하나에 맞춰 `--concurrency=1`이며, scale-out은
 각 worker마다 전용 socket/input volume과 전용 converter를 배치하는 운영 override가 먼저
 필요합니다. 기본 gVisor 강제는 없고 지원 Linux 환경에서만 선택 override를 사용합니다.
 tmpfs 768 MiB는 최대 input snapshot 128 MiB + untrusted PDF 300 MiB + trusted snapshot 300 MiB
 + bounded log/metadata 여유를 담고, container memory/memswap 1536 MiB는 변환기·validator 작업
 메모리를 포함합니다. qpdf `11.3.0-1+deb12u1`은 pinned Python Bookworm base와 ABI/package
-출처를 일치시키기 위해 선택했으며 binary와 loaded libraries도 manifest에 고정됩니다.
+출처를 일치시키기 위해 선택했으며 관측 version/source package, binary와 loaded libraries도
+manifest에 고정됩니다. 현재 build는 live Git/Cargo/Debian 입력을 사용하므로 hermetic/offline
+재현 build나 signed release attestation으로 간주하지 않습니다. T032/release가 vendored source,
+crate/deb checksum, SBOM, 서명 trust root와 acceptance object를 제공하기 전 production 활성화는
+차단됩니다. 현재 activation validator는 reference 모양이 올바르더라도 항상 false를 반환합니다.
+T032가 exact versioned object bytes를 가져와 SHA-256·schema·subject·OCI·manifest·all-pass를
+대조하고 외부 trust root로 release signature를 검증하는 코드를 구현하기 전에는
+`golden_corpus_approved=true` profile의 import, 검증, converter 생성이 모두 실패합니다.
+wrapper runtime self-report와 hard-coded runtime policy는 admission attestation이나 정책 승인
+증거가 아닙니다.
 
 ## WordPress 연결
 
@@ -482,10 +494,17 @@ transaction에 속하는지 다시 확인합니다. 다중 데이터베이스 �
 Run `docker compose --profile admin run --rm profile-admin` only after supplying the
 release-reviewed manifest path and SHA-256. The service contains both Paddle and HWP
 implementation material and mounts the model, UDS, input, and manifest boundaries read-only.
-Profile 1.1.0 remains an immutable `golden_corpus_approved=false` draft. T032 must produce the
-acceptance artifact and a new 1.2.0 profile with `golden_corpus_approved=true`, then retire 1.1.0.
+Profile 1.1.0 remains an immutable `golden_corpus_approved=false` superseded draft. T032 must
+produce the immutable acceptance artifact and approve a new 1.2.0 profile with
+`golden_corpus_approved=true`; it must not invent a retirement transition for 1.1.0.
+The activation validator is deliberately hard-false until T032 implements exact versioned-object
+fetch, byte/hash/schema/subject/OCI/manifest/all-results verification, and release-signature
+verification against an external trust root. Well-formed reference metadata, wrapper self-report,
+and hard-coded runtime policy cannot activate import, verification, or converter construction.
 The default worker uses concurrency one for one sidecar. Scale-out requires a dedicated
-socket/input volume and converter per worker. qpdf `11.3.0-1+deb12u1` stays pinned to the
+socket/input volume and converter per worker. The root supervisor has only CHOWN/KILL/SETUID/
+SETGID, while parser 65533 and validator 65531 execute with zero capabilities. qpdf
+`11.3.0-1+deb12u1` stays pinned to the
 Bookworm runtime and its actual binary/library bytes are included in the release manifest.
 
 ### Audit database role boundary (English)

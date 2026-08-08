@@ -31,7 +31,8 @@ from .models import (
 from .services import (
     EvidenceConflict,
     EvidenceInvariantError,
-    canonical_hash,
+    _profile_report_envelope,
+    _validate_profile_report_bytes,
     decide_evidence_review,
     decide_extraction_profile,
 )
@@ -94,6 +95,9 @@ def _profile_decision_payload(decision: ExtractionProfileDecision) -> dict[str, 
         "supersedesDecisionId": str(decision.supersedes_decision_id) if decision.supersedes_decision_id else None,
         "requestKey": decision.request_key,
         "decisionHash": decision.decision_hash,
+        "verificationReportObjectKey": decision.verification_report_object_key,
+        "verificationReportObjectVersion": decision.verification_report_object_version,
+        "verificationReportHash": decision.verification_report_hash,
         "decidedBy": str(decision.decided_by_id),
         "decidedAt": decision.decided_at.isoformat(),
         "reason": decision.reason,
@@ -156,27 +160,42 @@ def extraction_profile_decisions(request, profile_id):
 @require_GET
 def extraction_profile_report(request, profile_id):
     profile = get_object_or_404(ExtractionProfileSnapshot, pk=profile_id)
-    if not profile.verification_report_object_key or not profile.verification_report_hash:
+    if not (
+        profile.verification_report_object_key
+        and profile.verification_report_object_version
+        and profile.verification_report_hash
+    ):
+        if profile.approval_state in {"approved", "retired"}:
+            return problem_response(status=409, code="verification_report_hash_mismatch")
         return problem_response(status=404, code="verification_report_not_found")
     try:
-        raw = S3ObjectStorage().get_bytes(key=profile.verification_report_object_key)
-        report = json.loads(raw)
+        object_key, object_version, report_hash = _profile_report_envelope(profile)
+    except ValidationError:
+        return problem_response(status=409, code="verification_report_hash_mismatch")
+    try:
+        stored_version = object_version
+        raw = S3ObjectStorage().get_bytes(
+            key=object_key,
+            version_id=(
+                None
+                if stored_version.startswith("etag:")
+                else stored_version
+            ),
+        )
     except Exception:
         return problem_response(status=409, code="verification_report_unavailable")
-    core = {
-        key: value for key, value in report.items()
-        if key not in {"reportObjectKey", "reportObjectVersion", "reportHash"}
-    }
-    if (
-        canonical_hash(core) != profile.verification_report_hash
-        or report.get("reportHash") != profile.verification_report_hash
-        or report.get("subjectId") != str(profile.id)
-        or report.get("subjectMaterialHash") != profile.profile_material_hash
-        or report.get("reportObjectKey") != profile.verification_report_object_key
-        or report.get("reportObjectVersion") != profile.verification_report_object_version
-    ):
+    try:
+        report = _validate_profile_report_bytes(profile, raw)
+    except ValidationError:
         return problem_response(status=409, code="verification_report_hash_mismatch")
-    return JsonResponse(report)
+    return JsonResponse(
+        {
+            **report,
+            "reportObjectKey": object_key,
+            "reportObjectVersion": object_version,
+            "reportHash": report_hash,
+        }
+    )
 
 
 def _document_provenance(evidence: EvidenceAsset) -> dict[str, Any] | None:

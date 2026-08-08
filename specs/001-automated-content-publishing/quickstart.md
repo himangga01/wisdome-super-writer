@@ -120,9 +120,22 @@ docker compose --profile admin run --rm profile-admin
 
 기본 `legacy-hwp-v1@1.1.0`은 `golden_corpus_approved=false`인 불변 draft라 승인하지 않는다.
 T032는 지원 corpus 성공뿐 아니라 unsupported, warning, missing-font, tamper, exit 20/21/22가
-EvidenceAsset/ready/DocumentExtraction 0건과 `manual_required`로 끝나는 acceptance artifact를
+converted/derived EvidenceAsset, ready event, DocumentExtraction 0건과 `manual_required`로 끝나고,
+raw input은 `manual_required/publishable=false`로 격리되는 acceptance artifact를
 먼저 고정한다. 그 artifact와 release image/manifest digest를 결속한 새 1.2.0 profile을
-`golden_corpus_approved=true`로 import/승인하고, 그 다음 1.1.0을 retire한다.
+`golden_corpus_approved=true`로 import/승인한다. 1.1.0은 retire하지 않고 immutable superseded
+draft로 유지한다.
+
+`golden_corpus_approved=true`는 단독 승인 신호가 아니다. profile에는 acceptance object의 immutable
+key/version/SHA-256, target OCI digest, converter manifest hash, schema와 all-pass 결과가 모두 있어야
+한다. 실제 artifact fetch/signature trust root, hermetic/offline source/vendor/deb/SBOM material과 signed
+release attestation은 T032/release의 필수 blocker다.
+
+현재 activation validator는 위 reference가 형식상 완전해도 항상 false다. T032가 exact versioned
+artifact bytes를 저장소에서 가져와 SHA-256·schema·subject·OCI·manifest·all-results와 release
+signature를 외부 trust root로 검증하는 구현을 추가할 때까지 golden=true profile import/verify 및
+converter construction은 모두 실패한다. runtime self-report와 hard-coded policy는 admission
+attestation이 아니다.
 
 기본 `worker-extract --concurrency=1`과 converter 하나는 한 쌍이다. 수평 확장은 worker마다
 전용 UDS/input volume/converter를 배치한 Linux 운영 override가 있을 때만 허용한다. repo 기본
@@ -629,9 +642,12 @@ FR-012, FR-023, FR-024와 전체 수용 결과는 PASS다.
 Use `docker compose --profile admin run --rm profile-admin` with the externally reviewed
 manifest file and SHA-256. The command boundary contains both Paddle and HWP implementation
 material and verifies the real UDS socket type, bounded protocol identity, manifest, and policy.
-Profile 1.1.0 is an immutable inactive draft. T032 creates the acceptance artifact and a new
-1.2.0 profile with `golden_corpus_approved=true`, then retires 1.1.0. Unsupported, warning,
+Profile 1.1.0 is an immutable inactive superseded draft. T032 creates the immutable acceptance
+artifact and approves a new 1.2.0 profile with `golden_corpus_approved=true`; 1.1.0 is not retired.
+Unsupported, warning,
 missing-font, exit 20/21/22, and tamper cases must remain permanent/manual-required with zero
-EvidenceAsset, ready event, or DocumentExtraction. The default topology is one concurrency-one
-extract worker plus one dedicated converter; scale-out requires isolated socket/input volumes
-and a converter per worker.
+converted/derived EvidenceAsset, ready event, or DocumentExtraction; the raw input remains
+quarantined and non-publishable. The activation gate remains hard-false until T032 implements
+exact artifact-byte and external-trust-root signature verification. The default topology is one
+concurrency-one extract worker plus one dedicated converter; scale-out requires isolated
+socket/input volumes and a converter per worker.

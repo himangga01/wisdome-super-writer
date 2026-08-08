@@ -387,7 +387,8 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   run counters에 보존하고 finalizer가 `legacy_hwp_required_failure/manual_required`로 끝낸다. 다른 optional
   attachment의 부분 성공 의미는 바꾸지 않는다.
 - `legacy-hwp-v1@1.1.0`은 immutable `golden_corpus_approved=false` draft다. T032 acceptance artifact와
-  새 1.2.0 golden profile이 승인된 뒤 1.1.0을 retire하기 전에는 운영 event producer가 선택하면 안 된다.
+  새 1.2.0 golden profile이 승인된 뒤에도 1.1.0은 immutable superseded draft로 남고 운영 event
+  producer가 선택하면 안 된다.
 
 ## English — T005 Versioned Internal Event Addendum
 
@@ -570,5 +571,5 @@ infrastructure outcome. Unsupported input, warning/missing-font/fallback, exact 
 EvidenceAsset, ready event, or DocumentExtraction and the evidence finalizer projects manual
 recovery. Exact canonical report/locator/object/page bindings are rechecked before upload and
 during recovery. A pre-attempt required-HWP failure is retained as a typed run counter marker.
-Version 1.1.0 remains an immutable inactive draft; T032 creates the acceptance artifact and
-golden 1.2.0 profile, then retires 1.1.0.
+Version 1.1.0 remains an immutable inactive superseded draft; T032 creates the acceptance
+artifact and approves golden 1.2.0 without adding a retirement transition for 1.1.0.

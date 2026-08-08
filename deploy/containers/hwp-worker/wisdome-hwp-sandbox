@@ -1,7 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3.12
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import hashlib
 import json
@@ -43,8 +44,18 @@ APPROVED_CONVERTER = {
     "cargo_locked": True,
 }
 REQUIRED_ROLES = frozenset(
-    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
+    {
+        "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+        "library", "license", "lockfile", "build-metadata",
+    }
 )
+SUPERVISOR_CAPABILITY_MASK = (1 << 0) | (1 << 5) | (1 << 6) | (1 << 7)
+PR_SET_CHILD_SUBREAPER = 36
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_CLEAR_ALL = 4
+LINUX_CAPABILITY_VERSION_3 = 0x20080522
+SIGTERM_NUMBER = getattr(signal, "SIGTERM", 15)
+SIGKILL_NUMBER = getattr(signal, "SIGKILL", 9)
 REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -122,6 +133,10 @@ class SandboxConverterFailure(Exception):
 
 
 class SandboxResourceLimit(Exception):
+    pass
+
+
+class SandboxFatalIsolationFailure(RuntimeError):
     pass
 
 
@@ -395,6 +410,7 @@ def snapshot_via_identity(
     max_output_bytes: int,
     uid: int,
     gid: int,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     destination_fd = os.open(
         destination,
@@ -421,6 +437,7 @@ def snapshot_via_identity(
             uid=uid,
             gid=gid,
             pass_fds=(destination_fd,),
+            deadline=deadline,
         )
     finally:
         os.close(destination_fd)
@@ -493,6 +510,101 @@ def verify_manifest(path: Path) -> str:
     return sha256_bytes(raw)
 
 
+def _read_proc_status(path: Path = Path("/proc/self/status")) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            result[key] = value.strip()
+    return result
+
+
+def _status_ids(status: Mapping[str, str], key: str) -> tuple[int, int, int, int]:
+    try:
+        values = tuple(int(value) for value in status[key].split())
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"process status is missing {key}") from exc
+    if len(values) != 4:
+        raise RuntimeError(f"process status has invalid {key}")
+    return values
+
+
+def _status_cap(status: Mapping[str, str], key: str) -> int:
+    try:
+        return int(status[key], 16)
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"process status is missing {key}") from exc
+
+
+def _validate_supervisor_identity(status: Mapping[str, str]) -> None:
+    if (
+        _status_ids(status, "Uid") != (0, 0, 0, 0)
+        or _status_ids(status, "Gid") != (0, 0, 0, 0)
+        or status.get("NoNewPrivs") != "1"
+        or _status_cap(status, "CapEff") != SUPERVISOR_CAPABILITY_MASK
+        or _status_cap(status, "CapPrm") != SUPERVISOR_CAPABILITY_MASK
+        or _status_cap(status, "CapInh") != 0
+        or _status_cap(status, "CapAmb") != 0
+    ):
+        raise RuntimeError("sandbox supervisor identity/capability contract differs")
+
+
+def _validate_exec_identity(
+    status: Mapping[str, str],
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    if (
+        _status_ids(status, "Uid") != (uid, uid, uid, uid)
+        or _status_ids(status, "Gid") != (gid, gid, gid, gid)
+        or status.get("NoNewPrivs") != "1"
+        or any(
+            _status_cap(status, key) != 0
+            for key in ("CapEff", "CapPrm", "CapInh", "CapAmb")
+        )
+    ):
+        raise RuntimeError("sandbox child retained identity or capabilities")
+
+
+class _CapabilityHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class _CapabilityData(ctypes.Structure):
+    _fields_ = [
+        ("effective", ctypes.c_uint32),
+        ("permitted", ctypes.c_uint32),
+        ("inheritable", ctypes.c_uint32),
+    ]
+
+
+def _prctl(option: int, argument: int = 0) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(option, argument, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _clear_child_capabilities() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    header = _CapabilityHeader(LINUX_CAPABILITY_VERSION_3, 0)
+    data = (_CapabilityData * 2)()
+    if libc.capset(ctypes.byref(header), ctypes.byref(data)) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    _prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)
+
+
+def _identity_payload() -> bytes:
+    status = _read_proc_status()
+    payload = {
+        key: status[key]
+        for key in ("Uid", "Gid", "NoNewPrivs", "CapEff", "CapPrm", "CapInh", "CapAmb")
+    }
+    return canonical_json(payload)
+
+
 def _resource_preexec(
     limits: Mapping[str, int],
     *,
@@ -501,15 +613,14 @@ def _resource_preexec(
     child_umask: int = 0o077,
 ):
     def apply_limits() -> None:
-        if resource is None:
-            return
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"]))
-        resource.setrlimit(resource.RLIMIT_AS, (limits["address_space_bytes"], limits["address_space_bytes"]))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (limits["file_bytes"], limits["file_bytes"]))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (limits["open_files"], limits["open_files"]))
-        if hasattr(resource, "RLIMIT_NPROC"):
-            resource.setrlimit(resource.RLIMIT_NPROC, (limits["processes"], limits["processes"]))
+        if resource is not None:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"]))
+            resource.setrlimit(resource.RLIMIT_AS, (limits["address_space_bytes"], limits["address_space_bytes"]))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (limits["file_bytes"], limits["file_bytes"]))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limits["open_files"], limits["open_files"]))
+            if hasattr(resource, "RLIMIT_NPROC"):
+                resource.setrlimit(resource.RLIMIT_NPROC, (limits["processes"], limits["processes"]))
         os.umask(child_umask)
         if uid is not None or gid is not None:
             os.setgroups([])
@@ -517,6 +628,13 @@ def _resource_preexec(
             os.setgid(gid)
         if uid is not None:
             os.setuid(uid)
+        if uid is not None or gid is not None:
+            _clear_child_capabilities()
+            _validate_exec_identity(
+                _read_proc_status(),
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            )
 
     return apply_limits
 
@@ -545,6 +663,70 @@ def _terminate_process(process: subprocess.Popen[bytes], *, process_group: bool)
         process.wait()
 
 
+def _descendant_pids(parent_pid: int) -> set[int]:
+    parents: dict[int, int] = {}
+    for status_path in Path("/proc").glob("[0-9]*/status"):
+        try:
+            status = _read_proc_status(status_path)
+            pid = int(status_path.parent.name)
+            parent = int(status["PPid"])
+        except (OSError, KeyError, ValueError):
+            continue
+        parents[pid] = parent
+    descendants: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if pid not in descendants and (parent == parent_pid or parent in descendants):
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def _signal_pid(pid: int, signal_number: int) -> None:
+    try:
+        os.kill(pid, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def _reap_children() -> None:
+    while True:
+        try:
+            waited, _status = os.waitpid(-1, getattr(os, "WNOHANG", 1))
+        except ChildProcessError:
+            return
+        if waited == 0:
+            return
+
+
+def _cleanup_job_descendants(supervisor_pid: int, *, grace_seconds: float = 1.0) -> None:
+    descendants = _descendant_pids(supervisor_pid)
+    for pid in descendants:
+        _signal_pid(pid, SIGTERM_NUMBER)
+    deadline = time.monotonic() + grace_seconds
+    while descendants and time.monotonic() < deadline:
+        _reap_children()
+        descendants = _descendant_pids(supervisor_pid)
+        if descendants:
+            time.sleep(0.01)
+    for _attempt in range(100):
+        descendants = _descendant_pids(supervisor_pid)
+        if not descendants:
+            return
+        for pid in descendants:
+            _signal_pid(pid, SIGKILL_NUMBER)
+        _reap_children()
+        descendants = _descendant_pids(supervisor_pid)
+        if not descendants:
+            return
+        time.sleep(0.01)
+    raise SandboxFatalIsolationFailure(
+        "sandbox job descendants survived cleanup; refusing future requests"
+    )
+
+
 def _run_bounded(
     command: list[str],
     *,
@@ -557,8 +739,10 @@ def _run_bounded(
     gid: int | None = None,
     child_umask: int = 0o077,
     pass_fds: tuple[int, ...] = (),
+    deadline: float | None = None,
 ) -> tuple[int, bytes, bytes]:
     process: subprocess.Popen[bytes] | None = None
+    threads: list[threading.Thread] = []
     streams: list[bytearray] = [bytearray(), bytearray()]
     overflow = threading.Event()
     lock = threading.Lock()
@@ -605,12 +789,15 @@ def _run_bounded(
         ]
         for thread in threads:
             thread.start()
-        deadline = time.monotonic() + timeout_seconds
+        process_deadline = min(
+            deadline if deadline is not None else float("inf"),
+            time.monotonic() + timeout_seconds,
+        )
         while process.poll() is None:
             if overflow.is_set():
                 _terminate_process(process, process_group=process_group)
                 raise SandboxResourceLimit("converter log limit exceeded")
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= process_deadline:
                 _terminate_process(process, process_group=process_group)
                 raise SandboxResourceLimit("converter wall-clock limit exceeded")
             time.sleep(0.01)
@@ -626,6 +813,12 @@ def _run_bounded(
     finally:
         if process is not None and process_group:
             _terminate_process(process, process_group=True)
+            if os.name == "posix":
+                _cleanup_job_descendants(os.getpid())
+        for thread in threads:
+            thread.join(timeout=1)
+        if any(thread.is_alive() for thread in threads):
+            raise SandboxConverterFailure("sandbox log drain survived job cleanup")
 
 
 def _limits_from_environment(max_output_bytes: int, timeout_seconds: int) -> dict[str, int]:
@@ -644,7 +837,9 @@ def _sanitized_environment(workspace: Path) -> dict[str, str]:
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(workspace),
         "TMPDIR": str(workspace),
-        "FONTCONFIG_FILE": "/etc/fonts/fonts.conf",
+        "FONTCONFIG_FILE": "/etc/wisdome/fonts.conf",
+        "FONTCONFIG_PATH": "/etc/wisdome",
+        "XDG_CACHE_HOME": str(workspace / ".cache"),
         "LC_ALL": "C.UTF-8",
         "TZ": "UTC",
         "NO_PROXY": "*",
@@ -672,45 +867,33 @@ def _qpdf_page_count(
     limits: Mapping[str, int],
     uid: int | None = None,
     gid: int | None = None,
+    deadline: float | None = None,
 ) -> int:
-    descriptor: int | None = None
     target = str(output)
-    pass_fds: tuple[int, ...] = ()
-    if uid is not None:
-        descriptor = os.open(
-            output,
-            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        target = f"/proc/self/fd/{descriptor}"
-        pass_fds = (descriptor,)
-    try:
-        check_code, check_stdout, check_stderr = _run_bounded(
-            ["/usr/bin/qpdf", "--check", target],
-            cwd=workspace,
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-            limits=limits,
-            process_group=uid is not None,
-            uid=uid,
-            gid=gid,
-            pass_fds=pass_fds,
-        )
-        if check_code != 0 or _contains_warning(check_stdout, check_stderr):
-            raise SandboxConverterFailure("qpdf rejected the converted PDF")
-        page_code, page_stdout, page_stderr = _run_bounded(
-            ["/usr/bin/qpdf", "--show-npages", target],
-            cwd=workspace,
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-            limits=limits,
-            process_group=uid is not None,
-            uid=uid,
-            gid=gid,
-            pass_fds=pass_fds,
-        )
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    check_code, check_stdout, check_stderr = _run_bounded(
+        ["/usr/bin/qpdf", "--check", target],
+        cwd=workspace,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        limits=limits,
+        process_group=uid is not None,
+        uid=uid,
+        gid=gid,
+        deadline=deadline,
+    )
+    if check_code != 0 or _contains_warning(check_stdout, check_stderr):
+        raise SandboxConverterFailure("qpdf rejected the converted PDF")
+    page_code, page_stdout, page_stderr = _run_bounded(
+        ["/usr/bin/qpdf", "--show-npages", target],
+        cwd=workspace,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        limits=limits,
+        process_group=uid is not None,
+        uid=uid,
+        gid=gid,
+        deadline=deadline,
+    )
     try:
         page_count = int(page_stdout.strip())
     except ValueError as exc:
@@ -918,6 +1101,7 @@ def _send_response(
     report: bytes = b"",
     pdf_path: Path | None = None,
     pdf_size: int = 0,
+    deadline: float | None = None,
 ) -> None:
     if exit_code != 0 and (report or pdf_path is not None or pdf_size):
         raise ProtocolViolation("failed response cannot contain partial material")
@@ -939,15 +1123,23 @@ def _send_response(
             "pdf_bytes": pdf_size,
         }
     )
-    connection.sendall(PROTOCOL_MAGIC)
-    connection.sendall(struct.pack("!I", len(header)))
-    connection.sendall(header)
+    def send(value: bytes) -> None:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SandboxResourceLimit("sandbox response deadline expired")
+            connection.settimeout(remaining)
+        connection.sendall(value)
+
+    send(PROTOCOL_MAGIC)
+    send(struct.pack("!I", len(header)))
+    send(header)
     if report:
-        connection.sendall(report)
+        send(report)
     if pdf_path is not None:
         with pdf_path.open("rb") as pdf:
             for chunk in iter(lambda: pdf.read(64 * 1024), b""):
-                connection.sendall(chunk)
+                send(chunk)
 
 
 def _server_limits() -> dict[str, int]:
@@ -960,6 +1152,74 @@ def _server_limits() -> dict[str, int]:
     }
 
 
+def _prepare_job_directories(
+    workspace: Path,
+    *,
+    child_uid: int,
+    child_gid: int,
+    validator_uid: int = 65531,
+    validator_gid: int = 65531,
+) -> dict[str, Path]:
+    workspace.chmod(0o711)
+    input_dir = workspace / "input"
+    output_dir = workspace / "output"
+    trusted_dir = workspace / "trusted"
+    validator_dir = workspace / "validator"
+    input_dir.mkdir(mode=0o750)
+    output_dir.mkdir(mode=0o700)
+    trusted_dir.mkdir(mode=0o750)
+    validator_dir.mkdir(mode=0o700)
+    if os.name == "posix":
+        os.chown(input_dir, 0, child_gid)
+        os.chown(output_dir, child_uid, child_gid)
+        os.chown(trusted_dir, 0, validator_gid)
+        os.chown(validator_dir, validator_uid, validator_gid)
+    input_dir.chmod(0o750)
+    output_dir.chmod(0o700)
+    trusted_dir.chmod(0o750)
+    validator_dir.chmod(0o700)
+    return {
+        "input_dir": input_dir,
+        "output_dir": output_dir,
+        "trusted_dir": trusted_dir,
+        "validator_dir": validator_dir,
+    }
+
+
+def _reclaim_known_child_file(path: Path, *, child_gid: int) -> None:
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SandboxConverterFailure("child output is not a unique regular file")
+    os.chown(path, 0, child_gid)
+    path.chmod(0o440)
+
+
+def _remaining_job_seconds(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SandboxResourceLimit("sandbox request deadline expired")
+    return max(1, int(remaining))
+
+
+def _cleanup_workspace(workspace: Path) -> None:
+    if os.name == "posix" and workspace.exists() and not workspace.is_symlink():
+        for child in workspace.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                os.chown(child, 0, 0)
+                child.chmod(0o700)
+        for root, directories, files in os.walk(workspace, topdown=True, followlinks=False):
+            root_path = Path(root)
+            for name in directories:
+                candidate = root_path / name
+                if not candidate.is_symlink():
+                    os.chown(candidate, 0, 0)
+                    candidate.chmod(0o700)
+            for name in files:
+                candidate = root_path / name
+                os.chown(candidate, 0, 0, follow_symlinks=False)
+    shutil.rmtree(workspace, ignore_errors=True)
+
+
 def _process_request(
     connection: socket.socket,
     *,
@@ -969,41 +1229,45 @@ def _process_request(
     manifest_hash: str,
     wrapper_path: Path,
 ) -> None:
+    limits = request["limits"]
+    job_deadline = time.monotonic() + limits["timeout_seconds"]
+    response_deadline = job_deadline + 10.0
     if request["converter_manifest_hash"] != manifest_hash:
-        _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+        _send_response(
+            connection,
+            request,
+            exit_code=EXIT_CONVERTER_FAILURE,
+            deadline=response_deadline,
+        )
         return
     request_input = request["input"]
-    limits = request["limits"]
     workspace = Path(tempfile.mkdtemp(prefix="job-", dir=work_root))
     try:
         child_uid = int(os.environ.get("HWP_CHILD_UID", "65533"))
         child_gid = int(os.environ.get("HWP_CHILD_GID", "65533"))
-        validator_uid = int(os.environ.get("HWP_VALIDATOR_UID", "65534"))
-        validator_gid = int(os.environ.get("HWP_VALIDATOR_GID", "65534"))
+        validator_uid = int(os.environ.get("HWP_VALIDATOR_UID", "65531"))
+        validator_gid = int(os.environ.get("HWP_VALIDATOR_GID", "65531"))
         if (
             os.name != "posix"
-            or os.geteuid() in {0, child_uid, validator_uid}
-            or len({os.geteuid(), child_uid, validator_uid}) != 3
+            or os.geteuid() != 0
+            or len({0, child_uid, validator_uid}) != 3
             or min(child_uid, child_gid, validator_uid, validator_gid) < 1
         ):
             raise SandboxConverterFailure("sandbox process identities are not separated")
-        workspace.chmod(0o711)
-        untrusted = workspace / "untrusted"
-        trusted = workspace / "trusted"
-        validator_work = workspace / "validator"
-        untrusted.mkdir(mode=0o770)
-        trusted.mkdir(mode=0o700)
-        validator_work.mkdir(mode=0o700)
-        os.chown(untrusted, os.geteuid(), child_gid)
-        os.chown(validator_work, validator_uid, validator_gid)
-        # The supervisor owns the setgid directory, while the child group may create files.
-        # A fresh trusted helper under the child identity later opens only the known output.
-        untrusted.chmod(0o2770)
-        trusted.chmod(0o700)
-        validator_work.chmod(0o700)
-        private_input = untrusted / "input.hwp"
-        output = untrusted / "converted.pdf"
-        child_report_path = untrusted / "child-report.json"
+        job_paths = _prepare_job_directories(
+            workspace,
+            child_uid=child_uid,
+            child_gid=child_gid,
+            validator_uid=validator_uid,
+            validator_gid=validator_gid,
+        )
+        input_dir = job_paths["input_dir"]
+        output_dir = job_paths["output_dir"]
+        trusted = job_paths["trusted_dir"]
+        validator_work = job_paths["validator_dir"]
+        private_input = input_dir / "input.hwp"
+        output = output_dir / "converted.pdf"
+        child_report_path = output_dir / "child-report.json"
         trusted_output = trusted / "verified.pdf"
         snapshot_verified_input(
             input_root,
@@ -1012,9 +1276,9 @@ def _process_request(
             request_input["checksum_sha256"],
             private_input,
         )
-        private_input.chmod(0o400)
-        os.chown(private_input, child_uid, child_gid)
-        environment = _sanitized_environment(untrusted)
+        os.chown(private_input, 0, child_gid)
+        private_input.chmod(0o440)
+        environment = _sanitized_environment(output_dir)
         environment.update(
             {
                 "HWP_JOB_TIMEOUT_SECONDS": str(limits["timeout_seconds"]),
@@ -1036,25 +1300,42 @@ def _process_request(
                 "--report",
                 str(child_report_path),
             ],
-            cwd=untrusted,
+            cwd=output_dir,
             environment=environment,
-            timeout_seconds=limits["timeout_seconds"],
+            timeout_seconds=_remaining_job_seconds(job_deadline),
             limits=process_limits,
             process_group=True,
             uid=child_uid,
             gid=child_gid,
             child_umask=0o027,
+            deadline=job_deadline,
         )
         if _was_resource_signal(exit_code):
-            _send_response(connection, request, exit_code=EXIT_RESOURCE_LIMIT)
+            _send_response(
+                connection, request, exit_code=EXIT_RESOURCE_LIMIT,
+                deadline=response_deadline,
+            )
             return
         if exit_code in {EXIT_INVALID_INPUT, EXIT_CONVERTER_FAILURE, EXIT_RESOURCE_LIMIT}:
-            _send_response(connection, request, exit_code=exit_code)
+            _send_response(
+                connection, request, exit_code=exit_code,
+                deadline=response_deadline,
+            )
             return
         if exit_code != 0 or _contains_warning(stdout, stderr):
-            _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+            _send_response(
+                connection, request, exit_code=EXIT_CONVERTER_FAILURE,
+                deadline=response_deadline,
+            )
             return
-        child_report_raw = _read_bounded_regular(child_report_path, limits["max_report_bytes"])
+        os.chown(output_dir, 0, child_gid)
+        output_dir.chmod(0o750)
+        _reclaim_known_child_file(output, child_gid=child_gid)
+        _reclaim_known_child_file(child_report_path, child_gid=child_gid)
+        child_report_raw = _read_bounded_regular(
+            child_report_path,
+            limits["max_report_bytes"],
+        )
         child_report = strict_json(child_report_raw, fields=CHILD_REPORT_FIELDS)
         if (
             child_report.get("schema_version") != "v1"
@@ -1070,23 +1351,27 @@ def _process_request(
             output,
             trusted_output,
             wrapper_path=wrapper_path,
-            workspace=untrusted,
+            workspace=output_dir,
             environment=environment,
-            timeout_seconds=limits["timeout_seconds"],
+            timeout_seconds=_remaining_job_seconds(job_deadline),
             limits=process_limits,
             max_output_bytes=limits["max_output_bytes"],
             uid=child_uid,
             gid=child_gid,
+            deadline=job_deadline,
         )
+        os.chown(trusted_output, 0, validator_gid)
+        trusted_output.chmod(0o440)
         validator_environment = _sanitized_environment(validator_work)
         verified_page_count = _qpdf_page_count(
             trusted_output,
             workspace=validator_work,
             environment=validator_environment,
-            timeout_seconds=limits["timeout_seconds"],
+            timeout_seconds=_remaining_job_seconds(job_deadline),
             limits=process_limits,
             uid=validator_uid,
             gid=validator_gid,
+            deadline=job_deadline,
         )
         if verified_page_count != child_report["page_count"]:
             raise SandboxConverterFailure("supervisor qpdf page count differs from child report")
@@ -1122,15 +1407,54 @@ def _process_request(
             report=final_report,
             pdf_path=trusted_output,
             pdf_size=snapshot["byte_size"],
+            deadline=response_deadline,
         )
     except SandboxInvalidInput:
-        _send_response(connection, request, exit_code=EXIT_INVALID_INPUT)
+        _send_response(
+            connection, request, exit_code=EXIT_INVALID_INPUT,
+            deadline=response_deadline,
+        )
     except SandboxResourceLimit:
-        _send_response(connection, request, exit_code=EXIT_RESOURCE_LIMIT)
+        _send_response(
+            connection, request, exit_code=EXIT_RESOURCE_LIMIT,
+            deadline=response_deadline,
+        )
     except (SandboxConverterFailure, ProtocolViolation, OSError, ValueError, KeyError):
-        _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+        _send_response(
+            connection, request, exit_code=EXIT_CONVERTER_FAILURE,
+            deadline=response_deadline,
+        )
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        _cleanup_workspace(workspace)
+
+
+def _probe_exec_identity(
+    wrapper_path: Path,
+    *,
+    uid: int,
+    gid: int,
+    work_root: Path,
+) -> None:
+    limits = _limits_from_environment(1024 * 1024, 5)
+    return_code, stdout, stderr = _run_bounded(
+        [str(wrapper_path), "identity-probe"],
+        cwd=work_root,
+        environment=_sanitized_environment(work_root),
+        timeout_seconds=5,
+        limits=limits,
+        process_group=True,
+        uid=uid,
+        gid=gid,
+    )
+    if return_code != 0 or stderr:
+        raise RuntimeError("sandbox child identity probe failed")
+    status = strict_json(
+        stdout,
+        fields=frozenset(
+            {"Uid", "Gid", "NoNewPrivs", "CapEff", "CapPrm", "CapInh", "CapAmb"}
+        ),
+    )
+    _validate_exec_identity(status, uid=uid, gid=gid)
 
 
 def run_server(arguments: argparse.Namespace) -> int:
@@ -1139,8 +1463,8 @@ def run_server(arguments: argparse.Namespace) -> int:
     work_root = Path(arguments.work_root)
     manifest_path = Path(arguments.manifest)
     wrapper_path = Path(__file__).resolve()
-    if os.geteuid() == 0:
-        raise RuntimeError("HWP sandbox refuses to run as root")
+    _validate_supervisor_identity(_read_proc_status())
+    _prctl(PR_SET_CHILD_SUBREAPER, 1)
     if not socket_path.is_absolute() or not input_root.is_absolute() or not work_root.is_absolute():
         raise RuntimeError("sandbox roots must be absolute")
     if input_root.is_symlink() or not input_root.is_dir() or work_root.is_symlink() or not work_root.is_dir():
@@ -1149,12 +1473,28 @@ def run_server(arguments: argparse.Namespace) -> int:
         metadata = root.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_gid != os.getegid()
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
             raise RuntimeError("sandbox root is not supervisor-only")
     manifest_hash = verify_manifest(manifest_path)
+    child_uid = int(os.environ.get("HWP_CHILD_UID", "65533"))
+    child_gid = int(os.environ.get("HWP_CHILD_GID", "65533"))
+    validator_uid = int(os.environ.get("HWP_VALIDATOR_UID", "65531"))
+    validator_gid = int(os.environ.get("HWP_VALIDATOR_GID", "65531"))
+    _probe_exec_identity(
+        wrapper_path,
+        uid=child_uid,
+        gid=child_gid,
+        work_root=work_root,
+    )
+    _probe_exec_identity(
+        wrapper_path,
+        uid=validator_uid,
+        gid=validator_gid,
+        work_root=work_root,
+    )
     if socket_path.exists() or socket_path.is_symlink():
         metadata = socket_path.lstat()
         if socket_path.is_symlink() or not stat.S_ISSOCK(metadata.st_mode):
@@ -1257,6 +1597,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--destination-fd", required=True)
         parser.add_argument("--max-output-bytes", required=True)
         return run_snapshot_cli(parser.parse_args(argv))
+    if argv and argv[0] == "identity-probe":
+        if len(argv) != 1:
+            return 1
+        sys.stdout.buffer.write(_identity_payload())
+        sys.stdout.buffer.flush()
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", required=True)
     parser.add_argument("--input", required=True)

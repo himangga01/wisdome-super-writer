@@ -11,7 +11,10 @@
     "src/adapters/extractors/legacy_hwp.py",
     "deploy/containers/hwp-worker/wisdome-hwp-sandbox",
     "deploy/containers/hwp-worker/build_manifest.py",
-    "deploy/containers/hwp-worker/Dockerfile"
+    "deploy/containers/hwp-worker/fonts.conf",
+    "deploy/containers/hwp-worker/Dockerfile",
+    "deploy/containers/profile-admin/Dockerfile",
+    "compose.yaml"
   ],
   "config": {
     "protocol_version": "wisdome-hwp-uds-v1",
@@ -30,6 +33,7 @@
       "{report}"
     ],
     "golden_corpus_approved": false,
+    "golden_corpus_acceptance": null,
     "timeout_seconds": 180,
     "max_input_bytes": 134217728,
     "max_output_bytes": 314572800,

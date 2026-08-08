@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
+from unittest.mock import patch
 
 import yaml
 from django.core.exceptions import ValidationError
@@ -28,7 +29,12 @@ import django
 django.setup()
 
 from adapters.extractors.base import ExtractorError
-from adapters.extractors.legacy_hwp import LegacyHwpConverter, probe_legacy_hwp_sandbox
+from adapters.extractors.legacy_hwp import (
+    LegacyHwpConverter,
+    legacy_hwp_acceptance_reference_is_well_formed,
+    probe_legacy_hwp_sandbox,
+    validate_legacy_hwp_activation_config,
+)
 from apps.evidence import tasks
 from apps.evidence.profiles import load_profile_documents
 
@@ -188,8 +194,17 @@ class LegacyHwpClientTests(unittest.TestCase):
             "input_staging_root": str(staging_root.resolve()),
             "converter_manifest_hash": MANIFEST_HASH,
             "golden_corpus_approved": True,
-            "staging_owner_uid": 65532,
-            "staging_owner_gid": 65532,
+            "golden_corpus_acceptance": {
+                "schema_version": "legacy-hwp-golden-acceptance-v1",
+                "object_key": "release/t032/legacy-hwp-1.2.0.json",
+                "object_version": "immutable-version-1",
+                "sha256": "2" * 64,
+                "target_oci_image_digest": "sha256:" + "3" * 64,
+                "converter_manifest_hash": MANIFEST_HASH,
+                "all_pass": True,
+            },
+            "staging_owner_uid": 0,
+            "staging_owner_gid": 0,
             "timeout_seconds": 3,
             "max_input_bytes": 1024,
             "max_output_bytes": 4096,
@@ -211,15 +226,19 @@ class LegacyHwpClientTests(unittest.TestCase):
             client_socket, server_socket = socket.socketpair()
             server = _OneShotServer(server_socket, responder)
             try:
-                output = LegacyHwpConverter(
-                    self._config(socket_path, staging_root),
-                    socket_factory=lambda _path, _timeout: client_socket,
-                    staging_owner_setter=lambda _path, _uid, _gid: None,
-                ).extract(
-                    input_path,
-                    attempt_id="11111111-1111-4111-8111-111111111111",
-                    generation=1,
-                )
+                with patch(
+                    "adapters.extractors.legacy_hwp.validate_legacy_hwp_activation_config",
+                    return_value=True,
+                ):
+                    output = LegacyHwpConverter(
+                        self._config(socket_path, staging_root),
+                        socket_factory=lambda _path, _timeout: client_socket,
+                        staging_owner_setter=lambda _path, _uid, _gid: None,
+                    ).extract(
+                        input_path,
+                        attempt_id="11111111-1111-4111-8111-111111111111",
+                        generation=1,
+                    )
                 remaining = list(staging_root.iterdir())
                 durable_bytes = Path(output.records[0].object_path).read_bytes()
             finally:
@@ -343,6 +362,77 @@ class LegacyHwpClientTests(unittest.TestCase):
                 LegacyHwpConverter(config)
         self.assertEqual(caught.exception.code, "legacy_hwp_profile_inactive")
 
+    def test_golden_boolean_cannot_activate_without_immutable_t032_acceptance(self) -> None:
+        """A mutable boolean must not replace the T032 artifact and target image binding."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = self._config(root / "missing.sock", root / "staging")
+            for invalid in (
+                None,
+                config["golden_corpus_acceptance"] | {"all_pass": False},
+                config["golden_corpus_acceptance"]
+                | {"converter_manifest_hash": "4" * 64},
+                config["golden_corpus_acceptance"]
+                | {"target_oci_image_digest": "latest"},
+            ):
+                with self.subTest(invalid=invalid):
+                    config["golden_corpus_acceptance"] = invalid
+                    with self.assertRaises(ExtractorError) as caught:
+                        LegacyHwpConverter(config)
+                    self.assertEqual(caught.exception.code, "legacy_hwp_profile_inactive")
+
+    def test_well_formed_but_unsigned_t032_metadata_cannot_activate(self) -> None:
+        """Reference metadata and runtime self-report are not signed admission evidence."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = self._config(root / "missing.sock", root / "staging")
+            self.assertTrue(legacy_hwp_acceptance_reference_is_well_formed(config))
+            self.assertFalse(validate_legacy_hwp_activation_config(config))
+            with self.assertRaises(ExtractorError) as caught:
+                LegacyHwpConverter(config)
+        self.assertEqual(caught.exception.code, "legacy_hwp_profile_inactive")
+
+    def test_socket_budget_includes_one_bounded_stream_margin(self) -> None:
+        """The client deadline must cover the sidecar deadline plus the framed response drain."""
+        observed_timeouts: list[float] = []
+
+        def responder(connection: socket.socket, request: dict[str, Any]) -> None:
+            _send_response(connection, request)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            staging = root / "staging"
+            staging.mkdir()
+            source = root / "sample.hwp"
+            source.write_bytes(HWP_BYTES)
+            client_socket, server_socket = socket.socketpair()
+            server = _OneShotServer(server_socket, responder)
+
+            def socket_factory(_path: str, timeout: float) -> socket.socket:
+                observed_timeouts.append(timeout)
+                return client_socket
+
+            try:
+                with patch(
+                    "adapters.extractors.legacy_hwp.validate_legacy_hwp_activation_config",
+                    return_value=True,
+                ):
+                    LegacyHwpConverter(
+                        self._config(root / "hwp.sock", staging),
+                        socket_factory=socket_factory,
+                        staging_owner_setter=lambda _path, _uid, _gid: None,
+                    ).extract(
+                        source,
+                        attempt_id="11111111-1111-4111-8111-111111111111",
+                    )
+            finally:
+                client_socket.close()
+                server.finish()
+
+        self.assertEqual(len(observed_timeouts), 1)
+        self.assertGreater(observed_timeouts[0], 3)
+        self.assertLessEqual(observed_timeouts[0], 13)
+
     def test_staged_input_is_owned_by_the_supervisor_and_read_only(self) -> None:
         """A root-owned 0400 file is unreadable to the UID 65532 sidecar supervisor."""
         observed: list[tuple[str, int, int, int]] = []
@@ -356,11 +446,15 @@ class LegacyHwpClientTests(unittest.TestCase):
             source.write_bytes(HWP_BYTES)
             staging = root / "staging"
             staging.mkdir()
-            converter = LegacyHwpConverter(
-                self._config(root / "unused.sock", staging),
-                socket_factory=lambda _path, _timeout: socket.socketpair()[0],
-                staging_owner_setter=set_owner,
-            )
+            with patch(
+                "adapters.extractors.legacy_hwp.validate_legacy_hwp_activation_config",
+                return_value=True,
+            ):
+                converter = LegacyHwpConverter(
+                    self._config(root / "unused.sock", staging),
+                    socket_factory=lambda _path, _timeout: socket.socketpair()[0],
+                    staging_owner_setter=set_owner,
+                )
             staged = staging / "material.hwp"
             converter._prepare_staging_root()
             converter._stage_input(source, staged)
@@ -370,8 +464,8 @@ class LegacyHwpClientTests(unittest.TestCase):
             self.assertEqual(
                 observed,
                 [
-                    ("staging", expected_directory_mode, 65532, 65532),
-                    ("material.hwp", expected_mode, 65532, 65532),
+                    ("staging", expected_directory_mode, 0, 0),
+                    ("material.hwp", expected_mode, 0, 0),
                 ],
             )
 
@@ -420,7 +514,8 @@ class LegacyHwpClientTests(unittest.TestCase):
 class LegacyHwpProfileTests(unittest.TestCase):
     def _manifest(self) -> dict[str, Any]:
         roles = (
-            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
+            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+            "library", "license", "lockfile", "build-metadata",
         )
         return {
             "schema_version": "v1",
@@ -435,7 +530,7 @@ class LegacyHwpProfileTests(unittest.TestCase):
                 {
                     "role": role,
                     "path": f"/opt/wisdome/{role}.bin",
-                    "sha256": str(index + 1) * 64,
+                    "sha256": "123456789ab"[index] * 64,
                     "byte_size": index + 1,
                 }
                 for index, role in enumerate(roles)
@@ -488,6 +583,35 @@ class LegacyHwpProfileTests(unittest.TestCase):
             "9b16aa9e23f476e2b335d7c029fc9f24a199d63c",
         )
 
+    def test_profile_import_rejects_well_formed_unsigned_golden_reference(self) -> None:
+        """Import cannot promote reference-shaped metadata before T032 trust verification exists."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            manifest_path = root / "converter-manifest.json"
+            manifest_path.write_text(json.dumps(self._manifest()), encoding="utf-8")
+            expected_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            profiles = self._profile_root(root, manifest_path, expected_hash)
+            profile_path = profiles / "legacy.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            profile["config"].update(
+                {
+                    "golden_corpus_approved": True,
+                    "golden_corpus_acceptance": {
+                        "schema_version": "legacy-hwp-golden-acceptance-v1",
+                        "object_key": "release/hwp/acceptance.json",
+                        "object_version": "version-1",
+                        "sha256": "a" * 64,
+                        "target_oci_image_digest": "sha256:" + "b" * 64,
+                        "converter_manifest_hash": expected_hash,
+                        "all_pass": True,
+                    },
+                }
+            )
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+            with self.assertRaises(ValidationError):
+                load_profile_documents(profiles)
+
 
 class LegacyHwpSandboxArtifactTests(unittest.TestCase):
     def test_manifest_builder_hashes_sorted_actual_bytes_for_every_required_role(self) -> None:
@@ -497,7 +621,8 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             entries = []
             for index, role in enumerate(
                 (
-                    "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
+                    "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+                    "library", "license", "lockfile", "build-metadata",
                 ), start=1
             ):
                 path = root / f"{role}.bin"
@@ -533,7 +658,8 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             sorted(entry["path"] for entry in manifest["files"]),
         )
         self.assertEqual({entry["role"] for entry in manifest["files"]}, {
-            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
+            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+            "library", "license", "lockfile", "build-metadata",
         })
         self.assertTrue(all(entry["byte_size"] > 0 for entry in manifest["files"]))
 
@@ -690,14 +816,14 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
 
         self.assertEqual(service["network_mode"], "none")
         self.assertTrue(service["read_only"])
-        self.assertEqual(service["user"], "65532:65532")
+        self.assertEqual(service["user"], "0:0")
         self.assertEqual(service["cap_drop"], ["ALL"])
         self.assertIn("no-new-privileges:true", service["security_opt"])
         self.assertGreater(service["pids_limit"], 0)
-        self.assertEqual(service["cap_add"], ["SETUID", "SETGID"])
+        self.assertEqual(service["cap_add"], ["CHOWN", "KILL", "SETUID", "SETGID"])
         self.assertEqual(service["memswap_limit"], service["mem_limit"])
         self.assertEqual(service["environment"]["HWP_CHILD_UID"], "65533")
-        self.assertEqual(service["environment"]["HWP_VALIDATOR_UID"], "65534")
+        self.assertEqual(service["environment"]["HWP_VALIDATOR_UID"], "65531")
         self.assertIn("/work", service["tmpfs"][0])
         serialized_environment = json.dumps(service.get("environment", {})).lower()
         for forbidden in ("database", "redis", "broker", "aws", "minio", "secret", "password"):
@@ -706,14 +832,122 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             compose["services"]["worker-extract"]["command"][-1],
             "--concurrency=1",
         )
+        bootstrap = compose["services"]["hwp-volume-bootstrap"]
+        self.assertEqual(bootstrap["network_mode"], "none")
+        self.assertTrue(bootstrap["read_only"])
+        self.assertEqual(bootstrap["cap_add"], ["CHOWN"])
+        self.assertEqual(
+            service["depends_on"]["hwp-volume-bootstrap"]["condition"],
+            "service_completed_successfully",
+        )
         profile_admin = compose["services"]["profile-admin"]
+        self.assertEqual(
+            profile_admin["build"]["dockerfile"],
+            "deploy/containers/profile-admin/Dockerfile",
+        )
         self.assertIn("paddle-models:/models/paddleocr:ro", profile_admin["volumes"])
         self.assertIn("hwp-sandbox-socket:/run/wisdome-hwp:ro", profile_admin["volumes"])
         self.assertIn("HWP_CONVERTER_MANIFEST_SHA256", profile_admin["environment"])
-        app_dockerfile = (
-            REPOSITORY_ROOT / "deploy/containers/app/Dockerfile"
+        admin_dockerfile = (
+            REPOSITORY_ROOT / "deploy/containers/profile-admin/Dockerfile"
         ).read_text(encoding="utf-8")
-        self.assertIn("COPY deploy/containers/hwp-worker ./deploy/containers/hwp-worker", app_dockerfile)
+        self.assertIn("--extra ocr", admin_dockerfile)
+        self.assertIn("COPY deploy/containers/hwp-worker ./deploy/containers/hwp-worker", admin_dockerfile)
+
+    def test_supervisor_and_exec_children_have_exact_capability_identities(self) -> None:
+        """The root trust boundary and both exec identities must be checked from proc status."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        validate_supervisor = namespace["_validate_supervisor_identity"]
+        validate_child = namespace["_validate_exec_identity"]
+        root_status = {
+            "Uid": "0\t0\t0\t0",
+            "Gid": "0\t0\t0\t0",
+            "NoNewPrivs": "1",
+            "CapEff": "00000000000000e1",
+            "CapPrm": "00000000000000e1",
+            "CapInh": "0000000000000000",
+            "CapAmb": "0000000000000000",
+        }
+        validate_supervisor(root_status)
+        validate_child(
+            {
+                **root_status,
+                "Uid": "65533\t65533\t65533\t65533",
+                "Gid": "65533\t65533\t65533\t65533",
+                "CapEff": "0",
+                "CapPrm": "0",
+            },
+            uid=65533,
+            gid=65533,
+        )
+        with self.assertRaises(RuntimeError):
+            validate_child(root_status, uid=65533, gid=65533)
+
+    def test_input_parent_is_not_child_writable_and_validator_can_reopen_snapshot(self) -> None:
+        """Parser output write access must not imply input rename access or validator denial."""
+        if os.name != "posix":
+            self.skipTest("POSIX ownership and directory permissions are Linux contracts")
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        prepare = namespace["_prepare_job_directories"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = prepare(
+                Path(temporary_directory),
+                child_uid=65533,
+                child_gid=65533,
+                validator_gid=65531,
+            )
+            self.assertEqual(stat.S_IMODE(paths["input_dir"].stat().st_mode), 0o750)
+            self.assertEqual(paths["input_dir"].stat().st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(paths["output_dir"].stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(paths["trusted_dir"].stat().st_mode), 0o750)
+
+    def test_subreaper_cleanup_includes_descendants_that_escape_the_leader_group(self) -> None:
+        """setsid descendants must be signalled and reaped before a later serial job starts."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        cleanup = namespace["_cleanup_job_descendants"]
+        observed: list[tuple[int, int]] = []
+        descendants = iter(({301, 302}, {302}, set()))
+        with patch.dict(cleanup.__globals__, {
+            "_descendant_pids": lambda _pid: next(descendants),
+            "_signal_pid": lambda pid, signal_number: observed.append((pid, signal_number)),
+            "_reap_children": lambda: None,
+        }):
+            cleanup(100, grace_seconds=0)
+        self.assertTrue(any(pid == 302 for pid, _signal in observed))
+        kill_signal = namespace["SIGKILL_NUMBER"]
+        self.assertGreaterEqual(
+            sum(pid == 302 and signal_number == kill_signal for pid, signal_number in observed),
+            1,
+        )
+
+    def test_surviving_descendant_is_a_fail_stop_not_a_request_failure(self) -> None:
+        """An isolation cleanup failure must escape the per-request handler and stop serve."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        cleanup = namespace["_cleanup_job_descendants"]
+        fatal = namespace["SandboxFatalIsolationFailure"]
+        observed: list[tuple[int, int]] = []
+        with patch.dict(cleanup.__globals__, {
+            "_descendant_pids": lambda _pid: {401},
+            "_signal_pid": lambda pid, signal_number: observed.append((pid, signal_number)),
+            "_reap_children": lambda: None,
+            "time": SimpleNamespace(monotonic=time.monotonic, sleep=lambda _seconds: None),
+        }):
+            with self.assertRaises(fatal):
+                cleanup(100, grace_seconds=0)
+        self.assertGreaterEqual(
+            sum(signal_number == namespace["SIGKILL_NUMBER"] for _pid, signal_number in observed),
+            2,
+        )
+
+    def test_fontconfig_uses_only_the_manifested_noto_directory(self) -> None:
+        """Generic system font directories would escape the byte manifest."""
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(REPOSITORY_ROOT / "deploy/containers/hwp-worker/fonts.conf").getroot()
+        self.assertEqual(
+            [node.text for node in root.findall("dir")],
+            ["/usr/share/fonts/opentype/noto"],
+        )
 
     def test_supervisor_drops_child_identity_and_validates_only_a_trusted_snapshot(self) -> None:
         source = SANDBOX_SCRIPT.read_text(encoding="utf-8")
@@ -721,18 +955,21 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             "os.setgroups([])",
             "os.setgid(gid)",
             "os.setuid(uid)",
+            "_clear_child_capabilities()",
             "os.umask(child_umask)",
-            "untrusted.chmod(0o2770)",
+            "input_dir.chmod(0o750)",
+            "output_dir.chmod(0o700)",
+            "trusted_dir.chmod(0o750)",
             "child_umask=0o027",
             "snapshot_via_identity(\n            output,\n            trusted_output",
             '"snapshot",',
             "uid=validator_uid",
-            "pass_fds=pass_fds",
+            "trusted_output.chmod(0o440)",
         ):
             self.assertIn(boundary, source)
         self.assertLess(
             source.index("snapshot_via_identity(\n            output,\n            trusted_output"),
-            source.index("uid=validator_uid"),
+            source.index("verified_page_count = _qpdf_page_count("),
         )
 
 
@@ -851,6 +1088,41 @@ class LegacyHwpPageCountTests(unittest.TestCase):
             marker,
             {"legacyHwpRequiredFailures": 1, "legacyHwpRequiredFailureCodes": ["profile_not_approved"]},
         )
+
+    def test_recovery_requires_complete_attempt_input_and_profile_binding(self) -> None:
+        """A valid PDF from another attempt/input/profile must not be adopted during recovery."""
+        record = self._bound_record()
+        evidence = SimpleNamespace(
+            id="evidence",
+            object_key="evidence/derived/pdf",
+            object_version="v1",
+            checksum=hashlib.sha256(PDF_BYTES).hexdigest(),
+            byte_size=len(PDF_BYTES),
+            mime_type="application/pdf",
+            locator_type="hwp_conversion",
+            derivation_type="other_derived",
+            generic_extraction_attempt_id="11111111-1111-4111-8111-111111111111",
+            origin_run_source_item_id="run-source",
+            source_item_id="source",
+            parent_asset_id="raw",
+            structured_data={"records": [record]},
+        )
+        attempt = SimpleNamespace(
+            id="11111111-1111-4111-8111-111111111111",
+            run_source_item_id="run-source",
+            source_item_id="source",
+            input_asset_id="raw",
+            input_asset=SimpleNamespace(
+                checksum=record["locator"]["input_checksum"],
+                byte_size=record["locator"]["input_byte_size"],
+            ),
+            extraction_profile_snapshot=SimpleNamespace(
+                config={"converter_manifest_hash": MANIFEST_HASH}
+            ),
+        )
+        self.assertTrue(tasks._has_complete_legacy_hwp_pdf(evidence, expected_attempt=attempt))
+        evidence.parent_asset_id = "other-raw"
+        self.assertFalse(tasks._has_complete_legacy_hwp_pdf(evidence, expected_attempt=attempt))
 
 
 if __name__ == "__main__":

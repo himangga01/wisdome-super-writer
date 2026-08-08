@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --extra ocr --no-dev --no-install-project
 COPY src ./src
 COPY config ./config
 COPY compose.yaml ./compose.yaml
@@ -19,8 +19,7 @@ COPY specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml \
 COPY deploy/containers/app/entrypoint.sh ./deploy/containers/app/entrypoint.sh
 COPY deploy/containers/hwp-worker ./deploy/containers/hwp-worker
 COPY deploy/containers/profile-admin ./deploy/containers/profile-admin
-RUN uv sync --frozen --no-dev \
+RUN uv sync --frozen --extra ocr --no-dev \
     && chmod 0755 ./deploy/containers/app/entrypoint.sh
 
-EXPOSE 8000
 CMD ["/app/deploy/containers/app/entrypoint.sh"]

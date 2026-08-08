@@ -7,6 +7,7 @@ import secrets
 import socket
 import struct
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,7 @@ PROTOCOL_MAGIC = b"WSHWP001"
 PROBE_MAGIC = b"WSHWPP01"
 PROTOCOL_VERSION = "wisdome-hwp-uds-v1"
 MAX_HEADER_BYTES = 64 * 1024
+STREAM_MARGIN_SECONDS = 10.0
 _RESPONSE_FIELDS = frozenset(
     {
         "schema_version",
@@ -119,11 +121,25 @@ def _strict_json_object(raw: bytes, *, fields: frozenset[str]) -> dict[str, Any]
     return value
 
 
-def _read_exact(connection: socket.socket, length: int) -> bytes:
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _SocketDisconnected("sandbox response deadline expired")
+    return remaining
+
+
+def _read_exact(
+    connection: socket.socket,
+    length: int,
+    *,
+    deadline: float | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     remaining = length
     while remaining:
         try:
+            if deadline is not None:
+                connection.settimeout(_remaining_timeout(deadline))
             chunk = connection.recv(remaining)
         except (OSError, TimeoutError, socket.timeout) as exc:
             raise _SocketDisconnected("sandbox socket read failed") from exc
@@ -143,6 +159,61 @@ def _bounded_int(config: Mapping[str, Any], key: str, default: int, maximum: int
     if not _positive_int(value, maximum=maximum):
         raise ExtractorError("legacy_hwp_profile_invalid", f"{key} must be a bounded positive integer")
     return int(value)
+
+
+def _bounded_uid(config: Mapping[str, Any], key: str, default: int) -> int:
+    value = config.get(key, default)
+    if type(value) is not int or value < 0 or value > 2**31 - 1:
+        raise ExtractorError(
+            "legacy_hwp_profile_invalid",
+            f"{key} must be a bounded non-negative integer",
+        )
+    return value
+
+
+def legacy_hwp_acceptance_reference_is_well_formed(
+    config: Mapping[str, Any],
+) -> bool:
+    """Validate reference shape only; this is never admission evidence."""
+    approved = config.get("golden_corpus_approved")
+    acceptance = config.get("golden_corpus_acceptance")
+    if approved is not True:
+        return False
+    expected_manifest = config.get("converter_manifest_hash")
+    expected_fields = {
+        "schema_version",
+        "object_key",
+        "object_version",
+        "sha256",
+        "target_oci_image_digest",
+        "converter_manifest_hash",
+        "all_pass",
+    }
+    return bool(
+        isinstance(acceptance, Mapping)
+        and set(acceptance) == expected_fields
+        and acceptance.get("schema_version") == "legacy-hwp-golden-acceptance-v1"
+        and isinstance(acceptance.get("object_key"), str)
+        and bool(acceptance.get("object_key"))
+        and isinstance(acceptance.get("object_version"), str)
+        and bool(acceptance.get("object_version"))
+        and _is_sha256(acceptance.get("sha256"))
+        and acceptance.get("target_oci_image_digest", "").startswith("sha256:")
+        and _is_sha256(str(acceptance.get("target_oci_image_digest", ""))[7:])
+        and acceptance.get("converter_manifest_hash") == expected_manifest
+        and _is_sha256(expected_manifest)
+        and acceptance.get("all_pass") is True
+    )
+
+
+def validate_legacy_hwp_activation_config(config: Mapping[str, Any]) -> bool:
+    """Fail closed until T032 implements signed artifact-byte verification."""
+    if not legacy_hwp_acceptance_reference_is_well_formed(config):
+        return False
+    # Reference metadata and runtime self-report are attacker-controlled inputs. T032 must
+    # fetch the exact versioned bytes, validate their hash/schema/subject/results/OCI/manifest,
+    # and verify a release signature against an external trust root before this can return true.
+    return False
 
 
 def _default_socket_factory(path: str, timeout: float) -> socket.socket:
@@ -228,7 +299,7 @@ class LegacyHwpConverter:
         staging_owner_setter: Callable[[Path, int, int], None] | None = None,
     ) -> None:
         self.config = dict(config)
-        if self.config.get("golden_corpus_approved") is not True:
+        if not validate_legacy_hwp_activation_config(self.config):
             raise ExtractorError(
                 "legacy_hwp_profile_inactive",
                 "Legacy HWP remains inactive until the T032 golden corpus is approved",
@@ -246,8 +317,8 @@ class LegacyHwpConverter:
         )
         self.max_report_bytes = _bounded_int(self.config, "max_report_bytes", 64 * 1024, 1024 * 1024)
         self.max_pages = _bounded_int(self.config, "max_pages", 2000, 10000)
-        self.staging_owner_uid = _bounded_int(self.config, "staging_owner_uid", 65532, 2**31 - 1)
-        self.staging_owner_gid = _bounded_int(self.config, "staging_owner_gid", 65532, 2**31 - 1)
+        self.staging_owner_uid = _bounded_uid(self.config, "staging_owner_uid", 0)
+        self.staging_owner_gid = _bounded_uid(self.config, "staging_owner_gid", 0)
         self._socket_factory = socket_factory or _default_socket_factory
         self._staging_owner_setter = staging_owner_setter or _default_staging_owner_setter
         if (
@@ -455,29 +526,39 @@ class LegacyHwpConverter:
         output_handle.close()
         try:
             try:
-                connection = self._socket_factory(self.socket_path, float(self.timeout_seconds))
-                connection.settimeout(float(self.timeout_seconds))
+                socket_budget = float(self.timeout_seconds) + STREAM_MARGIN_SECONDS
+                deadline = time.monotonic() + socket_budget
+                connection = self._socket_factory(self.socket_path, socket_budget)
+                connection.settimeout(_remaining_timeout(deadline))
                 with connection:
                     connection.sendall(PROTOCOL_MAGIC + struct.pack("!I", len(request_bytes)) + request_bytes)
                     connection.shutdown(socket.SHUT_WR)
-                    response = self._receive_header(connection, request)
+                    response = self._receive_header(connection, request, deadline=deadline)
                     exit_code = response["exit_code"]
                     if exit_code != 0:
-                        self._require_end_of_stream(connection)
+                        self._require_end_of_stream(connection, deadline=deadline)
                         error = _EXIT_ERRORS.get(exit_code)
                         if error is None:
                             raise _ProtocolViolation("unknown sandbox exit code")
                         raise ExtractorError(error[0], error[1])
-                    report_bytes = _read_exact(connection, response["report_bytes"])
+                    report_bytes = _read_exact(
+                        connection,
+                        response["report_bytes"],
+                        deadline=deadline,
+                    )
                     digest = hashlib.sha256()
                     remaining = response["pdf_bytes"]
                     with output_path.open("wb") as output:
                         while remaining:
-                            chunk = _read_exact(connection, min(1024 * 1024, remaining))
+                            chunk = _read_exact(
+                                connection,
+                                min(1024 * 1024, remaining),
+                                deadline=deadline,
+                            )
                             digest.update(chunk)
                             output.write(chunk)
                             remaining -= len(chunk)
-                    self._require_end_of_stream(connection)
+                    self._require_end_of_stream(connection, deadline=deadline)
                 return output_path, report_bytes, digest.hexdigest(), response["pdf_bytes"]
             except ExtractorError:
                 raise
@@ -502,14 +583,21 @@ class LegacyHwpConverter:
             raise
 
     def _receive_header(
-        self, connection: socket.socket, request: Mapping[str, Any]
+        self,
+        connection: socket.socket,
+        request: Mapping[str, Any],
+        *,
+        deadline: float,
     ) -> dict[str, Any]:
-        if _read_exact(connection, len(PROTOCOL_MAGIC)) != PROTOCOL_MAGIC:
+        if _read_exact(connection, len(PROTOCOL_MAGIC), deadline=deadline) != PROTOCOL_MAGIC:
             raise _ProtocolViolation("wrong response magic")
-        header_length = struct.unpack("!I", _read_exact(connection, 4))[0]
+        header_length = struct.unpack("!I", _read_exact(connection, 4, deadline=deadline))[0]
         if not 0 < header_length <= MAX_HEADER_BYTES:
             raise _ProtocolViolation("response header length is outside policy")
-        response = _strict_json_object(_read_exact(connection, header_length), fields=_RESPONSE_FIELDS)
+        response = _strict_json_object(
+            _read_exact(connection, header_length, deadline=deadline),
+            fields=_RESPONSE_FIELDS,
+        )
         identity = ("protocol_version", "attempt_id", "generation", "nonce")
         if response.get("schema_version") != "v1" or any(
             response.get(field) != request.get(field) for field in identity
@@ -530,8 +618,9 @@ class LegacyHwpConverter:
         return response
 
     @staticmethod
-    def _require_end_of_stream(connection: socket.socket) -> None:
+    def _require_end_of_stream(connection: socket.socket, *, deadline: float) -> None:
         try:
+            connection.settimeout(_remaining_timeout(deadline))
             trailing = connection.recv(1)
         except (OSError, TimeoutError, socket.timeout) as exc:
             raise _ProtocolViolation("sandbox did not close the exact response frame") from exc

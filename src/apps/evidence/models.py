@@ -190,6 +190,18 @@ class ExtractionProfileDecision(UUIDModel):
     request_key = models.CharField(max_length=200)
     request_hash = models.CharField(max_length=64, validators=[sha256_validator])
     decision_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    verification_report_object_key = models.CharField(
+        max_length=1024, null=True, blank=True
+    )
+    verification_report_object_version = models.CharField(
+        max_length=256, null=True, blank=True
+    )
+    verification_report_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+        null=True,
+        blank=True,
+    )
     decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
     decided_at = models.DateTimeField()
     reason = models.CharField(max_length=500)
@@ -200,6 +212,43 @@ class ExtractionProfileDecision(UUIDModel):
             models.UniqueConstraint(fields=("profile_snapshot", "version"), name="uq_profile_decision_version"),
             models.UniqueConstraint(fields=("profile_snapshot", "request_key"), name="uq_profile_decision_request"),
         ]
+
+    def clean(self) -> None:
+        super().clean()
+        envelope = (
+            self.verification_report_object_key,
+            self.verification_report_object_version,
+            self.verification_report_hash,
+        )
+        if not all(envelope):
+            raise ValidationError(
+                "Profile decisions require a frozen verification report envelope"
+            )
+        profile = self.profile_snapshot
+        profile_envelope = (
+            profile.verification_report_object_key,
+            profile.verification_report_object_version,
+            profile.verification_report_hash,
+        )
+        if envelope != profile_envelope:
+            raise ValidationError(
+                "Profile decision report envelope differs from its profile projection"
+            )
+        if self.decision == self.Decision.RETIRED:
+            previous = self.supersedes_decision
+            if previous is None or previous.decision != self.Decision.APPROVED:
+                raise ValidationError(
+                    "A retired profile decision must supersede an approved decision"
+                )
+            previous_envelope = (
+                previous.verification_report_object_key,
+                previous.verification_report_object_version,
+                previous.verification_report_hash,
+            )
+            if envelope != previous_envelope:
+                raise ValidationError(
+                    "A retired decision must copy its approved report envelope"
+                )
 
 
 class DocumentExtraction(UUIDModel):

@@ -12,7 +12,10 @@ from typing import Iterable
 
 
 REQUIRED_ROLES = frozenset(
-    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
+    {
+        "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime",
+        "library", "license", "lockfile", "build-metadata",
+    }
 )
 
 
