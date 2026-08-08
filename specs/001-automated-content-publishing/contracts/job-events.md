@@ -228,7 +228,10 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 | `evidence.document_route_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `input_kind`, `document_extraction_id`, `input_checksum` | 상위 DocumentExtraction이 page route와 child run을 결정하도록 요청 |
 | `evidence.finalize_requested` | `run_id` | ready 또는 terminal 결과 뒤 run evidence 종료 조건 재평가 |
 | `evidence.profile_decided` | `profile_snapshot_id`, `decision_id`, `decision`, `profile_material_hash` | profile 관리자 판정 durable audit 신호 |
-| `run.draft_requested` | `run_id` | 현재 run 단위 생성 단계 진입; GenerationAttempt 생성 전 coarse-grained 연결 |
+| `run.evidence_ready` | `run_id` | evidence fan-out이 성공적으로 종결된 run의 clustering 연결 |
+| `editorial.cluster_requested` | `run_id` | terminal RunSourceItem을 cluster에 결합하고 불변 검증 결정 생성 |
+| `editorial.generate_requested` | `verification_id`, `run_id`, 정렬 `verification_ids`, `generation_manifest_hash` | 최신 frozen verification set에서 canonical article identity와 초안 생성 |
+| `run.draft_requested` | `run_id` | 기존 영속 이벤트 소비 호환용 legacy 연결; 신규 생산 금지 |
 | `publication.scheduled_run_requested` | `run_id` | validated schedule run의 publication intent/attempt 생성 |
 | `publication.preflight_requested` | `target_id`, `target_snapshot_id`, `target_config_hash` | 고정된 target fence로 preflight 시작 |
 | `publishing.target_preflight.completed` | `target_id`, `target_snapshot_id`, `target_config_hash`, `result_hash`, `passed` | fence가 유지된 preflight 결과의 durable 완료 신호 |
@@ -238,8 +241,41 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 `evidence.document_extract_requested`는 child `ExtractionRun` 단위의 공개 내부 계약이고,
 `article.draft_requested`는 미리 생성된 `GenerationAttempt` 단위 계약이다. 현재 상위
 orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. 상위 문서 routing은
-`evidence.document_route_requested`, GenerationAttempt 생성 전 run 연결은
-`run.draft_requested`를 사용한다.
+`evidence.document_route_requested`를 사용한다. 신규 생성 경로는
+`run.evidence_ready` → `editorial.cluster_requested` → `editorial.generate_requested`다.
+`held` verification은 독립 breaking 이벤트를 만들지 않고 daily digest frozen set에만 포함한다.
+`run.draft_requested` route/schema는
+이미 저장된 이벤트의 호환 소비를 위해서만 유지한다.
+
+### T013 검증 cluster 이벤트 불변조건
+
+- 세 이벤트는 모두 DB business transaction 안에서 outbox에 기록하며 run 또는 verification ID를
+  dedupe key에 포함한다.
+- `editorial.generate_requested`는 primary verification과 정렬된 전체 verification ID 목록,
+  각 evidence/rule/result hash·정책·KST 날짜의 canonical `generation_manifest_hash`를 고정한다.
+  consumer는 목록과 hash 및 모든 cluster head를 DB에서 다시 확인한다. 하나라도 superseded면
+  실패 재시도 대신 `{state: superseded}` 정상 no-op이다.
+- 중요 후보 `held`는 독립 breaking work unit이 0건이다. daily digest는 같은 run에서 대표
+  verification 하나를 사용하되 `daily_digest_candidate`와 `held` 전체 frozen set을 payload에
+  포함한다. 생성 입력은 이 목록의 selected/included publishable evidence만 허용한다.
+- 모든 cluster가 `rejected`이거나 과거 run의 늦은 전달이라 해당 run 소유 generation work unit이
+  0건이면 `validating`에 남겨두지 않고 editorial 단계에서 성공적으로 `completed` 종결한다.
+  이미 생성 이벤트가 만들어진 뒤 전부 superseded된 경우에도 run 전체 frozen event 집합을 확인한
+  마지막 no-op worker가 같은 종결을 수행하며, 일부만 superseded이면 다른 생성 단위를 막지 않는다.
+- 기사 identity는 청약 기관+공고/정정 identity, breaking cluster canonical key, 또는 run에서
+  고정한 KST local date+policy version hash다. 전달·처리 지연 시각은 identity에 사용하지 않는다.
+- `run.evidence_ready`, `editorial.cluster_requested` terminal callback은 payload/aggregate의 run ID를,
+  generation terminal callback은 payload의 `run_id`와 `verification_id`를 명시적으로 전달한다.
+  callback은 active worker event/lease를 재검증하고 immutable audit을 남긴다. generation 단위가
+  이미 superseded면 부분 stale은 정상 no-op, run 전체 stale은 `completed`이며, current 단위의
+  전달 소진만 run/editorial step을 `failed/manual_required`로 멱등 종결한다.
+- 같은 canonical article을 다른 run이 재사용한 경우 run 전체 generation event가 기존 article 또는
+  superseded 결과로 해소되고 run-owned article이 0건이면 성공 no-op `completed`로 종결한다. 일부
+  단위가 새 run-owned article을 만들면 기존 drafting/approval 상태를 유지한다.
+- validated-auto publication은 같은 run의 모든 generation work unit이 run-owned current revision으로
+  끝난 마지막 worker만 검토한다. run-owned article이 정확히 1개일 때만 publication event를 만들고,
+  reused digest 0개 또는 다중 article 2개 이상은 fail-closed 0건이다. 기존 dedupe event가 있으면
+  새 causation으로 enqueue하지 않는다.
 
 ### 발행·추출 재전달 규칙 보충
 
@@ -365,6 +401,9 @@ event version.
 | `evidence.document_route_requested@1` | `run_id`, `run_source_item_id`, `source_item_id`, optional `input_asset_id`, `input_kind`, `document_extraction_id`, `input_checksum` |
 | `evidence.finalize_requested@1` | `run_id` |
 | `evidence.profile_decided@1` | `profile_snapshot_id`, `decision_id`, `decision`, `profile_material_hash` |
+| `run.evidence_ready@1` | `run_id` |
+| `editorial.cluster_requested@1` | `run_id` |
+| `editorial.generate_requested@1` | `verification_id`, `run_id`, sorted `verification_ids`, `generation_manifest_hash` |
 | `run.draft_requested@1` | `run_id` |
 | `publication.scheduled_run_requested@1` | `run_id` |
 | `publication.preflight_requested@1` | `target_id`, `target_snapshot_id`, `target_config_hash` |
@@ -461,3 +500,28 @@ missing prior receipt generation as an interrupted infrastructure observation. F
 wake-ups are safe no-ops until every source
 attempt is terminal. Zero successes fail collection without evidence fan-out; partial
 success advances to extraction with durable failure and freshness-exclusion summaries.
+
+### T013 verified-clustering chain
+
+Successful evidence finalization persists `run.evidence_ready@1`. Its consumer persists
+`editorial.cluster_requested@1`, whose worker upserts canonical clusters and append-only
+verifications before emitting `editorial.generate_requested@1`. The final payload binds
+the primary verification, originating run, sorted frozen verification IDs, and their
+canonical generation-manifest hash. Consumers recompute the exact list/hash and verify
+every cluster head. A superseded set completes as a normal no-op. Held breaking candidates
+emit no standalone breaking unit but remain in the daily-digest frozen set. Generation
+uses only selected/included publishable evidence. Routed terminal callbacks receive the
+payload run ID explicitly for multi-argument generation events and fail the run with
+manual-required recovery after delivery exhaustion only while that generation unit remains
+current. They revalidate the active worker event/lease and persist immutable terminal audit;
+superseded units are normal no-ops and an all-superseded run completes. When every current
+unit reuses an existing canonical article and the run owns no article, the run also completes
+as a successful no-op. Auto-publication is emitted only by
+the last completed work unit when the run owns exactly one current-revision article; zero
+reused or multiple articles fail closed. The legacy
+`run.draft_requested@1` route remains consumption-only for already persisted events.
+Runs with no run-owned generation unit because every cluster is rejected or a delivery is
+causally stale complete successfully at the editorial stage instead of remaining in
+`validating`. If events already exist, completion requires every frozen generation event
+for the run to be superseded; a partially superseded run leaves its remaining current
+work units eligible.

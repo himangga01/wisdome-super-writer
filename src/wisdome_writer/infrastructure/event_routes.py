@@ -218,6 +218,35 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "apps.editorial.tasks.generate_run_draft",
         ("run_id",),
     ),
+    ("run.evidence_ready", 1): EventRoute(
+        "evidence-ready-clustering",
+        "editorial",
+        "apps.editorial.tasks.request_run_clustering",
+        ("run_id",),
+        "apps.editorial.tasks.finalize_editorial_run_delivery_failure",
+        ("run_id",),
+    ),
+    ("editorial.cluster_requested", 1): EventRoute(
+        "event-clustering",
+        "editorial",
+        "apps.editorial.tasks.cluster_and_verify_run",
+        ("run_id",),
+        "apps.editorial.tasks.finalize_editorial_run_delivery_failure",
+        ("run_id",),
+    ),
+    ("editorial.generate_requested", 1): EventRoute(
+        "verified-article-draft",
+        "editorial",
+        "apps.editorial.tasks.generate_verification_draft",
+        (
+            "verification_id",
+            "run_id",
+            "verification_ids",
+            "generation_manifest_hash",
+        ),
+        "apps.editorial.tasks.finalize_editorial_generation_delivery_failure",
+        ("run_id", "verification_id"),
+    ),
     ("publication.scheduled_run_requested", 1): EventRoute(
         "scheduled-publication",
         "publish.wordpress",
@@ -513,6 +542,27 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
     ("run.draft_requested", 1): _schema(
         {"run_id": STR},
         formats={"run_id": UUID_FORMAT},
+    ),
+    ("run.evidence_ready", 1): _schema(
+        {"run_id": STR},
+        formats={"run_id": UUID_FORMAT},
+    ),
+    ("editorial.cluster_requested", 1): _schema(
+        {"run_id": STR},
+        formats={"run_id": UUID_FORMAT},
+    ),
+    ("editorial.generate_requested", 1): _schema(
+        {
+            "verification_id": STR,
+            "run_id": STR,
+            "verification_ids": (list,),
+            "generation_manifest_hash": STR,
+        },
+        formats={
+            "verification_id": UUID_FORMAT,
+            "run_id": UUID_FORMAT,
+            "generation_manifest_hash": SHA256_FORMAT,
+        },
     ),
     ("publication.scheduled_run_requested", 1): _schema(
         {"run_id": STR},

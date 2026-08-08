@@ -188,7 +188,9 @@
 - Create: `src/apps/editorial/migrations/0002_event_cluster_verification.py`
 - Modify: `src/apps/editorial/services.py`
 - Modify: `src/apps/editorial/tasks.py`
-- Modify: `src/apps/collection/tasks.py`
+- Modify: `src/apps/audit/redaction.py`
+- Modify: `src/apps/evidence/tasks.py`
+- Modify: `src/wisdome_writer/infrastructure/event_routes.py`
 - Modify: `config/editorial-policies/housing_subscription.json`
 - Modify: `config/editorial-policies/semiconductor_news.json`
 - Modify: `specs/001-automated-content-publishing/data-model.md`
@@ -197,7 +199,7 @@
 
 **Interfaces:**
 - Consumes: terminal `RunSourceItem` lineage, `SourceItem.external_id`, `SourceItem.metadata["originIdentity"]`, topic policy version/hash.
-- Produces: `cluster_run_items(run_id) -> list[EventCluster]`, `verify_event_cluster(cluster_id) -> EventClusterVerification`, `article_identity_for_verification(verification) -> str`.
+- Produces: `cluster_run_items(run_id) -> list[EventCluster]`, `verify_event_cluster(cluster_id, run_id=...) -> EventClusterVerification`, `article_identity_for_verification(verification) -> str`.
 - Downstream: T018 consumes only the latest immutable verified decision, never mutable cluster fields.
 
 - [ ] **Step 1: cluster membership와 검증 결정을 별도 모델로 추가한다.**
@@ -214,6 +216,7 @@
 
   class EventClusterVerification(models.Model):
       cluster = models.ForeignKey(EventCluster, on_delete=models.PROTECT, related_name="verifications")
+      origin_run = models.ForeignKey("collection.CollectionRun", on_delete=models.PROTECT)
       version = models.PositiveIntegerField()
       decision = models.CharField(max_length=32)
       article_type = models.CharField(max_length=40)
@@ -223,11 +226,16 @@
       decision_reason = models.CharField(max_length=500)
       policy_version = models.CharField(max_length=40)
       policy_hash = models.CharField(max_length=64)
+      evidence_manifest = models.JSONField(default=list)
       evidence_manifest_hash = models.CharField(max_length=64)
+      conflict_manifest = models.JSONField(default=list)
+      excluded_source_manifest = models.JSONField(default=list)
+      rule_manifest_hash = models.CharField(max_length=64)
+      result_manifest_hash = models.CharField(max_length=64)
       supersedes = models.ForeignKey("self", null=True, on_delete=models.PROTECT)
   ```
 
-  `(cluster, run_source_item)`와 `(cluster, version)` 고유 제약을 추가한다.
+  `(cluster, run_source_item)`, `(cluster, version)`, `(cluster, origin_run)` 고유 제약을 추가한다.
 
 - [ ] **Step 2: 주택 canonical key를 공식 공고 identity로 만든다.**
 
@@ -236,12 +244,12 @@
       material = {
           "authority": item.source_item.publisher,
           "noticeId": item.source_item.external_id,
-          "correctionId": item.source_item.metadata.get("correction_id"),
       }
       return canonical_hash(material)
   ```
 
-  제목만 같은 다른 공고는 병합하지 않고, 정정 ID는 동일 공고 계보 안에서 새 verification을 만든다.
+  제목만 같은 다른 공고는 병합하지 않는다. 정정 ID는 cluster key가 아니라 article identity에 포함하여,
+  동일 공고 계보 안에서 새 verification과 정정 article identity를 만든다.
 
 - [ ] **Step 3: 반도체 사건과 independence group을 계산한다.**
 
@@ -273,12 +281,15 @@
 
 - [ ] **Step 7: collection 완료 이벤트를 clustering task로 연결한다.**
 
-  `run.evidence_ready` 이후 `editorial.cluster_requested`를 만들고 cluster verification 완료 후에만 `editorial.generate_requested`를 발행한다.
+  `run.evidence_ready` 이후 `editorial.cluster_requested`를 만들고 cluster verification 완료 후에만
+  정렬된 `verification_ids`와 `generation_manifest_hash`를 고정한 `editorial.generate_requested`를 발행한다.
+  stale/reused 결과는 run 전체 frozen generation 집합을 확인해 정상 no-op `completed`로 종결하고,
+  current generation의 전달 소진만 worker event provenance와 immutable audit을 남긴 뒤 실패시킨다.
 
 - [ ] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
-  git add src/apps/editorial src/apps/collection/tasks.py config/editorial-policies specs/001-automated-content-publishing
+  git add src/apps/editorial src/apps/evidence/tasks.py src/wisdome_writer/infrastructure/event_routes.py config/editorial-policies specs/001-automated-content-publishing
   git commit -m "feat: add verified event clustering and article identity"
   ```
 

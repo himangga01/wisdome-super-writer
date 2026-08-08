@@ -847,30 +847,58 @@ provenance와 같아야 한다. `raw`이면 두 provenance ID가 모두 null이�
 
 ### EventCluster
 
-여러 출처의 같은 사건을 묶는다. `topic_code`, `canonical_event_key`, `headline`,
+여러 출처의 같은 사건을 묶는 목표 계약은 `topic_code`, `canonical_event_key`, `headline`,
 `event_time`, `category`, `breaking_candidate`, `verification_state`, `conflict_summary`,
-`first_seen_at`, `last_seen_at`을 가진다. `EventClusterItem`은 cluster/source item뿐 아니라 exact
-SourceDefinitionSnapshot ID, independence group, origin source identity hash, role과 inclusion
-reason을 snapshot으로 보존한다.
-`(topic_code, canonical_event_key)`, `(event_cluster_id, source_item_id)`가 각각 고유하며 cluster
-worker는 canonical key 행을 upsert/lock해 동시 run을 하나로 합친다.
-`verification_state`는 `unverified/candidate_disruption/daily_digest_candidate/
-verified_breaking/rejected/conflicted`이다. 재난 신호만이면 candidate_disruption, 속보 기준 미달
-허용 사건이면 daily_digest_candidate이며 두 상태에서 breaking article 생성은 0건이고 digest의
-held/supporting membership만 허용한다.
+`first_seen_at`, `last_seen_at`을 가진다. T013 현재 projection은 `topic_code`, `canonical_key`,
+`title`, `verification_state`, `source_item_ids`, `created_at`까지 구현했으며, event semantic을
+upstream adapter가 아직 공급하지 않는 필드는 후속 구현 대상으로 남긴다. `EventClusterItem`은 cluster와
+정확한 `RunSourceItem`을 연결하고 `origin_identity_hash`, frozen snapshot의
+`independence_group`, `role`, `selection_state`, `decision_reason`을 보존한다.
+`(topic_code, canonical_key)`, `(event_cluster_id, run_source_item_id)`가 각각 고유하며 cluster
+worker는 모든 canonical key를 전역 정렬한 뒤 upsert/lock해 동시 run을 하나로 합치고 교차 run의
+반대 발견 순서로 인한 lock cycle을 피한다. 청약 cluster key는
+공식 기관+공고 ID이며 정정 ID는 이 key에서 제외한다. 따라서 같은 공고의 정정은 동일 cluster에
+합류하고 새 verification을 만든다. 정정 ID는 아래 article identity에는 포함한다. 반도체 key는
+주체+행위+공식 발표 ID+KST 사건일의 canonical hash다.
+`verification_state`는 최신 결정의 `candidate/verified_notice/daily_digest_candidate/
+verified_breaking/held/rejected` projection이다. immutable history의 기준은 이 mutable 필드가 아니라
+EventClusterVerification이다.
 
-`EventClusterVerification`은 cluster ID, rule/policy version, 정렬 source snapshot IDs,
-distinct independence group IDs, distinct origin identity IDs, direct-official-primary count,
-excluded company-claim source IDs/reasons,
-conflict manifest, `rule_manifest_hash`, `result_manifest_hash`, result와 checked_at을 가진다.
-같은 owner 그룹이나 같은 origin 보도 전재는 두 출처로 세지 않는다. 기업이 자기 제품의
-세계 최초·수율·고객 채택을 발표한 자료는 ‘회사가 그렇게 발표했다’는 `company_claim`만
-support하고 사건 사실의 direct-primary count에서는 독립 확인 전 제외한다.
+공식 source가 `corrected`를 반환했지만 안정적인 공식 correction ID를 제공하지 않으면 content/version
+hash를 correction identity로 대체하지 않는다. 해당 공식 계보 head는
+`official_correction_identity_missing`으로 fail-closed `rejected`하고, adapter가 correction document
+또는 sequence identity를 공급한 새 run에서만 정정 article identity를 만든다.
 
-반도체 속보는 `category`가 `regulation_export_control`, `fab_supply_disruption`,
-`ma_material_earnings`, `core_technology_mass_production` 중 하나이고, 1차 출처가 하나
+`EventClusterVerification`은 `(cluster_id, version)`과 `(cluster_id, origin_run_id)`가 고유한
+append-only 결정이다. `origin_run_id`가 cluster head보다 과거인 늦은 작업은 head를 덮어쓰지
+않고, 정상 새 run의 결정은 그 run의 `(created_at, id)` causal key 이하 멤버만 사용한다.
+이미 고정된 최신 head 뒤에 도착한 과거 run membership은 immutable 과거 결정을 소급 재작성하지
+않으며 다음 정상 신규 run의 causal 범위에서 합류한다. 이는 처리 지연 때문에 이미 생성·검토된
+기사의 근거 집합을 묵시적으로 바꾸지 않기 위한 의도된 observed-head 정책이다.
+`decision`, `article_type`, `category`, `primary_source_count`, `independent_origin_count`,
+`decision_reason`, run에 고정된 `policy_version/policy_hash`, `local_event_date`, 정렬된 전체
+`evidence_manifest`와 그 SHA-256, `conflict_manifest`, `excluded_source_manifest`,
+`rule_manifest_hash`, `result_manifest_hash`, `supersedes_id`, `verified_at`을 가진다. 목표 계약의
+정렬 source snapshot ID, independence/origin ID, direct-primary 및 excluded company-claim 목록은
+현재 evidence/excluded manifest 안에 명시적으로 포함한다. manifest는 선택·포함·
+제외·충돌 멤버 모두의 RunSourceItem, SourceItem, SourceDefinitionSnapshot/frozen config hash,
+origin/independence, reason code와 근거 ID/content hash를 보존한다. 같은 owner 그룹이나 같은
+origin 보도 전재는 union된 한 독립 출처로 센다. 기업이 자기 제품의 세계 최초·수율·고객 채택을
+발표한 자료는 ‘회사가 그렇게 발표했다’는 `company_claim`만 support하고 사건 사실의
+direct-primary count에서는 독립 확인 전 제외한다.
+
+반도체 속보는 `category`가 `regulation_export_control`, `factory_supply_disruption`,
+`merger_or_material_earnings`, `critical_technology_or_mass_production` 중 하나이고, 공식·규제
+1차 출처가 하나
 이상이거나 서로 독립적인 group과 original-report identity가 둘 이상이어야
 `verified_breaking`이 된다. 이 조건은 EventClusterVerification DB/domain gate로 강제한다.
+조건 미달 중요 후보는 `held`이며 독립 breaking 생성 이벤트를 만들지 않는다. 대신 같은 run의
+daily digest frozen verification set에는 `held` role로 포함한다. 비중요 사건은
+`daily_digest_candidate`다. `eventSubject/eventAction/officialAnnouncementId/breakingCategory`가
+모두 명시되지 않은 자료는 primary fallback으로 속보를 검증하지 않고 fail-closed
+`daily_digest_candidate`로 내린다. 현재 semiconductor adapter가 이 semantic 묶음을 항상
+공급하지 않는 것은 upstream blocker다. `retracted/unavailable`은 명시 reason으로 제외하고,
+청약 공식 계보 head가 terminal이면 과거 active 자료를 다시 선택하지 않고 `rejected`한다.
 
 ### DraftArticle
 
@@ -878,6 +906,7 @@ support하고 사건 사실의 direct-primary count에서는 독립 확인 전 �
 |---|---|---|
 | `id` | UUID PK | 글 식별자 |
 | `run_id` | FK nullable | 최초 생성 실행 |
+| `source_verification_id` | EventClusterVerification FK nullable | 생성을 허용한 최신 불변 검증 결정 |
 | `topic_code`, `article_type` | enum | 글 분류 |
 | `article_identity_key` | string | 공식 공고/cluster/digest 날짜 기반 주제별 안정 identity |
 | `local_digest_date`, `digest_policy_version` | date/int nullable | 반도체 daily digest dedupe 기준 |
@@ -888,16 +917,21 @@ support하고 사건 사실의 direct-primary count에서는 독립 확인 전 �
 | `withdrawal_state` | `none/pending/withdrawn/marked` | 철회 상태 |
 | `created_at`, `updated_at` | datetime | 시각 |
 
-`(topic_code, article_type, article_identity_key)`가 고유하다. 청약은 공식 notice/correction ID,
+`(topic_code, article_type, article_identity_key)`가 고유하다. 청약은 공식 기관+notice/correction ID,
 반도체 breaking은 canonical cluster key, daily digest는 `Asia/Seoul` local date+policy version을
 identity로 사용한다. content/title hash만으로 서로 다른 공고를 합치지 않는다. 동일 identity의
 다른 run/window는 기존 DraftArticle/GenerationAttempt subject를 멱등 반환한다.
 
-`ArticleEventCluster`는 `article_id`, `event_cluster_id`, `role: lead/supporting/held`,
-`display_order`, `inclusion_reason`, `cluster_snapshot_hash`를 가지는 M:N join이다. daily digest는
+`ArticleEventCluster`는 `article_id`, `event_cluster_id`, `verification_id`,
+`role: lead/supporting/held`, `display_order`, `inclusion_reason`, `cluster_snapshot_hash`를 가지는
+M:N join이다. daily digest는
 선정·보류된 모든 cluster의 stable order와 이유를 이 join에 고정하고 GenerationAttempt의 input
 manifest에 포함한다. 이후 한 cluster 정정은 이 join으로 영향 digest를 찾는다.
-`(article_id, event_cluster_id)`와 `(article_id, display_order)`가 각각 고유하다.
+`(article_id, event_cluster_id)`와 `(article_id, display_order)`가 각각 고유하다. article 최초
+생성 transaction에서만 고정하며 기존 revision/article 재사용 시 membership을 변경하지 않는다.
+모델/queryset과 PostgreSQL·SQLite trigger는 insert 이후 update/delete를 거절한다. insert도
+`verification.cluster_id=event_cluster_id`이고 `cluster_snapshot_hash`가 해당 verification의
+`evidence_manifest_hash`와 같을 때만 허용한다.
 
 `ArticleState`: `drafting → review_ready → approved → publishing → published`.
 품질 실패는 `blocked`, 정정 감지는 `correction_pending`, 관리자 중지는 `stopped`, 복구
@@ -932,13 +966,18 @@ manifest에 포함한다. 이후 한 cluster 정정은 이 join으로 영향 dig
 ### GenerationAttempt
 
 자동 초안 생성의 append-only 실행이다. `id`, `article_id`, `origin_collection_run_id`,
-`input_evidence_manifest_hash`, `generation_pipeline_manifest_hash`, `provider`, `model_name`,
+`input_evidence_manifest_hash`, `generation_manifest_hash`, `generation_pipeline_manifest_hash`, `provider`, `model_name`,
 `model_version`, `prompt_template_hash`, `output_schema_hash`, `postprocessor_manifest_hash`,
 `request_fingerprint`, `state: queued/running/succeeded/failed`, `output_checksum`,
 `article_revision_id` nullable, `started_at`, `finished_at`, `error_code`를 가진다. 동일 fingerprint의
 성공 시도는 하나고, worker는 event hint가 아니라 승인된 generation pipeline snapshot을 DB에서
 재조회한다. succeeded 결과와 immutable ArticleRevision, claim/quality outbox를 한 트랜잭션으로
 만든다.
+
+`generation_manifest_hash`는 정렬 verification ID와 각 verification의 evidence/rule/result hash,
+정책 version/hash, KST 기준일을 고정한다. `input_evidence_manifest_hash`는 이 generation material과
+`selection_state=selected/included`인 publishable evidence만 함께 hash하며 excluded, conflicting,
+duplicate evidence는 생성 입력에 포함하지 않는다.
 
 관리자 `CreateRevisionRequest`는 base revision CAS와 request key로 멱등 처리하며 새 revision을
 `provenance_kind=admin_edit`, `claim_graph_state=queued`, Article=`drafting`으로 만든다. 이전
@@ -1670,3 +1709,44 @@ backfilled as interrupted infrastructure observations by the next delivery or ex
 callback. A collection finalizer advances only after every
 source attempt is terminal. Zero successful sources fail the run without evidence fan-out;
 partial success advances to extraction while retaining failure counters and summaries.
+
+## English — T013 Verified Event Clustering
+
+Housing clusters use authority plus notice ID, while correction ID remains part of the
+verification-bound article identity. This keeps corrected versions in one notice lineage
+and appends a superseding verification. A corrected official lineage without a stable
+correction ID is rejected as `official_correction_identity_missing`; mutable source-version
+hashes never substitute for official correction identity. Semiconductor clusters hash subject, action,
+official announcement ID, and the KST event date. EventClusterItem is unique by cluster
+and exact RunSourceItem and freezes source-snapshot, origin, independence, selection, and
+reason provenance in the verification evidence manifest. Workers acquire canonical-key
+rows in one global sorted order to avoid cross-run lock cycles.
+
+EventClusterVerification is append-only and unique by cluster plus version and by cluster
+plus origin run. Origin-run `(created_at, id)` is the causal fence: a late older run cannot
+replace the head, and a normal new run sees only members at or below its causal key. It
+does not retroactively rewrite an already frozen newer observed head when an older run's
+membership arrives late; that membership joins the next normal newer-run verification.
+This preserves immutable generated/reviewed evidence sets.
+freezes the run policy version/hash, a run-derived KST local date, every included,
+excluded, and conflicting member, evidence identifiers and hashes, conflict and excluded
+source manifests, rule/result hashes, counts, result, and the superseded decision. Shared
+ownership or shared syndication origin forms one independent component.
+Corporate self-claims are not direct official primary evidence. The breaking categories
+are `regulation_export_control`, `factory_supply_disruption`,
+`merger_or_material_earnings`, and `critical_technology_or_mass_production`. A category
+is verified breaking with one official/regulatory primary or two independent origins;
+otherwise it is held. A held cluster emits no standalone breaking work unit but remains
+in the frozen daily-digest verification set. Non-breaking clusters are daily-digest
+candidates. Retracted and unavailable members are explicitly excluded; a terminal housing
+lineage head rejects the cluster. Breaking classification requires explicit subject,
+action, official announcement ID, and breaking category. Current adapters do not always
+supply this semantic bundle, so incomplete records fail closed to daily digest and remain
+an upstream blocker. Generation consumes only selected/included publishable evidence from
+the exact latest verification set and records that set in GenerationAttempt input material.
+
+ArticleEventCluster freezes the first article creation's stable verification order, role,
+reason, and cluster snapshot hash. Reusing an existing article or revision never mutates
+those memberships. Model/queryset guards and PostgreSQL/SQLite triggers reject later
+updates or deletes, and inserts must bind the verification's own cluster and exact frozen
+evidence-manifest hash.

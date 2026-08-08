@@ -10,24 +10,32 @@ from adapters.generators.base import EvidenceInput
 from apps.audit.models import AuditEvent
 from apps.audit.services import (
     AuditContext,
+    AuditIdentityConflict,
     record_audit_event,
     require_audit_replay,
     require_worker_event,
 )
 from apps.collection.models import CollectionRun, RunState
 from apps.evidence.models import EvidenceAsset
+from apps.evidence.services import calculate_review_subject_hash
 from wisdome_writer.domain.hashing import (
     CANONICAL_HASH_SCHEMA_V1,
     canonical_hash,
 )
 
 from .models import (
+    ArticleEventCluster,
     ArticleRevision,
     Claim,
     ClaimEvidence,
     DraftArticle,
     GenerationAttempt,
     QualityCheck,
+    EventClusterVerification,
+)
+from .clustering import (
+    article_identity_for_verification,
+    generation_manifest_for_verifications,
 )
 
 
@@ -118,7 +126,11 @@ def _manual_revision_id(
 def build_source_grounded_draft(
     run: CollectionRun,
     *,
+    verification: EventClusterVerification,
+    verification_rows: list[EventClusterVerification],
+    generation_manifest_hash: str,
     audit_context: AuditContext,
+    event_topic: str = "editorial.generate_requested",
 ) -> DraftArticle:
     if audit_context.actor_type != AuditEvent.ActorType.WORKER:
         raise ValueError("draft generation requires worker audit provenance")
@@ -127,6 +139,8 @@ def build_source_grounded_draft(
     alias = audit_context.database_alias
     if run._state.db != alias:
         raise ValueError("collection run and audit database aliases differ")
+    if verification._state.db != alias:
+        raise ValueError("cluster verification and audit database aliases differ")
 
     with transaction.atomic(using=alias):
         run = (
@@ -134,16 +148,49 @@ def build_source_grounded_draft(
             .select_for_update()
             .get(pk=run.pk)
         )
-        require_worker_event(
-            context=audit_context,
-            topic="run.draft_requested",
-            aggregate_id=run.id,
-            payload_identity={"run_id": str(run.id)},
+        verification = (
+            EventClusterVerification.objects.using(alias)
+            .select_related("cluster")
+            .get(pk=verification.pk)
         )
-        identity = canonical_hash(
-            {"run": str(run.id), "topic": run.topic_code},
-            schema_version=CANONICAL_HASH_SCHEMA_V1,
+        if event_topic == "editorial.generate_requested":
+            require_worker_event(
+                context=audit_context,
+                topic=event_topic,
+                aggregate_id=verification.id,
+                payload_identity={
+                    "verification_id": str(verification.id),
+                    "run_id": str(run.id),
+                    "verification_ids": [
+                        str(row.id) for row in verification_rows
+                    ],
+                    "generation_manifest_hash": generation_manifest_hash,
+                },
+            )
+        else:
+            require_worker_event(
+                context=audit_context,
+                topic=event_topic,
+                aggregate_id=run.id,
+                payload_identity={"run_id": str(run.id)},
+            )
+        if verification.decision not in {
+            "verified_notice",
+            "verified_breaking",
+            "daily_digest_candidate",
+            "held",
+        }:
+            raise ValueError("cluster verification is not eligible for generation")
+        verification_ids, expected_generation_hash, generation_material = (
+            generation_manifest_for_verifications(
+                run=run,
+                primary_verification=verification,
+                verifications=verification_rows,
+            )
         )
+        if generation_manifest_hash != expected_generation_hash:
+            raise ValueError("generation verification manifest hash mismatch")
+        identity = article_identity_for_verification(verification)
         article = (
             DraftArticle.objects.using(alias)
             .filter(article_identity_key=identity)
@@ -153,14 +200,43 @@ def build_source_grounded_draft(
             revision = ArticleRevision.objects.using(alias).get(
                 pk=article.current_revision_id
             )
-            require_audit_replay(
-                context=audit_context,
-                action="article.draft_generated",
-                entity=revision,
-                identity_key=audit_context.event_key,
-            )
+            try:
+                require_audit_replay(
+                    context=audit_context,
+                    action="article.draft_generated",
+                    entity=revision,
+                    identity_key=audit_context.event_key,
+                )
+            except AuditIdentityConflict:
+                material = _article_material(article, revision)
+                record_audit_event(
+                    context=audit_context,
+                    action="article.draft_generated",
+                    entity=revision,
+                    identity_key=audit_context.event_key,
+                    material_schema_version="article-audit-v1",
+                    before_material=material,
+                    after_material=material,
+                    metadata={
+                        "result": "reused",
+                        "state": article.state,
+                        "revision_id": str(revision.id),
+                        "revision_no": revision.revision_no,
+                        "collection_run_id": str(run.id),
+                        "manifest_hash": revision.input_manifest_hash,
+                        "result_hash": _revision_content_hash(
+                            title=revision.title,
+                            summary=revision.summary,
+                            body_markdown=revision.body_markdown,
+                        ),
+                    },
+                )
             return article
-        if run.state not in {RunState.VALIDATING, RunState.DRAFTING}:
+        if run.state not in {
+            RunState.VALIDATING,
+            RunState.DRAFTING,
+            RunState.AWAITING_APPROVAL,
+        }:
             raise ValueError(
                 "collection run is not eligible for draft generation"
             )
@@ -168,22 +244,66 @@ def build_source_grounded_draft(
         if run.state == RunState.VALIDATING:
             run.state = RunState.DRAFTING
             run.save(update_fields=["state"], using=alias)
+        expected_evidence: dict[str, dict] = {}
+        for decision in verification_rows:
+            for member in decision.evidence_manifest:
+                if member.get("selectionState") not in {"selected", "included"}:
+                    continue
+                for evidence in member.get("evidence", []):
+                    if evidence.get("publishable") is not True:
+                        continue
+                    evidence_id = str(evidence["evidenceId"])
+                    frozen = {
+                        **evidence,
+                        "runSourceItemId": member.get("runSourceItemId"),
+                        "sourceItemId": member.get("sourceItemId"),
+                        "authorityTier": member.get("authorityTier"),
+                    }
+                    existing_frozen = expected_evidence.setdefault(
+                        evidence_id,
+                        frozen,
+                    )
+                    if existing_frozen != frozen:
+                        raise ValueError(
+                            "frozen generation evidence identity conflicts"
+                        )
+        evidence_ids = sorted(expected_evidence)
         evidence_rows = list(
             EvidenceAsset.objects.using(alias)
-            .filter(
-                origin_run_source_item__run=run,
-                publishable=True,
+            .filter(pk__in=evidence_ids, publishable=True)
+            .select_related(
+                "source_item",
+                "origin_run_source_item",
+                "extraction_run",
+                "generic_extraction_attempt",
+                "document_extraction",
             )
-            .select_related("source_item")
             .order_by("source_item__published_at", "id")
         )
+        if {str(row.id) for row in evidence_rows} != set(evidence_ids):
+            raise ValueError("frozen generation evidence set is incomplete")
+        for row in evidence_rows:
+            frozen = expected_evidence[str(row.id)]
+            if (
+                str(row.origin_run_source_item_id)
+                != frozen["runSourceItemId"]
+                or str(row.source_item_id) != frozen["sourceItemId"]
+                or row.evidence_content_hash != frozen.get("contentHash")
+                or row.checksum != frozen.get("checksum")
+                or row.review_subject_hash != frozen.get("reviewSubjectHash")
+                or calculate_review_subject_hash(row)
+                != row.review_subject_hash
+            ):
+                raise ValueError(
+                    "live generation evidence no longer matches frozen verification"
+                )
         inputs = [
             EvidenceInput(
                 evidence_id=str(row.id),
                 title=row.source_item.title,
                 url=row.source_item.canonical_url,
                 publisher=row.source_item.publisher,
-                text=row.extracted_text or row.source_item.body_text,
+                text=row.extracted_text or "",
                 published_at=(
                     row.source_item.published_at.isoformat()
                     if row.source_item.published_at
@@ -192,24 +312,55 @@ def build_source_grounded_draft(
             )
             for row in evidence_rows
         ]
+        article_created = False
         if article is None:
-            article, _ = DraftArticle.objects.using(alias).get_or_create(
+            article, article_created = DraftArticle.objects.using(alias).get_or_create(
                 article_identity_key=identity,
                 defaults={
                     "topic_code": run.topic_code,
-                    "article_type": _article_type(run.topic_code),
+                    "article_type": verification.article_type,
                     "source_run": run,
+                    "source_verification": verification,
                 },
             )
+        if article_created:
+            verification_by_id = {
+                str(row.id): row for row in verification_rows
+            }
+            for display_order, verification_id in enumerate(
+                verification_ids,
+                start=1,
+            ):
+                row = verification_by_id[verification_id]
+                if row.decision == "held":
+                    role = "held"
+                elif row.id == verification.id:
+                    role = "lead"
+                else:
+                    role = "supporting"
+                ArticleEventCluster.objects.using(alias).create(
+                    article=article,
+                    event_cluster=row.cluster,
+                    verification=row,
+                    role=role,
+                    display_order=display_order,
+                    inclusion_reason=row.decision_reason,
+                    cluster_snapshot_hash=row.evidence_manifest_hash,
+                )
 
         before_material = _article_material(article, None)
         input_hash = canonical_hash(
-            [item.__dict__ for item in inputs],
+            {
+                "schema_version": "generation-input-manifest-v2",
+                "generation_manifest": generation_material,
+                "evidence": [item.__dict__ for item in inputs],
+            },
             schema_version=CANONICAL_HASH_SCHEMA_V1,
         )
         attempt = GenerationAttempt.objects.using(alias).create(
             article=article,
             input_manifest_hash=input_hash,
+            generation_manifest_hash=generation_manifest_hash,
         )
         try:
             generated = SourceGroundedTemplateGenerator().generate(
@@ -240,16 +391,23 @@ def build_source_grounded_draft(
             )
             evidence_by_id = {str(row.id): row for row in evidence_rows}
             for position, raw in enumerate(generated.claims):
+                evidence_id = raw["evidenceId"]
+                claim_type = raw["claimType"]
+                if (
+                    expected_evidence[evidence_id].get("authorityTier")
+                    == "primary_corporate"
+                ):
+                    claim_type = Claim.ClaimType.COMPANY_CLAIM
                 claim = Claim.objects.using(alias).create(
                     revision=revision,
-                    claim_type=raw["claimType"],
+                    claim_type=claim_type,
                     text=raw["text"],
                     position=position,
                     citation_marker=raw["citationMarker"],
                 )
                 ClaimEvidence.objects.using(alias).create(
                     claim=claim,
-                    evidence=evidence_by_id[raw["evidenceId"]],
+                    evidence=evidence_by_id[evidence_id],
                 )
             checks = {
                 "all_fact_claims_sourced": all(

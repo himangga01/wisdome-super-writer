@@ -2094,11 +2094,11 @@ def finalize_run_evidence(run_id: str):
             )
         )
         enqueue_event(
-            event_type="run.draft_requested",
+            event_type="run.evidence_ready",
             aggregate_type="collection_run",
             aggregate_id=run.id,
             job_id=run.id,
-            dedupe_key=f"run.draft_requested:{run.id}",
+            dedupe_key=f"run.evidence_ready:{run.id}",
             payload={"run_id": str(run.id)},
         )
         return {

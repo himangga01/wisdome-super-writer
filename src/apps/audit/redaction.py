@@ -324,6 +324,7 @@ _ARTICLE_KEYS = (
     "state",
     "status",
     "subject_hash",
+    "verification_id",
 )
 _EVIDENCE_KEYS = (
     "decision",
@@ -452,6 +453,7 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
             "article.draft_generated",
             "article.revision.created",
             "collection_run.publication_started",
+            "collection_run.editorial_failed",
         )
     },
     **{
