@@ -23,6 +23,7 @@
     "enable_formula_recognition": true,
     "enable_chart_recognition": true,
     "enable_seal_recognition": false,
+    "enable_region_detection": false,
     "confidence_thresholds": {"default": 0.78, "table": 0.82, "formula": 0.85, "chart": 0.82}
   }
 }

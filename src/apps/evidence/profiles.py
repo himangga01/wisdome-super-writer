@@ -36,8 +36,12 @@ PADDLEOCR_REQUIRED_MODELS = frozenset({
     "PP-DocLayout_plus-L",
     "PP-FormulaNet_plus-M",
     "PP-LCNet_x1_0_doc_ori",
+    "PP-LCNet_x1_0_table_cls",
     "PP-LCNet_x1_0_textline_ori",
     "PP-OCRv5_server_det",
+    "RT-DETR-L_wired_table_cell_det",
+    "RT-DETR-L_wireless_table_cell_det",
+    "SLANet_plus",
     "SLANeXt_wired",
     "UVDoc",
     "en_PP-OCRv5_mobile_rec",
@@ -108,6 +112,7 @@ def _validate_paddle_model_manifest(manifest: Mapping[str, Any], *, verify_files
         if not model_name or model_name in names or not directory.is_absolute() or not isinstance(files, list) or not files:
             raise ValidationError("PaddleOCR model entry is incomplete")
         names.add(model_name)
+        manifest_paths: set[str] = set()
         for raw_file in files:
             if not isinstance(raw_file, Mapping):
                 raise ValidationError("PaddleOCR model file entry is invalid")
@@ -125,13 +130,30 @@ def _validate_paddle_model_manifest(manifest: Mapping[str, Any], *, verify_files
                 or byte_size < 1
             ):
                 raise ValidationError("PaddleOCR model file manifest is invalid")
+            relative_path = relative.as_posix()
+            if relative_path in manifest_paths:
+                raise ValidationError("PaddleOCR model manifest has duplicate file paths")
+            manifest_paths.add(relative_path)
             candidate = (directory / relative).resolve()
             try:
                 candidate.relative_to(directory.resolve())
             except ValueError as exc:
                 raise ValidationError("PaddleOCR model path escapes its directory") from exc
-            if verify_files and (not candidate.is_file() or candidate.stat().st_size != byte_size or sha256_file(candidate) != expected_hash):
+            if verify_files and (
+                not candidate.is_file()
+                or candidate.is_symlink()
+                or candidate.stat().st_size != byte_size
+                or sha256_file(candidate) != expected_hash
+            ):
                 raise ValidationError("PaddleOCR model file differs from its manifest")
+        if verify_files:
+            actual_paths = {
+                path.relative_to(directory).as_posix()
+                for path in directory.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            if actual_paths != manifest_paths:
+                raise ValidationError("PaddleOCR model directory differs from its manifest")
     if names != PADDLEOCR_REQUIRED_MODELS:
         raise ValidationError("PaddleOCR model manifest has missing or unexpected models")
 

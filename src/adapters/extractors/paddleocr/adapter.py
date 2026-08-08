@@ -29,31 +29,45 @@ class PaddleOCRExtractor:
         "PP-DocLayout_plus-L",
         "PP-FormulaNet_plus-M",
         "PP-LCNet_x1_0_doc_ori",
+        "PP-LCNet_x1_0_table_cls",
         "PP-LCNet_x1_0_textline_ori",
         "PP-OCRv5_server_det",
+        "RT-DETR-L_wired_table_cell_det",
+        "RT-DETR-L_wireless_table_cell_det",
+        "SLANet_plus",
         "SLANeXt_wired",
         "UVDoc",
         "en_PP-OCRv5_mobile_rec",
         "korean_PP-OCRv5_mobile_rec",
     })
     model_options = {
-        "PP-Chart2Table": ("chart_recognition_model_name", "chart_recognition_model_dir"),
-        "PP-DocLayout_plus-L": ("layout_detection_model_name", "layout_detection_model_dir"),
-        "PP-FormulaNet_plus-M": ("formula_recognition_model_name", "formula_recognition_model_dir"),
+        "PP-Chart2Table": (("chart_recognition_model_name", "chart_recognition_model_dir"),),
+        "PP-DocLayout_plus-L": (("layout_detection_model_name", "layout_detection_model_dir"),),
+        "PP-FormulaNet_plus-M": (("formula_recognition_model_name", "formula_recognition_model_dir"),),
         "PP-LCNet_x1_0_doc_ori": (
-            "doc_orientation_classify_model_name",
-            "doc_orientation_classify_model_dir",
+            ("doc_orientation_classify_model_name", "doc_orientation_classify_model_dir"),
+            ("table_orientation_classify_model_name", "table_orientation_classify_model_dir"),
+        ),
+        "PP-LCNet_x1_0_table_cls": (
+            ("table_classification_model_name", "table_classification_model_dir"),
         ),
         "PP-LCNet_x1_0_textline_ori": (
-            "textline_orientation_model_name",
-            "textline_orientation_model_dir",
+            ("textline_orientation_model_name", "textline_orientation_model_dir"),
         ),
-        "PP-OCRv5_server_det": ("text_detection_model_name", "text_detection_model_dir"),
+        "PP-OCRv5_server_det": (("text_detection_model_name", "text_detection_model_dir"),),
+        "RT-DETR-L_wired_table_cell_det": (
+            ("wired_table_cells_detection_model_name", "wired_table_cells_detection_model_dir"),
+        ),
+        "RT-DETR-L_wireless_table_cell_det": (
+            ("wireless_table_cells_detection_model_name", "wireless_table_cells_detection_model_dir"),
+        ),
+        "SLANet_plus": (
+            ("wireless_table_structure_recognition_model_name", "wireless_table_structure_recognition_model_dir"),
+        ),
         "SLANeXt_wired": (
-            "wired_table_structure_recognition_model_name",
-            "wired_table_structure_recognition_model_dir",
+            ("wired_table_structure_recognition_model_name", "wired_table_structure_recognition_model_dir"),
         ),
-        "UVDoc": ("doc_unwarping_model_name", "doc_unwarping_model_dir"),
+        "UVDoc": (("doc_unwarping_model_name", "doc_unwarping_model_dir"),),
     }
 
     def __init__(
@@ -126,6 +140,7 @@ class PaddleOCRExtractor:
                 raise ExtractorError("model_manifest_mismatch", "PaddleOCR model entry is incomplete")
             seen_names.add(model_name)
             verified_files = []
+            manifest_paths = set()
             for item in files:
                 relative = Path(str(item.get("path", "")))
                 expected = str(item.get("sha256", ""))
@@ -141,6 +156,10 @@ class PaddleOCRExtractor:
                     or byte_size < 1
                 ):
                     raise ExtractorError("model_manifest_mismatch", "PaddleOCR model file manifest is invalid")
+                relative_path = relative.as_posix()
+                if relative_path in manifest_paths:
+                    raise ExtractorError("model_manifest_mismatch", "PaddleOCR model manifest has duplicate file paths")
+                manifest_paths.add(relative_path)
                 candidate = (directory / relative).resolve()
                 try:
                     candidate.relative_to(directory.resolve())
@@ -148,6 +167,7 @@ class PaddleOCRExtractor:
                     raise ExtractorError("model_manifest_mismatch", "PaddleOCR model path escapes its directory") from exc
                 if (
                     not candidate.is_file()
+                    or candidate.is_symlink()
                     or candidate.stat().st_size != byte_size
                     or sha256_file(candidate) != expected
                 ):
@@ -157,6 +177,13 @@ class PaddleOCRExtractor:
                     "sha256": expected,
                     "byte_size": byte_size,
                 })
+            actual_paths = {
+                path.relative_to(directory).as_posix()
+                for path in directory.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            if actual_paths != manifest_paths:
+                raise ExtractorError("model_manifest_mismatch", "PaddleOCR model directory differs from its manifest")
             actual_manifest["models"].append({
                 "model_name": model_name,
                 "directory": str(directory),
@@ -184,6 +211,8 @@ class PaddleOCRExtractor:
             raise ExtractorError("config_mismatch", "Profile selected an unapproved recognition model")
         if recognition_model not in model_dirs:
             raise ExtractorError("model_manifest_mismatch", "Recognition model directory is not in the manifest")
+        if self.config.get("enable_region_detection", False):
+            raise ExtractorError("config_mismatch", "PaddleOCR region detection must remain disabled")
         kwargs = {
             "use_doc_orientation_classify": bool(self.config.get("use_doc_orientation_classify", True)),
             "use_doc_unwarping": bool(self.config.get("use_doc_unwarping", True)),
@@ -194,12 +223,14 @@ class PaddleOCRExtractor:
             "use_formula_recognition": bool(self.config.get("enable_formula_recognition", True)),
             "use_chart_recognition": bool(self.config.get("enable_chart_recognition", True)),
             "use_seal_recognition": bool(self.config.get("enable_seal_recognition", False)),
+            "use_region_detection": False,
             "device": str(self.config.get("device", "cpu")),
         }
-        for model_name, (name_argument, directory_argument) in self.model_options.items():
+        for model_name, option_pairs in self.model_options.items():
             try:
-                kwargs[name_argument] = model_name
-                kwargs[directory_argument] = model_dirs[model_name]
+                for name_argument, directory_argument in option_pairs:
+                    kwargs[name_argument] = model_name
+                    kwargs[directory_argument] = model_dirs[model_name]
             except KeyError as exc:
                 raise ExtractorError("model_manifest_mismatch", "PaddleOCR model directory is not in the manifest") from exc
         os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "true"
