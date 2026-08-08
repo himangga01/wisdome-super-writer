@@ -1,13 +1,45 @@
 {
-  "profile_key": "legacy-hwp-v1", "profile_version": "1.0.0",
-  "engine": "legacy_hwp_converter", "extractor_version": "legacy-hwp-v1", "package_version": "deployment-pinned",
-  "runtime_version": "sandbox-v1", "pipeline_name": "hwp-to-pdf", "validation_mode": "deterministic",
-  "implementation_files": ["src/adapters/extractors/legacy_hwp.py"],
+  "profile_key": "legacy-hwp-v1",
+  "profile_version": "1.1.0",
+  "engine": "legacy_hwp_converter",
+  "extractor_version": "legacy-hwp-v1.1.0",
+  "package_version": "rhwp-0.8.2+9b16aa9e23f476e2b335d7c029fc9f24a199d63c",
+  "runtime_version": "sandbox-uds-v1",
+  "pipeline_name": "rhwp-to-qpdf-verified-pdf",
+  "validation_mode": "deterministic",
+  "implementation_files": [
+    "src/adapters/extractors/legacy_hwp.py",
+    "deploy/containers/hwp-worker/wisdome-hwp-sandbox",
+    "deploy/containers/hwp-worker/build_manifest.py",
+    "deploy/containers/hwp-worker/Dockerfile"
+  ],
   "config": {
-    "sandbox_command": ["/usr/local/bin/wisdome-hwp-sandbox", "--network=none", "--input", "{input}", "--output", "{output}", "--report", "{report}"],
-    "converter_manifest_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-    "timeout_seconds": 180, "max_output_bytes": 314572800, "network_access": false,
-    "read_only_input": true, "disposable_filesystem": true
+    "protocol_version": "wisdome-hwp-uds-v1",
+    "sandbox_socket_path": "${HWP_SANDBOX_SOCKET_PATH}",
+    "input_staging_root": "${HWP_INPUT_STAGING_ROOT}",
+    "converter_manifest_path": "${HWP_CONVERTER_MANIFEST_PATH}",
+    "converter_manifest_hash": "${HWP_CONVERTER_MANIFEST_SHA256}",
+    "sandbox_command": [
+      "/usr/local/bin/wisdome-hwp-sandbox",
+      "--network=none",
+      "--input",
+      "{input}",
+      "--output",
+      "{output}",
+      "--report",
+      "{report}"
+    ],
+    "golden_corpus_approved": false,
+    "timeout_seconds": 180,
+    "max_input_bytes": 134217728,
+    "max_output_bytes": 314572800,
+    "max_report_bytes": 65536,
+    "max_pages": 2000,
+    "network_access": false,
+    "read_only_rootfs": true,
+    "read_only_input": true,
+    "private_tmpfs": true,
+    "fallback_allowed": false,
+    "text_as_paths": false
   }
 }
-

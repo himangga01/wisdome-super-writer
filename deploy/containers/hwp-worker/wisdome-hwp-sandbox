@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+from typing import Any, Mapping
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - the deployed sidecar is Linux-only
+    resource = None
+
+
+PROTOCOL_MAGIC = b"WSHWP001"
+PROTOCOL_VERSION = "wisdome-hwp-uds-v1"
+MAX_HEADER_BYTES = 64 * 1024
+EXIT_INVALID_INPUT = 20
+EXIT_CONVERTER_FAILURE = 21
+EXIT_RESOURCE_LIMIT = 22
+HWP_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+APPROVED_CONVERTER = {
+    "name": "rhwp",
+    "version": "0.8.2",
+    "source_commit": "9b16aa9e23f476e2b335d7c029fc9f24a199d63c",
+    "rust_version": "1.93.1",
+    "cargo_locked": True,
+}
+REQUIRED_ROLES = frozenset({"converter", "qpdf", "wrapper", "config", "font", "library"})
+REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "protocol_version",
+        "attempt_id",
+        "generation",
+        "nonce",
+        "converter_manifest_hash",
+        "input",
+        "limits",
+    }
+)
+INPUT_FIELDS = frozenset({"relative_path", "checksum_sha256", "byte_size"})
+LIMIT_FIELDS = frozenset(
+    {"timeout_seconds", "max_input_bytes", "max_output_bytes", "max_report_bytes", "max_pages"}
+)
+CHILD_REPORT_FIELDS = frozenset(
+    {"schema_version", "page_count", "pdf_mime", "qpdf_validated", "warnings", "font_substitutions", "fallback_used"}
+)
+FINAL_REPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "protocol_version",
+        "attempt_id",
+        "generation",
+        "nonce",
+        "input_checksum_sha256",
+        "input_byte_size",
+        "output_pdf_checksum_sha256",
+        "output_pdf_byte_size",
+        "page_count",
+        "pdf_mime",
+        "qpdf_validated",
+        "converter_manifest_hash",
+        "sandbox_policy",
+        "warnings",
+        "font_substitutions",
+        "fallback_used",
+        "partial_text_used",
+        "stdout_evidence_used",
+    }
+)
+SANDBOX_POLICY = {
+    "network_allowed": False,
+    "read_only_rootfs": True,
+    "read_only_input": True,
+    "private_tmpfs": True,
+    "non_root": True,
+    "resource_limits_enforced": True,
+}
+INPUT_BASENAME = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[1-9][0-9]*-[0-9a-f]{64}\.hwp$"
+)
+WARNING_TOKENS = (b"warning", b"missing font", b"font substitution", b"fallback")
+RESOURCE_SIGNALS = frozenset(
+    value
+    for value in (
+        getattr(signal, "SIGXCPU", None),
+        getattr(signal, "SIGXFSZ", None),
+        getattr(signal, "SIGKILL", None),
+    )
+    if value is not None
+)
+
+
+class SandboxInvalidInput(Exception):
+    pass
+
+
+class SandboxConverterFailure(Exception):
+    pass
+
+
+class SandboxResourceLimit(Exception):
+    pass
+
+
+class ProtocolViolation(Exception):
+    pass
+
+
+def is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) != {"0"}
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def positive_int(value: object, maximum: int) -> bool:
+    return type(value) is int and 0 < value <= maximum
+
+
+def strict_json(raw: bytes, *, fields: frozenset[str]) -> dict[str, Any]:
+    def reject_constant(value: str) -> None:
+        raise ProtocolViolation(f"non-finite JSON value: {value}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProtocolViolation("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolViolation("invalid JSON") from exc
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProtocolViolation("JSON object has missing or unknown fields")
+    return value
+
+
+def canonical_json(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_relative_input(value: str) -> str:
+    if not isinstance(value, str):
+        raise SandboxInvalidInput("input path is not text")
+    path = PurePosixPath(value)
+    if path.is_absolute() or len(path.parts) != 1 or path.as_posix() != value or not INPUT_BASENAME.fullmatch(value):
+        raise SandboxInvalidInput("input path is not an approved basename")
+    return value
+
+
+def open_verified_input(root: Path, relative_path: str, expected_size: int, expected_hash: str) -> bytes:
+    validate_relative_input(relative_path)
+    if not positive_int(expected_size, 512 * 1024 * 1024) or not is_sha256(expected_hash):
+        raise SandboxInvalidInput("input material fields are invalid")
+    candidate = root / relative_path
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as exc:
+        raise SandboxInvalidInput("input cannot be opened safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != expected_size
+        ):
+            raise SandboxInvalidInput("input is not a single-link regular file of the expected size")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            value = source.read(expected_size + 1)
+        if len(value) != expected_size or sha256_bytes(value) != expected_hash:
+            raise SandboxInvalidInput("input bytes differ from the request")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def verify_manifest(path: Path) -> str:
+    try:
+        raw = path.read_bytes()
+        manifest = strict_json(raw, fields=frozenset({"schema_version", "converter", "files"}))
+    except OSError as exc:
+        raise RuntimeError("converter manifest is unavailable") from exc
+    if manifest.get("schema_version") != "v1" or manifest.get("converter") != APPROVED_CONVERTER:
+        raise RuntimeError("converter manifest identity is invalid")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("converter manifest files are missing")
+    roles: set[str] = set()
+    paths: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"role", "path", "sha256", "byte_size"}:
+            raise RuntimeError("converter manifest file entry is invalid")
+        role = entry.get("role")
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str):
+            raise RuntimeError("converter manifest path is invalid")
+        file_path = Path(raw_path)
+        if (
+            role not in REQUIRED_ROLES
+            or not file_path.is_absolute()
+            or file_path.as_posix() != raw_path
+            or raw_path in paths
+            or not is_sha256(entry.get("sha256"))
+            or not positive_int(entry.get("byte_size"), 2**63 - 1)
+        ):
+            raise RuntimeError("converter manifest entry violates policy")
+        try:
+            metadata = file_path.lstat()
+        except OSError as exc:
+            raise RuntimeError("manifested converter material is missing") from exc
+        if (
+            file_path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink < 1
+            or metadata.st_size != entry["byte_size"]
+            or sha256_file(file_path) != entry["sha256"]
+        ):
+            raise RuntimeError("manifested converter bytes differ")
+        roles.add(str(role))
+        paths.add(raw_path)
+    if not REQUIRED_ROLES.issubset(roles):
+        raise RuntimeError("converter manifest material role is missing")
+    return sha256_bytes(raw)
+
+
+def _resource_preexec(limits: Mapping[str, int]):
+    def apply_limits() -> None:
+        if resource is None:
+            return
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"]))
+        resource.setrlimit(resource.RLIMIT_AS, (limits["address_space_bytes"], limits["address_space_bytes"]))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limits["file_bytes"], limits["file_bytes"]))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limits["open_files"], limits["open_files"]))
+        if hasattr(resource, "RLIMIT_NPROC"):
+            resource.setrlimit(resource.RLIMIT_NPROC, (limits["processes"], limits["processes"]))
+
+    return apply_limits
+
+
+def _terminate_process(process: subprocess.Popen[bytes], *, process_group: bool) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        if process_group and os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if process_group and os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: int,
+    limits: Mapping[str, int],
+    process_group: bool,
+) -> tuple[int, bytes, bytes]:
+    stdout_path = cwd / f"stdout-{time.monotonic_ns()}.log"
+    stderr_path = cwd / f"stderr-{time.monotonic_ns()}.log"
+    try:
+        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=dict(environment),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                shell=False,
+                start_new_session=process_group and os.name == "posix",
+                preexec_fn=(_resource_preexec(limits) if os.name == "posix" else None),
+                close_fds=True,
+            )
+            try:
+                return_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                _terminate_process(process, process_group=process_group)
+                raise SandboxResourceLimit("converter wall-clock limit exceeded") from exc
+        max_log = limits["log_bytes"]
+        if stdout_path.stat().st_size > max_log or stderr_path.stat().st_size > max_log:
+            raise SandboxResourceLimit("converter log limit exceeded")
+        return return_code, stdout_path.read_bytes(), stderr_path.read_bytes()
+    except OSError as exc:
+        if exc.errno in {errno.EFBIG, errno.ENOMEM, errno.ENOSPC, errno.EMFILE, errno.ENFILE}:
+            raise SandboxResourceLimit("converter process resource limit exceeded") from exc
+        raise SandboxConverterFailure("converter process could not start") from exc
+    finally:
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def _limits_from_environment(max_output_bytes: int, timeout_seconds: int) -> dict[str, int]:
+    return {
+        "cpu_seconds": min(timeout_seconds, int(os.environ.get("HWP_RLIMIT_CPU_SECONDS", timeout_seconds))),
+        "address_space_bytes": int(os.environ.get("HWP_RLIMIT_AS_BYTES", str(512 * 1024 * 1024))),
+        "file_bytes": min(max_output_bytes, int(os.environ.get("HWP_RLIMIT_FSIZE_BYTES", str(max_output_bytes)))),
+        "open_files": int(os.environ.get("HWP_RLIMIT_NOFILE", "64")),
+        "processes": int(os.environ.get("HWP_RLIMIT_NPROC", "32")),
+        "log_bytes": int(os.environ.get("HWP_MAX_LOG_BYTES", str(1024 * 1024))),
+    }
+
+
+def _sanitized_environment(workspace: Path) -> dict[str, str]:
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(workspace),
+        "TMPDIR": str(workspace),
+        "FONTCONFIG_FILE": "/etc/fonts/fonts.conf",
+        "LC_ALL": "C.UTF-8",
+        "TZ": "UTC",
+        "NO_PROXY": "*",
+        "http_proxy": "",
+        "https_proxy": "",
+        "ALL_PROXY": "",
+    }
+
+
+def _contains_warning(stdout: bytes, stderr: bytes) -> bool:
+    lowered = stdout.lower() + b"\n" + stderr.lower()
+    return bool(stderr) or any(token in lowered for token in WARNING_TOKENS)
+
+
+def _was_resource_signal(return_code: int) -> bool:
+    return return_code < 0 and -return_code in RESOURCE_SIGNALS
+
+
+def _qpdf_page_count(
+    output: Path,
+    *,
+    workspace: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: int,
+    limits: Mapping[str, int],
+) -> int:
+    check_code, check_stdout, check_stderr = _run_bounded(
+        ["/usr/bin/qpdf", "--check", str(output)],
+        cwd=workspace,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        limits=limits,
+        process_group=False,
+    )
+    if check_code != 0 or _contains_warning(check_stdout, check_stderr):
+        raise SandboxConverterFailure("qpdf rejected the converted PDF")
+    page_code, page_stdout, page_stderr = _run_bounded(
+        ["/usr/bin/qpdf", "--show-npages", str(output)],
+        cwd=workspace,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        limits=limits,
+        process_group=False,
+    )
+    try:
+        page_count = int(page_stdout.strip())
+    except ValueError as exc:
+        raise SandboxConverterFailure("qpdf returned an invalid page count") from exc
+    if page_code != 0 or page_stderr or page_count < 1:
+        raise SandboxConverterFailure("qpdf page count validation failed")
+    return page_count
+
+
+def run_exact_cli(arguments: argparse.Namespace) -> int:
+    output = Path(arguments.output)
+    report = Path(arguments.report)
+    try:
+        input_path = Path(arguments.input)
+        if arguments.network != "none" or not input_path.is_absolute() or not output.is_absolute() or not report.is_absolute():
+            raise SandboxInvalidInput("exact CLI requires network=none and absolute paths")
+        if output.exists() or report.exists() or output.parent != report.parent:
+            raise SandboxInvalidInput("output and report must be new files in one private directory")
+        metadata = input_path.lstat()
+        if input_path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SandboxInvalidInput("input must be a single-link regular file")
+        with input_path.open("rb") as source:
+            if source.read(len(HWP_SIGNATURE)) != HWP_SIGNATURE:
+                raise SandboxInvalidInput("input does not have the HWP OLE signature")
+        timeout_seconds = int(os.environ.get("HWP_JOB_TIMEOUT_SECONDS", "180"))
+        max_output_bytes = int(os.environ.get("HWP_MAX_OUTPUT_BYTES", str(300 * 1024 * 1024)))
+        max_pages = int(os.environ.get("HWP_MAX_PAGES", "2000"))
+        limits = _limits_from_environment(max_output_bytes, timeout_seconds)
+        environment = _sanitized_environment(output.parent)
+        return_code, stdout, stderr = _run_bounded(
+            ["/usr/local/bin/rhwp", "export-pdf", str(input_path), "-o", str(output)],
+            cwd=output.parent,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            limits=limits,
+            process_group=False,
+        )
+        if _was_resource_signal(return_code):
+            raise SandboxResourceLimit("rhwp was terminated by a resource limit")
+        if return_code != 0 or _contains_warning(stdout, stderr):
+            raise SandboxConverterFailure("rhwp failed or emitted a warning/font fallback")
+        output_metadata = output.lstat()
+        if (
+            output.is_symlink()
+            or not stat.S_ISREG(output_metadata.st_mode)
+            or output_metadata.st_nlink != 1
+            or not 0 < output_metadata.st_size <= max_output_bytes
+            or output.read_bytes()[:5] != b"%PDF-"
+        ):
+            raise SandboxConverterFailure("rhwp output is not a bounded regular PDF")
+        page_count = _qpdf_page_count(
+            output,
+            workspace=output.parent,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            limits=limits,
+        )
+        if page_count > max_pages:
+            raise SandboxResourceLimit("converted PDF page count exceeds policy")
+        child_report = {
+            "schema_version": "v1",
+            "page_count": page_count,
+            "pdf_mime": "application/pdf",
+            "qpdf_validated": True,
+            "warnings": [],
+            "font_substitutions": [],
+            "fallback_used": False,
+        }
+        report.write_bytes(canonical_json(child_report))
+        return 0
+    except SandboxInvalidInput:
+        output.unlink(missing_ok=True)
+        report.unlink(missing_ok=True)
+        return EXIT_INVALID_INPUT
+    except SandboxResourceLimit:
+        output.unlink(missing_ok=True)
+        report.unlink(missing_ok=True)
+        return EXIT_RESOURCE_LIMIT
+    except (SandboxConverterFailure, OSError, ValueError):
+        output.unlink(missing_ok=True)
+        report.unlink(missing_ok=True)
+        return EXIT_CONVERTER_FAILURE
+
+
+def _read_exact(connection: socket.socket, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise ProtocolViolation("peer disconnected during a framed request")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_request(connection: socket.socket, server_limits: Mapping[str, int]) -> dict[str, Any]:
+    if _read_exact(connection, len(PROTOCOL_MAGIC)) != PROTOCOL_MAGIC:
+        raise ProtocolViolation("wrong request magic")
+    length = struct.unpack("!I", _read_exact(connection, 4))[0]
+    if not 0 < length <= MAX_HEADER_BYTES:
+        raise ProtocolViolation("request header length is outside policy")
+    request = strict_json(_read_exact(connection, length), fields=REQUEST_FIELDS)
+    if request.get("schema_version") != "v1" or request.get("protocol_version") != PROTOCOL_VERSION:
+        raise ProtocolViolation("request protocol is invalid")
+    try:
+        attempt_id = str(uuid.UUID(str(request.get("attempt_id"))))
+    except (ValueError, AttributeError) as exc:
+        raise ProtocolViolation("request attempt ID is invalid") from exc
+    if attempt_id != request.get("attempt_id") or not positive_int(request.get("generation"), 2**31 - 1):
+        raise ProtocolViolation("request identity is invalid")
+    nonce = request.get("nonce")
+    if not isinstance(nonce, str) or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+        raise ProtocolViolation("request nonce is invalid")
+    if not is_sha256(request.get("converter_manifest_hash")):
+        raise ProtocolViolation("request manifest hash is invalid")
+    input_value = request.get("input")
+    limits = request.get("limits")
+    if not isinstance(input_value, dict) or set(input_value) != INPUT_FIELDS:
+        raise ProtocolViolation("request input object is invalid")
+    if not isinstance(limits, dict) or set(limits) != LIMIT_FIELDS:
+        raise ProtocolViolation("request limit object is invalid")
+    validate_relative_input(input_value.get("relative_path"))
+    if not is_sha256(input_value.get("checksum_sha256")) or not positive_int(
+        input_value.get("byte_size"), server_limits["max_input_bytes"]
+    ):
+        raise ProtocolViolation("request input material is invalid")
+    for field in LIMIT_FIELDS:
+        if not positive_int(limits.get(field), server_limits[field]):
+            raise ProtocolViolation("request limit exceeds the sidecar policy")
+    return request
+
+
+def _send_response(
+    connection: socket.socket,
+    request: Mapping[str, Any],
+    *,
+    exit_code: int,
+    report: bytes = b"",
+    pdf: bytes = b"",
+) -> None:
+    if exit_code != 0 and (report or pdf):
+        raise ProtocolViolation("failed response cannot contain partial material")
+    header = canonical_json(
+        {
+            "schema_version": "v1",
+            "protocol_version": PROTOCOL_VERSION,
+            "attempt_id": request["attempt_id"],
+            "generation": request["generation"],
+            "nonce": request["nonce"],
+            "exit_code": exit_code,
+            "report_bytes": len(report),
+            "pdf_bytes": len(pdf),
+        }
+    )
+    connection.sendall(PROTOCOL_MAGIC + struct.pack("!I", len(header)) + header + report + pdf)
+
+
+def _server_limits() -> dict[str, int]:
+    return {
+        "timeout_seconds": int(os.environ.get("HWP_JOB_TIMEOUT_SECONDS", "180")),
+        "max_input_bytes": int(os.environ.get("HWP_MAX_INPUT_BYTES", str(128 * 1024 * 1024))),
+        "max_output_bytes": int(os.environ.get("HWP_MAX_OUTPUT_BYTES", str(300 * 1024 * 1024))),
+        "max_report_bytes": int(os.environ.get("HWP_MAX_REPORT_BYTES", str(64 * 1024))),
+        "max_pages": int(os.environ.get("HWP_MAX_PAGES", "2000")),
+    }
+
+
+def _process_request(
+    connection: socket.socket,
+    *,
+    request: dict[str, Any],
+    input_root: Path,
+    work_root: Path,
+    manifest_hash: str,
+    wrapper_path: Path,
+) -> None:
+    if request["converter_manifest_hash"] != manifest_hash:
+        _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+        return
+    request_input = request["input"]
+    limits = request["limits"]
+    workspace = Path(tempfile.mkdtemp(prefix="job-", dir=work_root))
+    try:
+        input_bytes = open_verified_input(
+            input_root,
+            request_input["relative_path"],
+            request_input["byte_size"],
+            request_input["checksum_sha256"],
+        )
+        private_input = workspace / "input.hwp"
+        output = workspace / "converted.pdf"
+        child_report_path = workspace / "child-report.json"
+        private_input.write_bytes(input_bytes)
+        private_input.chmod(0o400)
+        environment = _sanitized_environment(workspace)
+        environment.update(
+            {
+                "HWP_JOB_TIMEOUT_SECONDS": str(limits["timeout_seconds"]),
+                "HWP_MAX_OUTPUT_BYTES": str(limits["max_output_bytes"]),
+                "HWP_MAX_PAGES": str(limits["max_pages"]),
+                "HWP_RLIMIT_CPU_SECONDS": str(limits["timeout_seconds"]),
+                "HWP_RLIMIT_FSIZE_BYTES": str(limits["max_output_bytes"]),
+            }
+        )
+        process_limits = _limits_from_environment(limits["max_output_bytes"], limits["timeout_seconds"])
+        exit_code, stdout, stderr = _run_bounded(
+            [
+                str(wrapper_path),
+                "--network=none",
+                "--input",
+                str(private_input),
+                "--output",
+                str(output),
+                "--report",
+                str(child_report_path),
+            ],
+            cwd=workspace,
+            environment=environment,
+            timeout_seconds=limits["timeout_seconds"],
+            limits=process_limits,
+            process_group=True,
+        )
+        if _was_resource_signal(exit_code):
+            _send_response(connection, request, exit_code=EXIT_RESOURCE_LIMIT)
+            return
+        if exit_code in {EXIT_INVALID_INPUT, EXIT_CONVERTER_FAILURE, EXIT_RESOURCE_LIMIT}:
+            _send_response(connection, request, exit_code=exit_code)
+            return
+        if exit_code != 0 or _contains_warning(stdout, stderr):
+            _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+            return
+        child_report_raw = child_report_path.read_bytes()
+        if len(child_report_raw) > limits["max_report_bytes"]:
+            raise SandboxResourceLimit("child report exceeds its byte limit")
+        child_report = strict_json(child_report_raw, fields=CHILD_REPORT_FIELDS)
+        if (
+            child_report.get("schema_version") != "v1"
+            or child_report.get("pdf_mime") != "application/pdf"
+            or child_report.get("qpdf_validated") is not True
+            or child_report.get("warnings") != []
+            or child_report.get("font_substitutions") != []
+            or child_report.get("fallback_used") is not False
+            or not positive_int(child_report.get("page_count"), limits["max_pages"])
+        ):
+            raise SandboxConverterFailure("child conversion report is invalid")
+        output_metadata = output.lstat()
+        if (
+            output.is_symlink()
+            or not stat.S_ISREG(output_metadata.st_mode)
+            or output_metadata.st_nlink != 1
+            or not positive_int(output_metadata.st_size, limits["max_output_bytes"])
+        ):
+            raise SandboxConverterFailure("private PDF output is invalid")
+        pdf = output.read_bytes()
+        if not pdf.startswith(b"%PDF-") or len(pdf) != output_metadata.st_size:
+            raise SandboxConverterFailure("private PDF bytes are invalid")
+        final_report = canonical_json(
+            {
+                "schema_version": "v1",
+                "protocol_version": PROTOCOL_VERSION,
+                "attempt_id": request["attempt_id"],
+                "generation": request["generation"],
+                "nonce": request["nonce"],
+                "input_checksum_sha256": request_input["checksum_sha256"],
+                "input_byte_size": request_input["byte_size"],
+                "output_pdf_checksum_sha256": sha256_bytes(pdf),
+                "output_pdf_byte_size": len(pdf),
+                "page_count": child_report["page_count"],
+                "pdf_mime": "application/pdf",
+                "qpdf_validated": True,
+                "converter_manifest_hash": manifest_hash,
+                "sandbox_policy": SANDBOX_POLICY,
+                "warnings": [],
+                "font_substitutions": [],
+                "fallback_used": False,
+                "partial_text_used": False,
+                "stdout_evidence_used": False,
+            }
+        )
+        if len(final_report) > limits["max_report_bytes"]:
+            raise SandboxResourceLimit("final report exceeds its byte limit")
+        _send_response(connection, request, exit_code=0, report=final_report, pdf=pdf)
+    except SandboxInvalidInput:
+        _send_response(connection, request, exit_code=EXIT_INVALID_INPUT)
+    except SandboxResourceLimit:
+        _send_response(connection, request, exit_code=EXIT_RESOURCE_LIMIT)
+    except (SandboxConverterFailure, ProtocolViolation, OSError, ValueError, KeyError):
+        _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def run_server(arguments: argparse.Namespace) -> int:
+    socket_path = Path(arguments.socket)
+    input_root = Path(arguments.input_root)
+    work_root = Path(arguments.work_root)
+    manifest_path = Path(arguments.manifest)
+    wrapper_path = Path(__file__).resolve()
+    if os.geteuid() == 0:
+        raise RuntimeError("HWP sandbox refuses to run as root")
+    if not socket_path.is_absolute() or not input_root.is_absolute() or not work_root.is_absolute():
+        raise RuntimeError("sandbox roots must be absolute")
+    if input_root.is_symlink() or not input_root.is_dir() or work_root.is_symlink() or not work_root.is_dir():
+        raise RuntimeError("sandbox roots are missing or unsafe")
+    manifest_hash = verify_manifest(manifest_path)
+    if socket_path.exists() or socket_path.is_symlink():
+        metadata = socket_path.lstat()
+        if socket_path.is_symlink() or not stat.S_ISSOCK(metadata.st_mode):
+            raise RuntimeError("refusing to replace a non-socket control path")
+        socket_path.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(socket_path))
+        socket_path.chmod(0o660)
+        server.listen(8)
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(_server_limits()["timeout_seconds"] + 10)
+                try:
+                    request = _read_request(connection, _server_limits())
+                    _process_request(
+                        connection,
+                        request=request,
+                        input_root=input_root,
+                        work_root=work_root,
+                        manifest_hash=manifest_hash,
+                        wrapper_path=wrapper_path,
+                    )
+                except (ProtocolViolation, SandboxInvalidInput, OSError):
+                    continue
+    finally:
+        server.close()
+        socket_path.unlink(missing_ok=True)
+
+
+def run_probe(arguments: argparse.Namespace) -> int:
+    path = Path(arguments.socket)
+    if not hasattr(socket, "AF_UNIX") or not path.is_socket():
+        return 1
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(2)
+    try:
+        connection.connect(str(path))
+    except OSError:
+        return 1
+    finally:
+        connection.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("serve")
+        parser.add_argument("--socket", required=True)
+        parser.add_argument("--input-root", required=True)
+        parser.add_argument("--work-root", required=True)
+        parser.add_argument("--manifest", required=True)
+        return run_server(parser.parse_args(argv))
+    if argv and argv[0] == "probe":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("probe")
+        parser.add_argument("--socket", required=True)
+        return run_probe(parser.parse_args(argv))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--network", required=True)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--report", required=True)
+    return run_exact_cli(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

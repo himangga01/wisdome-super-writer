@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from django.conf import settings
@@ -48,6 +48,17 @@ PADDLEOCR_REQUIRED_MODELS = frozenset({
     "korean_PP-OCRv5_mobile_rec",
 })
 
+LEGACY_HWP_CONVERTER = {
+    "name": "rhwp",
+    "version": "0.8.2",
+    "source_commit": "9b16aa9e23f476e2b335d7c029fc9f24a199d63c",
+    "rust_version": "1.93.1",
+    "cargo_locked": True,
+}
+LEGACY_HWP_REQUIRED_MANIFEST_ROLES = frozenset(
+    {"converter", "qpdf", "wrapper", "config", "font", "library"}
+)
+
 
 def _expand(value: Any) -> Any:
     if isinstance(value, str):
@@ -85,11 +96,61 @@ def _resolve_deployment_material(document: dict[str, Any]) -> dict[str, Any]:
     if document.get("engine") == "legacy_hwp_converter" and isinstance(config, dict):
         manifest_path = str(config.get("converter_manifest_path", ""))
         path, manifest = _load_json_file(manifest_path, label="Legacy HWP converter manifest")
-        if manifest.get("schema_version") != "v1" or not manifest.get("files"):
-            raise ValidationError("Legacy HWP converter manifest has no verified file entries")
+        expected_hash = str(config.get("converter_manifest_hash", ""))
+        _validate_legacy_hwp_manifest(manifest)
+        if not _is_nonzero_sha256(expected_hash) or sha256_file(path) != expected_hash:
+            raise ValidationError(
+                "Legacy HWP converter manifest differs from the release-pinned expected hash"
+            )
         config["converter_manifest_path"] = str(path)
-        config["converter_manifest_hash"] = sha256_file(path)
+        config["converter_manifest_hash"] = expected_hash
+        config["converter_manifest"] = manifest
     return document
+
+
+def _is_nonzero_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) != {"0"}
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_legacy_hwp_manifest(manifest: Mapping[str, Any]) -> None:
+    if manifest.get("schema_version") != "v1" or manifest.get("converter") != LEGACY_HWP_CONVERTER:
+        raise ValidationError("Legacy HWP converter identity is not the approved pinned material")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValidationError("Legacy HWP converter manifest has no verified file entries")
+    paths: set[str] = set()
+    roles: set[str] = set()
+    for raw_file in files:
+        if not isinstance(raw_file, Mapping):
+            raise ValidationError("Legacy HWP converter manifest entry is invalid")
+        role = raw_file.get("role")
+        raw_path = raw_file.get("path")
+        file_hash = raw_file.get("sha256")
+        byte_size = raw_file.get("byte_size")
+        if not isinstance(raw_path, str):
+            raise ValidationError("Legacy HWP converter manifest path is invalid")
+        manifest_path = PurePosixPath(raw_path)
+        normalized = manifest_path.as_posix()
+        if (
+            role not in LEGACY_HWP_REQUIRED_MANIFEST_ROLES
+            or not manifest_path.is_absolute()
+            or ".." in manifest_path.parts
+            or normalized != raw_path
+            or normalized in paths
+            or not _is_nonzero_sha256(file_hash)
+            or type(byte_size) is not int
+            or byte_size < 1
+        ):
+            raise ValidationError("Legacy HWP converter manifest file entry is invalid")
+        paths.add(normalized)
+        roles.add(str(role))
+    if not LEGACY_HWP_REQUIRED_MANIFEST_ROLES.issubset(roles):
+        raise ValidationError("Legacy HWP converter manifest is missing a required material role")
 
 
 def _validate_paddle_model_manifest(manifest: Mapping[str, Any], *, verify_files: bool) -> None:
@@ -299,18 +360,32 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
             models_passed = False
         stage("paddle.local_models", models_passed, "All approved model files must be preloaded with exact SHA-256 and size")
     if profile.engine == ExtractionEngine.LEGACY_HWP:
-        command = profile.config.get("sandbox_command") or []
+        socket_path = Path(str(profile.config.get("sandbox_socket_path", "")))
+        manifest_path = Path(str(profile.config.get("converter_manifest_path", "")))
         manifest_hash = str(profile.config.get("converter_manifest_hash", ""))
-        wrapper = Path(str(command[0])) if command else Path("")
         stage(
-            "hwp.sandbox_wrapper",
-            bool(command) and wrapper.is_absolute() and wrapper.is_file(),
-            "A deployed absolute sandbox wrapper is required",
+            "hwp.sandbox_socket",
+            socket_path.is_absolute() and socket_path.exists(),
+            "A deployed absolute Unix-domain socket is required",
         )
+        manifest_passed = False
+        try:
+            _, local_manifest = _load_json_file(
+                str(manifest_path), label="Legacy HWP converter manifest"
+            )
+            _validate_legacy_hwp_manifest(local_manifest)
+            manifest_passed = sha256_file(manifest_path) == manifest_hash
+        except ValidationError:
+            pass
         stage(
             "hwp.converter_manifest",
-            len(manifest_hash) == 64 and set(manifest_hash) != {"0"},
-            "Replace the deployment placeholder with the approved converter manifest hash",
+            manifest_passed,
+            "The read-only manifest must match the release-pinned expected hash",
+        )
+        stage(
+            "hwp.golden_corpus",
+            profile.config.get("golden_corpus_approved") is True,
+            "T032 must approve the golden corpus before this profile is activated",
         )
     sample_hash = canonical_hash({"profile": str(profile.id), "material": profile.profile_material_hash})
     overall = all(item["result"] == "passed" for item in stages)

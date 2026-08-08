@@ -357,13 +357,21 @@
 - Modify: `config/extraction-profiles/generic/legacy-hwp-v1.json`
 - Modify: `src/adapters/extractors/legacy_hwp.py`
 - Modify: `src/apps/evidence/profiles.py`
+- Modify: `src/apps/evidence/tasks.py`
+- Modify: `specs/001-automated-content-publishing/contracts/generic-extractor.md`
+- Modify: `specs/001-automated-content-publishing/contracts/job-events.md`
+- Create: `tests/unit/test_legacy_hwp_sandbox.py`
 - Deferred contract test: `tests/contract/test_evidence_extractor.py`
 
 **Interfaces:**
-- Consumes: `{input}`, `{output}`, `{report}` arguments from `LegacyHwpConverter`.
-- Produces: validated PDF and `conversion-report.json` containing input/output checksum, page count, converter manifest hash and sandbox policy.
+- 일반 extraction worker의 `LegacyHwpConverter`는 고정 magic/version/length framing의 Unix-domain
+  socket으로 `network_mode: none` sidecar를 동기 호출한다. 새 Celery queue/event는 만들지 않는다.
+- sidecar는 read-only 공유 input의 basename만 열고 private tmpfs로 복사한 뒤 exact CLI
+  `wisdome-hwp-sandbox --network=none --input ... --output ... --report ...`를 실행한다.
+- 결과는 request identity, 실제 input/output checksum·크기, qpdf page count, converter manifest
+  hash와 sandbox policy가 모두 맞는 PDF/report bytes만 반환한다.
 
-- [ ] **Step 1: wrapper argument와 exit code 계약을 구현한다.**
+- [X] **Step 1: wrapper argument와 exit code 계약을 구현한다.**
 
   ```text
   wisdome-hwp-sandbox --network=none --input /input/a.hwp --output /output/a.pdf --report /output/report.json
@@ -373,28 +381,66 @@
   exit 22: resource limit
   ```
 
-- [ ] **Step 2: container 격리를 구성한다.**
+- [X] **Step 2: UDS sidecar와 container 격리를 구성한다.**
 
-  read-only rootfs/input, tmpfs output, no network, non-root UID, `pids_limit`, memory/CPU/time/file-size 한도를 Compose와 wrapper 양쪽에 적용한다.
+  read-only rootfs/input/manifest, private bounded tmpfs output, no network, UID/GID 65532,
+  `cap_drop: ALL`, no-new-privileges, PID/memory/CPU/time/file-size/open-file/process 한도를
+  Compose와 wrapper 양쪽에 적용한다. DB/Redis/MinIO 환경변수나 자격 증명은 converter에 전달하지
+  않는다. 기본 Compose에는 gVisor를 강제하지 않고 지원 Linux 운영환경의 선택적 override로만 둔다.
 
-- [ ] **Step 3: converter 실제 bytes manifest를 생성한다.**
+- [X] **Step 3: converter 실제 bytes manifest와 외부 expected hash를 연결한다.**
 
-  manifest schema v1에 converter binary, shared library, wrapper와 config의 SHA-256을 기록하고 `legacy-hwp-v1.json`의 zero hash를 실제 manifest path/hash로 교체한다.
+  `rhwp v0.8.2` commit `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1,
+  locked Cargo, qpdf 11.3.0, Noto CJK font bytes, loaded library, wrapper와 policy config를 schema v1
+  manifest에 기록한다. profile loader는 release/deploy가 외부 주입한 expected SHA-256을 보존해
+  read-only manifest bytes와 exact compare하며 runtime self-approval을 금지한다.
 
-- [ ] **Step 4: 결과 report를 더 엄격히 검증한다.**
+- [X] **Step 4: 요청 identity와 결과 report를 엄격히 검증한다.**
 
-  `LegacyHwpConverter.extract()`는 report의 `converter_manifest_hash`, `sandbox_policy.network_allowed == false`, input/output checksum과 PDF MIME을 모두 확인한다.
+  protocol/attempt/generation/nonce, manifest/policy, checksum/size, qpdf MIME/page count,
+  warning/font substitution/fallback/partial text/stdout 금지를 모두 확인한다. JSON duplicate key,
+  NaN, unknown field, bool-as-int, 잘못된 magic/length/trailing bytes와 path/symlink/hardlink/device
+  입력은 fail closed한다. socket/daemon 단절만 retryable이고 exit 20/21/22와 tamper는 permanent다.
 
-- [ ] **Step 5: 변환 성공 PDF만 document extraction으로 전달한다.**
+- [X] **Step 5: 변환 성공 PDF만 document extraction으로 전달한다.**
 
-  partial text나 converter stdout은 evidence로 만들지 않고 `follow_up_engine_allowlist`의 native PDF/PaddleOCR만 허용한다.
+  partial text나 converter stdout은 evidence로 만들지 않고 verified page count 전체를 새
+  DocumentExtraction에 전달한다. 후속 엔진은 native PDF/PaddleOCR만 허용한다. T015의
+  `generation=1` echo는 요청 identity일 뿐 DB fencing이 아니며 generation model과 stale-result
+  fence는 T016에서 구현한다.
 
-- [ ] **Step 6: 사용자 승인 후 sandbox contract를 검증하고 커밋한다.**
+- [X] **Step 6: 승인된 focused sandbox contract를 검증한다.**
+
+  T032 golden corpus 승인 전 `legacy-hwp-v1@1.1.0`은 비활성이다. unsupported/warning/missing-font,
+  exit 20/21/22 또는 tamper는 permanent `failed`로 끝나며 EvidenceAsset,
+  `evidence.other_ready`, DocumentExtraction을 만들지 않는다. run recovery는 `manual_required`다.
+  실제 image build·외부 HWP 변환·배포는 이번 검증에서 제외한다.
 
   ```powershell
-  git add deploy/containers/hwp-worker compose.yaml config/extraction-profiles/generic/legacy-hwp-v1.json src/adapters/extractors/legacy_hwp.py src/apps/evidence/profiles.py
+  .\.venv\Scripts\python.exe -m unittest tests.unit.test_legacy_hwp_sandbox -v
+  git add deploy/containers/hwp-worker compose.yaml config/extraction-profiles/generic/legacy-hwp-v1.json src/adapters/extractors/legacy_hwp.py src/apps/evidence/profiles.py src/apps/evidence/tasks.py specs/001-automated-content-publishing/contracts tests/unit/test_legacy_hwp_sandbox.py
   git commit -m "feat: isolate legacy HWP conversion sandbox"
   ```
+
+#### English / AI-readable T015 decision
+
+- Architecture: synchronous `LegacyHwpConverter` client plus a bounded UDS protocol to a
+  credential-free Docker sidecar with `network_mode: none`; no new Celery queue or event.
+- Converter: `rhwp 0.8.2` at full commit
+  `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1 and locked Cargo, followed by
+  pinned qpdf validation. No automatic fallback and no default `--text-as-paths`.
+- Trust chain: pinned image material -> externally release-pinned expected manifest hash ->
+  read-only manifest -> sidecar startup byte verification -> strict report hash -> immutable
+  profile snapshot. Runtime-generated material never self-approves the expected hash.
+- Protocol: fixed `WSHWP001` magic, version, bounded lengths, duplicate/NaN/unknown rejection,
+  exact attempt/generation/nonce echo, basename-only input, and exact EOF. Generation 1 is a
+  T015 compatibility identity only; DB-backed fencing belongs to T016.
+- Failure: only UDS infrastructure disconnect is retryable. Unsupported input, warnings, font
+  substitution, fallback, exit 20/21/22, or any mismatch is permanent and creates zero
+  EvidenceAsset, ready event, or DocumentExtraction; the run requires manual recovery.
+- Activation: the version-bumped profile remains inactive until T032 golden-corpus approval.
+  Deployment still must export the built manifest, pin its SHA-256 and image digest, and may add
+  a gVisor override only on a supported Linux runtime.
 
 ### Task 5: T016 extraction uniqueness, fencing과 terminal finalizer
 

@@ -228,11 +228,69 @@ services:
     <<: *app
     environment:
       <<: *runtime-environment
+      HWP_SANDBOX_SOCKET_PATH: /run/wisdome-hwp/converter.sock
+      HWP_INPUT_STAGING_ROOT: /var/lib/wisdome-hwp-input
+      HWP_CONVERTER_MANIFEST_PATH: /run/wisdome-hwp-manifest/converter-manifest.json
+      HWP_CONVERTER_MANIFEST_SHA256: ${HWP_CONVERTER_MANIFEST_SHA256:?set the release-reviewed HWP converter manifest SHA-256}
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.document,extract.generic"]
+    volumes:
+      - hwp-sandbox-socket:/run/wisdome-hwp:ro
+      - hwp-sandbox-input:/var/lib/wisdome-hwp-input
+      - ${HWP_CONVERTER_MANIFEST_PATH:?set the exported HWP converter manifest path}:/run/wisdome-hwp-manifest/converter-manifest.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      hwp-converter:
+        condition: service_healthy
     networks:
       - database
       - broker
       - object-storage
+
+  hwp-converter:
+    build:
+      context: .
+      dockerfile: deploy/containers/hwp-worker/Dockerfile
+    environment:
+      HWP_JOB_TIMEOUT_SECONDS: "180"
+      HWP_MAX_INPUT_BYTES: "134217728"
+      HWP_MAX_OUTPUT_BYTES: "314572800"
+      HWP_MAX_REPORT_BYTES: "65536"
+      HWP_MAX_PAGES: "2000"
+      HWP_MAX_LOG_BYTES: "1048576"
+      HWP_RLIMIT_CPU_SECONDS: "180"
+      HWP_RLIMIT_AS_BYTES: "536870912"
+      HWP_RLIMIT_FSIZE_BYTES: "314572800"
+      HWP_RLIMIT_NOFILE: "64"
+      HWP_RLIMIT_NPROC: "32"
+    network_mode: none
+    read_only: true
+    user: "65532:65532"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 768m
+    cpus: "1.0"
+    stop_grace_period: 10s
+    volumes:
+      - hwp-sandbox-socket:/run/wisdome-hwp
+      - hwp-sandbox-input:/input:ro
+    tmpfs:
+      - /work:rw,noexec,nosuid,nodev,size=384m,uid=65532,gid=65532,mode=0700
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/wisdome-hwp-sandbox", "probe", "--socket", "/run/wisdome-hwp/converter.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
 
   worker-editorial:
     <<: *app
@@ -336,6 +394,8 @@ volumes:
   redis-data:
   minio-data:
   paddle-models:
+  hwp-sandbox-socket:
+  hwp-sandbox-input:
 
 networks:
   web:

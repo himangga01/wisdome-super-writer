@@ -72,6 +72,36 @@ external link는 실행하지 않는다. output PDF checksum/MIME/page count와 
 native extraction 또는 **PaddleOCR PP-StructureV3**로 인식한다. converter 미설치·손상·timeout·
 지원 불가 문서는 `manual_required`이며 부분 text나 자동게시 결과를 만들지 않는다.
 
+T015의 legacy HWP 경계는 일반 worker가 새 queue/event 없이 synchronous UDS client로
+`network_mode: none` sidecar를 호출하는 구조다. 고정 magic `WSHWP001`, protocol version과
+bounded length framing을 쓰며 request의 attempt ID, `generation=1`, nonce, input basename/
+checksum/byte size와 resource bounds를 final report가 exact echo한다. 이 generation은 T015
+호환 identity일 뿐 DB stale-result fence가 아니며, 영속 generation/lease/fencing은 T016 범위다.
+
+sidecar는 DB·Redis·MinIO 환경변수/credential이 없고 read-only rootfs/input/manifest, private
+bounded tmpfs, non-root UID, `cap_drop: ALL`, no-new-privileges, PID/memory/CPU/time/file-size/
+open-file/process 제한을 함께 적용한다. basename만 `O_NOFOLLOW`로 열어 regular file,
+single hardlink, size와 hash를 검사한 뒤 private tmpfs로 복사한다. 기본 Compose는 gVisor를
+강제하지 않으며 지원 Linux 운영환경에서만 선택적 override를 둘 수 있다.
+
+변환기는 `rhwp 0.8.2` full commit
+`9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1과 locked `Cargo.lock`로 고정하고
+qpdf 11.3.0이 PDF 구조와 실제 page count를 검증한다. 자동 secondary converter fallback과
+기본 `--text-as-paths`를 금지한다. 승인 font bytes만 쓰며 warning, missing-font,
+font substitution 또는 fallback 징후는 terminal 실패다.
+
+manifest schema v1은 rhwp/qpdf/loaded library/font/wrapper/policy config의 normalized absolute
+path, SHA-256과 byte size를 기록한다. expected manifest SHA-256은 release/deploy 외부 입력이고
+profile loader가 read-only manifest bytes와 exact compare한다. image 내부 runtime material로
+expected hash를 덮어쓰는 self-approval은 금지한다.
+
+JSON duplicate key/NaN/unknown field/bool-as-int, 잘못된 magic/version/length/trailing bytes,
+identity·manifest·policy·checksum·size·MIME·qpdf page count 불일치는 fail closed한다. socket/
+daemon 단절만 retryable이다. unsupported/warning/missing-font, exit 20/21/22 또는 tamper는
+permanent `failed`이며 EvidenceAsset, `evidence.other_ready`, DocumentExtraction을 0건 만든다.
+run은 `manual_required` recovery로 넘긴다. `legacy-hwp-v1@1.1.0`은 T032 golden corpus가 승인한
+HWP subset과 deployment manifest/image digest를 확정하기 전 운영 비활성이다.
+
 ## 멱등성과 상태
 
 fingerprint v1은 run source item ID, source/input asset ID와 checksum, profile snapshot ID와
@@ -134,3 +164,34 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
 - HWPX zip-slip/zip-bomb/active-content fixture 거절, paragraph/table/cell locator 재현
 - legacy HWP sandbox의 network/process escape 0건, output PDF/report checksum 변조 거절,
   변환 성공 뒤 인식 엔진은 native PDF 또는 PaddleOCR뿐이며 converter 실패 시 자동게시 0건
+
+## English / AI-readable — T015 legacy HWP isolation
+
+- The normal extraction worker synchronously calls a credential-free Docker sidecar over a
+  bounded Unix-domain-socket protocol. The sidecar uses `network_mode: none`; no HWP-specific
+  Celery queue or domain event is added.
+- The request and response use fixed `WSHWP001` magic/version/length framing and strict JSON.
+  Duplicate keys, NaN, unknown fields, bool-as-int, identity mismatch, or trailing bytes fail
+  closed. The echoed T015 `generation=1` is compatibility identity, not DB fencing; T016 owns
+  persisted generations, leases, and stale-result fencing.
+- The sidecar accepts a basename-only, `O_NOFOLLOW`, regular, single-link input whose size and
+  checksum match, copies it into private tmpfs, and runs the exact no-network wrapper CLI.
+  Rootfs/input/manifest are read-only; tmpfs, UID, capabilities, no-new-privileges, PID, memory,
+  CPU, wall-time, file-size, descriptor, and process limits are bounded at container and process
+  boundaries. Base Compose does not mandate gVisor; a supported Linux deployment may add it as
+  an override.
+- Converter material is `rhwp 0.8.2` commit
+  `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1, locked Cargo, pinned qpdf, approved
+  fonts, loaded libraries, wrapper, and policy config. No automatic fallback and no default
+  `--text-as-paths` are permitted.
+- The release-pinned expected manifest SHA-256 is an external deployment trust input. The
+  profile loader exact-compares it with read-only manifest bytes and never replaces it with a
+  runtime-computed self-approval value.
+- Only a warning-free, no-font-substitution, qpdf-validated PDF with a complete matching report
+  may create one converted EvidenceAsset and a follow-up DocumentExtraction using the verified
+  page count. Follow-up engines are native PDF or PaddleOCR only; stdout/partial text is never
+  evidence.
+- Only UDS infrastructure disconnect is retryable. Unsupported input, warnings, missing fonts,
+  fallback, exact exits 20/21/22, or tamper is permanent and produces zero EvidenceAsset,
+  `evidence.other_ready`, or DocumentExtraction. Recovery is manual-required. Profile 1.1.0 stays
+  inactive until T032 golden-corpus acceptance and release-pinned manifest/image deployment.

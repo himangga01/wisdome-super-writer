@@ -214,12 +214,47 @@ def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
     if evidence is None:
         return False
     checksum = evidence.checksum
-    return (
+    material_complete = (
         bool(evidence.object_key)
         and isinstance(checksum, str)
         and len(checksum) == 64
         and all(character in "0123456789abcdef" for character in checksum)
     )
+    if not material_complete:
+        return False
+    try:
+        _verified_legacy_hwp_page_count(evidence.structured_data)
+    except ExtractorError:
+        return False
+    return True
+
+
+def _verified_legacy_hwp_page_count(structured_data: Any) -> int:
+    """Return only the page count carried by a fully validated T015 record."""
+    if not isinstance(structured_data, Mapping):
+        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP provenance is missing")
+    records = structured_data.get("records")
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], Mapping):
+        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP record is ambiguous")
+    record_data = records[0].get("structured_data")
+    if not isinstance(record_data, Mapping):
+        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP report is missing")
+    page_count = record_data.get("converted_page_count")
+    allowlist = record_data.get("follow_up_engine_allowlist")
+    if (
+        type(page_count) is not int
+        or page_count < 1
+        or page_count > 10000
+        or allowlist != ["native_pdf", "paddleocr_ppstructurev3"]
+        or record_data.get("qpdf_validated") is not True
+        or record_data.get("warnings") != []
+        or record_data.get("font_substitutions") != []
+        or record_data.get("fallback_used") is not False
+    ):
+        raise ExtractorError(
+            "legacy_hwp_report_invalid", "Converted HWP page count is not verified"
+        )
+    return page_count
 
 
 def _fail_incomplete_legacy_hwp_locked(
@@ -289,6 +324,7 @@ def _converge_legacy_hwp_document_locked(
                 error_code=error_code,
             )
 
+    page_count = _verified_legacy_hwp_page_count(evidence.structured_data)
     document = _get_or_create_document_extraction(
         run_source_item=attempt.run_source_item,
         source_item=attempt.source_item,
@@ -298,8 +334,8 @@ def _converge_legacy_hwp_document_locked(
         input_kind=DocumentInputKind.PDF,
         input_mime_type="application/pdf",
         input_checksum=evidence.checksum,
-        input_page_count=1,
-        expected_page_indices=[0],
+        input_page_count=page_count,
+        expected_page_indices=list(range(page_count)),
     )
     _enqueue_document_extraction(document)
     return attempt
@@ -1270,7 +1306,17 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 state=ExtractionState.RUNNING,
                 started_at=timezone.now(),
             )
-        output: GenericExtractionOutput = _generic_extractor(profile).extract(path)
+        extractor = _generic_extractor(profile)
+        if profile.engine == ExtractionEngine.LEGACY_HWP:
+            # T015 has no persisted generation field. The explicit generation=1 boundary is
+            # request/response identity only; T016 adds DB-backed fencing before it can advance.
+            output: GenericExtractionOutput = extractor.extract(
+                path,
+                attempt_id=str(attempt.id),
+                generation=1,
+            )
+        else:
+            output = extractor.extract(path)
         result = _store_result("generic", attempt.id, output.as_dict())
         reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
         reason_info = None

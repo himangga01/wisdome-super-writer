@@ -362,6 +362,27 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   taxonomy 결과만 registry 승인 근거로 인정한다. 새 draft나 정책 변경은 기존 health를
   재사용할 수 없다.
 
+## T015 구현 보충: legacy HWP sidecar identity와 실패 이벤트
+
+- legacy HWP도 기존 `evidence.other_extract_requested@1`과 `extract.generic` queue를 그대로
+  사용한다. 별도 HWP Celery queue/event를 만들지 않으며 event payload에는 converter bytes,
+  filesystem path, nonce 또는 report를 넣지 않는다.
+- consumer가 DB의 GenericExtractionAttempt와 승인 profile snapshot을 다시 읽은 뒤 attempt ID를
+  no-network sidecar UDS request identity로 사용한다. T015 호환 `generation=1`과 random nonce는
+  sidecar request/response replay 혼동을 막는 echo material일 뿐 outbox delivery generation이나
+  DB fence가 아니다. persisted generation/lease/stale-result 차단은 T016에서 추가한다.
+- UDS 응답의 attempt/generation/nonce, manifest, policy, input/output checksum·size, qpdf page
+  count가 모두 일치한 경우에만 GenericExtractionAttempt, converted EvidenceAsset과
+  `evidence.other_ready`를 기존 트랜잭션으로 저장한다. report의 verified page count 전체가
+  후속 DocumentExtraction identity와 expected page indices가 된다.
+- socket/daemon 단절만 기존 receipt route의 retryable infrastructure 오류다. unsupported,
+  warning/missing-font/fallback, wrapper exit 20/21/22, protocol/report/PDF tamper는 permanent
+  failure로 terminal callback에 전달한다. 실패 attempt는 EvidenceAsset,
+  `evidence.other_ready`, DocumentExtraction을 0건 만들고 evidence finalizer가 run을
+  `manual_required` recovery로 투영한다.
+- T032 golden corpus 승인 전 profile은 비활성이므로 운영 event producer가 해당 snapshot을
+  approved route로 선택해서는 안 된다.
+
 ## English — T005 Versioned Internal Event Addendum
 
 ### Strict routing and validation
@@ -525,3 +546,20 @@ causally stale complete successfully at the editorial stage instead of remaining
 `validating`. If events already exist, completion requires every frozen generation event
 for the run to be superseded; a partially superseded run leaves its remaining current
 work units eligible.
+
+### T015 legacy-HWP sidecar event boundary
+
+Legacy HWP keeps `evidence.other_extract_requested@1` and the existing generic extraction
+queue. No converter bytes, local paths, nonce, report, new queue, or new domain event is added
+to the broker contract. The consumer reloads the GenericExtractionAttempt and approved profile,
+then uses the attempt UUID plus a compatibility `generation=1` and random nonce only inside the
+bounded UDS request. That generation is not outbox delivery identity or database fencing; T016
+owns persisted generation, lease, and stale-result protection.
+
+Only an exact matching response may persist the attempt result, converted EvidenceAsset, and
+existing `evidence.other_ready` event. Its verified qpdf page count becomes the complete page
+range of the follow-up DocumentExtraction. A UDS daemon disconnect is the only retryable
+infrastructure outcome. Unsupported input, warning/missing-font/fallback, exact wrapper exits
+20/21/22, or protocol/report/PDF tamper is permanent: the terminal callback creates zero
+EvidenceAsset, ready event, or DocumentExtraction and the evidence finalizer projects manual
+recovery. The version 1.1.0 profile remains inactive until T032 golden-corpus acceptance.
