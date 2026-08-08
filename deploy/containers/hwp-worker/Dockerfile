@@ -41,8 +41,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 wisdome-hwp \
     && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wisdome-hwp \
-    && install -d -o 65532 -g 65532 -m 0750 /run/wisdome-hwp /work \
-    && install -d -o root -g root -m 0777 /input \
+    && groupadd --gid 65533 wisdome-hwp-child \
+    && useradd --uid 65533 --gid 65533 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wisdome-hwp-child \
+    && groupadd --gid 65534 wisdome-hwp-validator \
+    && useradd --uid 65534 --gid 65534 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wisdome-hwp-validator \
+    && install -d -o 65532 -g 65532 -m 0700 /run/wisdome-hwp /work \
+    && install -d -o 65532 -g 65532 -m 0700 /input \
     && install -d -o root -g root -m 0555 /opt/wisdome/manifest /etc/wisdome
 
 COPY --from=rhwp-builder /src/rhwp/target/release/rhwp /usr/local/bin/rhwp
@@ -62,9 +66,14 @@ RUN chmod 0555 /usr/local/bin/rhwp /usr/local/bin/wisdome-hwp-sandbox \
        --entry qpdf=/usr/bin/qpdf \
        --entry wrapper=/usr/local/bin/wisdome-hwp-sandbox \
        --entry config=/etc/wisdome/hwp-sandbox-policy.json \
+       --entry runtime=/usr/local/bin/python3.12 \
        --directory font=/usr/share/fonts/opentype/noto \
+       --entry fontconfig=/etc/fonts/fonts.conf \
+       --directory fontconfig=/etc/fonts/conf.avail \
+       --directory runtime=/usr/local/lib/python3.12 \
        --loaded-libraries-for /usr/local/bin/rhwp \
        --loaded-libraries-for /usr/bin/qpdf \
+       --loaded-libraries-for /usr/local/bin/python3.12 \
     && chmod 0444 /opt/wisdome/manifest/converter-manifest.json
 
 USER 65532:65532

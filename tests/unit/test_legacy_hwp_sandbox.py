@@ -5,13 +5,16 @@ import json
 import os
 import runpy
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import yaml
@@ -25,7 +28,8 @@ import django
 django.setup()
 
 from adapters.extractors.base import ExtractorError
-from adapters.extractors.legacy_hwp import LegacyHwpConverter
+from adapters.extractors.legacy_hwp import LegacyHwpConverter, probe_legacy_hwp_sandbox
+from apps.evidence import tasks
 from apps.evidence.profiles import load_profile_documents
 
 
@@ -55,7 +59,10 @@ def _receive_request(connection: socket.socket) -> dict[str, Any]:
     if _read_exact(connection, len(MAGIC)) != MAGIC:
         raise AssertionError("client sent the wrong protocol magic")
     header_length = struct.unpack("!I", _read_exact(connection, 4))[0]
-    return json.loads(_read_exact(connection, header_length).decode("utf-8"))
+    request = json.loads(_read_exact(connection, header_length).decode("utf-8"))
+    if connection.recv(1) != b"":
+        raise AssertionError("client did not half-close or sent trailing request bytes")
+    return request
 
 
 def _report_for(request: dict[str, Any], **changes: Any) -> dict[str, Any]:
@@ -181,6 +188,8 @@ class LegacyHwpClientTests(unittest.TestCase):
             "input_staging_root": str(staging_root.resolve()),
             "converter_manifest_hash": MANIFEST_HASH,
             "golden_corpus_approved": True,
+            "staging_owner_uid": 65532,
+            "staging_owner_gid": 65532,
             "timeout_seconds": 3,
             "max_input_bytes": 1024,
             "max_output_bytes": 4096,
@@ -205,6 +214,7 @@ class LegacyHwpClientTests(unittest.TestCase):
                 output = LegacyHwpConverter(
                     self._config(socket_path, staging_root),
                     socket_factory=lambda _path, _timeout: client_socket,
+                    staging_owner_setter=lambda _path, _uid, _gid: None,
                 ).extract(
                     input_path,
                     attempt_id="11111111-1111-4111-8111-111111111111",
@@ -234,6 +244,17 @@ class LegacyHwpClientTests(unittest.TestCase):
             ["native_pdf", "paddleocr_ppstructurev3"],
         )
         self.assertEqual(durable_bytes, PDF_BYTES)
+        self.assertEqual(record.structured_data["conversion_report"]["nonce"], record.locator["nonce"])
+        self.assertEqual(record.locator["input_byte_size"], len(HWP_BYTES))
+        self.assertEqual(record.locator["output_pdf_byte_size"], len(PDF_BYTES))
+        report_bytes = json.dumps(
+            record.structured_data["conversion_report"],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertEqual(record.locator["sandbox_report_hash"], hashlib.sha256(report_bytes).hexdigest())
         self.assertFalse(output.metadata["partial_text_used"])
         self.assertEqual(remaining, [])
 
@@ -322,10 +343,85 @@ class LegacyHwpClientTests(unittest.TestCase):
                 LegacyHwpConverter(config)
         self.assertEqual(caught.exception.code, "legacy_hwp_profile_inactive")
 
+    def test_staged_input_is_owned_by_the_supervisor_and_read_only(self) -> None:
+        """A root-owned 0400 file is unreadable to the UID 65532 sidecar supervisor."""
+        observed: list[tuple[str, int, int, int]] = []
+
+        def set_owner(path: Path, uid: int, gid: int) -> None:
+            observed.append((path.name, stat.S_IMODE(path.stat().st_mode), uid, gid))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "sample.hwp"
+            source.write_bytes(HWP_BYTES)
+            staging = root / "staging"
+            staging.mkdir()
+            converter = LegacyHwpConverter(
+                self._config(root / "unused.sock", staging),
+                socket_factory=lambda _path, _timeout: socket.socketpair()[0],
+                staging_owner_setter=set_owner,
+            )
+            staged = staging / "material.hwp"
+            converter._prepare_staging_root()
+            converter._stage_input(source, staged)
+
+            expected_mode = 0o444 if os.name == "nt" else 0o400
+            expected_directory_mode = 0o777 if os.name == "nt" else 0o700
+            self.assertEqual(
+                observed,
+                [
+                    ("staging", expected_directory_mode, 65532, 65532),
+                    ("material.hwp", expected_mode, 65532, 65532),
+                ],
+            )
+
+    def test_identity_probe_requires_manifest_policy_and_exact_eof(self) -> None:
+        client, server = socket.socketpair()
+        observed_error: list[BaseException] = []
+
+        def respond() -> None:
+            try:
+                with server:
+                    self.assertEqual(_read_exact(server, 8), b"WSHWPP01")
+                    length = struct.unpack("!I", _read_exact(server, 4))[0]
+                    request = json.loads(_read_exact(server, length))
+                    self.assertEqual(server.recv(1), b"")
+                    response = {
+                        "schema_version": "v1",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "nonce": request["nonce"],
+                        "converter_manifest_hash": MANIFEST_HASH,
+                        "sandbox_policy": {
+                            "network_allowed": False,
+                            "read_only_rootfs": True,
+                            "read_only_input": True,
+                            "private_tmpfs": True,
+                            "non_root": True,
+                            "resource_limits_enforced": True,
+                        },
+                        "ok": True,
+                    }
+                    raw = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+                    server.sendall(b"WSHWPP01" + struct.pack("!I", len(raw)) + raw)
+            except BaseException as exc:
+                observed_error.append(exc)
+
+        thread = threading.Thread(target=respond, daemon=True)
+        thread.start()
+        probe_legacy_hwp_sandbox(
+            "/unused.sock",
+            MANIFEST_HASH,
+            socket_factory=lambda _path, _timeout: client,
+        )
+        thread.join(timeout=5)
+        self.assertEqual(observed_error, [])
+
 
 class LegacyHwpProfileTests(unittest.TestCase):
     def _manifest(self) -> dict[str, Any]:
-        roles = ("converter", "qpdf", "wrapper", "config", "font", "library")
+        roles = (
+            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
+        )
         return {
             "schema_version": "v1",
             "converter": {
@@ -400,7 +496,9 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             root = Path(temporary_directory)
             entries = []
             for index, role in enumerate(
-                ("converter", "qpdf", "wrapper", "config", "font", "library"), start=1
+                (
+                    "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
+                ), start=1
             ):
                 path = root / f"{role}.bin"
                 path.write_bytes(bytes([index]) * index)
@@ -435,7 +533,7 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             sorted(entry["path"] for entry in manifest["files"]),
         )
         self.assertEqual({entry["role"] for entry in manifest["files"]}, {
-            "converter", "qpdf", "wrapper", "config", "font", "library"
+            "converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"
         })
         self.assertTrue(all(entry["byte_size"] > 0 for entry in manifest["files"]))
 
@@ -490,6 +588,101 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
             with self.assertRaises(invalid):
                 open_verified(root, ".", 1, "0" * 64)
 
+    def test_input_and_pdf_snapshots_stream_to_new_bounded_inodes(self) -> None:
+        """Holding complete untrusted input/PDF bytes in memory crosses the sidecar budget."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        snapshot_input = namespace["snapshot_verified_input"]
+        snapshot_pdf = namespace["snapshot_untrusted_pdf"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_root = root / "input"
+            input_root.mkdir()
+            name = "11111111-1111-4111-8111-111111111111-1-" + "a" * 64 + ".hwp"
+            source = input_root / name
+            source.write_bytes(HWP_BYTES)
+            private_input = root / "private.hwp"
+            input_hash = hashlib.sha256(HWP_BYTES).hexdigest()
+            observed_hash, observed_size = snapshot_input(
+                input_root, name, len(HWP_BYTES), input_hash, private_input
+            )
+            untrusted_pdf = root / "untrusted.pdf"
+            untrusted_pdf.write_bytes(PDF_BYTES)
+            trusted_pdf = root / "trusted.pdf"
+            snapshot = snapshot_pdf(untrusted_pdf, trusted_pdf, 4096)
+
+            self.assertEqual((observed_hash, observed_size), (input_hash, len(HWP_BYTES)))
+            self.assertEqual(private_input.read_bytes(), HWP_BYTES)
+            self.assertNotEqual(untrusted_pdf.stat().st_ino, trusted_pdf.stat().st_ino)
+            self.assertEqual(snapshot["sha256"], hashlib.sha256(PDF_BYTES).hexdigest())
+            self.assertEqual(snapshot["byte_size"], len(PDF_BYTES))
+            self.assertEqual(stat.S_IMODE(trusted_pdf.stat().st_mode) & 0o222, 0)
+
+    def test_response_streams_pdf_chunks_instead_of_concatenating_the_frame(self) -> None:
+        """One report+PDF sendall allocation would duplicate the entire converted document."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        send_response = namespace["_send_response"]
+
+        class BoundedConnection:
+            def __init__(self) -> None:
+                self.lengths: list[int] = []
+
+            def sendall(self, value: bytes) -> None:
+                self.lengths.append(len(value))
+                if len(value) > 64 * 1024:
+                    raise AssertionError("response chunk exceeded the streaming bound")
+
+        request = {
+            "attempt_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "nonce": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            pdf_path = Path(temporary_directory) / "large.pdf"
+            pdf_path.write_bytes(b"%PDF-" + b"x" * (2 * 1024 * 1024))
+            connection = BoundedConnection()
+            send_response(
+                connection,
+                request,
+                exit_code=0,
+                report=b"{}",
+                pdf_path=pdf_path,
+                pdf_size=pdf_path.stat().st_size,
+            )
+
+        self.assertGreater(len(connection.lengths), 3)
+        self.assertLessEqual(max(connection.lengths), 64 * 1024)
+
+    def test_log_limit_terminates_the_job_before_wall_clock_timeout(self) -> None:
+        """A post-exit stat check cannot stop an output-flooding child promptly."""
+        namespace = runpy.run_path(str(SANDBOX_SCRIPT))
+        run_bounded = namespace["_run_bounded"]
+        resource_limit = namespace["SandboxResourceLimit"]
+        limits = {
+            "cpu_seconds": 20,
+            "address_space_bytes": 256 * 1024 * 1024,
+            "file_bytes": 16 * 1024 * 1024,
+            "open_files": 64,
+            "processes": 16,
+            "log_bytes": 1024,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            started = time.monotonic()
+            with self.assertRaises(resource_limit):
+                run_bounded(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys,time; sys.stdout.write('x'*4096); sys.stdout.flush(); time.sleep(8)",
+                    ],
+                    cwd=Path(temporary_directory),
+                    environment=os.environ,
+                    timeout_seconds=10,
+                    limits=limits,
+                    process_group=True,
+                )
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3)
+
     def test_compose_declares_a_credential_free_networkless_bounded_sidecar(self) -> None:
         """Removing any container isolation boundary must be visible in parsed Compose config."""
         compose = yaml.safe_load((REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8"))
@@ -501,36 +694,163 @@ class LegacyHwpSandboxArtifactTests(unittest.TestCase):
         self.assertEqual(service["cap_drop"], ["ALL"])
         self.assertIn("no-new-privileges:true", service["security_opt"])
         self.assertGreater(service["pids_limit"], 0)
+        self.assertEqual(service["cap_add"], ["SETUID", "SETGID"])
+        self.assertEqual(service["memswap_limit"], service["mem_limit"])
+        self.assertEqual(service["environment"]["HWP_CHILD_UID"], "65533")
+        self.assertEqual(service["environment"]["HWP_VALIDATOR_UID"], "65534")
         self.assertIn("/work", service["tmpfs"][0])
         serialized_environment = json.dumps(service.get("environment", {})).lower()
         for forbidden in ("database", "redis", "broker", "aws", "minio", "secret", "password"):
             self.assertNotIn(forbidden, serialized_environment)
+        self.assertEqual(
+            compose["services"]["worker-extract"]["command"][-1],
+            "--concurrency=1",
+        )
+        profile_admin = compose["services"]["profile-admin"]
+        self.assertIn("paddle-models:/models/paddleocr:ro", profile_admin["volumes"])
+        self.assertIn("hwp-sandbox-socket:/run/wisdome-hwp:ro", profile_admin["volumes"])
+        self.assertIn("HWP_CONVERTER_MANIFEST_SHA256", profile_admin["environment"])
+        app_dockerfile = (
+            REPOSITORY_ROOT / "deploy/containers/app/Dockerfile"
+        ).read_text(encoding="utf-8")
+        self.assertIn("COPY deploy/containers/hwp-worker ./deploy/containers/hwp-worker", app_dockerfile)
+
+    def test_supervisor_drops_child_identity_and_validates_only_a_trusted_snapshot(self) -> None:
+        source = SANDBOX_SCRIPT.read_text(encoding="utf-8")
+        for boundary in (
+            "os.setgroups([])",
+            "os.setgid(gid)",
+            "os.setuid(uid)",
+            "os.umask(child_umask)",
+            "untrusted.chmod(0o2770)",
+            "child_umask=0o027",
+            "snapshot_via_identity(\n            output,\n            trusted_output",
+            '"snapshot",',
+            "uid=validator_uid",
+            "pass_fds=pass_fds",
+        ):
+            self.assertIn(boundary, source)
+        self.assertLess(
+            source.index("snapshot_via_identity(\n            output,\n            trusted_output"),
+            source.index("uid=validator_uid"),
+        )
 
 
 class LegacyHwpPageCountTests(unittest.TestCase):
+    @staticmethod
+    def _bound_record() -> dict[str, Any]:
+        request = {
+            "attempt_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "nonce": "a" * 64,
+            "input": {
+                "checksum_sha256": hashlib.sha256(HWP_BYTES).hexdigest(),
+                "byte_size": len(HWP_BYTES),
+            },
+        }
+        report = _report_for(request)
+        report_bytes = json.dumps(
+            report, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        return {
+            "locator": {
+                "attempt_id": report["attempt_id"],
+                "generation": report["generation"],
+                "nonce": report["nonce"],
+                "input_checksum": report["input_checksum_sha256"],
+                "input_byte_size": report["input_byte_size"],
+                "output_pdf_checksum": report["output_pdf_checksum_sha256"],
+                "output_pdf_byte_size": report["output_pdf_byte_size"],
+                "converter_manifest_hash": report["converter_manifest_hash"],
+                "sandbox_report_hash": hashlib.sha256(report_bytes).hexdigest(),
+                "page_count": report["page_count"],
+            },
+            "structured_data": {
+                "converted_page_count": report["page_count"],
+                "sandbox_policy": report["sandbox_policy"],
+                "follow_up_engine_allowlist": ["native_pdf", "paddleocr_ppstructurev3"],
+                "qpdf_validated": True,
+                "warnings": [],
+                "font_substitutions": [],
+                "fallback_used": False,
+                "conversion_report": report,
+            },
+        }
+
     def test_verified_conversion_page_count_drives_follow_up_document(self) -> None:
         """Falling back to one page would silently omit converted HWP pages."""
         from apps.evidence import tasks
 
-        structured = {
-            "records": [
-                {
-                    "structured_data": {
-                        "converted_page_count": 7,
-                        "follow_up_engine_allowlist": ["native_pdf", "paddleocr_ppstructurev3"],
-                        "qpdf_validated": True,
-                        "warnings": [],
-                        "font_substitutions": [],
-                        "fallback_used": False,
-                    }
-                }
-            ]
-        }
+        structured = {"records": [self._bound_record()]}
         self.assertEqual(tasks._verified_legacy_hwp_page_count(structured), 7)
         with self.assertRaises(ExtractorError):
             tasks._verified_legacy_hwp_page_count(
                 {"records": [{"structured_data": {"converted_page_count": True}}]}
             )
+
+    def test_pdf_upload_material_is_bound_to_locator_and_exact_report(self) -> None:
+        """Changing the PDF after adapter validation must prevent storage and evidence creation."""
+        record = self._bound_record()
+        self.assertEqual(tasks._verified_legacy_hwp_record_material(record, PDF_BYTES), 7)
+        with self.assertRaises(ExtractorError):
+            tasks._verified_legacy_hwp_record_material(record, PDF_BYTES + b"tamper")
+        report_tamper = json.loads(json.dumps(record))
+        report_tamper["structured_data"]["conversion_report"]["unknown"] = "field"
+        tampered_report = json.dumps(
+            report_tamper["structured_data"]["conversion_report"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        report_tamper["locator"]["sandbox_report_hash"] = hashlib.sha256(
+            tampered_report
+        ).hexdigest()
+        with self.assertRaises(ExtractorError):
+            tasks._verified_legacy_hwp_record_material(report_tamper, PDF_BYTES)
+
+    def test_reused_document_requires_complete_page_and_object_identity(self) -> None:
+        """A checksum-only match must not reuse a one-page or wrong-object projection."""
+        document = SimpleNamespace(
+            run_source_item_id="run-source",
+            source_item_id="source",
+            input_asset_id="asset",
+            input_object_key="key",
+            input_object_version="version",
+            input_kind="pdf",
+            input_mime_type="application/pdf",
+            input_frame_count=None,
+            input_checksum="a" * 64,
+            input_page_count=7,
+            expected_page_indices=list(range(7)),
+        )
+        kwargs = {
+            "run_source_item_id": "run-source",
+            "source_item_id": "source",
+            "input_asset_id": "asset",
+            "input_object_key": "key",
+            "input_object_version": "version",
+            "input_kind": "pdf",
+            "input_mime_type": "application/pdf",
+            "input_frame_count": None,
+            "input_checksum": "a" * 64,
+            "input_page_count": 7,
+            "expected_page_indices": list(range(7)),
+        }
+        tasks._validate_reused_document_identity(document, **kwargs)
+        document.input_page_count = 1
+        with self.assertRaises(Exception):
+            tasks._validate_reused_document_identity(document, **kwargs)
+
+    def test_only_legacy_hwp_attachment_failure_sets_required_manual_marker(self) -> None:
+        """Optional attachments stay partial while a required legacy HWP blocks run.evidence_ready."""
+        self.assertTrue(tasks._is_required_legacy_hwp_attachment({"filename": "required.HWP"}))
+        self.assertFalse(tasks._is_required_legacy_hwp_attachment({"filename": "optional.pdf"}))
+        marker = tasks._legacy_hwp_failure_marker(
+            [{"requiredLegacyHwp": True, "code": "profile_not_approved"}]
+        )
+        self.assertEqual(
+            marker,
+            {"legacyHwpRequiredFailures": 1, "legacyHwpRequiredFailureCodes": ["profile_not_approved"]},
+        )
 
 
 if __name__ == "__main__":

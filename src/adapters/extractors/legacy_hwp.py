@@ -17,11 +17,11 @@ from adapters.extractors.base import (
     GenericEvidenceRecord,
     GenericExtractionOutput,
     sha256_file,
-    sniff_mime,
 )
 
 
 PROTOCOL_MAGIC = b"WSHWP001"
+PROBE_MAGIC = b"WSHWPP01"
 PROTOCOL_VERSION = "wisdome-hwp-uds-v1"
 MAX_HEADER_BYTES = 64 * 1024
 _RESPONSE_FIELDS = frozenset(
@@ -72,6 +72,9 @@ _EXIT_ERRORS = {
     21: ("legacy_hwp_conversion_failed", "Sandboxed HWP conversion failed"),
     22: ("legacy_hwp_resource_limit", "Legacy HWP conversion exceeded a resource limit"),
 }
+_PROBE_RESPONSE_FIELDS = frozenset(
+    {"schema_version", "protocol_version", "nonce", "converter_manifest_hash", "sandbox_policy", "ok"}
+)
 
 
 class _SocketDisconnected(Exception):
@@ -155,6 +158,63 @@ def _default_socket_factory(path: str, timeout: float) -> socket.socket:
     return connection
 
 
+def _default_staging_owner_setter(path: Path, uid: int, gid: int) -> None:
+    """Transfer a staged input to the credential-free sidecar supervisor."""
+    if not hasattr(os, "chown"):
+        raise OSError("staging ownership transfer is unavailable on this platform")
+    os.chown(path, uid, gid)
+
+
+def probe_legacy_hwp_sandbox(
+    socket_path: str,
+    converter_manifest_hash: str,
+    *,
+    timeout_seconds: float = 2.0,
+    socket_factory: Callable[[str, float], socket.socket] | None = None,
+) -> None:
+    """Perform an identity-bearing bounded probe; a connect-only check is insufficient."""
+    if not _is_sha256(converter_manifest_hash):
+        raise ExtractorError("legacy_hwp_converter_unavailable", "Probe manifest hash is invalid")
+    nonce = secrets.token_hex(32)
+    request = {
+        "schema_version": "v1",
+        "protocol_version": PROTOCOL_VERSION,
+        "nonce": nonce,
+        "converter_manifest_hash": converter_manifest_hash,
+    }
+    raw = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    factory = socket_factory or _default_socket_factory
+    try:
+        connection = factory(socket_path, timeout_seconds)
+        connection.settimeout(timeout_seconds)
+        with connection:
+            connection.sendall(PROBE_MAGIC + struct.pack("!I", len(raw)) + raw)
+            connection.shutdown(socket.SHUT_WR)
+            if _read_exact(connection, len(PROBE_MAGIC)) != PROBE_MAGIC:
+                raise _ProtocolViolation("wrong probe response magic")
+            length = struct.unpack("!I", _read_exact(connection, 4))[0]
+            if not 0 < length <= MAX_HEADER_BYTES:
+                raise _ProtocolViolation("probe response length is outside policy")
+            response = _strict_json_object(
+                _read_exact(connection, length), fields=_PROBE_RESPONSE_FIELDS
+            )
+            if (
+                response.get("schema_version") != "v1"
+                or response.get("protocol_version") != PROTOCOL_VERSION
+                or response.get("nonce") != nonce
+                or response.get("converter_manifest_hash") != converter_manifest_hash
+                or response.get("sandbox_policy") != _POLICY
+                or response.get("ok") is not True
+                or connection.recv(1) != b""
+            ):
+                raise _ProtocolViolation("probe response identity mismatch")
+    except (OSError, TimeoutError, socket.timeout, _SocketDisconnected, _ProtocolViolation) as exc:
+        raise ExtractorError(
+            "legacy_hwp_converter_unavailable",
+            "Legacy HWP sandbox identity probe failed",
+        ) from exc
+
+
 class LegacyHwpConverter:
     """Synchronous client for the credential-free, no-network HWP sidecar."""
 
@@ -165,6 +225,7 @@ class LegacyHwpConverter:
         config: Mapping[str, Any],
         *,
         socket_factory: Callable[[str, float], socket.socket] | None = None,
+        staging_owner_setter: Callable[[Path, int, int], None] | None = None,
     ) -> None:
         self.config = dict(config)
         if self.config.get("golden_corpus_approved") is not True:
@@ -185,7 +246,10 @@ class LegacyHwpConverter:
         )
         self.max_report_bytes = _bounded_int(self.config, "max_report_bytes", 64 * 1024, 1024 * 1024)
         self.max_pages = _bounded_int(self.config, "max_pages", 2000, 10000)
+        self.staging_owner_uid = _bounded_int(self.config, "staging_owner_uid", 65532, 2**31 - 1)
+        self.staging_owner_gid = _bounded_int(self.config, "staging_owner_gid", 65532, 2**31 - 1)
         self._socket_factory = socket_factory or _default_socket_factory
+        self._staging_owner_setter = staging_owner_setter or _default_staging_owner_setter
         if (
             self.protocol_version != PROTOCOL_VERSION
             or not self.socket_path
@@ -221,7 +285,7 @@ class LegacyHwpConverter:
             raise ExtractorError("legacy_hwp_input_invalid", "Legacy HWP input size is outside policy")
 
         nonce = secrets.token_hex(32)
-        self.input_staging_root.mkdir(parents=True, exist_ok=True)
+        self._prepare_staging_root()
         staged_name = f"{normalized_attempt_id}-{generation}-{nonce}.hwp"
         staged_path = self.input_staging_root / staged_name
         output_temp: Path | None = None
@@ -282,7 +346,9 @@ class LegacyHwpConverter:
                     "generation": generation,
                     "nonce": nonce,
                     "input_checksum": input_checksum,
+                    "input_byte_size": input_size,
                     "output_pdf_checksum": output_checksum,
+                    "output_pdf_byte_size": output_size,
                     "converter_manifest_hash": self.converter_manifest_hash,
                     "sandbox_report_hash": report_hash,
                     "page_count": report["page_count"],
@@ -297,6 +363,7 @@ class LegacyHwpConverter:
                     "warnings": [],
                     "font_substitutions": [],
                     "fallback_used": False,
+                    "conversion_report": report,
                 },
             )
             return GenericExtractionOutput(
@@ -335,9 +402,37 @@ class LegacyHwpConverter:
                     digest.update(chunk)
                     writer.write(chunk)
             destination.chmod(0o400)
+            self._staging_owner_setter(
+                destination,
+                self.staging_owner_uid,
+                self.staging_owner_gid,
+            )
         except FileExistsError as exc:
             raise ExtractorError("legacy_hwp_request_invalid", "Staging identity already exists") from exc
+        except OSError as exc:
+            destination.unlink(missing_ok=True)
+            raise ExtractorError(
+                "legacy_hwp_converter_unavailable",
+                "Staged HWP ownership could not be transferred to the sandbox supervisor",
+            ) from exc
         return digest.hexdigest(), size
+
+    def _prepare_staging_root(self) -> None:
+        try:
+            self.input_staging_root.mkdir(parents=True, exist_ok=True)
+            if self.input_staging_root.is_symlink() or not self.input_staging_root.is_dir():
+                raise OSError("staging root is not a real directory")
+            self.input_staging_root.chmod(0o700)
+            self._staging_owner_setter(
+                self.input_staging_root,
+                self.staging_owner_uid,
+                self.staging_owner_gid,
+            )
+        except OSError as exc:
+            raise ExtractorError(
+                "legacy_hwp_converter_unavailable",
+                "HWP staging root cannot be assigned to the sandbox supervisor",
+            ) from exc
 
     def _request_conversion(
         self,
@@ -364,6 +459,7 @@ class LegacyHwpConverter:
                 connection.settimeout(float(self.timeout_seconds))
                 with connection:
                     connection.sendall(PROTOCOL_MAGIC + struct.pack("!I", len(request_bytes)) + request_bytes)
+                    connection.shutdown(socket.SHUT_WR)
                     response = self._receive_header(connection, request)
                     exit_code = response["exit_code"]
                     if exit_code != 0:
@@ -453,6 +549,14 @@ class LegacyHwpConverter:
     ) -> dict[str, Any]:
         try:
             report = _strict_json_object(report_bytes, fields=_REPORT_FIELDS)
+            if report_bytes != json.dumps(
+                report,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"):
+                raise _ProtocolViolation("conversion report is not the exact canonical frame")
             identity = ("protocol_version", "attempt_id", "generation", "nonce")
             if report.get("schema_version") != "v1" or any(
                 report.get(field) != request.get(field) for field in identity
@@ -479,9 +583,11 @@ class LegacyHwpConverter:
                 or output_size < 1
                 or output_size > self.max_output_bytes
                 or output_path.stat().st_size != output_size
-                or sniff_mime(output_path) != "application/pdf"
             ):
                 raise _ProtocolViolation("conversion report material mismatch")
+            with output_path.open("rb") as output:
+                if output.read(5) != b"%PDF-":
+                    raise _ProtocolViolation("converted output is not a PDF")
         except (OSError, _ProtocolViolation) as exc:
             raise ExtractorError(
                 "legacy_hwp_report_invalid", "Conversion report or PDF did not match the request"

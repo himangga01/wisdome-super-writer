@@ -3,13 +3,15 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 
-from adapters.extractors.base import sha256_file
+from adapters.extractors.base import ExtractorError, sha256_file
+from adapters.extractors.legacy_hwp import probe_legacy_hwp_sandbox
 
 from .models import ExtractionEngine, ExtractionProfileSnapshot
 from .services import canonical_hash
@@ -56,7 +58,7 @@ LEGACY_HWP_CONVERTER = {
     "cargo_locked": True,
 }
 LEGACY_HWP_REQUIRED_MANIFEST_ROLES = frozenset(
-    {"converter", "qpdf", "wrapper", "config", "font", "library"}
+    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
 )
 
 
@@ -363,10 +365,19 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
         socket_path = Path(str(profile.config.get("sandbox_socket_path", "")))
         manifest_path = Path(str(profile.config.get("converter_manifest_path", "")))
         manifest_hash = str(profile.config.get("converter_manifest_hash", ""))
+        socket_passed = False
+        try:
+            socket_passed = (
+                socket_path.is_absolute()
+                and not socket_path.is_symlink()
+                and stat.S_ISSOCK(socket_path.lstat().st_mode)
+            )
+        except OSError:
+            pass
         stage(
             "hwp.sandbox_socket",
-            socket_path.is_absolute() and socket_path.exists(),
-            "A deployed absolute Unix-domain socket is required",
+            socket_passed,
+            "A deployed absolute Unix-domain socket (not a path placeholder) is required",
         )
         manifest_passed = False
         try:
@@ -381,6 +392,18 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
             "hwp.converter_manifest",
             manifest_passed,
             "The read-only manifest must match the release-pinned expected hash",
+        )
+        probe_passed = False
+        if socket_passed and manifest_passed:
+            try:
+                probe_legacy_hwp_sandbox(str(socket_path), manifest_hash)
+                probe_passed = True
+            except ExtractorError:
+                pass
+        stage(
+            "hwp.sandbox_identity_probe",
+            probe_passed,
+            "The bounded UDS protocol must echo the reviewed manifest and no-network policy",
         )
         stage(
             "hwp.golden_corpus",

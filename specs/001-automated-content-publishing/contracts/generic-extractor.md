@@ -84,13 +84,27 @@ open-file/process 제한을 함께 적용한다. basename만 `O_NOFOLLOW`로 열
 single hardlink, size와 hash를 검사한 뒤 private tmpfs로 복사한다. 기본 Compose는 gVisor를
 강제하지 않으며 지원 Linux 운영환경에서만 선택적 override를 둘 수 있다.
 
+UDS supervisor는 UID/GID 65532로 유지하고 SETUID/SETGID만 허용한다. untrusted exact-CLI child는
+supplementary group/capability 없이 65533으로, qpdf validator는 65534로 내린다. socket/input root와
+supervisor trusted directory는 child가 traverse할 수 없다. 정상·오류 종료 모두 child process
+group을 TERM→KILL→wait 정리한 뒤 untrusted PDF를 streaming hash-copy로 supervisor 소유 새 inode에
+snapshot한다. validator는 그 snapshot의 read-only FD만 상속하며 supervisor만 final report를 만든다.
+
+stdout/stderr는 pipe를 동시에 drain해 합계 1 MiB를 넘는 즉시 전체 job group을 종료한다. request는
+client `SHUT_WR` 뒤 exact EOF여야 하고 response는 header/report/PDF를 64 KiB 이하 chunk로 보낸다.
+tmpfs 768 MiB는 128 MiB input + 300 MiB untrusted PDF + 300 MiB trusted snapshot + bounded log/metadata
+여유이며 container memory/memswap은 1536 MiB로 같다. 기본 extract worker concurrency는 1이고
+scale-out은 worker마다 전용 socket/input volume/converter가 있을 때만 허용한다.
+
 변환기는 `rhwp 0.8.2` full commit
 `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1과 locked `Cargo.lock`로 고정하고
-qpdf 11.3.0이 PDF 구조와 실제 page count를 검증한다. 자동 secondary converter fallback과
+qpdf `11.3.0-1+deb12u1`은 pinned Bookworm runtime과 배포/ABI 경계를 맞추고 binary와 loaded
+library bytes를 manifest에 포함해 PDF 구조와 실제 page count를 검증한다. 자동 secondary converter fallback과
 기본 `--text-as-paths`를 금지한다. 승인 font bytes만 쓰며 warning, missing-font,
 font substitution 또는 fallback 징후는 terminal 실패다.
 
-manifest schema v1은 rhwp/qpdf/loaded library/font/wrapper/policy config의 normalized absolute
+manifest schema v1은 rhwp/qpdf/Python interpreter와 runtime loaded library/font/fontconfig/
+wrapper/policy config의 normalized absolute
 path, SHA-256과 byte size를 기록한다. expected manifest SHA-256은 release/deploy 외부 입력이고
 profile loader가 read-only manifest bytes와 exact compare한다. image 내부 runtime material로
 expected hash를 덮어쓰는 self-approval은 금지한다.
@@ -99,8 +113,10 @@ JSON duplicate key/NaN/unknown field/bool-as-int, 잘못된 magic/version/length
 identity·manifest·policy·checksum·size·MIME·qpdf page count 불일치는 fail closed한다. socket/
 daemon 단절만 retryable이다. unsupported/warning/missing-font, exit 20/21/22 또는 tamper는
 permanent `failed`이며 EvidenceAsset, `evidence.other_ready`, DocumentExtraction을 0건 만든다.
-run은 `manual_required` recovery로 넘긴다. `legacy-hwp-v1@1.1.0`은 T032 golden corpus가 승인한
-HWP subset과 deployment manifest/image digest를 확정하기 전 운영 비활성이다.
+run은 `manual_required` recovery로 넘긴다. `legacy-hwp-v1@1.1.0`은 immutable
+`golden_corpus_approved=false` draft다. T032가 acceptance artifact와 새
+`legacy-hwp-v1@1.2.0(golden_corpus_approved=true)`을 만든 뒤 1.1.0을 retire하기 전까지 운영
+비활성이다.
 
 ## 멱등성과 상태
 
@@ -180,6 +196,11 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
   CPU, wall-time, file-size, descriptor, and process limits are bounded at container and process
   boundaries. Base Compose does not mandate gVisor; a supported Linux deployment may add it as
   an override.
+- The UID 65532 supervisor uses only SETUID/SETGID to launch a no-group/no-capability converter
+  child as 65533 and qpdf validator as 65534. It always cleans the child process group, streams
+  untrusted output into a new supervisor-owned inode, and gives qpdf only a read-only inherited
+  PDF descriptor. Requests require client SHUT_WR/exact EOF; logs and response chunks are hard
+  bounded. Default extract-worker concurrency is one for one converter.
 - Converter material is `rhwp 0.8.2` commit
   `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1, locked Cargo, pinned qpdf, approved
   fonts, loaded libraries, wrapper, and policy config. No automatic fallback and no default
@@ -193,5 +214,6 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
   evidence.
 - Only UDS infrastructure disconnect is retryable. Unsupported input, warnings, missing fonts,
   fallback, exact exits 20/21/22, or tamper is permanent and produces zero EvidenceAsset,
-  `evidence.other_ready`, or DocumentExtraction. Recovery is manual-required. Profile 1.1.0 stays
-  inactive until T032 golden-corpus acceptance and release-pinned manifest/image deployment.
+  `evidence.other_ready`, or DocumentExtraction. Recovery is manual-required. Profile 1.1.0 is
+  an immutable inactive draft. T032 creates the acceptance artifact and profile 1.2.0 with
+  `golden_corpus_approved=true`, then retires 1.1.0.

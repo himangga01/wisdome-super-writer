@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,31 @@ EXTRACTABLE_SOURCE_DISCOVERY_KINDS = (
     SourceDiscoveryKind.CORRECTED,
     SourceDiscoveryKind.RESTORED,
 )
+
+
+def _is_required_legacy_hwp_attachment(attachment: Mapping[str, Any]) -> bool:
+    """Identify only legacy .hwp inputs; other optional attachments keep partial semantics."""
+    candidates = (
+        attachment.get("filename"),
+        attachment.get("url"),
+        attachment.get("title"),
+    )
+    return any(
+        Path(urlparse(str(value)).path).suffix.lower() == ".hwp"
+        for value in candidates
+        if value
+    )
+
+
+def _legacy_hwp_failure_marker(failures: list[Mapping[str, Any]]) -> dict[str, Any]:
+    required = [failure for failure in failures if failure.get("requiredLegacyHwp") is True]
+    if not required:
+        return {}
+    codes = sorted({str(failure.get("code", "legacy_hwp_failed"))[:100] for failure in required})
+    return {
+        "legacyHwpRequiredFailures": len(required),
+        "legacyHwpRequiredFailureCodes": codes,
+    }
 
 
 def _begin_domain_step_observation(
@@ -200,14 +226,141 @@ def _get_or_create_document_extraction(
             "expected_page_indices": expected_page_indices,
         },
     )
-    if not created and (
-        document.run_source_item_id != run_source_item.id
-        or document.source_item_id != source_item.id
-        or document.input_kind != input_kind
-        or document.input_checksum != input_checksum
-    ):
-        raise PermanentEventError("document_input_identity_conflict")
+    if not created:
+        _validate_reused_document_identity(
+            document,
+            run_source_item_id=run_source_item.id,
+            source_item_id=source_item.id,
+            input_asset_id=input_asset.id,
+            input_object_key=input_object_key,
+            input_object_version=input_object_version,
+            input_kind=input_kind,
+            input_mime_type=input_mime_type,
+            input_frame_count=input_frame_count,
+            input_checksum=input_checksum,
+            input_page_count=input_page_count,
+            expected_page_indices=expected_page_indices,
+        )
     return document
+
+
+def _validate_reused_document_identity(document: Any, **expected: Any) -> None:
+    """Fail closed when a fingerprint collision points at different persisted material."""
+    for field, value in expected.items():
+        if getattr(document, field) != value:
+            raise PermanentEventError("document_input_identity_conflict")
+
+
+_LEGACY_HWP_POLICY = {
+    "network_allowed": False,
+    "read_only_rootfs": True,
+    "read_only_input": True,
+    "private_tmpfs": True,
+    "non_root": True,
+    "resource_limits_enforced": True,
+}
+_LEGACY_HWP_REPORT_FIELDS = frozenset(
+    {
+        "schema_version", "protocol_version", "attempt_id", "generation", "nonce",
+        "input_checksum_sha256", "input_byte_size", "output_pdf_checksum_sha256",
+        "output_pdf_byte_size", "page_count", "pdf_mime", "qpdf_validated",
+        "converter_manifest_hash", "sandbox_policy", "warnings", "font_substitutions",
+        "fallback_used", "partial_text_used", "stdout_evidence_used",
+    }
+)
+
+
+def _sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) != {"0"}
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _canonical_uuid(value: Any) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def _verified_legacy_hwp_record_material(
+    record: Mapping[str, Any],
+    pdf_bytes: bytes | None = None,
+) -> int:
+    """Bind the exact supervisor report, locator, and optionally the upload bytes."""
+    locator = record.get("locator")
+    structured = record.get("structured_data")
+    if not isinstance(locator, Mapping) or not isinstance(structured, Mapping):
+        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP provenance is missing")
+    report = structured.get("conversion_report")
+    if not isinstance(report, Mapping):
+        raise ExtractorError("legacy_hwp_report_invalid", "Exact conversion report is missing")
+    try:
+        report_bytes = canonical_bytes(dict(report))
+    except (TypeError, ValueError) as exc:
+        raise ExtractorError("legacy_hwp_report_invalid", "Conversion report is not canonical") from exc
+
+    page_count = report.get("page_count")
+    input_size = report.get("input_byte_size")
+    output_size = report.get("output_pdf_byte_size")
+    generation = report.get("generation")
+    bindings = (
+        (locator.get("attempt_id"), report.get("attempt_id")),
+        (locator.get("generation"), generation),
+        (locator.get("nonce"), report.get("nonce")),
+        (locator.get("input_checksum"), report.get("input_checksum_sha256")),
+        (locator.get("input_byte_size"), input_size),
+        (locator.get("output_pdf_checksum"), report.get("output_pdf_checksum_sha256")),
+        (locator.get("output_pdf_byte_size"), output_size),
+        (locator.get("converter_manifest_hash"), report.get("converter_manifest_hash")),
+        (locator.get("sandbox_report_hash"), hashlib.sha256(report_bytes).hexdigest()),
+        (locator.get("page_count"), page_count),
+        (structured.get("converted_page_count"), page_count),
+    )
+    if (
+        set(report) != _LEGACY_HWP_REPORT_FIELDS
+        or any(left != right for left, right in bindings)
+        or report.get("schema_version") != "v1"
+        or report.get("protocol_version") != "wisdome-hwp-uds-v1"
+        or not _canonical_uuid(report.get("attempt_id"))
+        or type(generation) is not int
+        or generation != 1
+        or not _sha256_hex(report.get("nonce"))
+        or type(input_size) is not int
+        or input_size < 1
+        or type(output_size) is not int
+        or output_size < 1
+        or type(page_count) is not int
+        or not 1 <= page_count <= 10000
+        or not _sha256_hex(report.get("input_checksum_sha256"))
+        or not _sha256_hex(report.get("output_pdf_checksum_sha256"))
+        or not _sha256_hex(report.get("converter_manifest_hash"))
+        or report.get("pdf_mime") != "application/pdf"
+        or report.get("qpdf_validated") is not True
+        or report.get("sandbox_policy") != _LEGACY_HWP_POLICY
+        or report.get("warnings") != []
+        or report.get("font_substitutions") != []
+        or report.get("fallback_used") is not False
+        or report.get("partial_text_used") is not False
+        or report.get("stdout_evidence_used") is not False
+        or structured.get("sandbox_policy") != _LEGACY_HWP_POLICY
+        or structured.get("follow_up_engine_allowlist")
+        != ["native_pdf", "paddleocr_ppstructurev3"]
+        or structured.get("qpdf_validated") is not True
+        or structured.get("warnings") != []
+        or structured.get("font_substitutions") != []
+        or structured.get("fallback_used") is not False
+    ):
+        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP material is not bound")
+    if pdf_bytes is not None and (
+        len(pdf_bytes) != output_size
+        or hashlib.sha256(pdf_bytes).hexdigest() != report.get("output_pdf_checksum_sha256")
+    ):
+        raise ExtractorError("legacy_hwp_output_invalid", "PDF changed after sandbox verification")
+    return page_count
 
 
 def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
@@ -223,8 +376,16 @@ def _has_complete_legacy_hwp_pdf(evidence: EvidenceAsset | None) -> bool:
     if not material_complete:
         return False
     try:
-        _verified_legacy_hwp_page_count(evidence.structured_data)
-    except ExtractorError:
+        page_count = _verified_legacy_hwp_page_count(evidence.structured_data)
+        record = evidence.structured_data["records"][0]
+        locator = record["locator"]
+        if (
+            locator.get("output_pdf_checksum") != evidence.checksum
+            or locator.get("output_pdf_byte_size") != evidence.byte_size
+            or locator.get("page_count") != page_count
+        ):
+            return False
+    except (ExtractorError, KeyError, TypeError):
         return False
     return True
 
@@ -236,25 +397,7 @@ def _verified_legacy_hwp_page_count(structured_data: Any) -> int:
     records = structured_data.get("records")
     if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], Mapping):
         raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP record is ambiguous")
-    record_data = records[0].get("structured_data")
-    if not isinstance(record_data, Mapping):
-        raise ExtractorError("legacy_hwp_report_invalid", "Converted HWP report is missing")
-    page_count = record_data.get("converted_page_count")
-    allowlist = record_data.get("follow_up_engine_allowlist")
-    if (
-        type(page_count) is not int
-        or page_count < 1
-        or page_count > 10000
-        or allowlist != ["native_pdf", "paddleocr_ppstructurev3"]
-        or record_data.get("qpdf_validated") is not True
-        or record_data.get("warnings") != []
-        or record_data.get("font_substitutions") != []
-        or record_data.get("fallback_used") is not False
-    ):
-        raise ExtractorError(
-            "legacy_hwp_report_invalid", "Converted HWP page count is not verified"
-        )
-    return page_count
+    return _verified_legacy_hwp_record_material(records[0])
 
 
 def _fail_incomplete_legacy_hwp_locked(
@@ -1336,6 +1479,9 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             if not converted_path.is_file():
                 raise ExtractorError("legacy_hwp_output_invalid", "Converted PDF disappeared before storage")
             converted_data = converted_path.read_bytes()
+            converted_page_count = _verified_legacy_hwp_record_material(
+                first.as_dict(), converted_data
+            )
             converted_checksum = hashlib.sha256(converted_data).hexdigest()
             info = _storage().put_bytes(
                 key=content_addressed_key(
@@ -1346,7 +1492,12 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                 checksum_sha256=converted_checksum,
                 metadata={"generic_attempt_id": str(attempt.id)},
             )
-            legacy_info = (info, converted_checksum, len(converted_data))
+            legacy_info = (
+                info,
+                converted_checksum,
+                len(converted_data),
+                converted_page_count,
+            )
 
         with transaction.atomic():
             attempt = GenericExtractionAttempt.objects.select_for_update().select_related(
@@ -1378,7 +1529,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             rights = _rights(attempt.run_source_item)
             storage_fields = {}
             if legacy_info:
-                info, converted_checksum, converted_size = legacy_info
+                info, converted_checksum, converted_size, _ = legacy_info
                 storage_fields = {
                     "object_key": info.key,
                     "object_version": info.version_id or info.etag or converted_checksum,
@@ -1450,7 +1601,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             )
 
             if legacy_info:
-                info, converted_checksum, _ = legacy_info
+                info, converted_checksum, _, converted_page_count = legacy_info
                 document = _get_or_create_document_extraction(
                     run_source_item=attempt.run_source_item,
                     source_item=attempt.source_item,
@@ -1460,8 +1611,8 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                     input_kind=DocumentInputKind.PDF,
                     input_mime_type="application/pdf",
                     input_checksum=converted_checksum,
-                    input_page_count=1,
-                    expected_page_indices=[0],
+                    input_page_count=converted_page_count,
+                    expected_page_indices=list(range(converted_page_count)),
                 )
                 _enqueue_document_extraction(document)
     return attempt
@@ -1931,7 +2082,7 @@ def finalize_run_evidence(run_id: str):
             error_code="selected_run_evidence_missing",
         ).exists()
         document_failures = failed_documents.count()
-        generic_failures = GenericExtractionAttempt.objects.filter(
+        generic_failure_attempts = GenericExtractionAttempt.objects.filter(
             run_source_item__run=run, state=ExtractionState.FAILED
         ).exclude(
             input_asset__derivation_type=EvidenceDerivationType.RAW,
@@ -1941,7 +2092,12 @@ def finalize_run_evidence(run_id: str):
                 EvidenceDerivationType.RAW
             ),
             input_asset__parent_asset__raw_input_fingerprint__isnull=True,
-        ).count()
+        )
+        required_legacy_hwp_failure = (
+            int((run.counters or {}).get("legacyHwpRequiredFailures", 0)) > 0
+            or generic_failure_attempts.filter(engine=ExtractionEngine.LEGACY_HWP).exists()
+        )
+        generic_failures = generic_failure_attempts.count()
         failure_count = document_failures + generic_failures
         if step.input_count == 0:
             finished_at = timezone.now()
@@ -2010,13 +2166,19 @@ def finalize_run_evidence(run_id: str):
                 "failures": 0,
                 "noSourceChanges": True,
             }
-        if missing_selected_evidence:
+        if missing_selected_evidence or required_legacy_hwp_failure:
             now = timezone.now()
-            error_code = "selected_run_evidence_missing"
+            error_code = (
+                "legacy_hwp_required_failure"
+                if required_legacy_hwp_failure
+                else "selected_run_evidence_missing"
+            )
             step.output_count = evidence_count
             step.error_code = error_code
             step.error_detail_redacted = (
-                "Selected successful extraction run has no evidence assets"
+                "Required legacy HWP did not produce a verified PDF"
+                if required_legacy_hwp_failure
+                else "Selected successful extraction run has no evidence assets"
             )
             step.state = "failed"
             _project_domain_step_terminal(
@@ -2582,7 +2744,7 @@ def process_run_evidence(run_id: str):
         )
 
     output_count = 0
-    failures: list[dict[str, str]] = []
+    failures: list[dict[str, Any]] = []
     items = run.run_source_items.select_related(
         "source_item", "source_snapshot__source"
     ).filter(
@@ -2609,6 +2771,7 @@ def process_run_evidence(run_id: str):
                         "runSourceItemId": str(run_source_item.id),
                         "attachment": str(attachment.get("title", "attachment"))[:120],
                         "code": getattr(exc, "code", exc.__class__.__name__),
+                        "requiredLegacyHwp": _is_required_legacy_hwp_attachment(attachment),
                     })
         except (DatabaseError, SoftTimeLimitExceeded):
             raise
@@ -2661,6 +2824,7 @@ def process_run_evidence(run_id: str):
             **run.counters,
             "evidence": output_count,
             "extractionFailures": len(failures),
+            **_legacy_hwp_failure_marker(failures),
         }
         run.save(update_fields=("counters",))
         _enqueue_finalize(str(run.id), "fanout-complete")

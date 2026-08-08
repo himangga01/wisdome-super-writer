@@ -374,14 +374,20 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
 - UDS 응답의 attempt/generation/nonce, manifest, policy, input/output checksum·size, qpdf page
   count가 모두 일치한 경우에만 GenericExtractionAttempt, converted EvidenceAsset과
   `evidence.other_ready`를 기존 트랜잭션으로 저장한다. report의 verified page count 전체가
-  후속 DocumentExtraction identity와 expected page indices가 된다.
+  후속 DocumentExtraction identity와 expected page indices가 된다. canonical exact report 전체와
+  report hash를 EvidenceAsset structured data에 보존하고 object upload 직전 실제 PDF checksum/size를
+  report/locator와 다시 대조한다. recovery와 기존 DocumentExtraction 재사용도 같은 결속과 object/page
+  identity 전체를 재검증한다.
 - socket/daemon 단절만 기존 receipt route의 retryable infrastructure 오류다. unsupported,
   warning/missing-font/fallback, wrapper exit 20/21/22, protocol/report/PDF tamper는 permanent
   failure로 terminal callback에 전달한다. 실패 attempt는 EvidenceAsset,
   `evidence.other_ready`, DocumentExtraction을 0건 만들고 evidence finalizer가 run을
   `manual_required` recovery로 투영한다.
-- T032 golden corpus 승인 전 profile은 비활성이므로 운영 event producer가 해당 snapshot을
-  approved route로 선택해서는 안 된다.
+- profile 선택 전에 실패해 attempt가 없더라도 required `.hwp` attachment의 typed failure count/code를
+  run counters에 보존하고 finalizer가 `legacy_hwp_required_failure/manual_required`로 끝낸다. 다른 optional
+  attachment의 부분 성공 의미는 바꾸지 않는다.
+- `legacy-hwp-v1@1.1.0`은 immutable `golden_corpus_approved=false` draft다. T032 acceptance artifact와
+  새 1.2.0 golden profile이 승인된 뒤 1.1.0을 retire하기 전에는 운영 event producer가 선택하면 안 된다.
 
 ## English — T005 Versioned Internal Event Addendum
 
@@ -562,4 +568,7 @@ range of the follow-up DocumentExtraction. A UDS daemon disconnect is the only r
 infrastructure outcome. Unsupported input, warning/missing-font/fallback, exact wrapper exits
 20/21/22, or protocol/report/PDF tamper is permanent: the terminal callback creates zero
 EvidenceAsset, ready event, or DocumentExtraction and the evidence finalizer projects manual
-recovery. The version 1.1.0 profile remains inactive until T032 golden-corpus acceptance.
+recovery. Exact canonical report/locator/object/page bindings are rechecked before upload and
+during recovery. A pre-attempt required-HWP failure is retained as a typed run counter marker.
+Version 1.1.0 remains an immutable inactive draft; T032 creates the acceptance artifact and
+golden 1.2.0 profile, then retires 1.1.0.

@@ -383,15 +383,20 @@
 
 - [X] **Step 2: UDS sidecar와 container 격리를 구성한다.**
 
-  read-only rootfs/input/manifest, private bounded tmpfs output, no network, UID/GID 65532,
-  `cap_drop: ALL`, no-new-privileges, PID/memory/CPU/time/file-size/open-file/process 한도를
-  Compose와 wrapper 양쪽에 적용한다. DB/Redis/MinIO 환경변수나 자격 증명은 converter에 전달하지
-  않는다. 기본 Compose에는 gVisor를 강제하지 않고 지원 Linux 운영환경의 선택적 override로만 둔다.
+  read-only rootfs/input/manifest, private bounded tmpfs output, no network, supervisor UID/GID
+  65532와 SETUID/SETGID만 둔다. converter child 65533과 qpdf validator 65534는 supplementary
+  group/capability와 socket/input 접근 없이 실행한다. 정상/오류 종료 모두 process group을 정리하고,
+  supervisor 소유 새 inode로 streaming snapshot한 PDF만 validator FD로 넘긴다. stdout/stderr 1 MiB,
+  PID/memory/memswap/CPU/time/file-size/open-file/process 한도를 함께 적용한다. 768 MiB tmpfs와
+  1536 MiB memory/memswap은 input 128 + untrusted PDF 300 + trusted PDF 300 MiB와 process 여유를
+  반영한다. DB/Redis/MinIO 자격 증명은 converter에 전달하지 않는다. 기본 Compose에는 gVisor를
+  강제하지 않고 지원 Linux 운영환경의 선택적 override로만 둔다.
 
 - [X] **Step 3: converter 실제 bytes manifest와 외부 expected hash를 연결한다.**
 
   `rhwp v0.8.2` commit `9b16aa9e23f476e2b335d7c029fc9f24a199d63c`, Rust 1.93.1,
-  locked Cargo, qpdf 11.3.0, Noto CJK font bytes, loaded library, wrapper와 policy config를 schema v1
+  locked Cargo, Bookworm ABI와 맞춘 qpdf `11.3.0-1+deb12u1`, Noto CJK/fontconfig, Python
+  interpreter/runtime loaded library, wrapper와 policy config를 schema v1
   manifest에 기록한다. profile loader는 release/deploy가 외부 주입한 expected SHA-256을 보존해
   read-only manifest bytes와 exact compare하며 runtime self-approval을 금지한다.
 
@@ -407,14 +412,17 @@
   partial text나 converter stdout은 evidence로 만들지 않고 verified page count 전체를 새
   DocumentExtraction에 전달한다. 후속 엔진은 native PDF/PaddleOCR만 허용한다. T015의
   `generation=1` echo는 요청 identity일 뿐 DB fencing이 아니며 generation model과 stale-result
-  fence는 T016에서 구현한다.
+  fence는 T016에서 구현한다. canonical exact report 전체와 locator/object checksum·size를 저장하고
+  upload 직전과 recovery에 재검증하며 기존 DocumentExtraction의 object/page identity 전체도 맞춰야 한다.
 
 - [X] **Step 6: 승인된 focused sandbox contract를 검증한다.**
 
-  T032 golden corpus 승인 전 `legacy-hwp-v1@1.1.0`은 비활성이다. unsupported/warning/missing-font,
+  `legacy-hwp-v1@1.1.0`은 immutable `golden_corpus_approved=false` draft다. unsupported/warning/missing-font,
   exit 20/21/22 또는 tamper는 permanent `failed`로 끝나며 EvidenceAsset,
   `evidence.other_ready`, DocumentExtraction을 만들지 않는다. run recovery는 `manual_required`다.
-  실제 image build·외부 HWP 변환·배포는 이번 검증에서 제외한다.
+  실제 image build·외부 HWP 변환·배포는 이번 검증에서 제외한다. worker-extract는 single sidecar에
+  맞춰 concurrency 1이고 scale-out은 worker별 전용 socket/input volume/converter가 필요하다. profile
+  import/verification은 Paddle와 HWP material 및 read-only UDS/manifest를 가진 `profile-admin`을 사용한다.
 
   ```powershell
   .\.venv\Scripts\python.exe -m unittest tests.unit.test_legacy_hwp_sandbox -v
@@ -438,7 +446,8 @@
 - Failure: only UDS infrastructure disconnect is retryable. Unsupported input, warnings, font
   substitution, fallback, exit 20/21/22, or any mismatch is permanent and creates zero
   EvidenceAsset, ready event, or DocumentExtraction; the run requires manual recovery.
-- Activation: the version-bumped profile remains inactive until T032 golden-corpus approval.
+- Activation: immutable profile 1.1.0 stays inactive. T032 creates the acceptance artifact and
+  profile 1.2.0 with `golden_corpus_approved=true`, then retires 1.1.0.
   Deployment still must export the built manifest, pin its SHA-256 and image digest, and may add
   a gVisor override only on a supported Linux runtime.
 
@@ -1510,6 +1519,12 @@
 - [ ] **Step 4: extraction contract와 PDF golden 30페이지를 작성한다.**
 
   text/scan/rotation/table/mixed-language fixture에서 page index·bbox/polygon·reading order·confidence를 검증한다. locator 누락과 저신뢰 high-impact value의 publishable 결과는 0건이어야 한다.
+  legacy HWP는 승인된 지원 corpus와 unsupported/warning/missing-font/exit 20/21/22/tamper 음성
+  corpus를 포함한다. 음성 표본은 EvidenceAsset, `evidence.other_ready`, DocumentExtraction 0건과
+  terminal `manual_required`를 증명하는 acceptance artifact를 만든다. 이 artifact와 실제 pinned
+  image/manifest hash를 결속한 새 immutable `legacy-hwp-v1@1.2.0`을
+  `golden_corpus_approved=true`로 import/승인한 뒤에만 1.1.0 draft를 retire한다. 1.1.0을 수정해
+  활성화하지 않는다.
 
 - [ ] **Step 5: publisher fault-injection 검증을 작성한다.**
 
@@ -1552,6 +1567,14 @@
   git add tests pyproject.toml specs/001-automated-content-publishing/quickstart.md
   git commit -m "test: add automated release verification"
   ```
+
+#### English / AI-readable T032 HWP activation transition
+
+- Profile 1.1.0 remains an immutable `golden_corpus_approved=false` draft.
+- T032 produces a hash-bound acceptance artifact covering the supported corpus and all required
+  permanent/manual negative cases, creates profile 1.2.0 with `golden_corpus_approved=true`, and
+  retires 1.1.0 only after the new profile is approved.
+- No in-place activation or runtime manifest self-approval is permitted.
 
 ### Task 22: T033 최종 문서·추적성 정리
 

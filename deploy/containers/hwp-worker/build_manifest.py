@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Iterable
 
 
-REQUIRED_ROLES = frozenset({"converter", "qpdf", "wrapper", "config", "font", "library"})
+REQUIRED_ROLES = frozenset(
+    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
+)
 
 
 def _sha256(path: Path) -> str:

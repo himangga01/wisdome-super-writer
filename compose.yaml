@@ -232,7 +232,7 @@ services:
       HWP_INPUT_STAGING_ROOT: /var/lib/wisdome-hwp-input
       HWP_CONVERTER_MANIFEST_PATH: /run/wisdome-hwp-manifest/converter-manifest.json
       HWP_CONVERTER_MANIFEST_SHA256: ${HWP_CONVERTER_MANIFEST_SHA256:?set the release-reviewed HWP converter manifest SHA-256}
-    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.document,extract.generic"]
+    command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.document,extract.generic", "--concurrency=1"]
     volumes:
       - hwp-sandbox-socket:/run/wisdome-hwp:ro
       - hwp-sandbox-input:/var/lib/wisdome-hwp-input
@@ -269,28 +269,77 @@ services:
       HWP_RLIMIT_FSIZE_BYTES: "314572800"
       HWP_RLIMIT_NOFILE: "64"
       HWP_RLIMIT_NPROC: "32"
+      HWP_CHILD_UID: "65533"
+      HWP_CHILD_GID: "65533"
+      HWP_VALIDATOR_UID: "65534"
+      HWP_VALIDATOR_GID: "65534"
     network_mode: none
     read_only: true
     user: "65532:65532"
     cap_drop: ["ALL"]
+    cap_add: ["SETUID", "SETGID"]
     security_opt:
       - no-new-privileges:true
     pids_limit: 32
-    mem_limit: 768m
+    mem_limit: 1536m
+    memswap_limit: 1536m
     cpus: "1.0"
     stop_grace_period: 10s
     volumes:
       - hwp-sandbox-socket:/run/wisdome-hwp
       - hwp-sandbox-input:/input:ro
     tmpfs:
-      - /work:rw,noexec,nosuid,nodev,size=384m,uid=65532,gid=65532,mode=0700
+      - /work:rw,noexec,nosuid,nodev,size=768m,uid=65532,gid=65532,mode=0700
     healthcheck:
-      test: ["CMD", "/usr/local/bin/wisdome-hwp-sandbox", "probe", "--socket", "/run/wisdome-hwp/converter.sock"]
+      test: ["CMD", "/usr/local/bin/wisdome-hwp-sandbox", "probe", "--socket", "/run/wisdome-hwp/converter.sock", "--manifest", "/opt/wisdome/manifest/converter-manifest.json"]
       interval: 10s
       timeout: 3s
       retries: 12
       start_period: 10s
     restart: unless-stopped
+
+  profile-admin:
+    <<: *app
+    profiles: ["admin"]
+    environment:
+      <<: *runtime-environment
+      PADDLEOCR_HOME: /models/paddleocr
+      PADDLEOCR_MODEL_MANIFEST_ROOT: /models/paddleocr
+      PADDLE_PDX_CACHE_HOME: /models/paddleocr
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+      HWP_SANDBOX_SOCKET_PATH: /run/wisdome-hwp/converter.sock
+      HWP_INPUT_STAGING_ROOT: /var/lib/wisdome-hwp-input
+      HWP_CONVERTER_MANIFEST_PATH: /run/wisdome-hwp-manifest/converter-manifest.json
+      HWP_CONVERTER_MANIFEST_SHA256: ${HWP_CONVERTER_MANIFEST_SHA256:?set the release-reviewed HWP converter manifest SHA-256}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        python src/manage.py import_extraction_profiles --root config/extraction-profiles
+        python src/manage.py verify_extraction_profile_files --root config/extraction-profiles
+    volumes:
+      - paddle-models:/models/paddleocr:ro
+      - hwp-sandbox-socket:/run/wisdome-hwp:ro
+      - hwp-sandbox-input:/var/lib/wisdome-hwp-input:ro
+      - ${HWP_CONVERTER_MANIFEST_PATH:?set the exported HWP converter manifest path}:/run/wisdome-hwp-manifest/converter-manifest.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      ocr-model-bootstrap:
+        condition: service_completed_successfully
+      hwp-converter:
+        condition: service_healthy
+    networks:
+      - database
+      - broker
+      - object-storage
+    restart: "no"
 
   worker-editorial:
     <<: *app

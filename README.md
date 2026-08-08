@@ -207,6 +207,32 @@ docker compose run --rm ocr-worker python src/manage.py verify_extraction_profil
 검증 실패 시 OCR worker를 운영 큐에 연결하지 마십시오. 모델 bytes 또는 설정이 바뀌면 기존
 프로필을 수정하지 말고 새 profile version과 material hash를 만들어 다시 승인해야 합니다.
 
+## Legacy HWP 격리 변환 준비
+
+Legacy `.hwp`는 일반 worker가 직접 변환하지 않고, 자격 증명이 없고 네트워크가 차단된
+`hwp-converter` sidecar를 UDS로 동기 호출합니다. 릴리스가 검토한 converter manifest 파일과
+그 파일의 SHA-256을 각각 `HWP_CONVERTER_MANIFEST_PATH`,
+`HWP_CONVERTER_MANIFEST_SHA256`으로 외부 주입한 뒤, Paddle 모델과 HWP 구현 파일을 모두 가진
+명시적 관리자 경계에서 프로필을 import/검증합니다.
+
+```powershell
+docker compose --profile admin run --rm profile-admin
+```
+
+`legacy-hwp-v1@1.1.0`은 `golden_corpus_approved=false`인 불변 draft입니다. T032가 지원/미지원,
+warning, missing-font, tamper와 exit 20/21/22를 포함한 승인 artifact를 만든 뒤에만 새
+`legacy-hwp-v1@1.2.0`(`golden_corpus_approved=true`)을 만들고 1.1.0을 retire합니다. 1.1.0을
+제자리 수정하거나 image 내부 manifest hash로 자기 승인하면 안 됩니다.
+
+기본 Compose는 converter supervisor(UID 65532), untrusted 변환 child(65533), qpdf validator
+(65534)를 분리합니다. worker-extract는 sidecar 하나에 맞춰 `--concurrency=1`이며, scale-out은
+각 worker마다 전용 socket/input volume과 전용 converter를 배치하는 운영 override가 먼저
+필요합니다. 기본 gVisor 강제는 없고 지원 Linux 환경에서만 선택 override를 사용합니다.
+tmpfs 768 MiB는 최대 input snapshot 128 MiB + untrusted PDF 300 MiB + trusted snapshot 300 MiB
++ bounded log/metadata 여유를 담고, container memory/memswap 1536 MiB는 변환기·validator 작업
+메모리를 포함합니다. qpdf `11.3.0-1+deb12u1`은 pinned Python Bookworm base와 ABI/package
+출처를 일치시키기 위해 선택했으며 binary와 loaded libraries도 manifest에 고정됩니다.
+
 ## WordPress 연결
 
 WordPress는 HTTPS 사이트와 Core REST API `/wp-json/wp/v2`를 사용합니다.
@@ -450,6 +476,17 @@ statement trigger도 설치합니다. SQLite 개발 DB는 raw `UPDATE`/`DELETE` 
 다른 별칭을 업무 row 변경 전에 거부하고, 업무 entity와 감사 insert가 같은 별칭 및 같은 outer
 transaction에 속하는지 다시 확인합니다. 다중 데이터베이스 감사 mutation은 별도 설계 없이는
 지원되지 않습니다.
+
+### Legacy HWP deployment boundary (English / AI-readable)
+
+Run `docker compose --profile admin run --rm profile-admin` only after supplying the
+release-reviewed manifest path and SHA-256. The service contains both Paddle and HWP
+implementation material and mounts the model, UDS, input, and manifest boundaries read-only.
+Profile 1.1.0 remains an immutable `golden_corpus_approved=false` draft. T032 must produce the
+acceptance artifact and a new 1.2.0 profile with `golden_corpus_approved=true`, then retire 1.1.0.
+The default worker uses concurrency one for one sidecar. Scale-out requires a dedicated
+socket/input volume and converter per worker. qpdf `11.3.0-1+deb12u1` stays pinned to the
+Bookworm runtime and its actual binary/library bytes are included in the release manifest.
 
 ### Audit database role boundary (English)
 

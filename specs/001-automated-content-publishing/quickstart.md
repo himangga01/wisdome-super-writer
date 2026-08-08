@@ -108,6 +108,26 @@ uv run python src/manage.py verify_extraction_profile_snapshots --require-approv
 수정하지 않고 새 version의 draft를 만들어야 한다. 승인 집합이 없거나 draft/retired/hash
 mismatch이면 관련 worker는 시작 전에 실패해야 한다.
 
+### 2.2 Legacy HWP profile-admin과 활성화
+
+운영 HWP manifest는 image에서 계산한 값을 재사용하지 않고 릴리스가 검토한 host file과
+SHA-256을 주입한다. Paddle 모델, HWP 구현 파일, read-only manifest와 실제 UDS identity probe를
+한 경계에서 확인하려면 다음 명시적 서비스를 사용한다.
+
+```powershell
+docker compose --profile admin run --rm profile-admin
+```
+
+기본 `legacy-hwp-v1@1.1.0`은 `golden_corpus_approved=false`인 불변 draft라 승인하지 않는다.
+T032는 지원 corpus 성공뿐 아니라 unsupported, warning, missing-font, tamper, exit 20/21/22가
+EvidenceAsset/ready/DocumentExtraction 0건과 `manual_required`로 끝나는 acceptance artifact를
+먼저 고정한다. 그 artifact와 release image/manifest digest를 결속한 새 1.2.0 profile을
+`golden_corpus_approved=true`로 import/승인하고, 그 다음 1.1.0을 retire한다.
+
+기본 `worker-extract --concurrency=1`과 converter 하나는 한 쌍이다. 수평 확장은 worker마다
+전용 UDS/input volume/converter를 배치한 Linux 운영 override가 있을 때만 허용한다. repo 기본
+Compose는 gVisor를 강제하지 않는다.
+
 ## 3. 로컬 부팅 목표
 
 ```powershell
@@ -603,3 +623,15 @@ uv run python src/manage.py check --deploy
 
 WordPress와 Blogger target이 각각 공식 연결·계약 검증을 통과하고 위 시나리오가 성공하면
 FR-012, FR-023, FR-024와 전체 수용 결과는 PASS다.
+
+## English / AI-readable — Legacy HWP deployment
+
+Use `docker compose --profile admin run --rm profile-admin` with the externally reviewed
+manifest file and SHA-256. The command boundary contains both Paddle and HWP implementation
+material and verifies the real UDS socket type, bounded protocol identity, manifest, and policy.
+Profile 1.1.0 is an immutable inactive draft. T032 creates the acceptance artifact and a new
+1.2.0 profile with `golden_corpus_approved=true`, then retires 1.1.0. Unsupported, warning,
+missing-font, exit 20/21/22, and tamper cases must remain permanent/manual-required with zero
+EvidenceAsset, ready event, or DocumentExtraction. The default topology is one concurrency-one
+extract worker plus one dedicated converter; scale-out requires isolated socket/input volumes
+and a converter per worker.

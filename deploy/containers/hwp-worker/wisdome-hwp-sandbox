@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -27,6 +28,7 @@ except ImportError:  # pragma: no cover - the deployed sidecar is Linux-only
 
 
 PROTOCOL_MAGIC = b"WSHWP001"
+PROBE_MAGIC = b"WSHWPP01"
 PROTOCOL_VERSION = "wisdome-hwp-uds-v1"
 MAX_HEADER_BYTES = 64 * 1024
 EXIT_INVALID_INPUT = 20
@@ -40,7 +42,9 @@ APPROVED_CONVERTER = {
     "rust_version": "1.93.1",
     "cargo_locked": True,
 }
-REQUIRED_ROLES = frozenset({"converter", "qpdf", "wrapper", "config", "font", "library"})
+REQUIRED_ROLES = frozenset(
+    {"converter", "qpdf", "wrapper", "config", "font", "fontconfig", "runtime", "library"}
+)
 REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -52,6 +56,9 @@ REQUEST_FIELDS = frozenset(
         "input",
         "limits",
     }
+)
+PROBE_FIELDS = frozenset(
+    {"schema_version", "protocol_version", "nonce", "converter_manifest_hash"}
 )
 INPUT_FIELDS = frozenset({"relative_path", "checksum_sha256", "byte_size"})
 LIMIT_FIELDS = frozenset(
@@ -191,7 +198,57 @@ def validate_relative_input(value: str) -> str:
     return value
 
 
-def open_verified_input(root: Path, relative_path: str, expected_size: int, expected_hash: str) -> bytes:
+def _stream_snapshot(
+    source_descriptor: int,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_hash: str | None,
+) -> tuple[str, int, bytes]:
+    digest = hashlib.sha256()
+    size = 0
+    prefix = bytearray()
+    destination_descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o400,
+    )
+    try:
+        while True:
+            chunk = os.read(source_descriptor, min(1024 * 1024, expected_size - size + 1))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > expected_size:
+                raise SandboxInvalidInput("untrusted material exceeds its byte limit")
+            if len(prefix) < 8:
+                prefix.extend(chunk[: 8 - len(prefix)])
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                view = view[written:]
+        os.fsync(destination_descriptor)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(destination_descriptor)
+    observed_hash = digest.hexdigest()
+    if size != expected_size or (expected_hash is not None and observed_hash != expected_hash):
+        destination.unlink(missing_ok=True)
+        raise SandboxInvalidInput("untrusted material differs from its declared identity")
+    destination.chmod(0o400)
+    return observed_hash, size, bytes(prefix)
+
+
+def snapshot_verified_input(
+    root: Path,
+    relative_path: str,
+    expected_size: int,
+    expected_hash: str,
+    destination: Path,
+) -> tuple[str, int]:
     validate_relative_input(relative_path)
     if not positive_int(expected_size, 512 * 1024 * 1024) or not is_sha256(expected_hash):
         raise SandboxInvalidInput("input material fields are invalid")
@@ -209,13 +266,182 @@ def open_verified_input(root: Path, relative_path: str, expected_size: int, expe
             or metadata.st_size != expected_size
         ):
             raise SandboxInvalidInput("input is not a single-link regular file of the expected size")
-        with os.fdopen(descriptor, "rb", closefd=False) as source:
-            value = source.read(expected_size + 1)
-        if len(value) != expected_size or sha256_bytes(value) != expected_hash:
-            raise SandboxInvalidInput("input bytes differ from the request")
-        return value
+        observed_hash, observed_size, _ = _stream_snapshot(
+            descriptor,
+            destination,
+            expected_size=expected_size,
+            expected_hash=expected_hash,
+        )
+        return observed_hash, observed_size
     finally:
         os.close(descriptor)
+
+
+def open_verified_input(root: Path, relative_path: str, expected_size: int, expected_hash: str) -> tuple[str, int]:
+    """Compatibility verifier that does not retain the complete input in memory."""
+    with tempfile.TemporaryDirectory(prefix="hwp-input-verify-") as temporary_directory:
+        return snapshot_verified_input(
+            root,
+            relative_path,
+            expected_size,
+            expected_hash,
+            Path(temporary_directory) / "snapshot.hwp",
+        )
+
+
+def snapshot_untrusted_pdf(source: Path, destination: Path, max_output_bytes: int) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise SandboxConverterFailure("private PDF cannot be opened safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not positive_int(metadata.st_size, max_output_bytes)
+        ):
+            raise SandboxConverterFailure("private PDF is not a bounded single-link regular file")
+        try:
+            digest, size, prefix = _stream_snapshot(
+                descriptor,
+                destination,
+                expected_size=metadata.st_size,
+                expected_hash=None,
+            )
+        except SandboxInvalidInput as exc:
+            raise SandboxConverterFailure("private PDF changed during snapshot") from exc
+        if prefix[:5] != b"%PDF-":
+            destination.unlink(missing_ok=True)
+            raise SandboxConverterFailure("private output is not a PDF")
+        return {"sha256": digest, "byte_size": size}
+    finally:
+        os.close(descriptor)
+
+
+def run_snapshot_cli(arguments: argparse.Namespace) -> int:
+    """Trusted post-conversion copier run as the untrusted UID with one supervisor-owned FD."""
+    source = Path(arguments.source)
+    maximum = int(arguments.max_output_bytes)
+    destination_fd = int(arguments.destination_fd)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if (
+            not source.is_absolute()
+            or source.name != "converted.pdf"
+            or source.parent.resolve() != Path.cwd().resolve()
+            or destination_fd < 3
+        ):
+            return 1
+        source_fd = os.open(source, flags)
+        try:
+            metadata = os.fstat(source_fd)
+            destination_metadata = os.fstat(destination_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or not positive_int(metadata.st_size, maximum)
+                or not stat.S_ISREG(destination_metadata.st_mode)
+                or destination_metadata.st_nlink != 1
+                or destination_metadata.st_size != 0
+                or destination_metadata.st_uid == os.geteuid()
+                or (metadata.st_dev, metadata.st_ino)
+                == (destination_metadata.st_dev, destination_metadata.st_ino)
+            ):
+                return 1
+            digest = hashlib.sha256()
+            size = 0
+            prefix = bytearray()
+            while True:
+                chunk = os.read(source_fd, min(1024 * 1024, metadata.st_size - size + 1))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > metadata.st_size:
+                    return 1
+                if len(prefix) < 5:
+                    prefix.extend(chunk[: 5 - len(prefix)])
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            os.fsync(destination_fd)
+            if size != metadata.st_size or bytes(prefix) != b"%PDF-":
+                return 1
+            sys.stdout.buffer.write(canonical_json({
+                "sha256": digest.hexdigest(),
+                "byte_size": size,
+                "pdf_mime": "application/pdf",
+            }))
+            sys.stdout.buffer.flush()
+            return 0
+        finally:
+            os.close(source_fd)
+    except (OSError, ValueError):
+        return 1
+
+
+def snapshot_via_identity(
+    source: Path,
+    destination: Path,
+    *,
+    wrapper_path: Path,
+    workspace: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: int,
+    limits: Mapping[str, int],
+    max_output_bytes: int,
+    uid: int,
+    gid: int,
+) -> dict[str, Any]:
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o400,
+    )
+    try:
+        return_code, stdout, stderr = _run_bounded(
+            [
+                str(wrapper_path),
+                "snapshot",
+                "--source",
+                str(source),
+                "--destination-fd",
+                str(destination_fd),
+                "--max-output-bytes",
+                str(max_output_bytes),
+            ],
+            cwd=workspace,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            limits=limits,
+            process_group=True,
+            uid=uid,
+            gid=gid,
+            pass_fds=(destination_fd,),
+        )
+    finally:
+        os.close(destination_fd)
+    if return_code != 0 or stderr:
+        destination.unlink(missing_ok=True)
+        raise SandboxConverterFailure("trusted streaming snapshot helper failed")
+    snapshot = strict_json(stdout, fields=frozenset({"sha256", "byte_size", "pdf_mime"}))
+    metadata = destination.lstat()
+    if (
+        destination.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size != snapshot.get("byte_size")
+        or not is_sha256(snapshot.get("sha256"))
+        or sha256_file(destination) != snapshot.get("sha256")
+        or snapshot.get("pdf_mime") != "application/pdf"
+    ):
+        destination.unlink(missing_ok=True)
+        raise SandboxConverterFailure("trusted streaming snapshot identity is invalid")
+    destination.chmod(0o400)
+    return snapshot
 
 
 def verify_manifest(path: Path) -> str:
@@ -267,7 +493,13 @@ def verify_manifest(path: Path) -> str:
     return sha256_bytes(raw)
 
 
-def _resource_preexec(limits: Mapping[str, int]):
+def _resource_preexec(
+    limits: Mapping[str, int],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    child_umask: int = 0o077,
+):
     def apply_limits() -> None:
         if resource is None:
             return
@@ -278,34 +510,39 @@ def _resource_preexec(limits: Mapping[str, int]):
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits["open_files"], limits["open_files"]))
         if hasattr(resource, "RLIMIT_NPROC"):
             resource.setrlimit(resource.RLIMIT_NPROC, (limits["processes"], limits["processes"]))
+        os.umask(child_umask)
+        if uid is not None or gid is not None:
+            os.setgroups([])
+        if gid is not None:
+            os.setgid(gid)
+        if uid is not None:
+            os.setuid(uid)
 
     return apply_limits
 
 
 def _terminate_process(process: subprocess.Popen[bytes], *, process_group: bool) -> None:
-    if process.poll() is not None:
-        process.wait()
-        return
     try:
         if process_group and os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
-        else:
+        elif process.poll() is None:
             process.terminate()
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=3)
-        return
+        if process.poll() is None:
+            process.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
     try:
         if process_group and os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        elif process.poll() is None:
             process.kill()
     except ProcessLookupError:
         pass
-    process.wait()
+    if process.poll() is None:
+        process.wait()
 
 
 def _run_bounded(
@@ -316,39 +553,79 @@ def _run_bounded(
     timeout_seconds: int,
     limits: Mapping[str, int],
     process_group: bool,
+    uid: int | None = None,
+    gid: int | None = None,
+    child_umask: int = 0o077,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, bytes, bytes]:
-    stdout_path = cwd / f"stdout-{time.monotonic_ns()}.log"
-    stderr_path = cwd / f"stderr-{time.monotonic_ns()}.log"
+    process: subprocess.Popen[bytes] | None = None
+    streams: list[bytearray] = [bytearray(), bytearray()]
+    overflow = threading.Event()
+    lock = threading.Lock()
+    total = 0
+
+    def drain(pipe: Any, target: bytearray) -> None:
+        nonlocal total
+        try:
+            while True:
+                chunk = os.read(pipe.fileno(), 64 * 1024)
+                if not chunk:
+                    return
+                with lock:
+                    if total + len(chunk) > limits["log_bytes"]:
+                        overflow.set()
+                        return
+                    total += len(chunk)
+                    target.extend(chunk)
+        finally:
+            pipe.close()
+
     try:
-        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=dict(environment),
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                shell=False,
-                start_new_session=process_group and os.name == "posix",
-                preexec_fn=(_resource_preexec(limits) if os.name == "posix" else None),
-                close_fds=True,
-            )
-            try:
-                return_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=process_group and os.name == "posix",
+            preexec_fn=(
+                _resource_preexec(limits, uid=uid, gid=gid, child_umask=child_umask)
+                if os.name == "posix"
+                else None
+            ),
+            close_fds=True,
+            pass_fds=pass_fds if os.name == "posix" else (),
+        )
+        assert process.stdout is not None and process.stderr is not None
+        threads = [
+            threading.Thread(target=drain, args=(process.stdout, streams[0]), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, streams[1]), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + timeout_seconds
+        while process.poll() is None:
+            if overflow.is_set():
                 _terminate_process(process, process_group=process_group)
-                raise SandboxResourceLimit("converter wall-clock limit exceeded") from exc
-        max_log = limits["log_bytes"]
-        if stdout_path.stat().st_size > max_log or stderr_path.stat().st_size > max_log:
+                raise SandboxResourceLimit("converter log limit exceeded")
+            if time.monotonic() >= deadline:
+                _terminate_process(process, process_group=process_group)
+                raise SandboxResourceLimit("converter wall-clock limit exceeded")
+            time.sleep(0.01)
+        for thread in threads:
+            thread.join(timeout=1)
+        if overflow.is_set():
             raise SandboxResourceLimit("converter log limit exceeded")
-        return return_code, stdout_path.read_bytes(), stderr_path.read_bytes()
+        return process.returncode, bytes(streams[0]), bytes(streams[1])
     except OSError as exc:
         if exc.errno in {errno.EFBIG, errno.ENOMEM, errno.ENOSPC, errno.EMFILE, errno.ENFILE}:
             raise SandboxResourceLimit("converter process resource limit exceeded") from exc
         raise SandboxConverterFailure("converter process could not start") from exc
     finally:
-        stdout_path.unlink(missing_ok=True)
-        stderr_path.unlink(missing_ok=True)
+        if process is not None and process_group:
+            _terminate_process(process, process_group=True)
 
 
 def _limits_from_environment(max_output_bytes: int, timeout_seconds: int) -> dict[str, int]:
@@ -393,25 +670,47 @@ def _qpdf_page_count(
     environment: Mapping[str, str],
     timeout_seconds: int,
     limits: Mapping[str, int],
+    uid: int | None = None,
+    gid: int | None = None,
 ) -> int:
-    check_code, check_stdout, check_stderr = _run_bounded(
-        ["/usr/bin/qpdf", "--check", str(output)],
-        cwd=workspace,
-        environment=environment,
-        timeout_seconds=timeout_seconds,
-        limits=limits,
-        process_group=False,
-    )
-    if check_code != 0 or _contains_warning(check_stdout, check_stderr):
-        raise SandboxConverterFailure("qpdf rejected the converted PDF")
-    page_code, page_stdout, page_stderr = _run_bounded(
-        ["/usr/bin/qpdf", "--show-npages", str(output)],
-        cwd=workspace,
-        environment=environment,
-        timeout_seconds=timeout_seconds,
-        limits=limits,
-        process_group=False,
-    )
+    descriptor: int | None = None
+    target = str(output)
+    pass_fds: tuple[int, ...] = ()
+    if uid is not None:
+        descriptor = os.open(
+            output,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        target = f"/proc/self/fd/{descriptor}"
+        pass_fds = (descriptor,)
+    try:
+        check_code, check_stdout, check_stderr = _run_bounded(
+            ["/usr/bin/qpdf", "--check", target],
+            cwd=workspace,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            limits=limits,
+            process_group=uid is not None,
+            uid=uid,
+            gid=gid,
+            pass_fds=pass_fds,
+        )
+        if check_code != 0 or _contains_warning(check_stdout, check_stderr):
+            raise SandboxConverterFailure("qpdf rejected the converted PDF")
+        page_code, page_stdout, page_stderr = _run_bounded(
+            ["/usr/bin/qpdf", "--show-npages", target],
+            cwd=workspace,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            limits=limits,
+            process_group=uid is not None,
+            uid=uid,
+            gid=gid,
+            pass_fds=pass_fds,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     try:
         page_count = int(page_stdout.strip())
     except ValueError as exc:
@@ -419,6 +718,32 @@ def _qpdf_page_count(
     if page_code != 0 or page_stderr or page_count < 1:
         raise SandboxConverterFailure("qpdf page count validation failed")
     return page_count
+
+
+def _read_bounded_regular(path: Path, maximum: int) -> bytes:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not positive_int(metadata.st_size, maximum)
+        ):
+            raise SandboxConverterFailure("bounded child report is not a regular file")
+        value = bytearray()
+        while len(value) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(value)))
+            if not chunk:
+                break
+            value.extend(chunk)
+        if len(value) != metadata.st_size:
+            raise SandboxResourceLimit("child report exceeds its byte limit")
+        return bytes(value)
+    finally:
+        os.close(descriptor)
 
 
 def run_exact_cli(arguments: argparse.Namespace) -> int:
@@ -454,12 +779,14 @@ def run_exact_cli(arguments: argparse.Namespace) -> int:
         if return_code != 0 or _contains_warning(stdout, stderr):
             raise SandboxConverterFailure("rhwp failed or emitted a warning/font fallback")
         output_metadata = output.lstat()
+        with output.open("rb") as converted:
+            pdf_prefix = converted.read(5)
         if (
             output.is_symlink()
             or not stat.S_ISREG(output_metadata.st_mode)
             or output_metadata.st_nlink != 1
             or not 0 < output_metadata.st_size <= max_output_bytes
-            or output.read_bytes()[:5] != b"%PDF-"
+            or pdf_prefix != b"%PDF-"
         ):
             raise SandboxConverterFailure("rhwp output is not a bounded regular PDF")
         page_count = _qpdf_page_count(
@@ -508,8 +835,13 @@ def _read_exact(connection: socket.socket, length: int) -> bytes:
     return b"".join(chunks)
 
 
-def _read_request(connection: socket.socket, server_limits: Mapping[str, int]) -> dict[str, Any]:
-    if _read_exact(connection, len(PROTOCOL_MAGIC)) != PROTOCOL_MAGIC:
+def _read_request(
+    connection: socket.socket,
+    server_limits: Mapping[str, int],
+    *,
+    magic: bytes | None = None,
+) -> dict[str, Any]:
+    if (magic if magic is not None else _read_exact(connection, len(PROTOCOL_MAGIC))) != PROTOCOL_MAGIC:
         raise ProtocolViolation("wrong request magic")
     length = struct.unpack("!I", _read_exact(connection, 4))[0]
     if not 0 < length <= MAX_HEADER_BYTES:
@@ -542,7 +874,40 @@ def _read_request(connection: socket.socket, server_limits: Mapping[str, int]) -
     for field in LIMIT_FIELDS:
         if not positive_int(limits.get(field), server_limits[field]):
             raise ProtocolViolation("request limit exceeds the sidecar policy")
+    if connection.recv(1) != b"":
+        raise ProtocolViolation("request contains trailing bytes")
     return request
+
+
+def _process_probe(connection: socket.socket, manifest_hash: str) -> None:
+    length = struct.unpack("!I", _read_exact(connection, 4))[0]
+    if not 0 < length <= MAX_HEADER_BYTES:
+        raise ProtocolViolation("probe header length is outside policy")
+    request = strict_json(_read_exact(connection, length), fields=PROBE_FIELDS)
+    nonce = request.get("nonce")
+    if (
+        request.get("schema_version") != "v1"
+        or request.get("protocol_version") != PROTOCOL_VERSION
+        or not isinstance(nonce, str)
+        or len(nonce) != 64
+        or any(character not in "0123456789abcdef" for character in nonce)
+        or request.get("converter_manifest_hash") != manifest_hash
+        or connection.recv(1) != b""
+    ):
+        raise ProtocolViolation("probe identity is invalid")
+    response = canonical_json(
+        {
+            "schema_version": "v1",
+            "protocol_version": PROTOCOL_VERSION,
+            "nonce": nonce,
+            "converter_manifest_hash": manifest_hash,
+            "sandbox_policy": SANDBOX_POLICY,
+            "ok": True,
+        }
+    )
+    connection.sendall(PROBE_MAGIC)
+    connection.sendall(struct.pack("!I", len(response)))
+    connection.sendall(response)
 
 
 def _send_response(
@@ -551,10 +916,17 @@ def _send_response(
     *,
     exit_code: int,
     report: bytes = b"",
-    pdf: bytes = b"",
+    pdf_path: Path | None = None,
+    pdf_size: int = 0,
 ) -> None:
-    if exit_code != 0 and (report or pdf):
+    if exit_code != 0 and (report or pdf_path is not None or pdf_size):
         raise ProtocolViolation("failed response cannot contain partial material")
+    if exit_code == 0 and (
+        pdf_path is None
+        or not positive_int(pdf_size, 512 * 1024 * 1024)
+        or pdf_path.stat().st_size != pdf_size
+    ):
+        raise ProtocolViolation("successful response PDF identity is invalid")
     header = canonical_json(
         {
             "schema_version": "v1",
@@ -564,10 +936,18 @@ def _send_response(
             "nonce": request["nonce"],
             "exit_code": exit_code,
             "report_bytes": len(report),
-            "pdf_bytes": len(pdf),
+            "pdf_bytes": pdf_size,
         }
     )
-    connection.sendall(PROTOCOL_MAGIC + struct.pack("!I", len(header)) + header + report + pdf)
+    connection.sendall(PROTOCOL_MAGIC)
+    connection.sendall(struct.pack("!I", len(header)))
+    connection.sendall(header)
+    if report:
+        connection.sendall(report)
+    if pdf_path is not None:
+        with pdf_path.open("rb") as pdf:
+            for chunk in iter(lambda: pdf.read(64 * 1024), b""):
+                connection.sendall(chunk)
 
 
 def _server_limits() -> dict[str, int]:
@@ -596,18 +976,45 @@ def _process_request(
     limits = request["limits"]
     workspace = Path(tempfile.mkdtemp(prefix="job-", dir=work_root))
     try:
-        input_bytes = open_verified_input(
+        child_uid = int(os.environ.get("HWP_CHILD_UID", "65533"))
+        child_gid = int(os.environ.get("HWP_CHILD_GID", "65533"))
+        validator_uid = int(os.environ.get("HWP_VALIDATOR_UID", "65534"))
+        validator_gid = int(os.environ.get("HWP_VALIDATOR_GID", "65534"))
+        if (
+            os.name != "posix"
+            or os.geteuid() in {0, child_uid, validator_uid}
+            or len({os.geteuid(), child_uid, validator_uid}) != 3
+            or min(child_uid, child_gid, validator_uid, validator_gid) < 1
+        ):
+            raise SandboxConverterFailure("sandbox process identities are not separated")
+        workspace.chmod(0o711)
+        untrusted = workspace / "untrusted"
+        trusted = workspace / "trusted"
+        validator_work = workspace / "validator"
+        untrusted.mkdir(mode=0o770)
+        trusted.mkdir(mode=0o700)
+        validator_work.mkdir(mode=0o700)
+        os.chown(untrusted, os.geteuid(), child_gid)
+        os.chown(validator_work, validator_uid, validator_gid)
+        # The supervisor owns the setgid directory, while the child group may create files.
+        # A fresh trusted helper under the child identity later opens only the known output.
+        untrusted.chmod(0o2770)
+        trusted.chmod(0o700)
+        validator_work.chmod(0o700)
+        private_input = untrusted / "input.hwp"
+        output = untrusted / "converted.pdf"
+        child_report_path = untrusted / "child-report.json"
+        trusted_output = trusted / "verified.pdf"
+        snapshot_verified_input(
             input_root,
             request_input["relative_path"],
             request_input["byte_size"],
             request_input["checksum_sha256"],
+            private_input,
         )
-        private_input = workspace / "input.hwp"
-        output = workspace / "converted.pdf"
-        child_report_path = workspace / "child-report.json"
-        private_input.write_bytes(input_bytes)
         private_input.chmod(0o400)
-        environment = _sanitized_environment(workspace)
+        os.chown(private_input, child_uid, child_gid)
+        environment = _sanitized_environment(untrusted)
         environment.update(
             {
                 "HWP_JOB_TIMEOUT_SECONDS": str(limits["timeout_seconds"]),
@@ -629,11 +1036,14 @@ def _process_request(
                 "--report",
                 str(child_report_path),
             ],
-            cwd=workspace,
+            cwd=untrusted,
             environment=environment,
             timeout_seconds=limits["timeout_seconds"],
             limits=process_limits,
             process_group=True,
+            uid=child_uid,
+            gid=child_gid,
+            child_umask=0o027,
         )
         if _was_resource_signal(exit_code):
             _send_response(connection, request, exit_code=EXIT_RESOURCE_LIMIT)
@@ -644,9 +1054,7 @@ def _process_request(
         if exit_code != 0 or _contains_warning(stdout, stderr):
             _send_response(connection, request, exit_code=EXIT_CONVERTER_FAILURE)
             return
-        child_report_raw = child_report_path.read_bytes()
-        if len(child_report_raw) > limits["max_report_bytes"]:
-            raise SandboxResourceLimit("child report exceeds its byte limit")
+        child_report_raw = _read_bounded_regular(child_report_path, limits["max_report_bytes"])
         child_report = strict_json(child_report_raw, fields=CHILD_REPORT_FIELDS)
         if (
             child_report.get("schema_version") != "v1"
@@ -658,17 +1066,30 @@ def _process_request(
             or not positive_int(child_report.get("page_count"), limits["max_pages"])
         ):
             raise SandboxConverterFailure("child conversion report is invalid")
-        output_metadata = output.lstat()
-        if (
-            output.is_symlink()
-            or not stat.S_ISREG(output_metadata.st_mode)
-            or output_metadata.st_nlink != 1
-            or not positive_int(output_metadata.st_size, limits["max_output_bytes"])
-        ):
-            raise SandboxConverterFailure("private PDF output is invalid")
-        pdf = output.read_bytes()
-        if not pdf.startswith(b"%PDF-") or len(pdf) != output_metadata.st_size:
-            raise SandboxConverterFailure("private PDF bytes are invalid")
+        snapshot = snapshot_via_identity(
+            output,
+            trusted_output,
+            wrapper_path=wrapper_path,
+            workspace=untrusted,
+            environment=environment,
+            timeout_seconds=limits["timeout_seconds"],
+            limits=process_limits,
+            max_output_bytes=limits["max_output_bytes"],
+            uid=child_uid,
+            gid=child_gid,
+        )
+        validator_environment = _sanitized_environment(validator_work)
+        verified_page_count = _qpdf_page_count(
+            trusted_output,
+            workspace=validator_work,
+            environment=validator_environment,
+            timeout_seconds=limits["timeout_seconds"],
+            limits=process_limits,
+            uid=validator_uid,
+            gid=validator_gid,
+        )
+        if verified_page_count != child_report["page_count"]:
+            raise SandboxConverterFailure("supervisor qpdf page count differs from child report")
         final_report = canonical_json(
             {
                 "schema_version": "v1",
@@ -678,9 +1099,9 @@ def _process_request(
                 "nonce": request["nonce"],
                 "input_checksum_sha256": request_input["checksum_sha256"],
                 "input_byte_size": request_input["byte_size"],
-                "output_pdf_checksum_sha256": sha256_bytes(pdf),
-                "output_pdf_byte_size": len(pdf),
-                "page_count": child_report["page_count"],
+                "output_pdf_checksum_sha256": snapshot["sha256"],
+                "output_pdf_byte_size": snapshot["byte_size"],
+                "page_count": verified_page_count,
                 "pdf_mime": "application/pdf",
                 "qpdf_validated": True,
                 "converter_manifest_hash": manifest_hash,
@@ -694,7 +1115,14 @@ def _process_request(
         )
         if len(final_report) > limits["max_report_bytes"]:
             raise SandboxResourceLimit("final report exceeds its byte limit")
-        _send_response(connection, request, exit_code=0, report=final_report, pdf=pdf)
+        _send_response(
+            connection,
+            request,
+            exit_code=0,
+            report=final_report,
+            pdf_path=trusted_output,
+            pdf_size=snapshot["byte_size"],
+        )
     except SandboxInvalidInput:
         _send_response(connection, request, exit_code=EXIT_INVALID_INPUT)
     except SandboxResourceLimit:
@@ -717,6 +1145,15 @@ def run_server(arguments: argparse.Namespace) -> int:
         raise RuntimeError("sandbox roots must be absolute")
     if input_root.is_symlink() or not input_root.is_dir() or work_root.is_symlink() or not work_root.is_dir():
         raise RuntimeError("sandbox roots are missing or unsafe")
+    for root in (socket_path.parent, input_root, work_root):
+        metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("sandbox root is not supervisor-only")
     manifest_hash = verify_manifest(manifest_path)
     if socket_path.exists() or socket_path.is_symlink():
         metadata = socket_path.lstat()
@@ -726,22 +1163,26 @@ def run_server(arguments: argparse.Namespace) -> int:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(str(socket_path))
-        socket_path.chmod(0o660)
+        socket_path.chmod(0o600)
         server.listen(8)
         while True:
             connection, _ = server.accept()
             with connection:
                 connection.settimeout(_server_limits()["timeout_seconds"] + 10)
                 try:
-                    request = _read_request(connection, _server_limits())
-                    _process_request(
-                        connection,
-                        request=request,
-                        input_root=input_root,
-                        work_root=work_root,
-                        manifest_hash=manifest_hash,
-                        wrapper_path=wrapper_path,
-                    )
+                    magic = _read_exact(connection, len(PROTOCOL_MAGIC))
+                    if magic == PROBE_MAGIC:
+                        _process_probe(connection, manifest_hash)
+                    else:
+                        request = _read_request(connection, _server_limits(), magic=magic)
+                        _process_request(
+                            connection,
+                            request=request,
+                            input_root=input_root,
+                            work_root=work_root,
+                            manifest_hash=manifest_hash,
+                            wrapper_path=wrapper_path,
+                        )
                 except (ProtocolViolation, SandboxInvalidInput, OSError):
                     continue
     finally:
@@ -753,14 +1194,43 @@ def run_probe(arguments: argparse.Namespace) -> int:
     path = Path(arguments.socket)
     if not hasattr(socket, "AF_UNIX") or not path.is_socket():
         return 1
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(2)
     try:
-        connection.connect(str(path))
-    except OSError:
+        manifest_hash = verify_manifest(Path(arguments.manifest))
+        nonce = hashlib.sha256(f"{os.getpid()}:{time.monotonic_ns()}".encode()).hexdigest()
+        request = canonical_json(
+            {
+                "schema_version": "v1",
+                "protocol_version": PROTOCOL_VERSION,
+                "nonce": nonce,
+                "converter_manifest_hash": manifest_hash,
+            }
+        )
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(2)
+        with connection:
+            connection.connect(str(path))
+            connection.sendall(PROBE_MAGIC + struct.pack("!I", len(request)) + request)
+            connection.shutdown(socket.SHUT_WR)
+            if _read_exact(connection, len(PROBE_MAGIC)) != PROBE_MAGIC:
+                return 1
+            length = struct.unpack("!I", _read_exact(connection, 4))[0]
+            if not 0 < length <= MAX_HEADER_BYTES:
+                return 1
+            response = strict_json(_read_exact(connection, length), fields=frozenset({
+                "schema_version", "protocol_version", "nonce", "converter_manifest_hash", "sandbox_policy", "ok"
+            }))
+            if (
+                response.get("schema_version") != "v1"
+                or response.get("protocol_version") != PROTOCOL_VERSION
+                or response.get("nonce") != nonce
+                or response.get("converter_manifest_hash") != manifest_hash
+                or response.get("sandbox_policy") != SANDBOX_POLICY
+                or response.get("ok") is not True
+                or connection.recv(1) != b""
+            ):
+                return 1
+    except (OSError, RuntimeError, ProtocolViolation):
         return 1
-    finally:
-        connection.close()
     return 0
 
 
@@ -778,7 +1248,15 @@ def main(argv: list[str] | None = None) -> int:
         parser = argparse.ArgumentParser()
         parser.add_argument("probe")
         parser.add_argument("--socket", required=True)
+        parser.add_argument("--manifest", required=True)
         return run_probe(parser.parse_args(argv))
+    if argv and argv[0] == "snapshot":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("snapshot")
+        parser.add_argument("--source", required=True)
+        parser.add_argument("--destination-fd", required=True)
+        parser.add_argument("--max-output-bytes", required=True)
+        return run_snapshot_cli(parser.parse_args(argv))
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", required=True)
     parser.add_argument("--input", required=True)

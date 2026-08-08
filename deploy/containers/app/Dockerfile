@@ -16,6 +16,7 @@ COPY config ./config
 COPY specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml \
     ./specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml
 COPY deploy/containers/app/entrypoint.sh ./deploy/containers/app/entrypoint.sh
+COPY deploy/containers/hwp-worker ./deploy/containers/hwp-worker
 RUN uv sync --frozen --no-dev \
     && chmod 0755 ./deploy/containers/app/entrypoint.sh
 
