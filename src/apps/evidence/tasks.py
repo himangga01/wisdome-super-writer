@@ -5,6 +5,7 @@ import json
 import tempfile
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -51,7 +52,15 @@ from apps.collection.services import (
     project_step_terminal_observation,
 )
 from wisdome_writer.infrastructure.http_safety import redact_url
-from wisdome_writer.infrastructure.outbox import PermanentEventError, enqueue_event
+from wisdome_writer.infrastructure.outbox import (
+    CURRENT_EVENT_CONSUMER_LEASE_TOKEN,
+    CURRENT_EVENT_CONSUMER_LEASE_GENERATION,
+    CURRENT_EVENT_CONSUMER_NAME,
+    CURRENT_EVENT_ID,
+    PermanentEventError,
+    current_event_consumer_attempt,
+    enqueue_event,
+)
 
 from .models import (
     DocumentExtraction,
@@ -60,6 +69,8 @@ from .models import (
     EvidenceDerivationType,
     EvidenceKind,
     ExtractionEngine,
+    ExtractionObjectWriteReservation,
+    ExtractionObjectWriteState,
     ExtractionProfileSnapshot,
     ExtractionRun,
     ExtractionState,
@@ -71,16 +82,33 @@ from .models import (
     RightsStatus,
 )
 from .services import (
+    EvidenceConflict,
+    EvidenceExtractionStopped,
     aggregate_document_extraction,
+    bind_extraction_object_write,
+    begin_document_extraction,
+    begin_evidence_fanout,
+    begin_extraction_run,
+    begin_generic_extraction,
     calculate_publishable,
     calculate_review_subject_hash,
     canonical_hash,
     evidence_content_hash,
+    evidence_fanout_completion_fence,
+    document_extraction_completion_fence,
+    document_evidence_manifest_entry,
+    extraction_run_completion_fence,
     extraction_fingerprint,
     generic_extraction_fingerprint,
     group_routes,
+    generic_extraction_completion_fence,
     normalize_low_confidence_reasons,
+    orphan_unbound_extraction_object_writes,
     profile_material,
+    queue_document_extraction_retry,
+    queue_generic_extraction_retry,
+    mark_extraction_object_uploaded,
+    reserve_extraction_object_write,
     route_pdf_pages,
 )
 
@@ -97,6 +125,39 @@ EXTRACTABLE_SOURCE_DISCOVERY_KINDS = (
     SourceDiscoveryKind.CORRECTED,
     SourceDiscoveryKind.RESTORED,
 )
+
+
+def _legacy_hwp_protocol_generation(database_lease_generation: int) -> int:
+    """The UDS v1 protocol generation is compatibility material, not a DB lease."""
+    if not isinstance(database_lease_generation, int) or database_lease_generation < 1:
+        raise ValueError("database lease generation must be positive")
+    return 1
+
+
+def _current_extraction_delivery(aggregate_id: Any) -> dict[str, Any]:
+    """Return the monotonic routed receipt lease; direct leaf calls are forbidden."""
+    event_id = CURRENT_EVENT_ID.get()
+    lease_generation = CURRENT_EVENT_CONSUMER_LEASE_GENERATION.get()
+    lease_owner = CURRENT_EVENT_CONSUMER_NAME.get()
+    lease_token = CURRENT_EVENT_CONSUMER_LEASE_TOKEN.get()
+    if (
+        event_id
+        and isinstance(lease_generation, int)
+        and lease_generation > 0
+        and lease_owner
+        and lease_token
+    ):
+        return {
+            "source_event_id": event_id,
+            "delivery_count": lease_generation,
+            "lease_generation": lease_generation,
+            "lease_owner": lease_owner,
+            "lease_token": lease_token,
+        }
+    raise PermanentEventError(
+        "routed_extraction_context_required",
+        "Extraction leaf tasks require an owned outbox consumer lease",
+    )
 
 
 def _is_required_legacy_hwp_attachment(attachment: Mapping[str, Any]) -> bool:
@@ -263,7 +324,18 @@ def _get_or_create_document_extraction(
 
 def _validate_reused_document_identity(document: Any, **expected: Any) -> None:
     """Fail closed when a fingerprint collision points at different persisted material."""
-    for field, value in expected.items():
+    immutable_fields = (
+        "run_source_item_id",
+        "source_item_id",
+        "input_asset_id",
+        "input_object_key",
+        "input_object_version",
+        "input_kind",
+        "input_mime_type",
+        "input_checksum",
+    )
+    for field in immutable_fields:
+        value = expected[field]
         if getattr(document, field) != value:
             raise PermanentEventError("document_input_identity_conflict")
 
@@ -447,24 +519,44 @@ def _fail_incomplete_legacy_hwp_locked(
     *,
     error_code: str,
 ) -> GenericExtractionAttempt:
-    attempt.state = ExtractionState.FAILED
-    attempt.error_code = error_code
-    attempt.error_detail_redacted = (
-        "legacy HWP converted PDF material is incomplete"
+    now = timezone.now()
+    run = CollectionRun.objects.get(pk=attempt.run_source_item.run_id)
+    step = RunStep.objects.get(
+        run=run,
+        name="extract",
+        attempt_no=1,
     )
-    attempt.finished_at = timezone.now()
-    attempt.save(
+    step.state = "failed"
+    step.error_code = error_code[:120]
+    step.error_detail_redacted = "legacy HWP converted PDF material is incomplete"
+    step.finished_at = now
+    step.recovery_state = RecoveryState.MANUAL_REQUIRED
+    step.lease_owner = ""
+    step.lease_token = None
+    step.save(
         update_fields=(
             "state",
             "error_code",
             "error_detail_redacted",
             "finished_at",
-            "updated_at",
+            "recovery_state",
+            "lease_owner",
+            "lease_token",
         )
     )
-    _enqueue_finalize(
-        str(attempt.run_source_item.run_id),
-        f"generic-terminal:{attempt.id}",
+    run.state = RunState.FAILED
+    run.error_summary = {"stage": "extract", "code": error_code[:120]}
+    run.completed_at = now
+    run.recovery_state = RecoveryState.MANUAL_REQUIRED
+    run.next_recovery_at = None
+    run.save(
+        update_fields=(
+            "state",
+            "error_summary",
+            "completed_at",
+            "recovery_state",
+            "next_recovery_at",
+        )
     )
     return attempt
 
@@ -533,18 +625,44 @@ def _converge_legacy_hwp_document_locked(
 def _ensure_legacy_hwp_document(
     attempt_id: Any,
 ) -> GenericExtractionAttempt:
+    run_id = GenericExtractionAttempt.objects.values_list(
+        "run_source_item__run_id", flat=True
+    ).get(pk=attempt_id)
     with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        RunStep.objects.select_for_update().get_or_create(
+            run=run, name="extract", attempt_no=1
+        )
         attempt = (
             GenericExtractionAttempt.objects.select_for_update()
-            .select_related(
-                "run_source_item",
-                "source_item",
-                "input_asset",
-                "evidence_asset",
-                "extraction_profile_snapshot",
-            )
             .get(pk=attempt_id)
         )
+        if run.state != RunState.EXTRACTING or run.stop_requested_at is not None:
+            return attempt
+        list(
+            EvidenceAsset.objects.select_for_update()
+            .filter(
+                Q(pk=attempt.evidence_asset_id)
+                | Q(generic_extraction_attempt_id=attempt.id)
+                | Q(producing_generic_attempt_id=attempt.id)
+            )
+            .order_by("id")
+        )
+        list(
+            DocumentExtraction.objects.select_for_update()
+            .filter(
+                Q(input_asset_id=attempt.evidence_asset_id)
+                | Q(run_source_item_id=attempt.run_source_item_id)
+            )
+            .order_by("id")
+        )
+        attempt = GenericExtractionAttempt.objects.select_related(
+            "run_source_item",
+            "source_item",
+            "input_asset",
+            "evidence_asset",
+            "extraction_profile_snapshot",
+        ).get(pk=attempt_id)
         return _converge_legacy_hwp_document_locked(attempt)
 
 
@@ -733,7 +851,30 @@ def _verify_profile(profile: ExtractionProfileSnapshot) -> None:
         raise ExtractorError("model_manifest_mismatch", "Model manifest hash does not match")
 
 
-def _create_raw_evidence(run_source_item) -> EvidenceAsset:
+def _lock_expected_fanout(run_id: Any, fence: Mapping[str, Any]) -> RunStep:
+    run = CollectionRun.objects.select_for_update().get(pk=run_id)
+    step = RunStep.objects.select_for_update().get(
+        run=run,
+        name="extract",
+        attempt_no=1,
+    )
+    if (
+        run.stop_requested_at is not None
+        or step.fanout_completed_at is not None
+        or step.state != "running"
+        or step.lease_generation != fence["expected_generation"]
+        or step.lease_owner != fence["expected_lease_owner"]
+        or step.lease_token != fence["expected_lease_token"]
+    ):
+        raise EvidenceConflict("Evidence fanout lease was lost")
+    return step
+
+
+def _create_raw_evidence(
+    run_source_item,
+    *,
+    fanout_fence: Mapping[str, Any],
+) -> EvidenceAsset:
     item = run_source_item.source_item
     content_hash = evidence_content_hash(text=item.body_text, structured_data=item.metadata, checksum=None)
     fingerprint = _raw_input_fingerprint(
@@ -744,6 +885,7 @@ def _create_raw_evidence(run_source_item) -> EvidenceAsset:
     )
     rights = _rights(run_source_item, scope="record")
     with transaction.atomic():
+        _lock_expected_fanout(run_source_item.run_id, fanout_fence)
         evidence, created = EvidenceAsset.objects.get_or_create(
             raw_input_fingerprint=fingerprint,
             defaults={
@@ -872,19 +1014,110 @@ def _attachment_rights_scope(mime_type: str) -> str:
     return "documentAttachment"
 
 
-def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: bytes, mime_type: str, filename: str):
+def _reusable_object_info(
+    reservation: ExtractionObjectWriteReservation,
+    *,
+    checksum: str,
+    byte_size: int,
+    content_type: str,
+) -> ObjectInfo | None:
+    if reservation.state not in (
+        ExtractionObjectWriteState.UPLOADED,
+        ExtractionObjectWriteState.BOUND,
+    ):
+        return None
+    if (
+        reservation.checksum != checksum
+        or reservation.byte_size != byte_size
+        or reservation.content_type != content_type
+        or not reservation.object_version
+    ):
+        raise EvidenceConflict("Existing object-write envelope differs from replay")
+    return ObjectInfo(
+        key=reservation.object_key,
+        version_id=reservation.object_version,
+        checksum_sha256=reservation.checksum,
+        size=reservation.byte_size,
+        content_type=reservation.content_type,
+        etag=reservation.object_etag,
+    )
+
+
+def _persist_attachment(
+    run_source_item,
+    attachment: Mapping[str, Any],
+    data: bytes,
+    mime_type: str,
+    filename: str,
+    *,
+    fanout_fence: Mapping[str, Any],
+):
     checksum = hashlib.sha256(data).hexdigest()
     key = content_addressed_key(namespace="evidence/raw", checksum_sha256=checksum, filename=filename)
-    info = _storage().put_bytes(
-        key=key,
-        data=data,
+    with transaction.atomic():
+        step = _lock_expected_fanout(run_source_item.run_id, fanout_fence)
+        reservation = reserve_extraction_object_write(
+            aggregate_kind="fanout",
+            aggregate_id=run_source_item.run_id,
+            source_event_id=step.source_event_id,
+            lease_generation=step.lease_generation,
+            lease_owner=step.lease_owner,
+            lease_token=step.lease_token,
+            purpose="raw",
+            object_key=key,
+        )
+    info = _reusable_object_info(
+        reservation,
+        checksum=checksum,
+        byte_size=len(data),
         content_type=mime_type,
-        checksum_sha256=checksum,
-        metadata={
-            "source_item_id": str(run_source_item.source_item_id),
-            "run_source_item_id": str(run_source_item.id),
-        },
     )
+    if info is None:
+        info = _storage().put_bytes(
+            key=key,
+            data=data,
+            content_type=mime_type,
+            checksum_sha256=checksum,
+            metadata={
+                "source_item_id": str(run_source_item.source_item_id),
+                "run_source_item_id": str(run_source_item.id),
+            },
+        )
+        mark_extraction_object_uploaded(
+            reservation.id,
+            object_version=info.version_id or info.etag or checksum,
+            object_etag=info.etag,
+            checksum=info.checksum_sha256,
+            byte_size=info.size,
+            content_type=info.content_type,
+        )
+    stale_after_upload = False
+    with transaction.atomic():
+        try:
+            _lock_expected_fanout(run_source_item.run_id, fanout_fence)
+        except EvidenceConflict:
+            stale_after_upload = True
+    if stale_after_upload:
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="fanout",
+            aggregate_id=run_source_item.run_id,
+            lease_generation=reservation.lease_generation,
+        )
+        raise EvidenceConflict("Evidence fanout lease was lost after object upload")
+    if (
+        info.checksum_sha256 != checksum
+        or info.size != len(data)
+        or info.content_type != mime_type
+    ):
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="fanout",
+            aggregate_id=run_source_item.run_id,
+            lease_generation=reservation.lease_generation,
+        )
+        raise ExtractorError(
+            "raw_object_identity_mismatch",
+            "Stored raw object identity differs from the verified attachment",
+        )
     rights = _rights(
         run_source_item,
         scope=_attachment_rights_scope(mime_type),
@@ -898,6 +1131,7 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
         input_hash=checksum,
     )
     with transaction.atomic():
+        _lock_expected_fanout(run_source_item.run_id, fanout_fence)
         evidence, created = EvidenceAsset.objects.get_or_create(
             raw_input_fingerprint=fingerprint,
             defaults={
@@ -958,6 +1192,7 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
                 content_type=evidence.mime_type,
                 etag=None,
             )
+            bind_extraction_object_write(reservation.id)
             return evidence, canonical_info
         evidence.review_subject_hash = calculate_review_subject_hash(evidence)
         evidence.publishable = calculate_publishable(evidence)
@@ -969,6 +1204,7 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
                 "updated_at",
             )
         )
+        bind_extraction_object_write(reservation.id)
         return evidence, info
 
 
@@ -1027,6 +1263,8 @@ def _metadata_only_attachment(
 def _persist_metadata_only_attachment(
     run_source_item,
     attachment: Mapping[str, Any],
+    *,
+    fanout_fence: Mapping[str, Any],
 ) -> EvidenceAsset:
     declared = _normalized_attachment_mime(
         attachment.get("mime_type")
@@ -1057,6 +1295,7 @@ def _persist_metadata_only_attachment(
         attachment=attachment,
     )
     with transaction.atomic():
+        _lock_expected_fanout(run_source_item.run_id, fanout_fence)
         evidence, created = EvidenceAsset.objects.get_or_create(
             raw_input_fingerprint=fingerprint,
             defaults={
@@ -1110,17 +1349,208 @@ def _persist_metadata_only_attachment(
         return evidence
 
 
-def _store_result(namespace: str, aggregate_id: Any, output: Mapping[str, Any]):
+@contextmanager
+def _leaf_object_write_fence(
+    aggregate: ExtractionRun | GenericExtractionAttempt,
+):
+    if isinstance(aggregate, ExtractionRun):
+        with extraction_run_completion_fence(
+            aggregate.id,
+            expected_parent_generation=aggregate.parent_lease_generation,
+            expected_child_generation=aggregate.lease_generation,
+            expected_lease_owner=aggregate.lease_owner,
+            expected_lease_token=aggregate.lease_token,
+        ) as locked:
+            yield locked
+    else:
+        with generic_extraction_completion_fence(
+            aggregate.id,
+            expected_generation=aggregate.lease_generation,
+            expected_lease_owner=aggregate.lease_owner,
+            expected_lease_token=aggregate.lease_token,
+        ) as locked:
+            yield locked
+
+
+def _store_result(
+    namespace: str,
+    aggregate: ExtractionRun | GenericExtractionAttempt,
+    output: Mapping[str, Any],
+):
     data = canonical_bytes(output)
     checksum = sha256_bytes(data)
-    key = f"evidence/results/{namespace}/{aggregate_id}/{checksum}.json"
-    return _storage().put_bytes(
-        key=key,
-        data=data,
+    key = f"evidence/results/{namespace}/{aggregate.id}/{checksum}.json"
+    with _leaf_object_write_fence(aggregate) as locked:
+        if locked is None:
+            raise EvidenceConflict("Extraction lease was lost before object reservation")
+        reservation = reserve_extraction_object_write(
+            aggregate_kind=(
+                "extraction_run"
+                if isinstance(locked, ExtractionRun)
+                else "generic"
+            ),
+            aggregate_id=locked.id,
+            source_event_id=locked.source_event_id,
+            lease_generation=locked.lease_generation,
+            lease_owner=locked.lease_owner,
+            lease_token=locked.lease_token,
+            purpose="reason" if namespace == "reasons" else "result",
+            object_key=key,
+        )
+    info = _reusable_object_info(
+        reservation,
+        checksum=checksum,
+        byte_size=len(data),
         content_type="application/json",
-        checksum_sha256=checksum,
-        metadata={"aggregate_id": str(aggregate_id)},
     )
+    if info is None:
+        info = _storage().put_bytes(
+            key=key,
+            data=data,
+            content_type="application/json",
+            checksum_sha256=checksum,
+            metadata={"aggregate_id": str(aggregate.id)},
+        )
+        mark_extraction_object_uploaded(
+            reservation.id,
+            object_version=info.version_id or info.etag or checksum,
+            object_etag=info.etag,
+            checksum=info.checksum_sha256,
+            byte_size=info.size,
+            content_type=info.content_type,
+        )
+    with _leaf_object_write_fence(aggregate) as locked:
+        stale_after_upload = locked is None
+    if stale_after_upload:
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind=reservation.aggregate_kind,
+            aggregate_id=reservation.aggregate_id,
+            lease_generation=reservation.lease_generation,
+        )
+        raise EvidenceConflict("Extraction lease was lost after object upload")
+    return info, reservation.id
+
+
+def _store_converted_pdf(
+    attempt: GenericExtractionAttempt,
+    *,
+    converted_path: Path,
+    converted_checksum: str,
+    converted_size: int,
+):
+    converted_key = content_addressed_key(
+        namespace="evidence/converted",
+        checksum_sha256=converted_checksum,
+        filename="converted.pdf",
+    )
+    with _leaf_object_write_fence(attempt) as locked:
+        if locked is None:
+            raise EvidenceConflict(
+                "Extraction lease was lost before converted object reservation"
+            )
+        reservation = reserve_extraction_object_write(
+            aggregate_kind="generic",
+            aggregate_id=locked.id,
+            source_event_id=locked.source_event_id,
+            lease_generation=locked.lease_generation,
+            lease_owner=locked.lease_owner,
+            lease_token=locked.lease_token,
+            purpose="converted",
+            object_key=converted_key,
+        )
+    info = _reusable_object_info(
+        reservation,
+        checksum=converted_checksum,
+        byte_size=converted_size,
+        content_type="application/pdf",
+    )
+    if info is None:
+        info = _storage().put_file(
+            key=converted_key,
+            path=converted_path,
+            content_type="application/pdf",
+            checksum_sha256=converted_checksum,
+            expected_size=converted_size,
+            metadata={"generic_attempt_id": str(attempt.id)},
+        )
+        mark_extraction_object_uploaded(
+            reservation.id,
+            object_version=info.version_id or info.etag or converted_checksum,
+            object_etag=info.etag,
+            checksum=info.checksum_sha256,
+            byte_size=info.size,
+            content_type=info.content_type,
+        )
+    with _leaf_object_write_fence(attempt) as locked:
+        stale_after_upload = locked is None
+    if stale_after_upload:
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="generic",
+            aggregate_id=attempt.id,
+            lease_generation=attempt.lease_generation,
+        )
+        raise EvidenceConflict(
+            "Extraction lease was lost after converted object upload"
+        )
+    if (
+        info.checksum_sha256 != converted_checksum
+        or info.size != converted_size
+        or info.content_type != "application/pdf"
+    ):
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="generic",
+            aggregate_id=attempt.id,
+            lease_generation=attempt.lease_generation,
+        )
+        raise ExtractorError(
+            "legacy_hwp_output_invalid",
+            "Stored PDF identity differs from the verified conversion",
+        )
+    return info, reservation.id
+
+
+def _expected_document_evidence_material(
+    document: DocumentExtraction,
+    run: ExtractionRun,
+    output,
+) -> tuple[str, int]:
+    entries: list[dict[str, str]] = []
+    for page in output.pages:
+        for block in page.blocks:
+            locator = {
+                "locator_type": "document_block",
+                "page_index": page.page_index,
+                "block_id": block.block_id,
+                "block_type": block.block_type,
+                "polygon": block.polygon,
+                "bbox": block.bbox,
+                "reading_order": block.reading_order,
+            }
+            entries.append(
+                document_evidence_manifest_entry(
+                    source_item_id=document.source_item_id,
+                    origin_run_source_item_id=document.run_source_item_id,
+                    parent_asset_id=document.input_asset_id,
+                    document_extraction_id=document.id,
+                    extraction_run_id=run.id,
+                    extraction_profile_snapshot_id=(
+                        run.extraction_profile_snapshot_id
+                    ),
+                    profile_material_hash=run.profile_material_hash,
+                    extraction_method=run.engine,
+                    extractor_version=run.package_version,
+                    extraction_config_hash=run.config_hash,
+                    result_checksum=run.result_checksum,
+                    locator=locator,
+                    evidence_content_hash_value=evidence_content_hash(
+                        text=block.text,
+                        structured_data=block.structured_data,
+                        checksum=None,
+                    ),
+                )
+            )
+    entries.sort(key=lambda entry: (entry["locator_hash"], entry["evidence_content_hash"]))
+    return canonical_hash(entries), len(entries)
 
 
 def _make_document_evidence(document, run, output, run_source_item) -> list[EvidenceAsset]:
@@ -1167,6 +1597,8 @@ def _make_document_evidence(document, run, output, run_source_item) -> list[Evid
                 structured_data=block.structured_data,
                 extraction_method=run.engine,
                 extractor_version=run.package_version,
+                extraction_config_hash=run.config_hash,
+                extraction_result_checksum=run.result_checksum,
                 confidence=block.confidence,
                 confidence_detail=output.confidence_summary,
                 low_confidence_reasons=reasons,
@@ -1187,7 +1619,133 @@ def _make_document_evidence(document, run, output, run_source_item) -> list[Evid
     return created
 
 
-def _run_document_extraction(document_id: Any) -> DocumentExtraction:
+def _load_or_create_document_plan(
+    document_id: Any,
+    *,
+    routes,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID,
+) -> dict[str, ExtractionRun]:
+    selected_by_engine: dict[str, ExtractionRun] = {}
+    route_groups = group_routes(routes)
+    with document_extraction_completion_fence(
+        document_id,
+        expected_generation=expected_generation,
+        expected_lease_owner=expected_lease_owner,
+        expected_lease_token=expected_lease_token,
+    ) as document:
+        if document is None:
+            return selected_by_engine
+        frozen_pages = (
+            document.routing_manifest.get("pages", [])
+            if isinstance(document.routing_manifest, dict)
+            else []
+        )
+        if frozen_pages:
+            expected_routes = {
+                route.page_index: (route.engine, route.reason) for route in routes
+            }
+            if len(frozen_pages) != len(expected_routes):
+                raise ExtractorError(
+                    "routing_manifest_changed",
+                    "Frozen document routing page count changed",
+                )
+            for page in frozen_pages:
+                page_index = page.get("page_index")
+                if expected_routes.get(page_index) != (
+                    page.get("engine"),
+                    page.get("reason"),
+                ):
+                    raise ExtractorError(
+                        "routing_manifest_changed",
+                        "Frozen document routing differs from repeated inspection",
+                    )
+                child = ExtractionRun.objects.select_for_update().get(
+                    pk=page.get("selected_run_id"),
+                    document_extraction=document,
+                )
+                if (
+                    str(child.extraction_profile_snapshot_id)
+                    != str(page.get("profile_snapshot_id"))
+                    or child.engine != page.get("engine")
+                    or page_index not in child.requested_page_indices
+                ):
+                    raise ExtractorError(
+                        "routing_manifest_invalid",
+                        "Frozen extraction profile routing is incompatible",
+                    )
+                selected_by_engine[child.engine] = child
+            if set(selected_by_engine) != set(route_groups):
+                raise ExtractorError(
+                    "routing_manifest_changed",
+                    "Frozen document routing engine set changed",
+                )
+            return selected_by_engine
+
+        for engine, pages in route_groups.items():
+            preferred = None
+            if engine == ExtractionEngine.PADDLEOCR:
+                language = document.run_source_item.source_snapshot.config.get(
+                    "ocrLanguage", "ko"
+                )
+                preferred = "paddle-en-v1" if language == "en" else "paddle-ko-v1"
+            elif engine == ExtractionEngine.NATIVE_PDF:
+                preferred = "native-pdf-v1"
+            profile = _profile(engine, preferred_key=preferred)
+            page_set_hash, fingerprint = extraction_fingerprint(document, profile, pages)
+            child, _ = ExtractionRun.objects.get_or_create(
+                document_extraction=document,
+                extraction_fingerprint=fingerprint,
+                defaults={
+                    "extraction_profile_snapshot": profile,
+                    "engine": engine,
+                    "page_set_hash": page_set_hash,
+                    "requested_page_indices": pages,
+                    "profile_key": profile.profile_key,
+                    "profile_version": profile.profile_version,
+                    "config_hash": profile.config_hash,
+                    "profile_material_hash": profile.profile_material_hash,
+                    "package_version": profile.package_version
+                    or profile.extractor_version,
+                    "runtime_version": profile.runtime_version
+                    or profile.extractor_version,
+                    "pipeline_name": profile.pipeline_name,
+                    "model_manifest": profile.model_manifest,
+                    "model_manifest_hash": profile.model_manifest_hash,
+                    "language_profile": profile.config.get("text_recognition_model"),
+                    "device_type": profile.config.get("device"),
+                    "source_event_id": document.source_event_id,
+                    "parent_lease_generation": document.lease_generation,
+                },
+            )
+            selected_by_engine[engine] = child
+        document.routing_manifest = {
+            "schema_version": "extraction-routing-v2",
+            "pages": [
+                {
+                    "page_index": route.page_index,
+                    "selected_run_id": str(selected_by_engine[route.engine].id),
+                    "profile_snapshot_id": str(
+                        selected_by_engine[route.engine].extraction_profile_snapshot_id
+                    ),
+                    "engine": route.engine,
+                    "reason": route.reason,
+                }
+                for route in routes
+            ],
+        }
+        document.save(update_fields=("routing_manifest", "updated_at"))
+        return selected_by_engine
+
+
+def _run_document_extraction(
+    document_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID,
+) -> DocumentExtraction:
     document = DocumentExtraction.objects.select_related(
         "run_source_item__run",
         "run_source_item__source_snapshot__source",
@@ -1203,6 +1761,14 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
         ExtractionState.LOW_CONFIDENCE,
     ):
         return document
+    with document_extraction_completion_fence(
+        document_id,
+        expected_generation=expected_generation,
+        expected_lease_owner=expected_lease_owner,
+        expected_lease_token=expected_lease_token,
+    ) as current_document:
+        if current_document is None:
+            return DocumentExtraction.objects.get(pk=document_id)
     data = _storage().get_bytes(key=document.input_object_key, version_id=document.input_object_version or None)
     if hashlib.sha256(data).hexdigest() != document.input_checksum:
         raise ExtractorError("input_checksum_mismatch", "Downloaded input checksum differs from provenance")
@@ -1231,70 +1797,61 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
         input_page_count = document.input_page_count
         input_frame_count = document.input_frame_count
         expected_page_indices = document.expected_page_indices
-        with transaction.atomic():
-            document = (
-                DocumentExtraction.objects.select_for_update()
-                .select_related(
-                    "run_source_item__run",
-                    "run_source_item__source_snapshot__source",
-                    "source_item",
-                    "input_asset__generic_extraction_attempt__input_asset",
-                    "input_asset__producing_generic_attempt__input_asset",
-                    "input_asset__parent_asset",
-                )
-                .get(pk=document_id)
-            )
-            if document.state not in (
-                ExtractionState.QUEUED,
-                ExtractionState.RUNNING,
-            ):
-                return document
+        with document_extraction_completion_fence(
+            document_id,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        ) as document:
+            if document is None:
+                return DocumentExtraction.objects.get(pk=document_id)
             document.input_page_count = input_page_count
             document.input_frame_count = input_frame_count
             document.expected_page_indices = expected_page_indices
-            document.state = ExtractionState.RUNNING
-            document.started_at = document.started_at or timezone.now()
             document.full_clean()
-            document.save()
-
-        selected_by_engine: dict[str, ExtractionRun] = {}
-        for engine, pages in group_routes(routes).items():
-            preferred = None
-            if engine == ExtractionEngine.PADDLEOCR:
-                language = document.run_source_item.source_snapshot.config.get("ocrLanguage", "ko")
-                preferred = "paddle-en-v1" if language == "en" else "paddle-ko-v1"
-            elif engine == ExtractionEngine.NATIVE_PDF:
-                preferred = "native-pdf-v1"
-            profile = _profile(engine, preferred_key=preferred)
-            page_set_hash, fingerprint = extraction_fingerprint(document, profile, pages)
-            run, _ = ExtractionRun.objects.get_or_create(
-                document_extraction=document,
-                extraction_fingerprint=fingerprint,
-                defaults={
-                    "extraction_profile_snapshot": profile,
-                    "engine": engine,
-                    "page_set_hash": page_set_hash,
-                    "requested_page_indices": pages,
-                    "profile_key": profile.profile_key,
-                    "profile_version": profile.profile_version,
-                    "config_hash": profile.config_hash,
-                    "profile_material_hash": profile.profile_material_hash,
-                    "package_version": profile.package_version or profile.extractor_version,
-                    "runtime_version": profile.runtime_version or profile.extractor_version,
-                    "pipeline_name": profile.pipeline_name,
-                    "model_manifest": profile.model_manifest,
-                    "model_manifest_hash": profile.model_manifest_hash,
-                    "language_profile": profile.config.get("text_recognition_model"),
-                    "device_type": profile.config.get("device"),
-                },
+            document.save(
+                update_fields=(
+                    "input_page_count",
+                    "input_frame_count",
+                    "expected_page_indices",
+                    "updated_at",
+                )
             )
+
+        route_groups = group_routes(routes)
+        selected_by_engine = _load_or_create_document_plan(
+            document_id,
+            routes=routes,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        )
+        if set(selected_by_engine) != set(route_groups):
+            return DocumentExtraction.objects.get(pk=document_id)
+
+        for engine, pages in route_groups.items():
+            run = selected_by_engine[engine]
             if run.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
-                selected_by_engine[engine] = run
                 continue
-            run.state = ExtractionState.RUNNING
-            run.started_at = timezone.now()
-            run.save(update_fields=("state", "started_at", "updated_at"))
+            run = begin_extraction_run(
+                run.id,
+                expected_parent_generation=expected_generation,
+                expected_parent_lease_owner=expected_lease_owner,
+                expected_parent_lease_token=expected_lease_token,
+            )
+            if run is None:
+                return DocumentExtraction.objects.get(pk=document_id)
+            profile = run.extraction_profile_snapshot
             started = timezone.now()
+            with extraction_run_completion_fence(
+                run.id,
+                expected_parent_generation=expected_generation,
+                expected_child_generation=run.lease_generation,
+                expected_lease_owner=run.lease_owner,
+                expected_lease_token=run.lease_token,
+            ) as current_child:
+                if current_child is None:
+                    return DocumentExtraction.objects.get(pk=document_id)
             if engine == ExtractionEngine.NATIVE_PDF:
                 output = NativePdfExtractor(profile.config).extract(path, pages)
             else:
@@ -1304,7 +1861,9 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                     model_manifest_hash=profile.model_manifest_hash or "",
                     config_hash=profile.config_hash,
                 ).extract(path, pages, input_kind=document.input_kind)
-            result = _store_result("document", run.id, output.as_dict())
+            result, result_reservation_id = _store_result(
+                "document", run, output.as_dict()
+            )
             reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
             terminal_state = (
                 ExtractionState.LOW_CONFIDENCE
@@ -1313,17 +1872,22 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
             )
             reason_info = None
             if reasons:
-                reason_info = _store_result("reasons", run.id, {"reasons": reasons})
+                reason_info, reason_reservation_id = _store_result(
+                    "reasons", run, {"reasons": reasons}
+                )
+            else:
+                reason_reservation_id = None
             finished_at = timezone.now()
             duration_ms = int((finished_at - started).total_seconds() * 1000)
-            with transaction.atomic():
-                run = ExtractionRun.objects.select_for_update().get(pk=run.pk)
-                if run.state in (
-                    ExtractionState.SUCCEEDED,
-                    ExtractionState.LOW_CONFIDENCE,
-                ):
-                    selected_by_engine[engine] = run
-                    continue
+            with extraction_run_completion_fence(
+                run.id,
+                expected_parent_generation=expected_generation,
+                expected_child_generation=run.lease_generation,
+                expected_lease_owner=run.lease_owner,
+                expected_lease_token=run.lease_token,
+            ) as run:
+                if run is None:
+                    return DocumentExtraction.objects.get(pk=document_id)
                 run.state = terminal_state
                 run.processed_page_indices = list(output.processed_page_indices)
                 run.result_object_key = result.key
@@ -1343,6 +1907,18 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                     )
                 run.duration_ms = duration_ms
                 run.finished_at = finished_at
+                (
+                    run.expected_evidence_manifest_hash,
+                    run.expected_evidence_count,
+                ) = _expected_document_evidence_material(document, run, output)
+                run.next_retry_at = None
+                run.lease_owner = ""
+                run.lease_token = None
+                run.terminal_state = "ready"
+                run.terminal_event_key = (
+                    f"extraction.run.ready:{run.id}:generation:"
+                    f"{run.lease_generation}:{run.result_checksum}"
+                )
                 run.full_clean()
                 run.save()
                 _make_document_evidence(
@@ -1351,29 +1927,43 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                     output,
                     document.run_source_item,
                 )
-            selected_by_engine[engine] = run
-
-        document.routing_manifest = {
-            "schema_version": "v1",
-            "pages": [
-                {
-                    "page_index": route.page_index,
-                    "selected_run_id": str(selected_by_engine[route.engine].id),
-                    "engine": route.engine,
-                    "reason": route.reason,
-                }
-                for route in routes
-            ],
-        }
-        document.save(update_fields=("routing_manifest", "updated_at"))
-    with transaction.atomic():
-        document = aggregate_document_extraction(document.id)
+                bind_extraction_object_write(result_reservation_id)
+                if reason_reservation_id is not None:
+                    bind_extraction_object_write(reason_reservation_id)
+    with document_extraction_completion_fence(
+        document_id,
+        expected_generation=expected_generation,
+        expected_lease_owner=expected_lease_owner,
+        expected_lease_token=expected_lease_token,
+    ) as current_document:
+        if current_document is None:
+            return DocumentExtraction.objects.get(pk=document_id)
+        document = aggregate_document_extraction(current_document.id)
         if document.document_complete:
+            ready_event_key = (
+                f"evidence.document_ready:{document.id}:"
+                f"{document.selected_evidence_manifest_hash}"
+            )
+            document.terminal_event_key = ready_event_key
+            document.terminal_state = "ready"
+            document.lease_owner = ""
+            document.lease_token = None
+            document.next_retry_at = None
+            document.save(
+                update_fields=(
+                    "terminal_event_key",
+                    "terminal_state",
+                    "lease_owner",
+                    "lease_token",
+                    "next_retry_at",
+                    "updated_at",
+                )
+            )
             enqueue_event(
                 topic="evidence.document_ready",
                 aggregate_type="DocumentExtraction",
                 aggregate_id=document.id,
-                message_key=f"evidence.document_ready:{document.id}:{document.selected_evidence_manifest_hash}",
+                message_key=ready_event_key,
                 payload={
                     "run_id": str(document.run_source_item.run_id),
                     "run_source_item_id": str(document.run_source_item_id),
@@ -1383,16 +1973,45 @@ def _run_document_extraction(document_id: Any) -> DocumentExtraction:
                     "coverage_manifest_hash": document.coverage_manifest_hash,
                     "selected_evidence_manifest_hash": document.selected_evidence_manifest_hash,
                     "document_complete": True,
+                    "input_asset_id": (
+                        str(document.input_asset_id)
+                        if document.input_asset_id else None
+                    ),
+                    "input_checksum": document.input_checksum,
+                    "input_fingerprint": document.input_fingerprint,
+                    "routing_manifest_hash": canonical_hash(
+                        document.routing_manifest
+                    ),
                 },
             )
         elif document.state in {
             ExtractionState.FAILED,
             ExtractionState.LOW_CONFIDENCE,
         }:
-            _enqueue_finalize(
-                str(document.run_source_item.run_id),
-                f"document-terminal:{document.id}:{document.state}",
+            cause = (
+                f"document-terminal:{document.id}:generation:"
+                f"{expected_generation}:{document.state}"
             )
+            document.terminal_event_key = (
+                f"evidence.finalize_requested:{document.run_source_item.run_id}:{cause}"
+            )
+            document.terminal_state = (
+                "ready"
+                if document.state == ExtractionState.LOW_CONFIDENCE
+                else "failed"
+            )
+            document.lease_owner = ""
+            document.lease_token = None
+            document.save(
+                update_fields=(
+                    "terminal_event_key",
+                    "terminal_state",
+                    "lease_owner",
+                    "lease_token",
+                    "updated_at",
+                )
+            )
+            _enqueue_finalize(str(document.run_source_item.run_id), cause)
     return document
 
 
@@ -1469,7 +2088,13 @@ def _is_audit_only_document(
     )
 
 
-def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
+def _run_generic_extraction(
+    attempt_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID,
+) -> GenericExtractionAttempt:
     attempt = GenericExtractionAttempt.objects.select_related(
         "run_source_item__run", "run_source_item__source_snapshot__source", "source_item",
         "input_asset__parent_asset", "evidence_asset", "extraction_profile_snapshot",
@@ -1523,27 +2148,34 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                     "Downloaded input checksum differs from provenance",
                 )
             path.write_bytes(data)
-        with transaction.atomic():
-            GenericExtractionAttempt.objects.select_for_update().filter(pk=attempt.id).update(
-                state=ExtractionState.RUNNING,
-                started_at=timezone.now(),
-            )
+        with generic_extraction_completion_fence(
+            attempt.id,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        ) as current_attempt:
+            if current_attempt is None:
+                return GenericExtractionAttempt.objects.get(pk=attempt.id)
         extractor = _generic_extractor(profile)
         if profile.engine == ExtractionEngine.LEGACY_HWP:
-            # T015 has no persisted generation field. The explicit generation=1 boundary is
-            # request/response identity only; T016 adds DB-backed fencing before it can advance.
             output: GenericExtractionOutput = extractor.extract(
                 path,
                 attempt_id=str(attempt.id),
-                generation=1,
+                generation=_legacy_hwp_protocol_generation(expected_generation),
             )
         else:
             output = extractor.extract(path)
-        result = _store_result("generic", attempt.id, output.as_dict())
+        result, result_reservation_id = _store_result(
+            "generic", attempt, output.as_dict()
+        )
         reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
         reason_info = None
         if reasons:
-            reason_info = _store_result("reasons", attempt.id, {"reasons": reasons})
+            reason_info, reason_reservation_id = _store_result(
+                "reasons", attempt, {"reasons": reasons}
+            )
+        else:
+            reason_reservation_id = None
         records = [record.as_dict() for record in output.records]
         first = output.records[0] if output.records else None
         if first is None:
@@ -1573,40 +2205,28 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                     "legacy_hwp_output_invalid",
                     "Converted PDF changed before storage",
                 )
-            info = _storage().put_file(
-                key=content_addressed_key(
-                    namespace="evidence/converted", checksum_sha256=converted_checksum, filename="converted.pdf"
-                ),
-                path=converted_path,
-                content_type="application/pdf",
-                checksum_sha256=converted_checksum,
-                expected_size=converted_size,
-                metadata={"generic_attempt_id": str(attempt.id)},
+            info, converted_reservation_id = _store_converted_pdf(
+                attempt,
+                converted_path=converted_path,
+                converted_checksum=converted_checksum,
+                converted_size=converted_size,
             )
-            if (
-                info.checksum_sha256 != converted_checksum
-                or info.size != converted_size
-                or info.content_type != "application/pdf"
-            ):
-                raise ExtractorError(
-                    "legacy_hwp_output_invalid",
-                    "Stored PDF identity differs from the verified conversion",
-                )
             legacy_info = (
                 info,
                 converted_checksum,
                 converted_size,
                 converted_page_count,
+                converted_reservation_id,
             )
 
-        with transaction.atomic():
-            attempt = GenericExtractionAttempt.objects.select_for_update().select_related(
-                "run_source_item__run",
-                "run_source_item__source_snapshot__source",
-                "source_item",
-                "input_asset__parent_asset",
-                "extraction_profile_snapshot",
-            ).get(pk=attempt_id)
+        with generic_extraction_completion_fence(
+            attempt_id,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        ) as attempt:
+            if attempt is None:
+                return GenericExtractionAttempt.objects.get(pk=attempt_id)
             if _is_quarantined_generic_attempt(attempt):
                 return attempt
             if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
@@ -1622,6 +2242,14 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                     reason_info.version_id or reason_info.etag
                 )
             attempt.finished_at = timezone.now()
+            attempt.next_retry_at = None
+            attempt.lease_owner = ""
+            attempt.lease_token = None
+            ready_event_key = (
+                f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
+            )
+            attempt.terminal_event_key = ready_event_key
+            attempt.terminal_state = "ready"
             attempt.full_clean()
             attempt.save()
 
@@ -1629,7 +2257,7 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             rights = _rights(attempt.run_source_item)
             storage_fields = {}
             if legacy_info:
-                info, converted_checksum, converted_size, _ = legacy_info
+                info, converted_checksum, converted_size, _, _ = legacy_info
                 storage_fields = {
                     "object_key": info.key,
                     "object_version": info.version_id or info.etag or converted_checksum,
@@ -1676,12 +2304,24 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
             evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
             attempt.evidence_asset = evidence
             attempt.save(update_fields=("evidence_asset", "updated_at"))
+            bind_extraction_object_write(result_reservation_id)
+            if reason_reservation_id is not None:
+                bind_extraction_object_write(reason_reservation_id)
+            if legacy_info:
+                bind_extraction_object_write(legacy_info[4])
 
+            attempt.save(
+                update_fields=(
+                    "terminal_event_key",
+                    "terminal_state",
+                    "updated_at",
+                )
+            )
             enqueue_event(
                 topic="evidence.other_ready",
                 aggregate_type="GenericExtractionAttempt",
                 aggregate_id=attempt.id,
-                message_key=f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}",
+                message_key=ready_event_key,
                 payload={
                     "run_id": str(attempt.run_source_item.run_id),
                     "run_source_item_id": str(attempt.run_source_item_id),
@@ -1697,11 +2337,28 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
                     "calibration_profile_version": attempt.calibration_profile_version,
                     "calibration_profile_hash": attempt.calibration_profile_hash,
                     "extraction_fingerprint": attempt.extraction_fingerprint,
+                    "input_asset_id": (
+                        str(attempt.input_asset_id)
+                        if attempt.input_asset_id else None
+                    ),
+                    "parent_asset_id": (
+                        str(evidence.parent_asset_id)
+                        if evidence.parent_asset_id else None
+                    ),
+                    "profile_snapshot_id": str(
+                        attempt.extraction_profile_snapshot_id
+                    ),
+                    "profile_material_hash": attempt.profile_material_hash,
+                    "extractor_version": attempt.extractor_version,
+                    "config_hash": attempt.config_hash,
+                    "evidence_content_hash": evidence.evidence_content_hash,
+                    "review_subject_hash": evidence.review_subject_hash,
+                    "locator_hash": canonical_hash(evidence.locator),
                 },
             )
 
             if legacy_info:
-                info, converted_checksum, _, converted_page_count = legacy_info
+                info, converted_checksum, _, converted_page_count, _ = legacy_info
                 document = _get_or_create_document_extraction(
                     run_source_item=attempt.run_source_item,
                     source_item=attempt.source_item,
@@ -1718,11 +2375,17 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
     return attempt
 
 
-def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
+def _process_attachment(
+    run_source_item,
+    attachment: Mapping[str, Any],
+    *,
+    fanout_fence: Mapping[str, Any],
+) -> None:
     if _metadata_only_attachment(run_source_item, attachment):
         _persist_metadata_only_attachment(
             run_source_item,
             attachment,
+            fanout_fence=fanout_fence,
         )
         return
     data, declared_mime, filename = _download_attachment(run_source_item, attachment)
@@ -1735,10 +2398,18 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         declared_mime=declared_mime,
         sniffed_mime=sniffed,
     )
-    raw_asset, info = _persist_attachment(run_source_item, attachment, data, mime_type, filename)
+    raw_asset, info = _persist_attachment(
+        run_source_item,
+        attachment,
+        data,
+        mime_type,
+        filename,
+        fanout_fence=fanout_fence,
+    )
     suffix = Path(filename).suffix.lower()
     if mime_type == "application/pdf":
         with transaction.atomic():
+            _lock_expected_fanout(run_source_item.run_id, fanout_fence)
             document = _get_or_create_document_extraction(
                 run_source_item=run_source_item,
                 source_item=run_source_item.source_item,
@@ -1755,6 +2426,7 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         return
     if mime_type in {"image/png", "image/jpeg", "image/tiff"}:
         with transaction.atomic():
+            _lock_expected_fanout(run_source_item.run_id, fanout_fence)
             document = _get_or_create_document_extraction(
                 run_source_item=run_source_item,
                 source_item=run_source_item.source_item,
@@ -1812,189 +2484,422 @@ def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
         engine, preferred = ExtractionEngine.STRUCTURED, "structured-deterministic-v1"
     if not engine:
         return
-    try:
-        profile = _profile(engine, preferred_key=preferred)
-    except ExtractorError:
-        if engine == ExtractionEngine.LEGACY_HWP:
-            _quarantine_legacy_hwp_raw_input(raw_asset)
-        raise
-    fingerprint = generic_extraction_fingerprint(
-        run_source_item_id=run_source_item.id,
-        source_item_id=run_source_item.source_item_id,
-        input_asset_id=raw_asset.id,
-        input_checksum=raw_asset.checksum,
-        profile=profile,
-    )
     with transaction.atomic():
-        attempt, _ = GenericExtractionAttempt.objects.get_or_create(
+        _lock_expected_fanout(run_source_item.run_id, fanout_fence)
+        attempt = _load_or_create_generic_attempt(
             run_source_item=run_source_item,
-            extraction_fingerprint=fingerprint,
-            defaults={
-                "source_item": run_source_item.source_item,
-                "input_asset": raw_asset,
-                "extraction_profile_snapshot": profile,
-                "profile_material_hash": profile.profile_material_hash,
-                "engine": profile.engine,
-                "extractor_version": profile.extractor_version,
-                "config_hash": profile.config_hash,
-                "validation_mode": (
-                    profile.validation_mode or GenericValidationMode.DETERMINISTIC
-                ),
-                "calibration_profile_key": profile.calibration_profile_key,
-                "calibration_profile_version": profile.calibration_profile_version,
-                "calibration_profile_hash": profile.calibration_profile_hash,
-            },
+            source_item=run_source_item.source_item,
+            input_asset=raw_asset,
+            engine=engine,
+            preferred_key=preferred,
+            fanout_fence=fanout_fence,
         )
         _enqueue_generic_extraction(attempt)
 
 
-def _queue_document_retry(document_id: str, exc: Exception) -> None:
-    DocumentExtraction.objects.filter(
-        pk=document_id,
-        input_fingerprint__isnull=False,
-        state__in=(
-            ExtractionState.QUEUED,
-            ExtractionState.RUNNING,
-        ),
-    ).exclude(
-        input_asset__derivation_type=EvidenceDerivationType.RAW,
-        input_asset__raw_input_fingerprint__isnull=True,
-    ).exclude(
-        input_asset__parent_asset__derivation_type=EvidenceDerivationType.RAW,
-        input_asset__parent_asset__raw_input_fingerprint__isnull=True,
-    ).exclude(
-        input_asset__generic_extraction_attempt__input_asset__derivation_type=(
-            EvidenceDerivationType.RAW
-        ),
-        input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
-            True
-        ),
-    ).exclude(
-        input_asset__producing_generic_attempt__input_asset__derivation_type=(
-            EvidenceDerivationType.RAW
-        ),
-        input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
-            True
-        ),
-    ).update(
-        state=ExtractionState.QUEUED,
-        document_complete=False,
-        error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
-        error_detail_redacted=str(
-            getattr(exc, "detail_redacted", str(exc))
-        )[:1000],
-        finished_at=None,
+def _load_or_create_generic_attempt(
+    *,
+    run_source_item,
+    source_item,
+    input_asset: EvidenceAsset,
+    engine: str,
+    preferred_key: str | None,
+    fanout_fence: Mapping[str, Any] | None,
+) -> GenericExtractionAttempt:
+    existing = list(
+        GenericExtractionAttempt.objects.select_for_update()
+        .filter(
+            run_source_item=run_source_item,
+            input_asset=input_asset,
+            engine=engine,
+        )
+        .order_by("created_at", "id")[:2]
     )
-
-
-def _queue_generic_retry(attempt_id: str, exc: Exception) -> None:
-    GenericExtractionAttempt.objects.filter(pk=attempt_id).exclude(
-        input_asset__derivation_type=EvidenceDerivationType.RAW,
-        input_asset__raw_input_fingerprint__isnull=True,
-    ).exclude(
-        input_asset__parent_asset__derivation_type=EvidenceDerivationType.RAW,
-        input_asset__parent_asset__raw_input_fingerprint__isnull=True,
-    ).update(
-        state=ExtractionState.QUEUED,
-        error_code=str(getattr(exc, "code", exc.__class__.__name__))[:120],
-        error_detail_redacted=str(
-            getattr(exc, "detail_redacted", str(exc))
-        )[:1000],
-        finished_at=None,
+    if len(existing) > 1:
+        raise EvidenceConflict("Generic extraction lineage has multiple frozen attempts")
+    if existing:
+        attempt = existing[0]
+        if attempt.source_item_id != source_item.id:
+            raise EvidenceConflict("Generic extraction source lineage changed")
+        return attempt
+    if fanout_fence is None:
+        raise EvidenceConflict("New generic attempts require an owned fanout lease")
+    _lock_expected_fanout(run_source_item.run_id, fanout_fence)
+    try:
+        profile = _profile(engine, preferred_key=preferred_key)
+    except ExtractorError:
+        if engine == ExtractionEngine.LEGACY_HWP:
+            _quarantine_legacy_hwp_raw_input(input_asset)
+        raise
+    fingerprint = generic_extraction_fingerprint(
+        run_source_item_id=run_source_item.id,
+        source_item_id=source_item.id,
+        input_asset_id=input_asset.id,
+        input_checksum=input_asset.checksum,
+        profile=profile,
     )
+    attempt, _ = GenericExtractionAttempt.objects.get_or_create(
+        run_source_item=run_source_item,
+        extraction_fingerprint=fingerprint,
+        defaults={
+            "source_item": source_item,
+            "input_asset": input_asset,
+            "extraction_profile_snapshot": profile,
+            "profile_material_hash": profile.profile_material_hash,
+            "engine": profile.engine,
+            "extractor_version": profile.extractor_version,
+            "config_hash": profile.config_hash,
+            "validation_mode": (
+                profile.validation_mode or GenericValidationMode.DETERMINISTIC
+            ),
+            "calibration_profile_key": profile.calibration_profile_key,
+            "calibration_profile_version": profile.calibration_profile_version,
+            "calibration_profile_hash": profile.calibration_profile_hash,
+        },
+    )
+    return attempt
 
 
-@shared_task
-def finalize_document_extraction_failure(document_id: str, error_code: str):
+def _terminalize_generic_extraction(
+    attempt_id: Any,
+    *,
+    error_code: str,
+    error_detail_redacted: str,
+    expected_generation: int | None = None,
+    expected_source_event_id: uuid.UUID | str | None = None,
+    expected_lease_owner: str | None = None,
+    expected_lease_token: uuid.UUID | None = None,
+) -> dict[str, str]:
+    run_id = GenericExtractionAttempt.objects.values_list(
+        "run_source_item__run_id", flat=True
+    ).get(pk=attempt_id)
     with transaction.atomic():
-        document = (
-            DocumentExtraction.objects.select_for_update()
-            .select_related(
-                "run_source_item",
-                "input_asset__generic_extraction_attempt__input_asset",
-                "input_asset__producing_generic_attempt__input_asset",
-                "input_asset__parent_asset",
-            )
-            .get(pk=document_id)
-        )
-        if _is_audit_only_document(document):
-            return {
-                "documentExtractionId": str(document.id),
-                "state": "legacy_duplicate_audit_only",
-            }
-        if document.state in {
-            ExtractionState.SUCCEEDED,
-            ExtractionState.LOW_CONFIDENCE,
-        }:
-            return {"documentExtractionId": str(document.id), "state": document.state}
-        document.state = ExtractionState.FAILED
-        document.document_complete = False
-        document.error_code = error_code[:120]
-        document.finished_at = timezone.now()
-        document.save(
-            update_fields=(
-                "state",
-                "document_complete",
-                "error_code",
-                "finished_at",
-                "updated_at",
-            )
-        )
-        _enqueue_finalize(
-            str(document.run_source_item.run_id),
-            f"document-terminal:{document.id}",
-        )
-        return {"documentExtractionId": str(document.id), "state": document.state}
-
-
-@shared_task
-def finalize_generic_extraction_failure(attempt_id: str, error_code: str):
-    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        RunStep.objects.select_for_update().filter(
+            run_id=run_id, name="extract", attempt_no=1
+        ).first()
         attempt = (
             GenericExtractionAttempt.objects.select_for_update()
             .select_related("run_source_item", "input_asset__parent_asset")
             .get(pk=attempt_id)
         )
-        if _is_quarantined_generic_attempt(attempt):
-            return {
-                "genericExtractionAttemptId": str(attempt.id),
-                "state": "legacy_duplicate_audit_only",
-            }
         if attempt.state in {
             ExtractionState.SUCCEEDED,
             ExtractionState.LOW_CONFIDENCE,
-        }:
-            return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+        } or attempt.terminal_state == "ready":
+            return {
+                "genericExtractionAttemptId": str(attempt.id),
+                "state": attempt.state,
+            }
+        if attempt.terminal_event_key:
+            return {
+                "genericExtractionAttemptId": str(attempt.id),
+                "state": attempt.state,
+            }
+        if expected_generation is not None:
+            run_accepts_terminal = (
+                run.state == RunState.EXTRACTING
+                and run.stop_requested_at is None
+            )
+            same_source = (
+                attempt.source_event_id is not None
+                and str(attempt.source_event_id) == str(expected_source_event_id)
+            )
+            owned_running = (
+                run_accepts_terminal
+                and attempt.state == ExtractionState.RUNNING
+                and same_source
+                and attempt.lease_generation == expected_generation
+                and attempt.lease_owner == expected_lease_owner
+                and attempt.lease_token == expected_lease_token
+            )
+            released_retry = (
+                run_accepts_terminal
+                and attempt.state == ExtractionState.QUEUED
+                and same_source
+                and attempt.lease_owner == ""
+                and attempt.lease_token is None
+            )
+            virgin_delivery = (
+                run_accepts_terminal
+                and attempt.state == ExtractionState.QUEUED
+                and attempt.source_event_id is None
+                and attempt.lease_generation == 0
+                and attempt.lease_owner == ""
+                and attempt.lease_token is None
+            )
+            if virgin_delivery:
+                attempt.source_event_id = expected_source_event_id
+                attempt.lease_generation = expected_generation
+                attempt.delivery_count = expected_generation
+            if not (owned_running or released_retry or virgin_delivery):
+                return {
+                    "genericExtractionAttemptId": str(attempt.id),
+                    "state": attempt.state,
+                }
         attempt.state = ExtractionState.FAILED
         attempt.error_code = error_code[:120]
+        attempt.error_detail_redacted = error_detail_redacted[:1000]
         attempt.finished_at = timezone.now()
+        attempt.next_retry_at = None
+        attempt.lease_owner = ""
+        attempt.lease_token = None
+        cause = f"generic-terminal:{attempt.id}:generation:{attempt.lease_generation}"
+        attempt.terminal_event_key = (
+            f"evidence.finalize_requested:{run_id}:{cause}"
+        )
+        attempt.terminal_state = "failed"
         if attempt.engine == ExtractionEngine.LEGACY_HWP:
             _quarantine_legacy_hwp_raw_input(attempt.input_asset)
         attempt.save(
-            update_fields=("state", "error_code", "finished_at", "updated_at")
+            update_fields=(
+                "state",
+                "source_event_id",
+                "lease_generation",
+                "delivery_count",
+                "error_code",
+                "error_detail_redacted",
+                "finished_at",
+                "next_retry_at",
+                "lease_owner",
+                "lease_token",
+                "terminal_event_key",
+                "terminal_state",
+                "updated_at",
+            )
         )
-        _enqueue_finalize(
-            str(attempt.run_source_item.run_id),
-            f"generic-terminal:{attempt.id}",
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="generic",
+            aggregate_id=attempt.id,
+            lease_generation=attempt.lease_generation,
         )
-        return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+        _enqueue_finalize(str(run_id), cause)
+        return {
+            "genericExtractionAttemptId": str(attempt.id),
+            "state": attempt.state,
+        }
+
+
+def _terminalize_document_extraction(
+    document_id: Any,
+    *,
+    error_code: str,
+    error_detail_redacted: str,
+    expected_generation: int | None = None,
+    expected_source_event_id: uuid.UUID | str | None = None,
+    expected_lease_owner: str | None = None,
+    expected_lease_token: uuid.UUID | None = None,
+) -> dict[str, str]:
+    run_id = DocumentExtraction.objects.values_list(
+        "run_source_item__run_id", flat=True
+    ).get(pk=document_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        RunStep.objects.select_for_update().filter(
+            run_id=run_id, name="extract", attempt_no=1
+        ).first()
+        document = (
+            DocumentExtraction.objects.select_for_update()
+            .select_related("run_source_item")
+            .get(pk=document_id)
+        )
+        child_runs = list(
+            ExtractionRun.objects.select_for_update()
+            .filter(document_extraction=document)
+            .order_by("id")
+        )
+        if document.state == ExtractionState.SUCCEEDED or document.terminal_state == "ready":
+            return {
+                "documentExtractionId": str(document.id),
+                "state": document.state,
+            }
+        if document.terminal_event_key:
+            return {
+                "documentExtractionId": str(document.id),
+                "state": document.state,
+            }
+        if expected_generation is not None:
+            run_accepts_terminal = (
+                run.state == RunState.EXTRACTING
+                and run.stop_requested_at is None
+            )
+            same_source = (
+                document.source_event_id is not None
+                and str(document.source_event_id) == str(expected_source_event_id)
+            )
+            owned_running = (
+                run_accepts_terminal
+                and document.state == ExtractionState.RUNNING
+                and same_source
+                and document.lease_generation == expected_generation
+                and document.lease_owner == expected_lease_owner
+                and document.lease_token == expected_lease_token
+            )
+            released_retry = (
+                run_accepts_terminal
+                and document.state == ExtractionState.QUEUED
+                and same_source
+                and document.lease_owner == ""
+                and document.lease_token is None
+            )
+            virgin_delivery = (
+                run_accepts_terminal
+                and document.state == ExtractionState.QUEUED
+                and document.source_event_id is None
+                and document.lease_generation == 0
+                and document.lease_owner == ""
+                and document.lease_token is None
+            )
+            if virgin_delivery:
+                document.source_event_id = expected_source_event_id
+                document.lease_generation = expected_generation
+                document.delivery_count = expected_generation
+                document.save(
+                    update_fields=(
+                        "source_event_id",
+                        "lease_generation",
+                        "delivery_count",
+                        "updated_at",
+                    )
+                )
+            if not (owned_running or released_retry or virgin_delivery):
+                return {
+                    "documentExtractionId": str(document.id),
+                    "state": document.state,
+                }
+        finished_at = timezone.now()
+        for child in child_runs:
+            if child.state in (ExtractionState.QUEUED, ExtractionState.RUNNING):
+                child.parent_lease_generation = document.lease_generation
+                child.source_event_id = document.source_event_id
+                child.state = ExtractionState.FAILED
+                child.error_code = error_code[:120]
+                child.error_detail_redacted = error_detail_redacted[:1000]
+                child.finished_at = finished_at
+                child.lease_owner = ""
+                child.lease_token = None
+                child.terminal_state = "failed"
+                child.terminal_event_key = (
+                    f"extraction.run.failed:{child.id}:generation:"
+                    f"{child.lease_generation}"
+                )
+                child.save()
+                orphan_unbound_extraction_object_writes(
+                    aggregate_kind="extraction_run",
+                    aggregate_id=child.id,
+                    lease_generation=child.lease_generation,
+                )
+        document.state = ExtractionState.FAILED
+        document.document_complete = False
+        document.error_code = error_code[:120]
+        document.error_detail_redacted = error_detail_redacted[:1000]
+        document.finished_at = finished_at
+        document.next_retry_at = None
+        document.lease_owner = ""
+        document.lease_token = None
+        cause = f"document-terminal:{document.id}:generation:{document.lease_generation}"
+        document.terminal_event_key = (
+            f"evidence.finalize_requested:{run_id}:{cause}"
+        )
+        document.terminal_state = "failed"
+        document.save()
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="document",
+            aggregate_id=document.id,
+            lease_generation=document.lease_generation,
+        )
+        _enqueue_finalize(str(run_id), cause)
+        return {
+            "documentExtractionId": str(document.id),
+            "state": document.state,
+        }
+
+
+@shared_task
+def finalize_document_extraction_failure(document_id: str, error_code: str):
+    delivery = _current_extraction_delivery(document_id)
+    return _terminalize_document_extraction(
+        document_id,
+        error_code=error_code,
+        error_detail_redacted="Document extraction delivery exhausted",
+        expected_generation=delivery["lease_generation"],
+        expected_source_event_id=delivery["source_event_id"],
+        expected_lease_owner=delivery["lease_owner"],
+        expected_lease_token=delivery["lease_token"],
+    )
+
+
+@shared_task
+def finalize_generic_extraction_failure(attempt_id: str, error_code: str):
+    delivery = _current_extraction_delivery(attempt_id)
+    return _terminalize_generic_extraction(
+        attempt_id,
+        error_code=error_code,
+        error_detail_redacted="Generic extraction delivery exhausted",
+        expected_generation=delivery["lease_generation"],
+        expected_source_event_id=delivery["source_event_id"],
+        expected_lease_owner=delivery["lease_owner"],
+        expected_lease_token=delivery["lease_token"],
+    )
 
 
 @shared_task
 def process_document_extraction(document_id: str):
+    delivery = _current_extraction_delivery(document_id)
     try:
-        document = _run_document_extraction(document_id)
+        initial = DocumentExtraction.objects.select_related(
+            "input_asset__generic_extraction_attempt__input_asset",
+            "input_asset__producing_generic_attempt__input_asset",
+            "input_asset__parent_asset",
+        ).get(pk=document_id)
+        if _is_audit_only_document(initial):
+            return {
+                "documentExtractionId": str(initial.id),
+                "state": "legacy_duplicate_audit_only",
+            }
+        claimed = begin_document_extraction(document_id, **delivery)
+        if claimed is None:
+            document = DocumentExtraction.objects.get(pk=document_id)
+            return {"documentExtractionId": str(document.id), "state": document.state}
+        document = _run_document_extraction(
+            document_id,
+            expected_generation=claimed.lease_generation,
+            expected_lease_owner=claimed.lease_owner,
+            expected_lease_token=claimed.lease_token,
+        )
         return {"documentExtractionId": str(document.id), "state": document.state}
+    except EvidenceExtractionStopped:
+        run_id = DocumentExtraction.objects.values_list(
+            "run_source_item__run_id", flat=True
+        ).get(pk=document_id)
+        _terminalize_stopped_run_evidence(run_id)
+        document = DocumentExtraction.objects.get(pk=document_id)
+        return {"documentExtractionId": str(document.id), "state": document.state}
+    except EvidenceConflict as exc:
+        raise PermanentEventError(
+            "extraction_source_event_conflict",
+            "Extraction aggregate source event did not match",
+        ) from exc
+    except (DatabaseError, SoftTimeLimitExceeded, OSError, httpx.HTTPError):
+        raise
     except ExtractorError as exc:
-        with transaction.atomic():
-            _queue_document_retry(document_id, exc)
         if exc.retryable:
+            queue_document_extraction_retry(
+                document_id,
+                expected_generation=claimed.lease_generation,
+                expected_lease_owner=claimed.lease_owner,
+                expected_lease_token=claimed.lease_token,
+                retry_at=timezone.now(),
+                error_code=exc.code,
+                error_detail_redacted=exc.detail_redacted,
+            )
             raise
         raise PermanentEventError(exc.code, exc.detail_redacted) from exc
     except Exception as exc:
-        with transaction.atomic():
-            _queue_document_retry(document_id, exc)
-        raise
+        raise PermanentEventError(
+            "unexpected_extraction_failure",
+            "Unexpected extraction failure",
+        ) from exc
 
 
 @shared_task
@@ -2005,19 +2910,248 @@ def process_paddleocr_document(document_id: str):
 
 @shared_task
 def process_generic_extraction(attempt_id: str):
+    delivery = _current_extraction_delivery(attempt_id)
     try:
-        attempt = _run_generic_extraction(attempt_id)
+        initial = GenericExtractionAttempt.objects.select_related(
+            "input_asset__parent_asset"
+        ).get(pk=attempt_id)
+        if _is_quarantined_generic_attempt(initial):
+            return {
+                "genericExtractionAttemptId": str(initial.id),
+                "state": "legacy_duplicate_audit_only",
+            }
+        claimed = begin_generic_extraction(attempt_id, **delivery)
+        if claimed is None:
+            attempt = GenericExtractionAttempt.objects.select_related(
+                "run_source_item__run"
+            ).get(pk=attempt_id)
+            if (
+                attempt.engine == ExtractionEngine.LEGACY_HWP
+                and attempt.state
+                in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE)
+                and attempt.run_source_item.run.state == RunState.EXTRACTING
+                and attempt.run_source_item.run.stop_requested_at is None
+            ):
+                attempt = _ensure_legacy_hwp_document(attempt.id)
+            return {
+                "genericExtractionAttemptId": str(attempt.id),
+                "state": attempt.state,
+            }
+        attempt = _run_generic_extraction(
+            attempt_id,
+            expected_generation=claimed.lease_generation,
+            expected_lease_owner=claimed.lease_owner,
+            expected_lease_token=claimed.lease_token,
+        )
         return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+    except EvidenceExtractionStopped:
+        run_id = GenericExtractionAttempt.objects.values_list(
+            "run_source_item__run_id", flat=True
+        ).get(pk=attempt_id)
+        _terminalize_stopped_run_evidence(run_id)
+        attempt = GenericExtractionAttempt.objects.get(pk=attempt_id)
+        return {"genericExtractionAttemptId": str(attempt.id), "state": attempt.state}
+    except EvidenceConflict as exc:
+        raise PermanentEventError(
+            "extraction_source_event_conflict",
+            "Extraction aggregate source event did not match",
+        ) from exc
+    except (DatabaseError, SoftTimeLimitExceeded, OSError, httpx.HTTPError):
+        raise
     except ExtractorError as exc:
-        with transaction.atomic():
-            _queue_generic_retry(attempt_id, exc)
         if exc.retryable:
+            retry_at = timezone.now()
+            queue_generic_extraction_retry(
+                attempt_id,
+                expected_generation=claimed.lease_generation,
+                expected_lease_owner=claimed.lease_owner,
+                expected_lease_token=claimed.lease_token,
+                retry_at=retry_at,
+                error_code=exc.code,
+                error_detail_redacted=exc.detail_redacted,
+            )
             raise
         raise PermanentEventError(exc.code, exc.detail_redacted) from exc
     except Exception as exc:
-        with transaction.atomic():
-            _queue_generic_retry(attempt_id, exc)
-        raise
+        raise PermanentEventError(
+            "unexpected_extraction_failure",
+            "Unexpected extraction failure",
+        ) from exc
+
+
+def _ready_identity_mismatch(kind: str) -> PermanentEventError:
+    return PermanentEventError(
+        f"{kind}_ready_identity_mismatch",
+        "Ready event identity no longer matches the locked extraction aggregate",
+    )
+
+
+@shared_task(name="apps.evidence.tasks.consume_document_ready")
+def consume_document_ready(
+    run_id: str,
+    run_source_item_id: str,
+    source_item_id: str,
+    document_extraction_id: str,
+    input_page_count: int,
+    coverage_manifest_hash: str,
+    selected_evidence_manifest_hash: str,
+    document_complete: bool,
+    input_asset_id: str | None = None,
+    input_checksum: str | None = None,
+    input_fingerprint: str | None = None,
+    routing_manifest_hash: str | None = None,
+):
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = (
+            DocumentExtraction.objects.select_for_update()
+            .select_related("run_source_item")
+            .get(pk=document_extraction_id)
+        )
+        document = aggregate_document_extraction(document.id)
+        expected_ready_key = (
+            f"evidence.document_ready:{document.id}:"
+            f"{document.selected_evidence_manifest_hash}"
+        )
+        if (
+            str(document.run_source_item.run_id) != str(run.id)
+            or str(document.run_source_item_id) != run_source_item_id
+            or str(document.source_item_id) != source_item_id
+            or document.state != ExtractionState.SUCCEEDED
+            or document.input_page_count != input_page_count
+            or document.coverage_manifest_hash != coverage_manifest_hash
+            or document.selected_evidence_manifest_hash
+            != selected_evidence_manifest_hash
+            or document.document_complete is not document_complete
+            or document_complete is not True
+            or document.terminal_state != "ready"
+            or document.terminal_event_key != expected_ready_key
+            or (
+                input_asset_id is not None
+                and str(document.input_asset_id) != input_asset_id
+            )
+            or (
+                input_checksum is not None
+                and document.input_checksum != input_checksum
+            )
+            or (
+                input_fingerprint is not None
+                and document.input_fingerprint != input_fingerprint
+            )
+            or (
+                routing_manifest_hash is not None
+                and canonical_hash(document.routing_manifest)
+                != routing_manifest_hash
+            )
+        ):
+            raise _ready_identity_mismatch("document")
+        return finalize_run_evidence.run(str(run.id))
+
+
+@shared_task(name="apps.evidence.tasks.consume_other_ready")
+def consume_other_ready(
+    run_id: str,
+    run_source_item_id: str,
+    source_item_id: str,
+    evidence_asset_id: str,
+    generic_extraction_attempt_id: str,
+    engine: str,
+    locator_type: str,
+    validation_mode: str,
+    result_checksum: str,
+    low_confidence_reasons_hash: str | None,
+    calibration_profile_key: str | None,
+    calibration_profile_version: str | None,
+    calibration_profile_hash: str | None,
+    extraction_fingerprint: str,
+    input_asset_id: str | None = None,
+    parent_asset_id: str | None = None,
+    profile_snapshot_id: str | None = None,
+    profile_material_hash: str | None = None,
+    extractor_version: str | None = None,
+    config_hash: str | None = None,
+    evidence_content_hash: str | None = None,
+    review_subject_hash: str | None = None,
+    locator_hash: str | None = None,
+):
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        attempt = (
+            GenericExtractionAttempt.objects.select_for_update()
+            .select_related(
+                "run_source_item",
+                "evidence_asset",
+                "input_asset",
+                "extraction_profile_snapshot",
+            )
+            .get(pk=generic_extraction_attempt_id)
+        )
+        evidence = EvidenceAsset.objects.select_for_update().get(pk=evidence_asset_id)
+        expected_ready_key = f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
+        if (
+            str(attempt.run_source_item.run_id) != str(run.id)
+            or str(attempt.run_source_item_id) != run_source_item_id
+            or str(attempt.source_item_id) != source_item_id
+            or attempt.state
+            not in {ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE}
+            or attempt.evidence_asset_id != evidence.id
+            or evidence.generic_extraction_attempt_id != attempt.id
+            or evidence.source_item_id != attempt.source_item_id
+            or evidence.origin_run_source_item_id != attempt.run_source_item_id
+            or evidence.parent_asset_id != attempt.input_asset_id
+            or attempt.engine != engine
+            or evidence.locator_type != locator_type
+            or evidence.extraction_method != attempt.engine
+            or evidence.extractor_version != attempt.extractor_version
+            or evidence.extraction_config_hash != attempt.config_hash
+            or evidence.validation_mode != attempt.validation_mode
+            or attempt.validation_mode != validation_mode
+            or attempt.result_checksum != result_checksum
+            or evidence.extraction_result_checksum != result_checksum
+            or attempt.low_confidence_reasons_hash != low_confidence_reasons_hash
+            or attempt.calibration_profile_key != calibration_profile_key
+            or attempt.calibration_profile_version != calibration_profile_version
+            or attempt.calibration_profile_hash != calibration_profile_hash
+            or attempt.extraction_fingerprint != extraction_fingerprint
+            or attempt.terminal_state != "ready"
+            or attempt.terminal_event_key != expected_ready_key
+            or (
+                input_asset_id is not None
+                and str(attempt.input_asset_id) != input_asset_id
+            )
+            or (
+                parent_asset_id is not None
+                and str(evidence.parent_asset_id) != parent_asset_id
+            )
+            or (
+                profile_snapshot_id is not None
+                and str(attempt.extraction_profile_snapshot_id)
+                != profile_snapshot_id
+            )
+            or (
+                profile_material_hash is not None
+                and attempt.profile_material_hash != profile_material_hash
+            )
+            or (
+                extractor_version is not None
+                and attempt.extractor_version != extractor_version
+            )
+            or (config_hash is not None and attempt.config_hash != config_hash)
+            or (
+                evidence_content_hash is not None
+                and evidence.evidence_content_hash != evidence_content_hash
+            )
+            or (
+                review_subject_hash is not None
+                and evidence.review_subject_hash != review_subject_hash
+            )
+            or (
+                locator_hash is not None
+                and canonical_hash(evidence.locator) != locator_hash
+            )
+        ):
+            raise _ready_identity_mismatch("other")
+        return finalize_run_evidence.run(str(run.id))
 
 
 @shared_task
@@ -2051,46 +3185,53 @@ def finalize_run_evidence(run_id: str):
                 "pending": True,
                 "fanoutComplete": False,
             }
-        pending_documents = DocumentExtraction.objects.filter(
-            run_source_item__run=run,
-            input_fingerprint__isnull=False,
-            state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
-        ).exclude(
-            input_asset__derivation_type=EvidenceDerivationType.RAW,
-            input_asset__raw_input_fingerprint__isnull=True,
-        ).exclude(
-            input_asset__parent_asset__derivation_type=(
-                EvidenceDerivationType.RAW
-            ),
-            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
-        ).exclude(
-            input_asset__generic_extraction_attempt__input_asset__derivation_type=(
-                EvidenceDerivationType.RAW
-            ),
-            input_asset__generic_extraction_attempt__input_asset__raw_input_fingerprint__isnull=(
-                True
-            ),
-        ).exclude(
-            input_asset__producing_generic_attempt__input_asset__derivation_type=(
-                EvidenceDerivationType.RAW
-            ),
-            input_asset__producing_generic_attempt__input_asset__raw_input_fingerprint__isnull=(
-                True
-            ),
-        ).exists()
-        pending_generic = GenericExtractionAttempt.objects.filter(
-            run_source_item__run=run,
-            state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
-        ).exclude(
-            input_asset__derivation_type=EvidenceDerivationType.RAW,
-            input_asset__raw_input_fingerprint__isnull=True,
-        ).exclude(
-            input_asset__parent_asset__derivation_type=(
-                EvidenceDerivationType.RAW
-            ),
-            input_asset__parent_asset__raw_input_fingerprint__isnull=True,
-        ).exists()
-        if pending_documents or pending_generic:
+        documents = list(
+            DocumentExtraction.objects.select_for_update()
+            .filter(run_source_item__run=run)
+            .select_related(
+                "input_asset__generic_extraction_attempt__input_asset__parent_asset",
+                "input_asset__producing_generic_attempt__input_asset__parent_asset",
+                "input_asset__parent_asset",
+            )
+            .order_by("id")
+        )
+        attempts = list(
+            GenericExtractionAttempt.objects.select_for_update()
+            .filter(run_source_item__run=run)
+            .select_related("input_asset__parent_asset")
+            .order_by("id")
+        )
+        children = list(
+            ExtractionRun.objects.select_for_update()
+            .filter(document_extraction__run_source_item__run=run)
+            .order_by("document_extraction_id", "id")
+        )
+        list(
+            EvidenceAsset.objects.select_for_update()
+            .filter(origin_run_source_item__run=run)
+            .order_by("id")
+        )
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="fanout",
+            aggregate_id=run.id,
+            lease_generation=step.lease_generation,
+        )
+        pending_documents = any(
+            document.input_fingerprint is not None
+            and document.state in (ExtractionState.QUEUED, ExtractionState.RUNNING)
+            and not _is_audit_only_document(document)
+            for document in documents
+        )
+        pending_generic = any(
+            attempt.state in (ExtractionState.QUEUED, ExtractionState.RUNNING)
+            and not _is_quarantined_generic_attempt(attempt)
+            for attempt in attempts
+        )
+        pending_children = any(
+            child.state in (ExtractionState.QUEUED, ExtractionState.RUNNING)
+            for child in children
+        )
+        if pending_documents or pending_generic or pending_children:
             return {"runId": str(run.id), "state": run.state, "pending": True}
         evidence_count = (
             EvidenceAsset.objects.filter(origin_run_source_item__run=run)
@@ -2447,7 +3588,14 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
             return _stop_run_evidence_locked(run, step)
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="fanout",
+            aggregate_id=run.id,
+            lease_generation=step.lease_generation,
+        )
         step.state = "stopped" if stopped else "failed"
+        step.lease_owner = ""
+        step.lease_token = None
         step.error_code = redacted_code
         step.error_detail_redacted = "evidence fan-out delivery exhausted"
         _project_domain_step_terminal(
@@ -2468,6 +3616,8 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
                 "correlation_id",
                 "worker_task_id",
                 "state",
+                "lease_owner",
+                "lease_token",
                 "error_code",
                 "error_detail_redacted",
                 "finished_at",
@@ -2482,6 +3632,12 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
             run.state = RunState.STOPPED
             run.error_summary = None
         else:
+            _close_active_extraction_aggregates_locked(
+                run,
+                error_code=redacted_code,
+                error_detail_redacted="Evidence fanout delivery exhausted",
+                finished_at=now,
+            )
             run.state = RunState.FAILED
             run.error_summary = {
                 "stage": "extract",
@@ -2525,7 +3681,20 @@ def _stop_run_evidence_locked(
     output_count: int | None = None,
 ) -> dict[str, str]:
     now = timezone.now()
+    _close_active_extraction_aggregates_locked(
+        run,
+        error_code="extraction_stopped",
+        error_detail_redacted="Extraction stopped by collection request",
+        finished_at=now,
+    )
+    orphan_unbound_extraction_object_writes(
+        aggregate_kind="fanout",
+        aggregate_id=run.id,
+        lease_generation=step.lease_generation,
+    )
     step.state = "stopped"
+    step.lease_owner = ""
+    step.lease_token = None
     if output_count is not None:
         step.output_count = output_count
     step.error_code = "stop_requested"
@@ -2547,6 +3716,8 @@ def _stop_run_evidence_locked(
             "correlation_id",
             "worker_task_id",
             "state",
+            "lease_owner",
+            "lease_token",
             "output_count",
             "error_code",
             "error_detail_redacted",
@@ -2584,6 +3755,104 @@ def _stop_run_evidence_locked(
         )
     )
     return {"runId": str(run.id), "state": run.state}
+
+
+def _close_active_extraction_aggregates_locked(
+    run: CollectionRun,
+    *,
+    error_code: str,
+    error_detail_redacted: str,
+    finished_at,
+) -> None:
+    documents = list(
+        DocumentExtraction.objects.select_for_update()
+        .filter(run_source_item__run=run)
+        .order_by("id")
+    )
+    attempts = list(
+        GenericExtractionAttempt.objects.select_for_update()
+        .filter(run_source_item__run=run)
+        .order_by("id")
+    )
+    children = list(
+        ExtractionRun.objects.select_for_update()
+        .filter(document_extraction__run_source_item__run=run)
+        .order_by("document_extraction_id", "id")
+    )
+    for child in children:
+        if child.state not in (ExtractionState.QUEUED, ExtractionState.RUNNING):
+            continue
+        child.state = ExtractionState.FAILED
+        child.error_code = error_code[:120]
+        child.error_detail_redacted = error_detail_redacted[:1000]
+        child.finished_at = finished_at
+        child.next_retry_at = None
+        child.lease_owner = ""
+        child.lease_token = None
+        child.terminal_event_key = (
+            f"extraction.run.failed:{child.id}:generation:{child.lease_generation}"
+        )
+        child.terminal_state = "failed"
+        child.save()
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind="extraction_run",
+            aggregate_id=child.id,
+            lease_generation=child.lease_generation,
+        )
+    for aggregate, aggregate_kind in (
+        *((document, "document") for document in documents),
+        *((attempt, "generic") for attempt in attempts),
+    ):
+        if aggregate.state not in (ExtractionState.QUEUED, ExtractionState.RUNNING):
+            continue
+        aggregate.state = ExtractionState.FAILED
+        aggregate.error_code = error_code[:120]
+        aggregate.error_detail_redacted = error_detail_redacted[:1000]
+        aggregate.finished_at = finished_at
+        aggregate.next_retry_at = None
+        aggregate.lease_owner = ""
+        aggregate.lease_token = None
+        if isinstance(aggregate, DocumentExtraction):
+            aggregate.document_complete = False
+        terminal_cause = (
+            f"stop:{aggregate_kind}:{aggregate.id}:generation:"
+            f"{aggregate.lease_generation}"
+        )
+        aggregate.terminal_event_key = (
+            f"evidence.finalize_requested:{run.id}:{terminal_cause}"
+        )
+        aggregate.terminal_state = "failed"
+        aggregate.save()
+        _enqueue_finalize(str(run.id), terminal_cause)
+        orphan_unbound_extraction_object_writes(
+            aggregate_kind=aggregate_kind,
+            aggregate_id=aggregate.id,
+            lease_generation=aggregate.lease_generation,
+        )
+
+
+def _terminalize_stopped_run_evidence(
+    run_id: Any,
+    *,
+    source_event_id: Any | None = None,
+    expected_generation: int | None = None,
+) -> dict[str, str]:
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run, name="extract", attempt_no=1
+        )
+        if source_event_id is not None and step.source_event_id not in (
+            None,
+            uuid.UUID(str(source_event_id)),
+        ):
+            return {"runId": str(run.id), "state": run.state, "stale": True}
+        if expected_generation is not None and step.lease_generation not in (
+            0,
+            expected_generation,
+        ):
+            return {"runId": str(run.id), "state": run.state, "stale": True}
+        return _stop_run_evidence_locked(run, step)
 
 
 def _finalize_run_evidence_wake_failure_locked(
@@ -2669,6 +3938,8 @@ def _finalize_run_evidence_wake_failure_locked(
     now = timezone.now()
     redacted_code = str(error_code)[:100]
     step.state = "failed"
+    step.lease_owner = ""
+    step.lease_token = None
     step.error_code = redacted_code
     step.error_detail_redacted = (
         "evidence finalizer delivery exhausted before completion"
@@ -2687,6 +3958,8 @@ def _finalize_run_evidence_wake_failure_locked(
             "correlation_id",
             "worker_task_id",
             "state",
+            "lease_owner",
+            "lease_token",
             "error_code",
             "error_detail_redacted",
             "finished_at",
@@ -2698,6 +3971,14 @@ def _finalize_run_evidence_wake_failure_locked(
         )
     )
     run.state = RunState.FAILED
+    _close_active_extraction_aggregates_locked(
+        run,
+        error_code=redacted_code,
+        error_detail_redacted=(
+            "Evidence finalizer delivery exhausted before completion"
+        ),
+        finished_at=now,
+    )
     run.error_summary = {
         "stage": "extract",
         "code": redacted_code,
@@ -2750,7 +4031,15 @@ def finalize_document_ready_wake_failure(
     document_id: str,
     error_code: str,
 ):
+    run_id = (
+        DocumentExtraction.objects.filter(pk=document_id)
+        .values_list("run_source_item__run_id", flat=True)
+        .first()
+    )
+    if run_id is None:
+        return {"documentExtractionId": document_id, "state": "missing"}
     with transaction.atomic():
+        CollectionRun.objects.select_for_update().get(pk=run_id)
         document = (
             DocumentExtraction.objects.select_for_update()
             .select_related(
@@ -2785,7 +4074,15 @@ def finalize_other_ready_wake_failure(
     attempt_id: str,
     error_code: str,
 ):
+    run_id = (
+        GenericExtractionAttempt.objects.filter(pk=attempt_id)
+        .values_list("run_source_item__run_id", flat=True)
+        .first()
+    )
+    if run_id is None:
+        return {"genericExtractionAttemptId": attempt_id, "state": "missing"}
     with transaction.atomic():
+        CollectionRun.objects.select_for_update().get(pk=run_id)
         attempt = (
             GenericExtractionAttempt.objects.select_for_update()
             .select_related(
@@ -2813,24 +4110,39 @@ def finalize_other_ready_wake_failure(
 
 @shared_task(name="apps.evidence.tasks.process_run_evidence")
 def process_run_evidence(run_id: str):
-    with transaction.atomic():
-        run = CollectionRun.objects.select_for_update().get(pk=run_id)
-        step, _ = RunStep.objects.select_for_update().get_or_create(
-            run=run,
-            name="extract",
-            attempt_no=1,
-        )
-        if run.stop_requested_at:
+    delivery = _current_extraction_delivery(run_id)
+    try:
+        claimed = begin_evidence_fanout(run_id, **delivery)
+    except EvidenceExtractionStopped:
+        with transaction.atomic():
+            run = CollectionRun.objects.select_for_update().get(pk=run_id)
+            step, _ = RunStep.objects.select_for_update().get_or_create(
+                run=run,
+                name="extract",
+                attempt_no=1,
+            )
             return _stop_run_evidence_locked(run, step, output_count=0)
+    if claimed is None:
+        run = CollectionRun.objects.get(pk=run_id)
+        step = RunStep.objects.filter(run=run, name="extract", attempt_no=1).first()
+        return {
+            "runId": str(run.id),
+            "state": run.state,
+            "fanoutComplete": bool(step and step.fanout_completed_at),
+            "stale": bool(step and step.fanout_completed_at is None),
+        }
+    fanout_fence = {
+        "expected_generation": claimed.lease_generation,
+        "expected_lease_owner": claimed.lease_owner,
+        "expected_lease_token": claimed.lease_token,
+    }
+    with evidence_fanout_completion_fence(run_id, **fanout_fence) as step:
+        if step is None:
+            run = CollectionRun.objects.get(pk=run_id)
+            return {"runId": str(run.id), "state": run.state, "stale": True}
+        run = step.run
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
-        if step.fanout_completed_at is not None:
-            return {
-                "runId": str(run.id),
-                "state": run.state,
-                "fanoutComplete": True,
-            }
-        step.state = "running"
         started_at = timezone.now()
         _begin_domain_step_observation(
             step,
@@ -2865,6 +4177,7 @@ def process_run_evidence(run_id: str):
         discovery_kind__in=EXTRACTABLE_SOURCE_DISCOVERY_KINDS,
         collection_attempt__state="succeeded",
     ).order_by("id")
+    lost_fence = False
     for run_source_item in items:
         if CollectionRun.objects.filter(
             pk=run_id,
@@ -2872,11 +4185,30 @@ def process_run_evidence(run_id: str):
         ).exists():
             break
         try:
-            _create_raw_evidence(run_source_item)
+            with evidence_fanout_completion_fence(
+                run_id, **fanout_fence
+            ) as current_step:
+                if current_step is None:
+                    lost_fence = True
+                    break
+            _create_raw_evidence(
+                run_source_item,
+                fanout_fence=fanout_fence,
+            )
             output_count += 1
             for attachment in run_source_item.source_item.attachments or []:
                 try:
-                    _process_attachment(run_source_item, attachment)
+                    with evidence_fanout_completion_fence(
+                        run_id, **fanout_fence
+                    ) as current_step:
+                        if current_step is None:
+                            lost_fence = True
+                            break
+                    _process_attachment(
+                        run_source_item,
+                        attachment,
+                        fanout_fence=fanout_fence,
+                    )
                     output_count += 1
                 except (ExtractorError, httpx.HTTPError, OSError) as exc:
                     if isinstance(exc, ExtractorError) and exc.retryable:
@@ -2887,6 +4219,11 @@ def process_run_evidence(run_id: str):
                         "code": getattr(exc, "code", exc.__class__.__name__),
                         "requiredLegacyHwp": _is_required_legacy_hwp_attachment(attachment),
                     })
+            if lost_fence:
+                break
+        except EvidenceConflict:
+            lost_fence = True
+            break
         except (DatabaseError, SoftTimeLimitExceeded):
             raise
         except (ExtractorError, httpx.HTTPError, OSError) as exc:
@@ -2897,27 +4234,31 @@ def process_run_evidence(run_id: str):
                 "attachment": "source-record",
                 "code": getattr(exc, "code", exc.__class__.__name__),
             })
-    with transaction.atomic():
-        run = CollectionRun.objects.select_for_update().get(pk=run_id)
-        step = RunStep.objects.select_for_update().get(
-            run=run,
-            name="extract",
-            attempt_no=1,
-        )
-        if run.stop_requested_at:
+    if lost_fence:
+        run = CollectionRun.objects.get(pk=run_id)
+        return {"runId": str(run.id), "state": run.state, "stale": True}
+    if CollectionRun.objects.filter(
+        pk=run_id, stop_requested_at__isnull=False
+    ).exists():
+        with transaction.atomic():
+            run = CollectionRun.objects.select_for_update().get(pk=run_id)
+            step = RunStep.objects.select_for_update().get(
+                run=run,
+                name="extract",
+                attempt_no=1,
+            )
             return _stop_run_evidence_locked(
                 run,
                 step,
                 output_count=output_count,
             )
+    with evidence_fanout_completion_fence(run_id, **fanout_fence) as step:
+        if step is None:
+            run = CollectionRun.objects.get(pk=run_id)
+            return {"runId": str(run.id), "state": run.state, "stale": True}
+        run = step.run
         if run.state != RunState.EXTRACTING:
             return {"runId": str(run.id), "state": run.state}
-        if step.fanout_completed_at is not None:
-            return {
-                "runId": str(run.id),
-                "state": run.state,
-                "fanoutComplete": True,
-            }
         step.output_count = output_count
         step.error_code = "partial_extraction_failure" if failures else None
         step.error_detail_redacted = (
@@ -2926,12 +4267,18 @@ def process_run_evidence(run_id: str):
             else None
         )
         step.fanout_completed_at = timezone.now()
+        step.state = "succeeded"
+        step.lease_owner = ""
+        step.lease_token = None
         step.save(
             update_fields=(
                 "output_count",
                 "error_code",
                 "error_detail_redacted",
                 "fanout_completed_at",
+                "state",
+                "lease_owner",
+                "lease_token",
             )
         )
         run.counters = {

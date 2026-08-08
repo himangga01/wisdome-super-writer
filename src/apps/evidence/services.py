@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import unicodedata
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -22,6 +24,7 @@ from apps.audit.services import (
     record_audit_event,
     require_audit_replay,
 )
+from apps.collection.models import CollectionRun, RunStep
 from wisdome_writer.domain.concurrency import (
     canonical_request_hash,
     require_expected_version,
@@ -38,6 +41,8 @@ from .models import (
     EvidenceKind,
     EvidenceReviewDecision,
     ExtractionEngine,
+    ExtractionObjectWriteReservation,
+    ExtractionObjectWriteState,
     ExtractionProfileDecision,
     ExtractionProfileSnapshot,
     ExtractionRun,
@@ -56,6 +61,598 @@ class EvidenceConflict(Exception):
 
 class EvidenceInvariantError(Exception):
     """Raised when stored provenance cannot satisfy the extraction contract."""
+
+
+class EvidenceExtractionStopped(Exception):
+    """Raised before external extraction work when the collection run is stopping."""
+
+
+_TERMINAL_EXTRACTION_STATES = frozenset(
+    {
+        ExtractionState.SUCCEEDED,
+        ExtractionState.LOW_CONFIDENCE,
+        ExtractionState.FAILED,
+    }
+)
+
+
+def _validated_lease_identity(
+    *,
+    source_event_id: uuid.UUID | str,
+    delivery_count: int,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: uuid.UUID | str,
+) -> tuple[uuid.UUID, int, int, str, uuid.UUID]:
+    try:
+        event_id = uuid.UUID(str(source_event_id))
+        token = uuid.UUID(str(lease_token))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise EvidenceInvariantError("Extraction lease identity must contain UUIDs") from exc
+    if type(delivery_count) is not int or delivery_count < 1:
+        raise EvidenceInvariantError("Extraction delivery count must be positive")
+    if type(lease_generation) is not int or lease_generation != delivery_count:
+        raise EvidenceInvariantError(
+            "Extraction generation must equal the owned consumer lease generation"
+        )
+    owner = str(lease_owner).strip()
+    if not owner or len(owner) > 160:
+        raise EvidenceInvariantError("Extraction lease owner is invalid")
+    return event_id, delivery_count, lease_generation, owner, token
+
+
+def _run_id_for_generic(attempt_id: Any) -> uuid.UUID:
+    return GenericExtractionAttempt.objects.values_list(
+        "run_source_item__run_id", flat=True
+    ).get(pk=attempt_id)
+
+
+def _run_id_for_document(document_id: Any) -> uuid.UUID:
+    return DocumentExtraction.objects.values_list(
+        "run_source_item__run_id", flat=True
+    ).get(pk=document_id)
+
+
+def _claim_locked_extraction(
+    aggregate: DocumentExtraction | GenericExtractionAttempt,
+    *,
+    source_event_id: uuid.UUID,
+    delivery_count: int,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: uuid.UUID,
+):
+    if aggregate.state in _TERMINAL_EXTRACTION_STATES or aggregate.terminal_event_key:
+        return None
+    if aggregate.source_event_id not in (None, source_event_id):
+        raise EvidenceConflict("Extraction aggregate belongs to another source event")
+    if delivery_count <= aggregate.delivery_count:
+        return None
+    aggregate_kind = (
+        "document"
+        if isinstance(aggregate, DocumentExtraction)
+        else "generic"
+    )
+    ExtractionObjectWriteReservation.objects.filter(
+        aggregate_kind=aggregate_kind,
+        aggregate_id=aggregate.id,
+        lease_generation__lt=lease_generation,
+        state__in=(
+            ExtractionObjectWriteState.RESERVED,
+            ExtractionObjectWriteState.UPLOADED,
+        ),
+    ).update(
+        state=ExtractionObjectWriteState.ORPHANED,
+        orphaned_at=timezone.now(),
+    )
+    aggregate.lease_generation = lease_generation
+    aggregate.source_event_id = source_event_id
+    aggregate.delivery_count = delivery_count
+    aggregate.lease_owner = lease_owner
+    aggregate.lease_token = lease_token
+    aggregate.next_retry_at = None
+    aggregate.state = ExtractionState.RUNNING
+    aggregate.started_at = aggregate.started_at or timezone.now()
+    aggregate.error_code = None
+    aggregate.error_detail_redacted = None
+    aggregate.finished_at = None
+    aggregate.save(
+        update_fields=(
+            "source_event_id",
+            "delivery_count",
+            "lease_generation",
+            "lease_owner",
+            "lease_token",
+            "next_retry_at",
+            "state",
+            "started_at",
+            "error_code",
+            "error_detail_redacted",
+            "finished_at",
+            "updated_at",
+        )
+    )
+    return aggregate
+
+
+def begin_generic_extraction(
+    attempt_id: Any,
+    *,
+    source_event_id: uuid.UUID | str,
+    delivery_count: int,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: uuid.UUID | str,
+) -> GenericExtractionAttempt | None:
+    event_id, count, generation, owner, token = _validated_lease_identity(
+        source_event_id=source_event_id,
+        delivery_count=delivery_count,
+        lease_generation=lease_generation,
+        lease_owner=lease_owner,
+        lease_token=lease_token,
+    )
+    run_id = _run_id_for_generic(attempt_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        attempt = GenericExtractionAttempt.objects.select_for_update().get(pk=attempt_id)
+        if run.stop_requested_at is not None or run.state == "stopping":
+            raise EvidenceExtractionStopped
+        if run.state != "extracting":
+            return None
+        return _claim_locked_extraction(
+            attempt,
+            source_event_id=event_id,
+            delivery_count=count,
+            lease_generation=generation,
+            lease_owner=owner,
+            lease_token=token,
+        )
+
+
+def begin_document_extraction(
+    document_id: Any,
+    *,
+    source_event_id: uuid.UUID | str,
+    delivery_count: int,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: uuid.UUID | str,
+) -> DocumentExtraction | None:
+    event_id, count, generation, owner, token = _validated_lease_identity(
+        source_event_id=source_event_id,
+        delivery_count=delivery_count,
+        lease_generation=lease_generation,
+        lease_owner=lease_owner,
+        lease_token=lease_token,
+    )
+    run_id = _run_id_for_document(document_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+        if run.stop_requested_at is not None or run.state == "stopping":
+            raise EvidenceExtractionStopped
+        if run.state != "extracting":
+            return None
+        claimed = _claim_locked_extraction(
+            document,
+            source_event_id=event_id,
+            delivery_count=count,
+            lease_generation=generation,
+            lease_owner=owner,
+            lease_token=token,
+        )
+        if claimed is None:
+            return None
+        children = list(
+            ExtractionRun.objects.select_for_update()
+            .filter(
+                document_extraction=document,
+                state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+            )
+            .order_by("id")
+        )
+        for child in children:
+            child.source_event_id = event_id
+            child.parent_lease_generation = generation
+            child.state = ExtractionState.QUEUED
+            child.lease_owner = ""
+            child.lease_token = None
+            child.next_retry_at = None
+            child.save(
+                update_fields=(
+                    "source_event_id",
+                    "parent_lease_generation",
+                    "state",
+                    "lease_owner",
+                    "lease_token",
+                    "next_retry_at",
+                    "updated_at",
+                )
+            )
+        return claimed
+
+
+def begin_evidence_fanout(
+    run_id: Any,
+    *,
+    source_event_id: uuid.UUID | str,
+    delivery_count: int,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: uuid.UUID | str,
+) -> RunStep | None:
+    event_id, count, generation, owner, token = _validated_lease_identity(
+        source_event_id=source_event_id,
+        delivery_count=delivery_count,
+        lease_generation=lease_generation,
+        lease_owner=lease_owner,
+        lease_token=lease_token,
+    )
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        step, _ = RunStep.objects.select_for_update().get_or_create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        if run.stop_requested_at is not None or run.state == "stopping":
+            raise EvidenceExtractionStopped
+        if run.state != "extracting":
+            return None
+        if step.fanout_completed_at is not None:
+            return None
+        if step.source_event_id not in (None, event_id):
+            raise EvidenceConflict("Evidence fanout belongs to another source event")
+        if count <= step.delivery_count:
+            return None
+        ExtractionObjectWriteReservation.objects.filter(
+            aggregate_kind="fanout",
+            aggregate_id=run.id,
+            lease_generation__lt=generation,
+            state__in=(
+                ExtractionObjectWriteState.RESERVED,
+                ExtractionObjectWriteState.UPLOADED,
+            ),
+        ).update(
+            state=ExtractionObjectWriteState.ORPHANED,
+            orphaned_at=timezone.now(),
+        )
+        step.lease_generation = generation
+        step.source_event_id = event_id
+        step.delivery_count = count
+        step.lease_owner = owner
+        step.lease_token = token
+        step.state = "running"
+        step.save(
+            update_fields=(
+                "source_event_id",
+                "delivery_count",
+                "lease_generation",
+                "lease_owner",
+                "lease_token",
+                "state",
+            )
+        )
+        return step
+
+
+@contextmanager
+def evidence_fanout_completion_fence(
+    run_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+):
+    try:
+        token = uuid.UUID(str(expected_lease_token))
+    except (TypeError, ValueError, AttributeError):
+        token = None
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        step = RunStep.objects.select_for_update().get(
+            run=run,
+            name="extract",
+            attempt_no=1,
+        )
+        if (
+            run.stop_requested_at is not None
+            or run.state != "extracting"
+            or step.fanout_completed_at is not None
+            or step.state != "running"
+            or step.lease_generation != expected_generation
+            or step.lease_owner != expected_lease_owner
+            or step.lease_token != token
+        ):
+            yield None
+            return
+        yield step
+
+
+def _lease_matches(
+    aggregate: DocumentExtraction | ExtractionRun | GenericExtractionAttempt,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+) -> bool:
+    try:
+        token = uuid.UUID(str(expected_lease_token))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return bool(
+        aggregate.state == ExtractionState.RUNNING
+        and aggregate.lease_generation == expected_generation
+        and aggregate.lease_owner == expected_lease_owner
+        and aggregate.lease_token == token
+    )
+
+
+def queue_generic_extraction_retry(
+    attempt_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+    retry_at: datetime,
+    error_code: str,
+    error_detail_redacted: str,
+) -> bool:
+    run_id = _run_id_for_generic(attempt_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        attempt = GenericExtractionAttempt.objects.select_for_update().get(pk=attempt_id)
+        if run.stop_requested_at is not None or run.state != "extracting" or not _lease_matches(
+            attempt,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        ):
+            return False
+        attempt.state = ExtractionState.QUEUED
+        attempt.lease_owner = ""
+        attempt.lease_token = None
+        attempt.next_retry_at = retry_at
+        attempt.error_code = error_code[:120]
+        attempt.error_detail_redacted = error_detail_redacted[:1000]
+        attempt.finished_at = None
+        attempt.save(
+            update_fields=(
+                "state",
+                "lease_owner",
+                "lease_token",
+                "next_retry_at",
+                "error_code",
+                "error_detail_redacted",
+                "finished_at",
+                "updated_at",
+            )
+        )
+        return True
+
+
+def queue_document_extraction_retry(
+    document_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+    retry_at: datetime,
+    error_code: str,
+    error_detail_redacted: str,
+) -> bool:
+    run_id = _run_id_for_document(document_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+        if run.stop_requested_at is not None or run.state != "extracting" or not _lease_matches(
+            document,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+        ):
+            return False
+        document.state = ExtractionState.QUEUED
+        document.document_complete = False
+        document.lease_owner = ""
+        document.lease_token = None
+        document.next_retry_at = retry_at
+        document.error_code = error_code[:120]
+        document.error_detail_redacted = error_detail_redacted[:1000]
+        document.finished_at = None
+        document.save(
+            update_fields=(
+                "state",
+                "document_complete",
+                "lease_owner",
+                "lease_token",
+                "next_retry_at",
+                "error_code",
+                "error_detail_redacted",
+                "finished_at",
+                "updated_at",
+            )
+        )
+        child_runs = list(
+            ExtractionRun.objects.select_for_update()
+            .filter(document_extraction=document)
+            .order_by("id")
+        )
+        for child in child_runs:
+            if child.state in _TERMINAL_EXTRACTION_STATES:
+                continue
+            child.parent_lease_generation = document.lease_generation
+            child.source_event_id = document.source_event_id
+            child.lease_owner = ""
+            child.lease_token = None
+            child.next_retry_at = retry_at
+            if child.state == ExtractionState.RUNNING:
+                child.state = ExtractionState.QUEUED
+                child.lease_generation = document.lease_generation
+                child.error_code = error_code[:120]
+                child.error_detail_redacted = error_detail_redacted[:1000]
+                child.finished_at = None
+            child.save(
+                update_fields=(
+                    "parent_lease_generation",
+                    "source_event_id",
+                    "lease_generation",
+                    "lease_owner",
+                    "lease_token",
+                    "next_retry_at",
+                    "state",
+                    "error_code",
+                    "error_detail_redacted",
+                    "finished_at",
+                    "updated_at",
+                )
+            )
+        return True
+
+
+@contextmanager
+def generic_extraction_completion_fence(
+    attempt_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+):
+    run_id = _run_id_for_generic(attempt_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        attempt = GenericExtractionAttempt.objects.select_for_update().get(pk=attempt_id)
+        if (
+            run.stop_requested_at is not None
+            or run.state != "extracting"
+            or not _lease_matches(
+            attempt,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+            )
+        ):
+            yield None
+            return
+        yield attempt
+
+
+@contextmanager
+def document_extraction_completion_fence(
+    document_id: Any,
+    *,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+):
+    run_id = _run_id_for_document(document_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+        if (
+            run.stop_requested_at is not None
+            or run.state != "extracting"
+            or not _lease_matches(
+            document,
+            expected_generation=expected_generation,
+            expected_lease_owner=expected_lease_owner,
+            expected_lease_token=expected_lease_token,
+            )
+        ):
+            yield None
+            return
+        yield document
+
+
+def begin_extraction_run(
+    extraction_run_id: Any,
+    *,
+    expected_parent_generation: int,
+    expected_parent_lease_owner: str,
+    expected_parent_lease_token: uuid.UUID | str,
+) -> ExtractionRun | None:
+    run_id, document_id = ExtractionRun.objects.values_list(
+        "document_extraction__run_source_item__run_id",
+        "document_extraction_id",
+    ).get(pk=extraction_run_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+        child = ExtractionRun.objects.select_for_update().get(pk=extraction_run_id)
+        if run.stop_requested_at is not None or run.state == "stopping":
+            raise EvidenceExtractionStopped
+        if run.state != "extracting":
+            return None
+        if not _lease_matches(
+            document,
+            expected_generation=expected_parent_generation,
+            expected_lease_owner=expected_parent_lease_owner,
+            expected_lease_token=expected_parent_lease_token,
+        ):
+            return None
+        if child.state in {ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE}:
+            return None
+        ExtractionObjectWriteReservation.objects.filter(
+            aggregate_kind="extraction_run",
+            aggregate_id=child.id,
+            lease_generation__lt=document.lease_generation,
+            state__in=(
+                ExtractionObjectWriteState.RESERVED,
+                ExtractionObjectWriteState.UPLOADED,
+            ),
+        ).update(
+            state=ExtractionObjectWriteState.ORPHANED,
+            orphaned_at=timezone.now(),
+        )
+        child.source_event_id = document.source_event_id
+        child.parent_lease_generation = document.lease_generation
+        child.lease_generation = document.lease_generation
+        child.delivery_count = document.delivery_count
+        child.lease_owner = document.lease_owner
+        child.lease_token = document.lease_token
+        child.next_retry_at = None
+        child.state = ExtractionState.RUNNING
+        child.started_at = child.started_at or timezone.now()
+        child.error_code = None
+        child.error_detail_redacted = None
+        child.finished_at = None
+        child.save()
+        return child
+
+
+@contextmanager
+def extraction_run_completion_fence(
+    extraction_run_id: Any,
+    *,
+    expected_parent_generation: int,
+    expected_child_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID | str,
+):
+    run_id, document_id = ExtractionRun.objects.values_list(
+        "document_extraction__run_source_item__run_id",
+        "document_extraction_id",
+    ).get(pk=extraction_run_id)
+    with transaction.atomic():
+        run = CollectionRun.objects.select_for_update().get(pk=run_id)
+        document = DocumentExtraction.objects.select_for_update().get(pk=document_id)
+        child = ExtractionRun.objects.select_for_update().get(pk=extraction_run_id)
+        if (
+            run.stop_requested_at is not None
+            or run.state != "extracting"
+            or document.state != ExtractionState.RUNNING
+            or document.lease_generation != expected_parent_generation
+            or child.parent_lease_generation != expected_parent_generation
+            or not _lease_matches(
+                child,
+                expected_generation=expected_child_generation,
+                expected_lease_owner=expected_lease_owner,
+                expected_lease_token=expected_lease_token,
+            )
+        ):
+            yield None
+            return
+        yield child
 
 
 def _normalize(value: Any) -> Any:
@@ -95,6 +692,213 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def canonical_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def extraction_lease_identity_hash(
+    *, source_event_id: Any, lease_generation: int, lease_owner: str, lease_token: Any
+) -> str:
+    return canonical_hash(
+        {
+            "source_event_id": str(source_event_id),
+            "lease_generation": lease_generation,
+            "lease_owner": lease_owner,
+            "lease_token": str(lease_token),
+        }
+    )
+
+
+def reserve_extraction_object_write(
+    *,
+    aggregate_kind: str,
+    aggregate_id: Any,
+    source_event_id: Any,
+    lease_generation: int,
+    lease_owner: str,
+    lease_token: Any,
+    purpose: str,
+    object_key: str,
+) -> ExtractionObjectWriteReservation:
+    identity_hash = extraction_lease_identity_hash(
+        source_event_id=source_event_id,
+        lease_generation=lease_generation,
+        lease_owner=lease_owner,
+        lease_token=lease_token,
+    )
+    with transaction.atomic():
+        token = uuid.UUID(str(lease_token))
+        if aggregate_kind == "fanout":
+            run = CollectionRun.objects.select_for_update().get(pk=aggregate_id)
+            aggregate = RunStep.objects.select_for_update().get(
+                run=run, name="extract", attempt_no=1
+            )
+            owned = (
+                run.state == "extracting"
+                and run.stop_requested_at is None
+                and aggregate.state == "running"
+                and str(aggregate.source_event_id) == str(source_event_id)
+                and aggregate.lease_generation == lease_generation
+                and aggregate.lease_owner == lease_owner
+                and aggregate.lease_token == token
+            )
+        elif aggregate_kind == "generic":
+            run_id = _run_id_for_generic(aggregate_id)
+            run = CollectionRun.objects.select_for_update().get(pk=run_id)
+            aggregate = GenericExtractionAttempt.objects.select_for_update().get(
+                pk=aggregate_id
+            )
+            owned = (
+                run.state == "extracting"
+                and run.stop_requested_at is None
+                and str(aggregate.source_event_id) == str(source_event_id)
+                and _lease_matches(
+                    aggregate,
+                    expected_generation=lease_generation,
+                    expected_lease_owner=lease_owner,
+                    expected_lease_token=token,
+                )
+            )
+        elif aggregate_kind == "document":
+            run_id = _run_id_for_document(aggregate_id)
+            run = CollectionRun.objects.select_for_update().get(pk=run_id)
+            aggregate = DocumentExtraction.objects.select_for_update().get(
+                pk=aggregate_id
+            )
+            owned = (
+                run.state == "extracting"
+                and run.stop_requested_at is None
+                and str(aggregate.source_event_id) == str(source_event_id)
+                and _lease_matches(
+                    aggregate,
+                    expected_generation=lease_generation,
+                    expected_lease_owner=lease_owner,
+                    expected_lease_token=token,
+                )
+            )
+        elif aggregate_kind == "extraction_run":
+            run_id, document_id = ExtractionRun.objects.values_list(
+                "document_extraction__run_source_item__run_id",
+                "document_extraction_id",
+            ).get(pk=aggregate_id)
+            run = CollectionRun.objects.select_for_update().get(pk=run_id)
+            DocumentExtraction.objects.select_for_update().get(pk=document_id)
+            aggregate = ExtractionRun.objects.select_for_update().get(pk=aggregate_id)
+            owned = (
+                run.state == "extracting"
+                and run.stop_requested_at is None
+                and str(aggregate.source_event_id) == str(source_event_id)
+                and _lease_matches(
+                    aggregate,
+                    expected_generation=lease_generation,
+                    expected_lease_owner=lease_owner,
+                    expected_lease_token=token,
+                )
+            )
+        else:
+            raise EvidenceInvariantError("Unknown extraction object aggregate kind")
+        if not owned:
+            raise EvidenceConflict("Object-write reservation lease is stale")
+        reservation, created = ExtractionObjectWriteReservation.objects.get_or_create(
+            aggregate_kind=aggregate_kind,
+            aggregate_id=aggregate_id,
+            lease_generation=lease_generation,
+            purpose=purpose,
+            object_key=object_key,
+            defaults={
+                "source_event_id": source_event_id,
+                "lease_identity_hash": identity_hash,
+            },
+        )
+        if not created and (
+            str(reservation.source_event_id) != str(source_event_id)
+            or reservation.lease_identity_hash != identity_hash
+        ):
+            raise EvidenceConflict("Object-write reservation belongs to another lease")
+        return reservation
+
+
+def mark_extraction_object_uploaded(
+    reservation_id: Any,
+    *,
+    object_version: str,
+    object_etag: str | None = None,
+    checksum: str,
+    byte_size: int,
+    content_type: str = "application/octet-stream",
+) -> ExtractionObjectWriteReservation:
+    with transaction.atomic():
+        reservation = ExtractionObjectWriteReservation.objects.select_for_update().get(
+            pk=reservation_id
+        )
+        uploaded_envelope = (
+            reservation.object_version == object_version
+            and reservation.object_etag == object_etag
+            and reservation.checksum == checksum
+            and reservation.byte_size == byte_size
+            and reservation.content_type == content_type
+        )
+        if reservation.state in (
+            ExtractionObjectWriteState.UPLOADED,
+            ExtractionObjectWriteState.BOUND,
+        ):
+            if not uploaded_envelope:
+                raise EvidenceConflict("Uploaded object envelope changed")
+            return reservation
+        if reservation.state == ExtractionObjectWriteState.ORPHANED:
+            if reservation.object_version is not None:
+                if not uploaded_envelope:
+                    raise EvidenceConflict("Orphaned object envelope changed")
+                return reservation
+        elif reservation.state != ExtractionObjectWriteState.RESERVED:
+            raise EvidenceConflict("Object-write reservation is no longer uploadable")
+        if reservation.state == ExtractionObjectWriteState.RESERVED:
+            reservation.state = ExtractionObjectWriteState.UPLOADED
+        reservation.object_version = object_version
+        reservation.object_etag = object_etag
+        reservation.checksum = checksum
+        reservation.byte_size = byte_size
+        reservation.content_type = content_type
+        reservation.uploaded_at = timezone.now()
+        reservation.save()
+        return reservation
+
+
+def bind_extraction_object_write(reservation_id: Any) -> bool:
+    reservation = ExtractionObjectWriteReservation.objects.select_for_update().get(
+        pk=reservation_id
+    )
+    if reservation.state == ExtractionObjectWriteState.BOUND:
+        return True
+    if reservation.state != ExtractionObjectWriteState.UPLOADED:
+        return False
+    reservation.state = ExtractionObjectWriteState.BOUND
+    reservation.bound_at = timezone.now()
+    reservation.save(update_fields=("state", "bound_at", "updated_at"))
+    return True
+
+
+def orphan_unbound_extraction_object_writes(
+    *, aggregate_kind: str, aggregate_id: Any, lease_generation: int
+) -> int:
+    now = timezone.now()
+    with transaction.atomic():
+        reservations = list(
+            ExtractionObjectWriteReservation.objects.select_for_update()
+            .filter(
+                aggregate_kind=aggregate_kind,
+                aggregate_id=aggregate_id,
+                lease_generation=lease_generation,
+                state__in=(
+                    ExtractionObjectWriteState.RESERVED,
+                    ExtractionObjectWriteState.UPLOADED,
+                ),
+            )
+            .order_by("id")
+        )
+        for reservation in reservations:
+            reservation.state = ExtractionObjectWriteState.ORPHANED
+            reservation.orphaned_at = now
+            reservation.save(update_fields=("state", "orphaned_at", "updated_at"))
+        return len(reservations)
 
 
 def normalize_page_indices(indices: Iterable[int], *, page_count: int | None = None) -> list[int]:
@@ -357,21 +1161,90 @@ def calculate_publishable(evidence: EvidenceAsset, *, document_complete: bool | 
     return evidence.review_state in (ReviewState.PASSED, ReviewState.PENDING)
 
 
-def _selected_runs(document: DocumentExtraction) -> dict[int, ExtractionRun]:
-    pages = document.routing_manifest.get("pages", []) if isinstance(document.routing_manifest, dict) else []
-    run_ids = {str(page.get("selected_run_id")) for page in pages if page.get("selected_run_id")}
-    runs = {
-        str(run.id): run
-        for run in document.extraction_runs.filter(id__in=run_ids).select_related("extraction_profile_snapshot")
-    }
+def validate_selected_page_coverage(
+    *,
+    routing_manifest: Mapping[str, Any],
+    expected_page_indices: Sequence[int],
+    runs_by_id: Mapping[str, ExtractionRun],
+) -> dict[int, ExtractionRun]:
+    pages = routing_manifest.get("pages", [])
+    if not isinstance(pages, list):
+        raise EvidenceInvariantError("Routing manifest pages must be a list")
     selected: dict[int, ExtractionRun] = {}
     for page in pages:
-        index = int(page["page_index"])
-        run = runs.get(str(page.get("selected_run_id")))
-        if run is None or index in selected or index not in run.processed_page_indices:
-            raise EvidenceInvariantError("Routing manifest references a missing, duplicate or incompatible run")
+        if not isinstance(page, Mapping) or type(page.get("page_index")) is not int:
+            raise EvidenceInvariantError("Routing manifest page identity is invalid")
+        index = page["page_index"]
+        run = runs_by_id.get(str(page.get("selected_run_id")))
+        if (
+            run is None
+            or index in selected
+            or index not in run.requested_page_indices
+            or index not in run.processed_page_indices
+        ):
+            raise EvidenceInvariantError(
+                "Routing manifest references a missing, duplicate or incompatible run"
+            )
         selected[index] = run
+    if sorted(selected) != list(expected_page_indices):
+        raise EvidenceInvariantError("Routing manifest does not exactly cover the document")
     return selected
+
+
+def document_evidence_manifest_entry(
+    *,
+    source_item_id: Any,
+    origin_run_source_item_id: Any,
+    parent_asset_id: Any,
+    document_extraction_id: Any,
+    extraction_run_id: Any,
+    extraction_profile_snapshot_id: Any,
+    profile_material_hash: str,
+    extraction_method: str,
+    extractor_version: str,
+    extraction_config_hash: str,
+    result_checksum: str,
+    locator: Mapping[str, Any],
+    evidence_content_hash_value: str,
+) -> dict[str, Any]:
+    return {
+        "source_item_id": str(source_item_id),
+        "origin_run_source_item_id": str(origin_run_source_item_id),
+        "parent_asset_id": str(parent_asset_id) if parent_asset_id else None,
+        "document_extraction_id": str(document_extraction_id),
+        "extraction_run_id": str(extraction_run_id),
+        "extraction_profile_snapshot_id": str(extraction_profile_snapshot_id),
+        "profile_material_hash": profile_material_hash,
+        "extraction_method": extraction_method,
+        "extractor_version": extractor_version,
+        "extraction_config_hash": extraction_config_hash,
+        "result_checksum": result_checksum,
+        "page_index": locator.get("page_index"),
+        "locator_hash": canonical_hash(locator),
+        "evidence_content_hash": evidence_content_hash_value,
+    }
+
+
+def _selected_runs(
+    document: DocumentExtraction,
+    *,
+    locked_runs: Sequence[ExtractionRun] | None = None,
+) -> dict[int, ExtractionRun]:
+    pages = document.routing_manifest.get("pages", []) if isinstance(document.routing_manifest, dict) else []
+    run_ids = {str(page.get("selected_run_id")) for page in pages if page.get("selected_run_id")}
+    candidates = (
+        locked_runs
+        if locked_runs is not None
+        else document.extraction_runs.filter(id__in=run_ids).select_related(
+            "extraction_profile_snapshot"
+        )
+    )
+    runs = {str(run.id): run for run in candidates if str(run.id) in run_ids}
+    return validate_selected_page_coverage(
+        routing_manifest=document.routing_manifest,
+        expected_page_indices=list(range(document.input_page_count)),
+        runs_by_id=runs,
+    )
 
 
 def aggregate_document_extraction(
@@ -379,7 +1252,16 @@ def aggregate_document_extraction(
     *,
     using: str = "default",
 ) -> DocumentExtraction:
+    run_id = (
+        DocumentExtraction.objects.using(using)
+        .values_list("run_source_item__run_id", flat=True)
+        .get(pk=document_id)
+    )
     with transaction.atomic(using=using):
+        CollectionRun.objects.using(using).select_for_update().get(pk=run_id)
+        RunStep.objects.using(using).select_for_update().filter(
+            run_id=run_id, name="extract", attempt_no=1
+        ).first()
         document = (
             DocumentExtraction.objects.using(using)
             .select_for_update()
@@ -390,12 +1272,19 @@ def aggregate_document_extraction(
             )
             .get(pk=document_id)
         )
+        locked_runs = list(
+            ExtractionRun.objects.using(using)
+            .select_for_update()
+            .filter(document_extraction=document)
+            .select_related("extraction_profile_snapshot")
+            .order_by("id")
+        )
         input_asset = document.input_asset
         duplicate_input = _uses_audit_only_raw_input(input_asset)
         if document.input_fingerprint is None or duplicate_input:
             return document
         try:
-            selected = _selected_runs(document)
+            selected = _selected_runs(document, locked_runs=locked_runs)
         except EvidenceInvariantError as exc:
             document.state = ExtractionState.FAILED
             document.error_code = "routing_manifest_invalid"
@@ -403,6 +1292,15 @@ def aggregate_document_extraction(
             document.document_complete = False
             document.coverage_manifest_hash = None
             document.selected_evidence_manifest_hash = None
+            document.finished_at = timezone.now()
+            document.next_retry_at = None
+            document.lease_owner = ""
+            document.lease_token = None
+            document.terminal_event_key = (
+                f"evidence.document.failed:{document.id}:generation:"
+                f"{document.lease_generation}:routing_manifest_invalid"
+            )
+            document.terminal_state = "failed"
             document.save(
                 update_fields=(
                     "state",
@@ -411,6 +1309,12 @@ def aggregate_document_extraction(
                     "document_complete",
                     "coverage_manifest_hash",
                     "selected_evidence_manifest_hash",
+                    "finished_at",
+                    "next_retry_at",
+                    "lease_owner",
+                    "lease_token",
+                    "terminal_event_key",
+                    "terminal_state",
                 ),
                 using=using,
             )
@@ -432,7 +1336,10 @@ def aggregate_document_extraction(
         )
         missing_successful_evidence = False
         if complete:
-            for run in selected.values():
+            selected_pages_by_run: dict[Any, set[int]] = {}
+            for page_index, run in selected.items():
+                selected_pages_by_run.setdefault(run.id, set()).add(page_index)
+            for run in {item.id: item for item in selected.values()}.values():
                 if run.state not in (
                     ExtractionState.SUCCEEDED,
                     ExtractionState.LOW_CONFIDENCE,
@@ -445,6 +1352,57 @@ def aggregate_document_extraction(
                 if not run_evidence:
                     missing_successful_evidence = True
                     complete = False
+                    break
+                evidence_manifest = sorted(
+                    (
+                        document_evidence_manifest_entry(
+                            source_item_id=item.source_item_id,
+                            origin_run_source_item_id=item.origin_run_source_item_id,
+                            parent_asset_id=item.parent_asset_id,
+                            document_extraction_id=item.document_extraction_id,
+                            extraction_run_id=item.extraction_run_id,
+                            extraction_profile_snapshot_id=(
+                                run.extraction_profile_snapshot_id
+                            ),
+                            profile_material_hash=run.profile_material_hash,
+                            extraction_method=item.extraction_method,
+                            extractor_version=item.extractor_version,
+                            extraction_config_hash=item.extraction_config_hash,
+                            result_checksum=item.extraction_result_checksum,
+                            locator=item.locator,
+                            evidence_content_hash_value=item.evidence_content_hash,
+                        )
+                        for item in run_evidence
+                    ),
+                    key=lambda entry: (
+                        entry["locator_hash"],
+                        entry["evidence_content_hash"],
+                    ),
+                )
+                if (
+                    run.expected_evidence_count != len(run_evidence)
+                    or run.expected_evidence_manifest_hash
+                    != canonical_hash(evidence_manifest)
+                    or run.profile_key
+                    != run.extraction_profile_snapshot.profile_key
+                    or run.profile_version
+                    != run.extraction_profile_snapshot.profile_version
+                    or run.config_hash != run.extraction_profile_snapshot.config_hash
+                    or run.profile_material_hash
+                    != run.extraction_profile_snapshot.profile_material_hash
+                    or any(
+                        not isinstance(item.locator, dict)
+                        or item.locator.get("page_index")
+                        not in selected_pages_by_run[run.id]
+                        or item.extraction_result_checksum != run.result_checksum
+                        for item in run_evidence
+                    )
+                ):
+                    complete = False
+                    document.error_code = "selected_evidence_manifest_mismatch"
+                    document.error_detail_redacted = (
+                        "Selected evidence does not match its immutable child manifest"
+                    )
                     break
                 if (
                     run.state == ExtractionState.LOW_CONFIDENCE
@@ -471,11 +1429,7 @@ def aggregate_document_extraction(
                 {
                     "evidence_asset_id": str(item.id),
                     "evidence_content_hash": item.evidence_content_hash,
-                    "result_checksum": (
-                        item.extraction_run.result_checksum
-                        if item.extraction_run
-                        else None
-                    ),
+                    "result_checksum": item.extraction_result_checksum,
                     "locator_hash": canonical_hash(item.locator),
                 }
                 for item in evidence
@@ -493,7 +1447,10 @@ def aggregate_document_extraction(
             document.coverage_manifest_hash = None
             document.selected_evidence_manifest_hash = None
             document.document_complete = False
-            if missing_successful_evidence:
+            if document.error_code == "selected_evidence_manifest_mismatch":
+                document.state = ExtractionState.FAILED
+                document.finished_at = timezone.now()
+            elif missing_successful_evidence:
                 document.state = ExtractionState.FAILED
                 document.finished_at = timezone.now()
                 document.error_code = "selected_run_evidence_missing"
@@ -507,6 +1464,36 @@ def aggregate_document_extraction(
                 document.state = ExtractionState.FAILED
             elif selected:
                 document.state = ExtractionState.LOW_CONFIDENCE
+        if document.state == ExtractionState.SUCCEEDED:
+            document.terminal_event_key = (
+                f"evidence.document_ready:{document.id}:"
+                f"{document.selected_evidence_manifest_hash}"
+            )
+            document.terminal_state = "ready"
+            document.next_retry_at = None
+            document.lease_owner = ""
+            document.lease_token = None
+        elif document.state == ExtractionState.FAILED:
+            document.terminal_event_key = (
+                f"evidence.document.failed:{document.id}:generation:"
+                f"{document.lease_generation}:{document.error_code or 'failed'}"
+            )
+            document.terminal_state = "failed"
+            document.next_retry_at = None
+            document.lease_owner = ""
+            document.lease_token = None
+        elif document.state == ExtractionState.LOW_CONFIDENCE:
+            cause = (
+                f"document-terminal:{document.id}:generation:"
+                f"{document.lease_generation}:{document.state}"
+            )
+            document.terminal_event_key = (
+                f"evidence.finalize_requested:{run_id}:{cause}"
+            )
+            document.terminal_state = "ready"
+            document.next_retry_at = None
+            document.lease_owner = ""
+            document.lease_token = None
         document.full_clean()
         document.save(using=using)
 
@@ -1130,12 +2117,34 @@ def decide_evidence_review(
         return replay(existing)
 
     with transaction.atomic(using=alias):
-        document_id = (
+        document_id, generic_attempt_id, origin_run_id = (
             EvidenceAsset.objects.using(alias)
             .filter(pk=evidence_id)
-            .values_list("document_extraction_id", flat=True)
+            .values_list(
+                "document_extraction_id",
+                "generic_extraction_attempt_id",
+                "origin_run_source_item__run_id",
+            )
             .get()
         )
+        run_id = origin_run_id
+        if document_id is not None:
+            run_id = (
+                DocumentExtraction.objects.using(alias)
+                .values_list("run_source_item__run_id", flat=True)
+                .get(pk=document_id)
+            )
+        elif generic_attempt_id is not None:
+            run_id = (
+                GenericExtractionAttempt.objects.using(alias)
+                .values_list("run_source_item__run_id", flat=True)
+                .get(pk=generic_attempt_id)
+            )
+        if run_id is not None:
+            CollectionRun.objects.using(alias).select_for_update().get(pk=run_id)
+            RunStep.objects.using(alias).select_for_update().filter(
+                run_id=run_id, name="extract", attempt_no=1
+            ).first()
         if document_id is not None:
             DocumentExtraction.objects.using(alias).select_for_update().get(
                 pk=document_id
@@ -1154,6 +2163,13 @@ def decide_evidence_review(
                 raise EvidenceConflict(
                     "The evidence document membership changed; retry the review"
                 )
+        elif generic_attempt_id is not None:
+            GenericExtractionAttempt.objects.using(alias).select_for_update().get(
+                pk=generic_attempt_id
+            )
+            EvidenceAsset.objects.using(alias).select_for_update().get(
+                pk=evidence_id
+            )
         else:
             EvidenceAsset.objects.using(alias).select_for_update().get(
                 pk=evidence_id
@@ -1275,15 +2291,15 @@ def decide_evidence_review(
             ),
             using=alias,
         )
-        if evidence.document_extraction_id:
-            aggregate_document_extraction(
-                evidence.document_extraction_id,
-                using=alias,
-            )
-            evidence.refresh_from_db(using=alias)
-        else:
-            evidence.publishable = calculate_publishable(evidence)
-            evidence.save(update_fields=("publishable",), using=alias)
+        evidence.publishable = calculate_publishable(
+            evidence,
+            document_complete=(
+                evidence.document_extraction.document_complete
+                if evidence.document_extraction_id
+                else None
+            ),
+        )
+        evidence.save(update_fields=("publishable",), using=alias)
         document_after_material = _document_review_projection_material(
             evidence,
             using=alias,

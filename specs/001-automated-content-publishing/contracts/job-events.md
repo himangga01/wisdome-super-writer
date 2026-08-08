@@ -573,3 +573,39 @@ recovery. Exact canonical report/locator/object/page bindings are rechecked befo
 during recovery. A pre-attempt required-HWP failure is retained as a typed run counter marker.
 Version 1.1.0 remains an immutable inactive superseded draft; T032 creates the acceptance
 artifact and approves golden 1.2.0 without adding a retirement transition for 1.1.0.
+
+## 한국어 — T016 추출 이벤트 fencing 보강
+
+- leaf/fanout handler는 outbox `event_context`의 source event, consumer, token,
+  `lease_generation`이 없으면 실행하지 않는다. production synthetic identity는 없다.
+- `evidence.document_ready@1`과 `evidence.other_ready@1`의 기존 필드는 그대로 유지한다. 새
+  producer는 input/profile/config/content/locator hash를 optional provenance 필드로 함께 보내며,
+  router는 과거 event에서 빠진 optional 필드를 `null`로 전달한다. consumer는 행 잠금 뒤 DB의
+  전체 lineage와 child expected manifest를 항상 재검증한다.
+- permanent extractor/domain 오류는 worker 본문에서 aggregate terminal을 미리 저장하지 않는다.
+  `PermanentEventError`가 receipt dead-letter transaction의 terminal callback으로 전달되고,
+  callback이 current event/generation을 확인해 child revoke, redacted failure, 단일 finalizer
+  outbox를 원자 기록한다. DB/soft-time-limit/합의된 infrastructure 오류는 그대로 raise한다.
+- stop fence 상실과 stale fence 상실은 다르다. STOPPING/stop-requested만 terminal stop projection을
+  만들며, 더 높은 generation 또는 이미 terminal run의 delivery는 no-op이다.
+- migration 중 in-flight requested event와 receipt는 exact immutable identity가 하나일 때만
+  pending/retry로 재무장한다. 과거 pending ready는 v1 selected-manifest hash를 바꾸지 않으며,
+  aggregate 재계산 후에도 같은 message key로 수용되어야 한다.
+
+## English / AI-readable — T016 extraction event fencing addendum
+
+- Leaf and fanout handlers require the outbox event context: source event, consumer, token, and
+  `lease_generation`. Production has no synthetic direct-call identity.
+- Existing required fields of `evidence.document_ready@1` and `evidence.other_ready@1` remain
+  compatible. New producers add optional input/profile/config/content/locator hashes; routing
+  passes omitted legacy fields as null. Consumers always revalidate full locked DB lineage and
+  the child expected manifest.
+- Permanent extractor/domain failures do not precommit terminal state in the task body. They flow
+  as `PermanentEventError` to the receipt dead-letter transaction, whose terminal callback fences
+  the current event/generation and atomically revokes children, stores redacted failure, and emits
+  one finalizer event. Database, soft-time-limit, and agreed infrastructure failures are re-raised.
+- Stop fence loss is distinct from stale fence loss. Only STOPPING/stop-requested creates a stop
+  projection; a higher generation or an already terminal run makes delayed delivery a no-op.
+- Migration rearms an in-flight requested event/receipt to pending/retry only when one exact
+  immutable identity exists. Historical pending-ready keeps the v1 selected-manifest hash and must
+  remain acceptable after aggregate recomputation.

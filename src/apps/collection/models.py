@@ -658,9 +658,33 @@ class RunStep(models.Model):
         default=RecoveryState.IN_PROGRESS,
         db_index=True,
     )
+    source_event_id = models.UUIDField(null=True, blank=True, db_index=True)
+    lease_generation = models.PositiveBigIntegerField(default=0)
+    lease_owner = models.CharField(max_length=160, blank=True, default="")
+    lease_token = models.UUIDField(null=True, blank=True)
+    delivery_count = models.PositiveBigIntegerField(default=0)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=["run", "name", "attempt_no"], name="uq_run_step_attempt")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "name", "attempt_no"], name="uq_run_step_attempt"
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="running",
+                        source_event_id__isnull=False,
+                        lease_generation__gt=0,
+                        delivery_count=models.F("lease_generation"),
+                        lease_token__isnull=False,
+                    )
+                    & ~models.Q(lease_owner="")
+                    | ~models.Q(state="running")
+                    & models.Q(lease_owner="", lease_token__isnull=True)
+                ),
+                name="ck_run_step_lease_complete",
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         if self.run_id:

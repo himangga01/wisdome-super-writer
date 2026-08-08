@@ -258,6 +258,22 @@ def _validate_event_payload(
             raise ForbiddenEventPayload(f"event payload field has unsupported value: {key}")
 
 
+def routed_event_arguments(
+    event_type: str,
+    event_version: int,
+    argument_keys: tuple[str, ...],
+    payload: dict[str, Any],
+) -> list[Any]:
+    """Build positional arguments while preserving optional payload compatibility."""
+    schema = payload_schema_for(event_type, event_version)
+    if schema is None:
+        raise KeyError(f"unknown event schema: {event_type}@{event_version}")
+    return [
+        payload[key] if key in schema.required else payload.get(key)
+        for key in argument_keys
+    ]
+
+
 def _validate_policy_versions(policy_versions: Any) -> dict[str, int | str]:
     if not isinstance(policy_versions, dict):
         raise ForbiddenEventPayload("policy_versions must be a JSON object")
@@ -1232,7 +1248,12 @@ def consume_event(
         )
 
     try:
-        args = [payload[key] for key in argument_keys]
+        args = routed_event_arguments(
+            event.topic,
+            event.event_version,
+            argument_keys,
+            payload,
+        )
     except KeyError as exc:
         try:
             return dead_letter_consumer_event(

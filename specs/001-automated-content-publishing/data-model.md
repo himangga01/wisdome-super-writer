@@ -1776,3 +1776,61 @@ core bytes and envelope. Migration 0004 backfills historical decision chains fro
 profile projection and aborts when that projection is incomplete. Because older rows did not store
 the contemporaneous envelope, this preserves runtime compatibility without claiming historical
 reconstruction beyond the available frozen projection.
+
+## 한국어 — T016 추출 세대·종결·객체 쓰기 계약
+
+`RunStep`은 source event와 consumer receipt의 단조 증가 `lease_generation`, owner/token으로
+구성된 lease envelope만 영속화한다. `DocumentExtraction`, `ExtractionRun`,
+`GenericExtractionAttempt`는 같은 lease envelope와 terminal event key/state를 영속화한다.
+`delivery_count`는 receipt attempt 수가 아니라 같은 64-bit lease generation의
+도메인 별칭이다. RUNNING 행은 완전한 lease를 가져야 하고 queued/terminal 행은 lease를
+비워야 한다. succeeded/low-confidence는 `terminal_state=ready`, failed는
+`terminal_state=failed`와 단 하나의 terminal key를 가져야 한다. legacy HWP UDS protocol의
+`generation=1`은 이 DB lease와 분리된 호환 상수다.
+
+추출 claim, retry, completion, dead-letter terminal callback은 `CollectionRun → RunStep →
+DocumentExtraction/GenericExtractionAttempt → ExtractionRun → EvidenceAsset` 순서로 잠근다.
+동일 source event의 더 높은 receipt lease만 RUNNING을 재점유할 수 있고, 이전 token 결과는
+no-op이다. retry가 lease를 해제한 직후 max-attempt terminal callback이 실행되어도 같은
+source event/current generation이면 terminalize한다. stop은 모든 active child lease를 같은
+transaction에서 폐기하지만 이미 failed/completed/stopped인 run의 지연 delivery는 run 상태를
+변경하지 않는다.
+
+`ExtractionObjectWriteReservation`은 raw/result/reason/converted 객체 쓰기를
+`reserved → uploaded → bound`로 기록한다. fence 상실, stop, crash recovery는 아직 bound되지
+않은 행을 `orphaned`로 수렴시킨다. object key는 content-addressed/shared일 수 있으므로 이
+ledger에서 즉시 삭제하지 않는다. 실제 삭제는 참조를 재계산하는 retention/reconcile 작업
+(T030 이후 경계)만 수행한다.
+
+evidence migration 0005는 collection 0009와 infrastructure 0002 뒤에 실행한다. historical
+model과 schema-editor DB alias만 사용해 exact requested event/receipt를 pending/retry로
+재무장하고, 증명 가능한 pending ready 및 full child provenance manifest만 보존한다. 0개 또는
+복수 event, 불완전 lineage, 불명확한 성공/실행 중 행은 synthetic ready를 만들지 않고
+deterministic failed/manual recovery로 닫는다.
+
+## English / AI-readable — T016 extraction generation, terminal, and object-write contract
+
+`RunStep` persists only the source-event and monotonic consumer-receipt lease envelope:
+`lease_generation`, owner, and token. `DocumentExtraction`, `ExtractionRun`, and
+`GenericExtractionAttempt` persist that lease envelope plus terminal event key/state.
+`delivery_count` is a 64-bit domain alias of the receipt lease generation, not the rollback-prone
+attempt counter. RUNNING requires a complete lease; queued and terminal rows clear it. Successful
+or low-confidence rows reserve `terminal_state=ready`, failed rows reserve
+`terminal_state=failed`, and each aggregate has one terminal key. The legacy-HWP UDS
+`generation=1` remains a separate compatibility constant.
+
+Claims, retries, completions, and DLQ terminal callbacks lock in the order CollectionRun, RunStep,
+Document/Generic, ExtractionRun, then Evidence. Only a higher receipt lease for the same source
+event may reclaim RUNNING work; an older token is a no-op. A max-attempt callback may terminalize
+the same event/current generation after retry released the lease. Stop revokes every active child
+in one transaction, while delayed work for an already terminal run never rewrites the run state.
+
+`ExtractionObjectWriteReservation` records raw, result, reason, and converted writes as
+`reserved → uploaded → bound`; fence loss, stop, and recovery converge unbound rows to
+`orphaned`. Shared content-addressed keys are never deleted immediately. Physical deletion belongs
+to a later reference-aware retention/reconcile boundary (T030+).
+
+Evidence migration 0005 depends on collection 0009 and infrastructure 0002. It uses historical
+models and the schema-editor alias, rearms only exact requested events/receipts to pending/retry,
+and preserves only provable pending-ready envelopes and full child-provenance manifests. Missing,
+multiple, or ambiguous material fails closed instead of creating synthetic ready state.

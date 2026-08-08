@@ -79,6 +79,20 @@ class LocatorType(models.TextChoices):
     VISUALIZATION = "visualization", "Visualization"
 
 
+class ExtractionObjectWriteState(models.TextChoices):
+    RESERVED = "reserved", "Reserved"
+    UPLOADED = "uploaded", "Uploaded"
+    BOUND = "bound", "Bound"
+    ORPHANED = "orphaned", "Orphaned"
+
+
+class ExtractionObjectWritePurpose(models.TextChoices):
+    RAW = "raw", "Raw input"
+    RESULT = "result", "Extraction result"
+    REASON = "reason", "Low-confidence reason"
+    CONVERTED = "converted", "Converted document"
+
+
 class RightsStatus(models.TextChoices):
     ALLOWED = "allowed", "Allowed"
     ATTRIBUTION_REQUIRED = "attribution_required", "Attribution required"
@@ -291,8 +305,55 @@ class DocumentExtraction(UUIDModel):
     finished_at = models.DateTimeField(null=True, blank=True)
     error_code = models.CharField(max_length=120, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=1000, null=True, blank=True)
+    source_event_id = models.UUIDField(null=True, blank=True, db_index=True)
+    lease_generation = models.PositiveBigIntegerField(default=0)
+    lease_owner = models.CharField(max_length=160, blank=True, default="")
+    lease_token = models.UUIDField(null=True, blank=True)
+    delivery_count = models.PositiveBigIntegerField(default=0)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    terminal_event_key = models.CharField(
+        max_length=200, null=True, blank=True, unique=True
+    )
+    terminal_state = models.CharField(max_length=32, null=True, blank=True)
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state=ExtractionState.RUNNING,
+                        source_event_id__isnull=False,
+                        lease_generation__gt=0,
+                        delivery_count=models.F("lease_generation"),
+                        lease_token__isnull=False,
+                    )
+                    & ~models.Q(lease_owner="")
+                    | ~models.Q(state=ExtractionState.RUNNING)
+                    & models.Q(lease_owner="", lease_token__isnull=True)
+                ),
+                name="ck_document_extraction_lease_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+                        terminal_event_key__isnull=True,
+                        terminal_state__isnull=True,
+                    )
+                    | models.Q(
+                        state__in=(ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE),
+                        terminal_event_key__isnull=False,
+                        terminal_state="ready",
+                    )
+                    | models.Q(
+                        state=ExtractionState.FAILED,
+                        terminal_event_key__isnull=False,
+                        terminal_state="failed",
+                    )
+                ),
+                name="ck_document_extraction_terminal_complete",
+            ),
+        ]
         indexes = [
             models.Index(fields=("run_source_item", "state")),
             models.Index(fields=("source_item", "created_at")),
@@ -352,19 +413,69 @@ class ExtractionRun(UUIDModel):
     result_checksum = models.CharField(
         max_length=64, validators=[sha256_validator], null=True, blank=True
     )
+    expected_evidence_manifest_hash = models.CharField(
+        max_length=64, validators=[sha256_validator], null=True, blank=True
+    )
+    expected_evidence_count = models.PositiveIntegerField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
     peak_memory_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     error_code = models.CharField(max_length=120, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=1000, null=True, blank=True)
+    source_event_id = models.UUIDField(null=True, blank=True, db_index=True)
+    parent_lease_generation = models.PositiveBigIntegerField(default=0)
+    lease_generation = models.PositiveBigIntegerField(default=0)
+    lease_owner = models.CharField(max_length=160, blank=True, default="")
+    lease_token = models.UUIDField(null=True, blank=True)
+    delivery_count = models.PositiveBigIntegerField(default=0)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    terminal_event_key = models.CharField(
+        max_length=200, null=True, blank=True, unique=True
+    )
+    terminal_state = models.CharField(max_length=32, null=True, blank=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
                 fields=("document_extraction", "extraction_fingerprint"),
                 name="uq_document_extraction_fingerprint",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state=ExtractionState.RUNNING,
+                        source_event_id__isnull=False,
+                        lease_generation__gt=0,
+                        delivery_count=models.F("lease_generation"),
+                        lease_token__isnull=False,
+                    )
+                    & ~models.Q(lease_owner="")
+                    | ~models.Q(state=ExtractionState.RUNNING)
+                    & models.Q(lease_owner="", lease_token__isnull=True)
+                ),
+                name="ck_extraction_run_lease_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+                        terminal_event_key__isnull=True,
+                        terminal_state__isnull=True,
+                    )
+                    | models.Q(
+                        state__in=(ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE),
+                        terminal_event_key__isnull=False,
+                        terminal_state="ready",
+                    )
+                    | models.Q(
+                        state=ExtractionState.FAILED,
+                        terminal_event_key__isnull=False,
+                        terminal_state="failed",
+                    )
+                ),
+                name="ck_extraction_run_terminal_complete",
+            ),
         ]
         indexes = [models.Index(fields=("document_extraction", "state"))]
 
@@ -422,13 +533,58 @@ class GenericExtractionAttempt(UUIDModel):
     finished_at = models.DateTimeField(null=True, blank=True)
     error_code = models.CharField(max_length=120, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=1000, null=True, blank=True)
+    source_event_id = models.UUIDField(null=True, blank=True, db_index=True)
+    lease_generation = models.PositiveBigIntegerField(default=0)
+    lease_owner = models.CharField(max_length=160, blank=True, default="")
+    lease_token = models.UUIDField(null=True, blank=True)
+    delivery_count = models.PositiveBigIntegerField(default=0)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    terminal_event_key = models.CharField(
+        max_length=200, null=True, blank=True, unique=True
+    )
+    terminal_state = models.CharField(max_length=32, null=True, blank=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
                 fields=("run_source_item", "extraction_fingerprint"),
                 name="uq_generic_attempt_fingerprint",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state=ExtractionState.RUNNING,
+                        source_event_id__isnull=False,
+                        lease_generation__gt=0,
+                        delivery_count=models.F("lease_generation"),
+                        lease_token__isnull=False,
+                    )
+                    & ~models.Q(lease_owner="")
+                    | ~models.Q(state=ExtractionState.RUNNING)
+                    & models.Q(lease_owner="", lease_token__isnull=True)
+                ),
+                name="ck_generic_extraction_lease_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state__in=(ExtractionState.QUEUED, ExtractionState.RUNNING),
+                        terminal_event_key__isnull=True,
+                        terminal_state__isnull=True,
+                    )
+                    | models.Q(
+                        state__in=(ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE),
+                        terminal_event_key__isnull=False,
+                        terminal_state="ready",
+                    )
+                    | models.Q(
+                        state=ExtractionState.FAILED,
+                        terminal_event_key__isnull=False,
+                        terminal_state="failed",
+                    )
+                ),
+                name="ck_generic_extraction_terminal_complete",
+            ),
         ]
 
     def clean(self) -> None:
@@ -445,6 +601,102 @@ class GenericExtractionAttempt(UUIDModel):
             raise ValidationError("Only calibrated generic extraction can be low-confidence")
         if self.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE) and not self.result_checksum:
             raise ValidationError({"result_checksum": "Completed attempts require a result checksum"})
+
+
+class ExtractionObjectWriteReservation(UUIDModel):
+    aggregate_kind = models.CharField(max_length=32)
+    aggregate_id = models.UUIDField(db_index=True)
+    source_event_id = models.UUIDField(db_index=True)
+    lease_generation = models.PositiveBigIntegerField()
+    lease_identity_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    purpose = models.CharField(max_length=24, choices=ExtractionObjectWritePurpose.choices)
+    object_key = models.CharField(max_length=1024)
+    state = models.CharField(
+        max_length=16,
+        choices=ExtractionObjectWriteState.choices,
+        default=ExtractionObjectWriteState.RESERVED,
+    )
+    object_version = models.CharField(max_length=256, null=True, blank=True)
+    object_etag = models.CharField(max_length=256, null=True, blank=True)
+    checksum = models.CharField(
+        max_length=64, validators=[sha256_validator], null=True, blank=True
+    )
+    byte_size = models.PositiveBigIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=255, null=True, blank=True)
+    uploaded_at = models.DateTimeField(null=True, blank=True)
+    bound_at = models.DateTimeField(null=True, blank=True)
+    orphaned_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=(
+                    "aggregate_kind",
+                    "aggregate_id",
+                    "lease_generation",
+                    "purpose",
+                    "object_key",
+                ),
+                name="uq_extraction_object_write_generation",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state=ExtractionObjectWriteState.RESERVED,
+                        object_version__isnull=True,
+                        object_etag__isnull=True,
+                        checksum__isnull=True,
+                        byte_size__isnull=True,
+                        content_type__isnull=True,
+                        uploaded_at__isnull=True,
+                        bound_at__isnull=True,
+                        orphaned_at__isnull=True,
+                    )
+                    | models.Q(
+                        state=ExtractionObjectWriteState.UPLOADED,
+                        object_version__isnull=False,
+                        checksum__isnull=False,
+                        byte_size__isnull=False,
+                        content_type__isnull=False,
+                        uploaded_at__isnull=False,
+                        bound_at__isnull=True,
+                        orphaned_at__isnull=True,
+                    )
+                    | models.Q(
+                        state=ExtractionObjectWriteState.BOUND,
+                        object_version__isnull=False,
+                        checksum__isnull=False,
+                        byte_size__isnull=False,
+                        content_type__isnull=False,
+                        uploaded_at__isnull=False,
+                        bound_at__isnull=False,
+                        orphaned_at__isnull=True,
+                    )
+                    | models.Q(
+                        state=ExtractionObjectWriteState.ORPHANED,
+                        object_version__isnull=True,
+                        object_etag__isnull=True,
+                        checksum__isnull=True,
+                        byte_size__isnull=True,
+                        content_type__isnull=True,
+                        uploaded_at__isnull=True,
+                        bound_at__isnull=True,
+                        orphaned_at__isnull=False,
+                    )
+                    | models.Q(
+                        state=ExtractionObjectWriteState.ORPHANED,
+                        object_version__isnull=False,
+                        checksum__isnull=False,
+                        byte_size__isnull=False,
+                        content_type__isnull=False,
+                        uploaded_at__isnull=False,
+                        bound_at__isnull=True,
+                        orphaned_at__isnull=False,
+                    )
+                ),
+                name="ck_extraction_object_write_state",
+            ),
+        ]
 
 
 class EvidenceAsset(UUIDModel):
@@ -509,7 +761,7 @@ class EvidenceAsset(UUIDModel):
         validators=[MinValueValidator(0), MaxValueValidator(1)],
     )
     confidence_detail = models.JSONField(null=True, blank=True)
-    low_confidence_reasons = models.JSONField(default=list)
+    low_confidence_reasons = models.JSONField(default=list, blank=True)
     rights_status = models.CharField(max_length=32, choices=RightsStatus.choices, default=RightsStatus.UNKNOWN)
     rights_basis_url = models.URLField(max_length=2048, null=True, blank=True)
     attribution_text = models.TextField(null=True, blank=True)
