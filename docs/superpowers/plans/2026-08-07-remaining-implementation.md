@@ -202,7 +202,7 @@
 - Produces: `cluster_run_items(run_id) -> list[EventCluster]`, `verify_event_cluster(cluster_id, run_id=...) -> EventClusterVerification`, `article_identity_for_verification(verification) -> str`.
 - Downstream: T018 consumes only the latest immutable verified decision, never mutable cluster fields.
 
-- [ ] **Step 1: cluster membership와 검증 결정을 별도 모델로 추가한다.**
+- [X] **Step 1: cluster membership와 검증 결정을 별도 모델로 추가한다.**
 
   ```python
   class EventClusterItem(models.Model):
@@ -237,7 +237,7 @@
 
   `(cluster, run_source_item)`, `(cluster, version)`, `(cluster, origin_run)` 고유 제약을 추가한다.
 
-- [ ] **Step 2: 주택 canonical key를 공식 공고 identity로 만든다.**
+- [X] **Step 2: 주택 canonical key를 공식 공고 identity로 만든다.**
 
   ```python
   def housing_cluster_key(item) -> str:
@@ -251,15 +251,15 @@
   제목만 같은 다른 공고는 병합하지 않는다. 정정 ID는 cluster key가 아니라 article identity에 포함하여,
   동일 공고 계보 안에서 새 verification과 정정 article identity를 만든다.
 
-- [ ] **Step 3: 반도체 사건과 independence group을 계산한다.**
+- [X] **Step 3: 반도체 사건과 independence group을 계산한다.**
 
   사건 key는 주체·행위·공식 발표 ID·KST 사건일을 사용한다. syndication/origin identity가 같은 자료는 독립 출처 한 곳으로 계산한다.
 
-- [ ] **Step 4: 충돌 선택 순서를 정책으로 고정한다.**
+- [X] **Step 4: 충돌 선택 순서를 정책으로 고정한다.**
 
   주택은 `latest correction document > authority detail > structured API > aggregator` 순서로 선택하고, 모든 excluded/conflicting member에 reason code를 남긴다.
 
-- [ ] **Step 5: 반도체 중요 속보 조건을 구현한다.**
+- [X] **Step 5: 반도체 중요 속보 조건을 구현한다.**
 
   ```python
   BREAKING_CATEGORIES = {
@@ -275,18 +275,18 @@
       return "verified_breaking" if primary_count >= 1 or independent_origin_count >= 2 else "held"
   ```
 
-- [ ] **Step 6: article identity를 run UUID에서 verification으로 전환한다.**
+- [X] **Step 6: article identity를 run UUID에서 verification으로 전환한다.**
 
   housing은 notice/correction identity, breaking은 cluster canonical key, daily digest는 `KST date + policy version` hash를 사용한다.
 
-- [ ] **Step 7: collection 완료 이벤트를 clustering task로 연결한다.**
+- [X] **Step 7: collection 완료 이벤트를 clustering task로 연결한다.**
 
   `run.evidence_ready` 이후 `editorial.cluster_requested`를 만들고 cluster verification 완료 후에만
   정렬된 `verification_ids`와 `generation_manifest_hash`를 고정한 `editorial.generate_requested`를 발행한다.
   stale/reused 결과는 run 전체 frozen generation 집합을 확인해 정상 no-op `completed`로 종결하고,
   current generation의 전달 소진만 worker event provenance와 immutable audit을 남긴 뒤 실패시킨다.
 
-- [ ] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [X] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
   git add src/apps/editorial src/apps/evidence/tasks.py src/wisdome_writer/infrastructure/event_routes.py config/editorial-policies specs/001-automated-content-publishing
@@ -311,7 +311,7 @@
 - Produces: `${PADDLEOCR_MODEL_MANIFEST_ROOT}/manifest.json` schema v1 with file-level SHA-256.
 - Consumes: `verify_local_profile(profile)` and `PaddleOCRExtractor` model directory bindings.
 
-- [ ] **Step 1: bootstrap output schema를 고정한다.**
+- [X] **Step 1: bootstrap output schema를 고정한다.**
 
   ```python
   manifest = {
@@ -324,23 +324,23 @@
 
   각 model entry는 `model_name`, absolute `directory`, 정렬된 `{path, sha256, byte_size}`를 포함한다.
 
-- [ ] **Step 2: bootstrap container가 승인된 모델만 내려받고 manifest를 생성하게 한다.**
+- [X] **Step 2: bootstrap container가 승인된 모델만 내려받고 manifest를 생성하게 한다.**
 
   모델 목록은 한국어/영어 recognition, layout, table, formula, chart와 orientation 구성 전체를 명시한다. 임의 최신 버전 해석을 금지한다.
 
-- [ ] **Step 3: Compose에 완료형 bootstrap dependency와 read-only volume을 연결한다.**
+- [X] **Step 3: Compose에 완료형 bootstrap dependency와 read-only volume을 연결한다.**
 
   `ocr-model-bootstrap`은 `paddle-models` volume에 기록하고 `ocr-worker`는 `service_completed_successfully` 이후 같은 volume을 `:ro`로 읽는다.
 
-- [ ] **Step 4: profile document가 실제 manifest root를 참조하게 한다.**
+- [X] **Step 4: profile document가 실제 manifest root를 참조하게 한다.**
 
   `model_manifest_file`을 `${PADDLEOCR_MODEL_MANIFEST_ROOT}/manifest.json`으로 통일하고 zero hash나 누락 파일을 fail-closed 처리한다.
 
-- [ ] **Step 5: extractor에 전체 model directory를 명시적으로 주입한다.**
+- [X] **Step 5: extractor에 전체 model directory를 명시적으로 주입한다.**
 
   `PaddleOCRExtractor` 생성 시 profile model names를 PPStructureV3 constructor option에 1:1 매핑하고 runtime download option을 비활성화한다.
 
-- [ ] **Step 6: 사용자 승인 후 offline manifest 검증을 수행하고 커밋한다.**
+- [X] **Step 6: 사용자 승인 후 offline manifest 검증을 수행하고 커밋한다.**
 
   ```powershell
   git add deploy/containers/paddleocr-model-bootstrap deploy/containers/paddleocr-worker compose.yaml .env.example config/extraction-profiles/paddleocr src/apps/evidence
