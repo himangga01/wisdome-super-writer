@@ -8,7 +8,7 @@
   "pipeline_name": "PPStructureV3",
   "validation_mode": null,
   "implementation_files": ["src/adapters/extractors/paddleocr/adapter.py"],
-  "model_manifest_file": "${PADDLEOCR_MODEL_MANIFEST_ROOT}/paddle-ko-v1.models.json",
+  "model_manifest_file": "${PADDLEOCR_MODEL_MANIFEST_ROOT}/manifest.json",
   "config": {
     "pipeline_name": "PPStructureV3",
     "runtime_version": "3.2.2",

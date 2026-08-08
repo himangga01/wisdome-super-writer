@@ -286,11 +286,15 @@ services:
     environment:
       <<: *runtime-environment
       PADDLEOCR_HOME: /models/paddleocr
+      PADDLEOCR_MODEL_MANIFEST_ROOT: /models/paddleocr
+      PADDLE_PDX_CACHE_HOME: /models/paddleocr
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
     command: ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.ocr.paddle", "--concurrency=1"]
     volumes:
       - paddle-models:/models/paddleocr:ro
     depends_on:
+      ocr-model-bootstrap:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -304,6 +308,19 @@ services:
       - broker
       - object-storage
     restart: unless-stopped
+
+  ocr-model-bootstrap:
+    build:
+      context: .
+      dockerfile: deploy/containers/paddleocr-model-bootstrap/Dockerfile
+    environment:
+      PADDLEOCR_HOME: /models/paddleocr
+      PADDLEOCR_MODEL_MANIFEST_ROOT: /models/paddleocr
+      PADDLE_PDX_CACHE_HOME: /models/paddleocr
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+    volumes:
+      - paddle-models:/models/paddleocr
+    restart: "no"
 
   beat:
     <<: *app

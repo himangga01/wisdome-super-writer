@@ -3,7 +3,6 @@ FROM python:3.12.10-slim@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5
 ARG UV_VERSION=0.11.26
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src \
     PATH=/app/.venv/bin:$PATH \
     TZ=Asia/Seoul \
     PADDLEOCR_HOME=/models/paddleocr \
@@ -18,8 +17,7 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir "uv==${UV_VERSION}"
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --extra ocr --no-install-project
-COPY src ./src
-COPY config ./config
+COPY deploy/containers/paddleocr-model-bootstrap/bootstrap.py ./bootstrap.py
 RUN uv sync --frozen --no-dev --extra ocr
 
-CMD ["celery", "-A", "wisdome_writer", "worker", "--loglevel=INFO", "--queues=extract.ocr.paddle", "--concurrency=1"]
+CMD ["python", "bootstrap.py"]

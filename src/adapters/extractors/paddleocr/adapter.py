@@ -24,6 +24,37 @@ class PaddleOCRExtractor:
     engine = "paddleocr_ppstructurev3"
     package_version = "3.7.0"
     pipeline_name = "PPStructureV3"
+    required_models = frozenset({
+        "PP-Chart2Table",
+        "PP-DocLayout_plus-L",
+        "PP-FormulaNet_plus-M",
+        "PP-LCNet_x1_0_doc_ori",
+        "PP-LCNet_x1_0_textline_ori",
+        "PP-OCRv5_server_det",
+        "SLANeXt_wired",
+        "UVDoc",
+        "en_PP-OCRv5_mobile_rec",
+        "korean_PP-OCRv5_mobile_rec",
+    })
+    model_options = {
+        "PP-Chart2Table": ("chart_recognition_model_name", "chart_recognition_model_dir"),
+        "PP-DocLayout_plus-L": ("layout_detection_model_name", "layout_detection_model_dir"),
+        "PP-FormulaNet_plus-M": ("formula_recognition_model_name", "formula_recognition_model_dir"),
+        "PP-LCNet_x1_0_doc_ori": (
+            "doc_orientation_classify_model_name",
+            "doc_orientation_classify_model_dir",
+        ),
+        "PP-LCNet_x1_0_textline_ori": (
+            "textline_orientation_model_name",
+            "textline_orientation_model_dir",
+        ),
+        "PP-OCRv5_server_det": ("text_detection_model_name", "text_detection_model_dir"),
+        "SLANeXt_wired": (
+            "wired_table_structure_recognition_model_name",
+            "wired_table_structure_recognition_model_dir",
+        ),
+        "UVDoc": ("doc_unwarping_model_name", "doc_unwarping_model_dir"),
+    }
 
     def __init__(
         self,
@@ -65,35 +96,74 @@ class PaddleOCRExtractor:
         return runtime
 
     def _verify_local_models(self) -> None:
-        actual_manifest = {"models": []}
+        actual_manifest = {
+            "schema_version": "v1",
+            "paddleocr_version": self.package_version,
+            "pipeline": self.pipeline_name,
+            "models": [],
+        }
         models = self.model_manifest.get("models")
-        if not isinstance(models, list) or not models:
+        if (
+            self.model_manifest.get("schema_version") != "v1"
+            or self.model_manifest.get("paddleocr_version") != self.package_version
+            or self.model_manifest.get("pipeline") != self.pipeline_name
+            or not isinstance(models, list)
+            or not models
+        ):
             raise ExtractorError("model_manifest_mismatch", "PaddleOCR model manifest is empty")
+        seen_names = set()
         for model in models:
             model_name = str(model.get("model_name", ""))
             directory = Path(str(model.get("directory", "")))
             files = model.get("files")
-            if not model_name or not directory.is_absolute() or not isinstance(files, list) or not files:
+            if (
+                not model_name
+                or model_name in seen_names
+                or not directory.is_absolute()
+                or not isinstance(files, list)
+                or not files
+            ):
                 raise ExtractorError("model_manifest_mismatch", "PaddleOCR model entry is incomplete")
+            seen_names.add(model_name)
             verified_files = []
             for item in files:
                 relative = Path(str(item.get("path", "")))
                 expected = str(item.get("sha256", ""))
-                if relative.is_absolute() or ".." in relative.parts or len(expected) != 64 or set(expected) == {"0"}:
+                byte_size = item.get("byte_size")
+                if (
+                    not relative.parts
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or len(expected) != 64
+                    or set(expected) == {"0"}
+                    or any(character not in "0123456789abcdef" for character in expected)
+                    or not isinstance(byte_size, int)
+                    or byte_size < 1
+                ):
                     raise ExtractorError("model_manifest_mismatch", "PaddleOCR model file manifest is invalid")
                 candidate = (directory / relative).resolve()
                 try:
                     candidate.relative_to(directory.resolve())
                 except ValueError as exc:
                     raise ExtractorError("model_manifest_mismatch", "PaddleOCR model path escapes its directory") from exc
-                if not candidate.is_file() or sha256_file(candidate) != expected:
+                if (
+                    not candidate.is_file()
+                    or candidate.stat().st_size != byte_size
+                    or sha256_file(candidate) != expected
+                ):
                     raise ExtractorError("model_manifest_mismatch", "PaddleOCR model checksum differs from profile")
-                verified_files.append({"path": relative.as_posix(), "sha256": expected})
+                verified_files.append({
+                    "path": relative.as_posix(),
+                    "sha256": expected,
+                    "byte_size": byte_size,
+                })
             actual_manifest["models"].append({
                 "model_name": model_name,
                 "directory": str(directory),
                 "files": sorted(verified_files, key=lambda item: item["path"]),
             })
+        if seen_names != self.required_models:
+            raise ExtractorError("model_manifest_mismatch", "PaddleOCR model manifest has missing or unexpected models")
         actual_manifest["models"].sort(key=lambda item: item["model_name"])
         if sha256_bytes(canonical_bytes(actual_manifest)) != self.expected_model_manifest_hash:
             raise ExtractorError("model_manifest_mismatch", "PaddleOCR model manifest hash differs from profile")
@@ -120,18 +190,19 @@ class PaddleOCRExtractor:
             "use_textline_orientation": bool(self.config.get("use_textline_orientation", True)),
             "text_recognition_model_name": recognition_model,
             "text_recognition_model_dir": model_dirs[recognition_model],
+            "use_table_recognition": bool(self.config.get("enable_table_recognition", True)),
+            "use_formula_recognition": bool(self.config.get("enable_formula_recognition", True)),
+            "use_chart_recognition": bool(self.config.get("enable_chart_recognition", True)),
+            "use_seal_recognition": bool(self.config.get("enable_seal_recognition", False)),
             "device": str(self.config.get("device", "cpu")),
         }
-        optional_dir_keys = {
-            "PP-LCNet_x1_0_doc_ori": "doc_orientation_classify_model_dir",
-            "UVDoc": "doc_unwarping_model_dir",
-            "PP-LCNet_x1_0_textline_ori": "textline_orientation_model_dir",
-            "PP-FormulaNet_plus-M": "formula_recognition_model_dir",
-            "SLANeXt_wired": "table_structure_recognition_model_dir",
-        }
-        for model_name, argument in optional_dir_keys.items():
-            if model_name in model_dirs:
-                kwargs[argument] = model_dirs[model_name]
+        for model_name, (name_argument, directory_argument) in self.model_options.items():
+            try:
+                kwargs[name_argument] = model_name
+                kwargs[directory_argument] = model_dirs[model_name]
+            except KeyError as exc:
+                raise ExtractorError("model_manifest_mismatch", "PaddleOCR model directory is not in the manifest") from exc
+        os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "true"
         os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
         try:
             self._pipeline = PPStructureV3(**kwargs)

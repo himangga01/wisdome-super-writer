@@ -1,10 +1,10 @@
 from pathlib import Path
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.evidence.models import ExtractionEngine, ExtractionProfileSnapshot
-from apps.evidence.profiles import verify_local_profile
+from apps.evidence.profiles import load_profile_documents, profile_snapshot_values
 
 
 class Command(BaseCommand):
@@ -14,15 +14,15 @@ class Command(BaseCommand):
         parser.add_argument("--profiles", default="config/extraction-profiles/paddleocr")
 
     def handle(self, *args, **options):
-        profiles = ExtractionProfileSnapshot.objects.filter(engine=ExtractionEngine.PADDLEOCR)
-        if not profiles.exists():
-            raise CommandError("No PaddleOCR profile snapshot has been imported")
-        failed = []
-        for profile in profiles:
-            report = verify_local_profile(profile)
-            if report["overallResult"] != "passed":
-                failed.append(profile.profile_key)
-        if failed:
-            raise CommandError(f"PaddleOCR profile verification failed: {', '.join(failed)}")
-        self.stdout.write(self.style.SUCCESS(f"verified {profiles.count()} PaddleOCR profiles"))
+        root = Path(options["profiles"])
+        if not root.is_absolute():
+            root = settings.REPOSITORY_ROOT / root
+        try:
+            documents = load_profile_documents(root)
+            values = [profile_snapshot_values(document) for document in documents]
+        except (KeyError, ValidationError) as exc:
+            raise CommandError(str(exc)) from exc
+        if not values:
+            raise CommandError("No PaddleOCR profile documents were found")
+        self.stdout.write(self.style.SUCCESS(f"verified {len(values)} PaddleOCR profiles"))
 

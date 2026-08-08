@@ -29,6 +29,21 @@ MVP_PROFILE_KEYS = frozenset({
     "manual-entry-v1",
 })
 
+PADDLEOCR_VERSION = "3.7.0"
+PADDLEOCR_PIPELINE = "PPStructureV3"
+PADDLEOCR_REQUIRED_MODELS = frozenset({
+    "PP-Chart2Table",
+    "PP-DocLayout_plus-L",
+    "PP-FormulaNet_plus-M",
+    "PP-LCNet_x1_0_doc_ori",
+    "PP-LCNet_x1_0_textline_ori",
+    "PP-OCRv5_server_det",
+    "SLANeXt_wired",
+    "UVDoc",
+    "en_PP-OCRv5_mobile_rec",
+    "korean_PP-OCRv5_mobile_rec",
+})
+
 
 def _expand(value: Any) -> Any:
     if isinstance(value, str):
@@ -59,8 +74,7 @@ def _resolve_deployment_material(document: dict[str, Any]) -> dict[str, Any]:
     model_manifest_file = document.get("model_manifest_file")
     if model_manifest_file:
         _, model_manifest = _load_json_file(str(model_manifest_file), label="PaddleOCR model manifest")
-        if model_manifest.get("schema_version") != "v1" or not model_manifest.get("models"):
-            raise ValidationError("PaddleOCR model manifest has no verified model entries")
+        _validate_paddle_model_manifest(model_manifest, verify_files=True)
         document["model_manifest"] = model_manifest
 
     config = document.get("config")
@@ -74,15 +88,68 @@ def _resolve_deployment_material(document: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
+def _validate_paddle_model_manifest(manifest: Mapping[str, Any], *, verify_files: bool) -> None:
+    if (
+        manifest.get("schema_version") != "v1"
+        or manifest.get("paddleocr_version") != PADDLEOCR_VERSION
+        or manifest.get("pipeline") != PADDLEOCR_PIPELINE
+    ):
+        raise ValidationError("PaddleOCR model manifest version or pipeline is invalid")
+    models = manifest.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValidationError("PaddleOCR model manifest has no verified model entries")
+    names: set[str] = set()
+    for raw_model in models:
+        if not isinstance(raw_model, Mapping):
+            raise ValidationError("PaddleOCR model entry is invalid")
+        model_name = str(raw_model.get("model_name", ""))
+        directory = Path(str(raw_model.get("directory", "")))
+        files = raw_model.get("files")
+        if not model_name or model_name in names or not directory.is_absolute() or not isinstance(files, list) or not files:
+            raise ValidationError("PaddleOCR model entry is incomplete")
+        names.add(model_name)
+        for raw_file in files:
+            if not isinstance(raw_file, Mapping):
+                raise ValidationError("PaddleOCR model file entry is invalid")
+            relative = Path(str(raw_file.get("path", "")))
+            expected_hash = str(raw_file.get("sha256", ""))
+            byte_size = raw_file.get("byte_size")
+            if (
+                not relative.parts
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or len(expected_hash) != 64
+                or set(expected_hash) == {"0"}
+                or any(character not in "0123456789abcdef" for character in expected_hash)
+                or not isinstance(byte_size, int)
+                or byte_size < 1
+            ):
+                raise ValidationError("PaddleOCR model file manifest is invalid")
+            candidate = (directory / relative).resolve()
+            try:
+                candidate.relative_to(directory.resolve())
+            except ValueError as exc:
+                raise ValidationError("PaddleOCR model path escapes its directory") from exc
+            if verify_files and (not candidate.is_file() or candidate.stat().st_size != byte_size or sha256_file(candidate) != expected_hash):
+                raise ValidationError("PaddleOCR model file differs from its manifest")
+    if names != PADDLEOCR_REQUIRED_MODELS:
+        raise ValidationError("PaddleOCR model manifest has missing or unexpected models")
+
+
 def load_profile_documents(root: Path) -> list[dict[str, Any]]:
     manifest_path = root / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValidationError(f"Invalid extraction profile manifest: {manifest_path}") from exc
-    entries = manifest.get("profiles")
-    if not isinstance(entries, list):
-        raise ValidationError("Extraction profile manifest must contain a profiles array")
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValidationError(f"Invalid extraction profile manifest: {manifest_path}") from exc
+        entries = manifest.get("profiles")
+        if not isinstance(entries, list):
+            raise ValidationError("Extraction profile manifest must contain a profiles array")
+    else:
+        entries = [{"file": path.name} for path in sorted(root.glob("*.json"))]
+        if not entries:
+            raise ValidationError(f"No extraction profile documents found: {root}")
     documents = []
     for entry in entries:
         relative = Path(str(entry.get("file", "")))
@@ -201,21 +268,14 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
     else:
         stage("dependency.version", True, "stdlib/local wrapper")
     if profile.engine == ExtractionEngine.PADDLEOCR:
-        stage("paddle.pipeline", profile.pipeline_name == "PPStructureV3")
-        stage("paddle.package", profile.package_version == "3.7.0")
-        models_passed = True
-        for model in (profile.model_manifest or {}).get("models", []):
-            directory = Path(str(model.get("directory", "")))
-            files = model.get("files") or []
-            if not directory.is_absolute() or not files:
-                models_passed = False
-                continue
-            for item in files:
-                expected = str(item.get("sha256", ""))
-                candidate = directory / str(item.get("path", ""))
-                if not candidate.is_file() or set(expected) == {"0"} or sha256_file(candidate) != expected:
-                    models_passed = False
-        stage("paddle.local_models", models_passed, "All model files must be preloaded with exact SHA-256")
+        stage("paddle.pipeline", profile.pipeline_name == PADDLEOCR_PIPELINE)
+        stage("paddle.package", profile.package_version == PADDLEOCR_VERSION)
+        try:
+            _validate_paddle_model_manifest(profile.model_manifest or {}, verify_files=True)
+            models_passed = True
+        except ValidationError:
+            models_passed = False
+        stage("paddle.local_models", models_passed, "All approved model files must be preloaded with exact SHA-256 and size")
     if profile.engine == ExtractionEngine.LEGACY_HWP:
         command = profile.config.get("sandbox_command") or []
         manifest_hash = str(profile.config.get("converter_manifest_hash", ""))
