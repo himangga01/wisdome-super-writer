@@ -10,11 +10,19 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 
 class ExtractorError(RuntimeError):
-    def __init__(self, code: str, detail_redacted: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        detail_redacted: str,
+        *,
+        retryable: bool = False,
+        retry_after_seconds: int | None = None,
+    ) -> None:
         super().__init__(detail_redacted)
         self.code = code
         self.detail_redacted = detail_redacted[:1000]
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 def normalize_text(text: str | None) -> str | None:

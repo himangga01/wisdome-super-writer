@@ -271,6 +271,39 @@ RunSourceItem은 활성 registry membership과 성공한 직전 관측만 가리
 DATA_GO_KR_SERVICE_KEY=발급받은_서비스_키
 ```
 
+### 5.2 T012 접근·권리·최신성 정책 확인 절차
+
+다음 순서로 확인한다. 정책 변경 뒤 기존 승인이나 health를 그대로 재사용하지 않는다.
+
+1. source draft의 `externalConfig.accessPolicy`에 review 시각, 연락 가능한 User-Agent,
+   collection/source-check traffic scope, HTTP/retry/redirect/request/elapsed 예산과 origin별
+   purpose·method·path·robots 규칙을 넣는다.
+2. `externalConfig.rightsPolicy`에 record, document attachment, media attachment별 status,
+   근거 종류/URL, 귀속 문구와 publishable 판정을 넣는다. 첨부 권리는 record보다 넓을 수 없다.
+3. `POST /api/v1/sources/{sourceId}/check`를 요청하고 `lastHealth`가
+   `source-check-taxonomy-v1`, 현재 snapshot/config/access-policy/rights-policy hash,
+   `status=passed`, ETag/Last-Modified/content hash와 record count를 가리키는지 확인한다.
+4. 같은 hash의 최근 source check가 통과한 draft만 registry decision으로 승인한다. draft나
+   정책 hash가 바뀌면 source check부터 다시 수행한다.
+5. 수동 CollectionRun을 만든 뒤 상세 API에서 run의 TopicPolicy ID/version/hash,
+   freshness cutoff, allowed authority tiers, registry ID/version/hash와 source별
+   attempt/observation을 확인한다.
+
+운영 확인 시 다음 실패를 서로 구분한다.
+
+- robots deny, 승인되지 않은 host/path/method/purpose, MIME 불일치는 영구 policy/schema
+  실패이며 차단 뒤 후속 record/evidence가 없어야 한다.
+- poll/rate/concurrency 제한, 429/502/503/504, DNS/transport/Redis 일시 오류는
+  `retry_scheduled`와 redacted observation을 남기고 `Retry-After` 우선으로 source 하나만
+  최대 5회 전달한다.
+- TopicPolicy authority tier 밖의 source와 cutoff보다 오래되거나 미래인 active record는
+  분류된 제외로 남고 SourceItem/evidence를 만들지 않는다.
+- 권리 policy가 `prohibited`이거나 근거가 없는 visual/document는 다운로드·게시 가능
+  evidence를 만들지 않는다. metadata-only media는 원격 bytes를 받지 않고 metadata evidence만
+  남긴다.
+- 일부 source만 성공하면 run은 실패 수를 보존하고 extraction으로 진행한다. 모든 source가
+  실패하면 run/collect step이 failed이고 `run.evidence_requested`가 없어야 한다.
+
 ### 5.1 Housing collection contract (English)
 
 The housing registry freezes approved HTTPS API targets, exact record hosts, request and
@@ -301,6 +334,23 @@ terminal observations create no fresh evidence; new/corrected/restored observati
 extraction. Terminal/restored impact walks the full lineage and creates or converges
 article correction cases. Only explicit provider state creates corrected, retracted, or
 unavailable records; transport and schema failures remain collection failures.
+
+### 5.2 T012 access-policy verification (English)
+
+Create or update a source draft with complete accessPolicy v1 and rightsPolicy v1 material,
+then run `POST /api/v1/sources/{sourceId}/check`. Approval requires a recent passed
+`source-check-taxonomy-v1` result bound to the exact source snapshot, config hash,
+access-policy hash, and rights-policy hash. Any draft or policy change invalidates that
+evidence and requires a new check before registry approval.
+
+A CollectionRun detail response must expose its pinned TopicPolicy and registry material,
+freshness cutoff, allowed authority tiers, and every source attempt/observation. Permanent
+robots, scope, method, path, MIME, authentication, and rights failures do not produce
+records or evidence. Retryable poll/rate/concurrency, 429/502/503/504, DNS, transport, and
+Redis failures record `retry_scheduled` and honor Retry-After within the source route's
+five-delivery budget. Stale/future records and disallowed authority tiers are excluded
+with durable categories. Partial source success advances to extraction; zero successes
+fail collection and emit no evidence fan-out.
 
 ## 6. PaddleOCR PDF 인식 검증
 

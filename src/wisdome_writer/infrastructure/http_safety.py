@@ -34,6 +34,14 @@ class OutboundRequestFailed(HttpSafetyError):
     """Raised for network failures without exposing the original request URL."""
 
 
+class OutboundResolutionFailed(HttpSafetyError):
+    """Raised when a public host cannot be resolved at request time."""
+
+
+class OutboundResponseMimeRejected(HttpSafetyError):
+    """Raised from response headers before an unapproved body is consumed."""
+
+
 @dataclass(frozen=True)
 class _ValidatedTarget:
     logical_url: str
@@ -95,6 +103,7 @@ def safe_get(
     https_only: bool = False,
     before_request: Callable[[], None] | None = None,
     url_validator: Callable[[str], None] | None = None,
+    allowed_content_types: Collection[str] | None = None,
 ) -> httpx.Response:
     """GET a public HTTP(S) resource with DNS pinning, redirect checks, and bounded streaming."""
     return _safe_request(
@@ -109,6 +118,7 @@ def safe_get(
         https_only=https_only,
         before_request=before_request,
         url_validator=url_validator,
+        allowed_content_types=allowed_content_types,
     )
 
 
@@ -125,6 +135,7 @@ def safe_post_form(
     https_only: bool = False,
     before_request: Callable[[], None] | None = None,
     url_validator: Callable[[str], None] | None = None,
+    allowed_content_types: Collection[str] | None = None,
 ) -> httpx.Response:
     """POST an encoded form through the same pinned, bounded path as ``safe_get``."""
     return _safe_request(
@@ -140,6 +151,7 @@ def safe_post_form(
         https_only=https_only,
         before_request=before_request,
         url_validator=url_validator,
+        allowed_content_types=allowed_content_types,
     )
 
 
@@ -156,6 +168,7 @@ def _safe_request(
     https_only: bool,
     before_request: Callable[[], None] | None,
     url_validator: Callable[[str], None] | None,
+    allowed_content_types: Collection[str] | None,
     form_data: Mapping[str, Any] | None = None,
 ) -> httpx.Response:
 
@@ -195,19 +208,31 @@ def _safe_request(
             timeout=timeout,
             deadline=deadline,
             before_request=before_request,
+            allowed_content_types=allowed_content_types,
         )
         location = response.headers.get("location")
-        if response.status_code not in _REDIRECT_STATUSES or not location:
+        if not 300 <= response.status_code < 400:
             return response
+        if response.status_code not in _REDIRECT_STATUSES:
+            raise UnsafeOutboundUrl(
+                "Outbound response used an unsupported redirect status: "
+                f"{response.status_code} for {redact_url(current_url)}"
+            )
+        if not location:
+            raise UnsafeOutboundUrl(
+                "Outbound redirect response omitted Location: "
+                f"{redact_url(current_url)}"
+            )
+        if method == "POST":
+            raise UnsafeOutboundUrl(
+                "Outbound POST redirects are not permitted: "
+                f"{redact_url(current_url)}"
+            )
         if redirect_count == max_redirects:
             raise UnsafeOutboundUrl(
                 f"Outbound redirect limit exceeded for {redact_url(current_url)}"
             )
         current_url = urljoin(current_url, location)
-        if response.status_code in {301, 302, 303}:
-            current_method = "GET"
-            current_form = None
-
     raise RuntimeError("unreachable")
 
 
@@ -281,7 +306,7 @@ def _resolve_public_addresses(
                 proto=socket.IPPROTO_TCP,
             )
         except OSError:
-            raise UnsafeOutboundUrl(
+            raise OutboundResolutionFailed(
                 f"Outbound host resolution failed for {redact_url(logical_url)}"
             ) from None
         raw_addresses = tuple(
@@ -323,6 +348,7 @@ def _request_pinned(
     timeout: httpx.Timeout | float,
     deadline: float,
     before_request: Callable[[], None] | None,
+    allowed_content_types: Collection[str] | None,
 ) -> httpx.Response:
     last_failure: str | None = None
     for address in target.addresses:
@@ -345,14 +371,23 @@ def _request_pinned(
                     data=form_data,
                     extensions={"sni_hostname": target.hostname},
                 ) as streamed:
+                    if not 300 <= streamed.status_code < 400 and streamed.status_code < 400:
+                        _require_approved_content_type(
+                            streamed,
+                            allowed_content_types,
+                            target.logical_url,
+                        )
                     content = (
                         b""
-                        if streamed.status_code in _REDIRECT_STATUSES
-                        else _read_bounded(
+                        if 300 <= streamed.status_code < 400
+                        else _read_limited(
                             streamed,
-                            max_bytes,
+                            min(max_bytes, 8 * 1024)
+                            if streamed.status_code >= 400
+                            else max_bytes,
                             target.logical_url,
                             deadline,
+                            reject_declared_size=streamed.status_code < 400,
                         )
                     )
                     safe_request = httpx.Request(method, redact_url(target.logical_url))
@@ -420,16 +455,38 @@ def _remaining_seconds(deadline: float, logical_url: str) -> float:
     return remaining
 
 
-def _read_bounded(
+def _require_approved_content_type(
+    response: httpx.Response,
+    allowed_content_types: Collection[str] | None,
+    logical_url: str,
+) -> None:
+    if allowed_content_types is None:
+        return
+    allowed = {
+        str(value).split(";", 1)[0].strip().lower()
+        for value in allowed_content_types
+        if str(value).strip()
+    }
+    actual = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if not allowed or actual not in allowed:
+        raise OutboundResponseMimeRejected(
+            "Outbound response MIME type is not approved: "
+            f"{redact_url(logical_url)}"
+        )
+
+
+def _read_limited(
     response: httpx.Response,
     max_bytes: int,
     logical_url: str,
     deadline: float,
+    *,
+    reject_declared_size: bool,
 ) -> bytes:
     content_length = response.headers.get("content-length")
     if content_length:
         try:
-            if int(content_length) > max_bytes:
+            if reject_declared_size and int(content_length) > max_bytes:
                 raise OutboundResponseTooLarge(
                     f"Outbound response exceeds the configured limit: {redact_url(logical_url)}"
                 )
@@ -440,6 +497,8 @@ def _read_bounded(
     for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_BYTES):
         _remaining_seconds(deadline, logical_url)
         if len(content) + len(chunk) > max_bytes:
+            if not reject_declared_size:
+                break
             raise OutboundResponseTooLarge(
                 f"Outbound response exceeds the configured limit: {redact_url(logical_url)}"
             )

@@ -117,6 +117,8 @@ version을 DB에서 재조회한다. enable 경합 중 이미 시작된 호출�
 | `terms_url`, `robots_url`, `license_url` | URL nullable | 접근·권리 근거 |
 | `poll_interval_seconds` | positive int | 최소 점검 간격 |
 | `rate_limit_policy` | JSONB | 동시성/분당 호출 제한 |
+| `external_config.accessPolicy` | policy v1 JSONB | 승인 시각·User-Agent·요청/재시도/redirect 예산과 origin별 목적·method·path·robots 판정 |
+| `external_config.rightsPolicy` | policy v1 JSONB | record·document attachment·media attachment별 권리 근거·귀속 문구·게시 가능 판정 |
 | `enabled` | boolean | 운영 여부 |
 | `latest_approved_snapshot_version` | positive int nullable | draft는 null인 read-only projection |
 | `latest_draft_snapshot_id`, `latest_draft_snapshot_version`, `latest_draft_config_hash` | FK/int/SHA-256 nullable | create/PATCH가 만든 current draft material |
@@ -130,7 +132,8 @@ version을 DB에서 재조회한다. enable 경합 중 이미 시작된 호출�
 
 실행 재현을 위한 개별 출처의 불변 JSON 스냅샷이다. `id`, `source_definition_id`,
 `topic_code`, `snapshot_version`, `config_json`, `config_hash`, `frozen_config_json`,
-`frozen_config_hash`, `independence_group_id`, `owner_name`, `editorial_control_name`,
+`frozen_config_hash`, `accessPolicy`, `accessPolicyHash`, `rightsPolicy`, `rightsPolicyHash`,
+`independence_group_id`, `owner_name`, `editorial_control_name`,
 `status: draft/approved/retired`, `request_key`, `request_hash`, `created_at`, `approved_at`을
 가진다. `config_json/config_hash`는 기존 registry와 run이 참조한 역사적 identity material을
 보존한다. adapter는 mutable SourceDefinition이나 이 역사 필드를 다시 조합하지 않고,
@@ -319,6 +322,10 @@ validation/activation ref와 두 manifest가 모두 빈 배열/null이어야 한
 | `schedule_id` | FK nullable | 일정 실행인 경우 |
 | `window_start`, `window_end` | datetime | 자료 시간 범위 |
 | `source_registry_snapshot_id`, `registry_version`, `policy_version` | FK/int/int | 실행 시 고정된 주제별 출처 집합과 정책 버전 |
+| `registry_manifest_hash` | SHA-256 | 실행 시 고정된 registry manifest |
+| `topic_policy_id`, `policy_hash` | FK/SHA-256 | 실행 시 고정한 활성 TopicPolicy와 전체 정책 지문 |
+| `freshness_minutes`, `freshness_cutoff` | positive int/datetime | `window_end - freshness_minutes`로 고정한 최신성 경계 |
+| `allowed_authority_tiers` | ordered string array | TopicPolicy에서 고정한 수집 허용 authority tier |
 | `requested_target_ids` | sorted UUID array | 실행 생성 시 고정한 발행 대상; 빈 배열은 초안 전용 |
 | `requested_target_snapshot_refs` | sorted JSONB array | target ID, immutable target snapshot ID/config hash 묶음 |
 | `target_snapshot_manifest_hash` | SHA-256 | 위 정렬 배열의 NFC+RFC 8785 JCS 지문; 빈 배열도 고정 hash |
@@ -342,7 +349,8 @@ validation/activation ref와 두 manifest가 모두 빈 배열/null이어야 한
 명시적 하위 작업 재개를 생성한다.
 
 request fingerprint는 topic, window, trigger, source registry snapshot ID/manifest hash,
-policy version, 정렬된 target snapshot refs/manifest hash, approval mode, schedule snapshot hash,
+TopicPolicy ID/version/hash, freshness 기준, authority tier, 정렬된 target snapshot
+refs/manifest hash, approval mode, schedule snapshot hash,
 auto-validation snapshot hash와 auto-activation manifest hash의 null 표현까지 포함한다.
 CollectionRun target/mode snapshot은 자동 파이프라인의
 최초 의도와 감사 기준이며 외부 쓰기는 아래 append-only PublicationIntent를 사용한다.
@@ -405,15 +413,45 @@ topic/registry version과 같아야 한다.
 
 ### SourceCollectionAttempt
 
-collector 구현까지 재현하는 append-only source 단위 실행이다. `id`, `collection_run_id`,
-`source_definition_snapshot_id`, `adapter_name`, `adapter_version`,
+collector 구현까지 재현하는 source 단위 durable 실행 projection이다. `id`,
+`collection_run_id`, `source_definition_snapshot_id`, `adapter_name`, `adapter_version`,
 `adapter_implementation_manifest_hash`, `adapter_config_hash`, `request_fingerprint`,
-`request_window_start/end`, `response_body_checksum` nullable, `http_status` nullable,
-`state: queued/running/succeeded/failed`, `started_at`, `finished_at`, `error_code`를 가진다.
+`request_window_start/end`, `response_checksum` nullable, `http_status` nullable,
+`state: queued/running/retry_scheduled/succeeded/failed/skipped`, `failure_category`,
+`error_code`, `error_detail_redacted`, `retry_count`, `retry_at`, `retry_after_seconds`,
+`request_count`, `response_count`, `access_policy_hash`, `rights_policy_hash`, `authority_tier`,
+`freshness_cutoff`, `freshness_excluded_count`, `duration_ms`, `started_at`, `finished_at`을 가진다.
 `(collection_run_id, source_definition_snapshot_id, request_fingerprint)`가 고유하다. RunSourceItem은
 반드시 자신을 만든 succeeded attempt를 참조하고, adapter/response 지문은 SourceItem identity/
 version 판단과 PublishedEvidenceSnapshot provenance에 포함한다. 배포 adapter manifest가 승인된
 source-adapter manifest와 다르면 수집 전에 실패하며 event hint만 신뢰하지 않는다.
+
+각 enabled membership은 독립 `source.collect_requested` 이벤트를 가진다. 기본적으로
+`policy/schema/authentication/security` 접근 오류는 영구 실패이며, 명시적으로 retryable인
+`transient/infrastructure` 오류만 `retry_scheduled`와 `retry_at`을 기록하고 outbox 전달 예산
+안에서 재시도한다. 영구 오류나
+전달 예산 소진은 해당 attempt만 `failed`로 끝낸다. `freshness/authority/rights` 제외는
+별도 failure category로 기록한다. finalizer는 모든 source attempt가 terminal일 때만
+집계하며 성공 출처가 하나도 없으면 run을 `failed`로 끝내고 evidence fan-out을 만들지 않는다.
+하나 이상 성공하면 부분 실패를 counters/error summary에 남기고 `extracting`으로 전진한다.
+최신성 판정 시각은 `modified_at`을 우선하고 없을 때 `published_at`을 사용한다. 신규 evidence를
+만들 수 있는 `active/corrected` record에 같은 기준을 적용하고, 명시적 `reconciliation_only`와
+신규 evidence를 만들지 않는 `retracted/unavailable`만 시간창 판정의 예외로 둔다. 성공한 source에서
+시간창 밖 자료를 제외한 경우에도 attempt와 해당 전달 observation에 `freshness` 분류와
+`freshness_excluded_count`를 남기고 run counters/error summary에 같은 합계를 투영한다.
+
+### SourceCollectionObservation
+
+source 전달 세대마다 남기는 append-only 관측이다. `id`,
+`source_collection_attempt_id`, `delivery_attempt_no`, `outcome`,
+`failure_category`, `error_code`, `error_detail_redacted`, `http_status`,
+`retry_count`, `retry_at`, `retry_after_seconds`, `request_count`, `freshness_excluded_count`, `duration_ms`,
+`access_policy_hash`, `authority_tier`, `freshness_cutoff`, `recorded_at`을 가진다.
+`(source_collection_attempt_id, delivery_attempt_no)`가 고유하며 instance/queryset/base manager와
+PostgreSQL trigger가 update/delete를 거부한다.
+attempt는 최신 운영 projection이고 observation은 재시도와 terminal 결정의 감사 계보다.
+worker 종료로 정산되지 않은 앞선 전달 번호는 다음 전달 또는 소진 callback이
+`source_delivery_interrupted` infrastructure 관측으로 보충한다.
 
 ### SourceItem
 
@@ -1602,3 +1640,33 @@ that entered its next stage. Unchanged and terminal observations create no new e
 Terminal and restored impact evaluation walks the immutable lineage to the evidence-bearing
 article and converges pending terminal cases. Network and schema failures never imply
 unavailable.
+
+## English — T012 Source Access and Collection Runtime
+
+Every version-3 source snapshot freezes canonical `accessPolicy` and `rightsPolicy`
+documents plus their SHA-256 hashes. Access policy v1 binds the reviewed decision,
+contactable User-Agent, traffic scope, request/retry/redirect budgets, and per-origin
+purpose, method, path, and robots rules. Rights policy v1 makes separate fail-closed
+decisions for records, document attachments, and media attachments; attachment rights
+cannot widen the record decision.
+
+Each CollectionRun pins the exact TopicPolicy identity, version, policy hash, freshness
+minutes/cutoff, allowed authority tiers, source-registry identity, and registry manifest.
+Each enabled registry membership receives one durable SourceCollectionAttempt and
+`source.collect_requested` event. Attempt state is
+`queued/running/retry_scheduled/succeeded/failed/skipped`; its projection records stable
+failure category, redacted error, HTTP status, retry timing, request/response counts,
+access- and rights-policy hashes, authority tier, freshness cutoff, freshness-exclusion
+count, and duration. Freshness uses `modified_at` first and falls back to `published_at`
+for active and corrected records; explicit reconciliation-only and non-evidence terminal
+records are exempt.
+
+SourceCollectionObservation is append-only and unique by attempt plus the actual receipt
+delivery generation. It also freezes the delivery's freshness-exclusion count.
+It preserves every retry, success, skip, and terminal failure without treating the mutable
+attempt projection as audit history. Instance, queryset, base-manager, and PostgreSQL
+trigger guards reject updates and deletes. Missing earlier receipt generations are
+backfilled as interrupted infrastructure observations by the next delivery or exhaustion
+callback. A collection finalizer advances only after every
+source attempt is terminal. Zero successful sources fail the run without evidence fan-out;
+partial success advances to extraction while retaining failure counters and summaries.

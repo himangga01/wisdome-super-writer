@@ -35,6 +35,9 @@ CURRENT_EVENT_CONSUMER_LEASE_TOKEN: ContextVar[uuid.UUID | None] = ContextVar(
 CURRENT_EVENT_CONSUMER_LEASE_GENERATION: ContextVar[int | None] = ContextVar(
     "outbox_event_consumer_lease_generation", default=None
 )
+CURRENT_EVENT_CONSUMER_ATTEMPT: ContextVar[int | None] = ContextVar(
+    "outbox_event_consumer_attempt", default=None
+)
 
 FORBIDDEN_KEY_PARTS = {
     "access_token",
@@ -840,6 +843,10 @@ def dead_letter_consumer_event(
             consumer_name=consumer_name,
             lease_token=receipt.lease_token,
             lease_generation=receipt.lease_generation,
+            consumer_attempt=max(
+                receipt.attempts + int(increment_attempt),
+                1,
+            ),
         ):
             terminal_handler(*terminal_args, error_code[:120])
     receipt.state = OutboxConsumerReceipt.State.DEAD_LETTER
@@ -995,6 +1002,11 @@ def _verify_received_envelope(event: OutboxMessage, envelope: dict[str, Any]) ->
             raise OutboxConflict(f"received envelope does not match persisted event: {key}")
 
 
+def current_event_consumer_attempt() -> int | None:
+    attempt = CURRENT_EVENT_CONSUMER_ATTEMPT.get()
+    return attempt if isinstance(attempt, int) and attempt > 0 else None
+
+
 @contextmanager
 def event_context(
     envelope: dict[str, Any],
@@ -1002,6 +1014,7 @@ def event_context(
     consumer_name: str | None = None,
     lease_token: uuid.UUID | None = None,
     lease_generation: int | None = None,
+    consumer_attempt: int | None = None,
 ):
     event_token = CURRENT_EVENT_ID.set(envelope["event_id"])
     correlation_token = CURRENT_EVENT_CORRELATION_ID.set(envelope["correlation_id"])
@@ -1010,10 +1023,14 @@ def event_context(
     consumer_lease_generation_token = (
         CURRENT_EVENT_CONSUMER_LEASE_GENERATION.set(lease_generation)
     )
+    consumer_attempt_token = CURRENT_EVENT_CONSUMER_ATTEMPT.set(
+        consumer_attempt
+    )
     try:
         with correlation_context(envelope["correlation_id"]):
             yield
     finally:
+        CURRENT_EVENT_CONSUMER_ATTEMPT.reset(consumer_attempt_token)
         CURRENT_EVENT_CONSUMER_LEASE_GENERATION.reset(
             consumer_lease_generation_token
         )
@@ -1242,6 +1259,7 @@ def consume_event(
             consumer_name=consumer_name,
             lease_token=lease_token,
             lease_generation=lease_generation,
+            consumer_attempt=receipt.attempts,
         ):
             result = handler(*args)
     except DatabaseError as exc:

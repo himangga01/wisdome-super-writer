@@ -3,11 +3,13 @@ from __future__ import annotations
 import email.utils
 import hashlib
 import json
+import random
 import re
 import time
 from collections.abc import Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import (
     parse_qsl,
@@ -18,16 +20,25 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
+from urllib import robotparser
 from zoneinfo import ZoneInfo
 
 import httpx
+from django.conf import settings
 from defusedxml import ElementTree
+from redis import Redis
+from redis.exceptions import RedisError
 
 from wisdome_writer.domain.hashing import (
     CANONICAL_HASH_SCHEMA_V1,
     canonical_hash,
 )
 from wisdome_writer.infrastructure.http_safety import (
+    HttpSafetyError,
+    OutboundRequestFailed,
+    OutboundResponseMimeRejected,
+    OutboundResponseTooLarge,
+    UnsafeOutboundUrl,
     redact_url,
     redact_urls_in_text,
     safe_get,
@@ -36,6 +47,7 @@ from wisdome_writer.infrastructure.http_safety import (
 from wisdome_writer.infrastructure.secrets import SecretResolver
 
 from .base import CollectedSourceRecord, SourceAttachment
+from .errors import SourceAccessError
 
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 ATTACHMENT_EXTENSIONS = (".pdf", ".hwp", ".hwpx", ".xlsx", ".xls", ".csv")
@@ -77,6 +89,15 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "x_goog_signature",
     }
 )
+
+
+def _frozen_material_hash(value: Any) -> str:
+    return canonical_hash(
+        value,
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
+    )
+
+
 _COMPACT_SENSITIVE_KEYS = frozenset(
     re.sub(r"[^a-z0-9]", "", value)
     for value in _SENSITIVE_QUERY_KEYS
@@ -162,8 +183,16 @@ _OPEN_DATA_CANONICAL_QUERY_KEYS = frozenset(
 )
 
 
-class SourceSchemaError(ValueError):
+class SourceSchemaError(SourceAccessError, ValueError):
     """The approved source returned a shape that cannot be identified safely."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            code="source_schema_invalid",
+            category="schema",
+            detail=redact_urls_in_text(detail),
+            remediation="Review the frozen source contract and source response.",
+        )
 
 
 def parse_source_datetime(value: Any) -> datetime | None:
@@ -638,10 +667,233 @@ def parse_html_page(
     )
 
 
+class _RedisSourceLimiter:
+    """Redis-backed source-wide rate and concurrency boundary."""
+
+    _RATE_SCRIPT = """
+local now = tonumber(ARGV[1])
+local refill = tonumber(ARGV[2])
+local capacity = tonumber(ARGV[3])
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or capacity)
+local updated = tonumber(redis.call('HGET', KEYS[1], 'updated') or now)
+tokens = math.min(capacity, tokens + math.max(0, now - updated) * refill)
+if tokens < 1 then
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated', now)
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
+  return {0, math.ceil((1 - tokens) / refill)}
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'updated', now)
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return {1, 0}
+"""
+    _LEASE_SCRIPT = """
+local now = tonumber(ARGV[1])
+local expiry = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if redis.call('ZSCORE', KEYS[1], ARGV[4]) or redis.call('ZCARD', KEYS[1]) < limit then
+  redis.call('ZADD', KEYS[1], expiry, ARGV[4])
+  redis.call('PEXPIRE', KEYS[1], math.max(1, expiry - now))
+  return {1, 0}
+end
+local next_expiry = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')[2]
+return {0, math.max(1, math.ceil((tonumber(next_expiry) - now) / 1000))}
+"""
+
+    def __init__(
+        self,
+        *,
+        source_id: Any,
+        traffic_scope: str,
+        requests_per_minute: int,
+        burst: int,
+        max_concurrency: int,
+        lease_seconds: int,
+        operation_id: str,
+    ) -> None:
+        self._prefix = "wisdome:source-http:" + hashlib.sha256(
+            f"{source_id}:{traffic_scope}".encode("utf-8")
+        ).hexdigest()
+        self._rpm = requests_per_minute
+        self._burst = burst
+        self._max_concurrency = max_concurrency
+        self._lease_seconds = lease_seconds
+        self._operation_id = operation_id
+        self._client: Redis | None = None
+
+    @property
+    def _redis(self) -> Redis:
+        if self._client is None:
+            try:
+                self._client = Redis.from_url(
+                    settings.REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
+            except Exception as exc:
+                raise _infrastructure_error("Redis limiter is unavailable.") from exc
+        return self._client
+
+    def reserve_poll(self, interval_seconds: int) -> None:
+        try:
+            poll_key = f"{self._prefix}:poll"
+            if self._redis.get(poll_key) == self._operation_id:
+                return
+            acquired = self._redis.set(
+                poll_key,
+                self._operation_id,
+                nx=True,
+                ex=max(1, interval_seconds),
+            )
+            if acquired:
+                return
+            delay = self._redis.ttl(poll_key)
+        except RedisError as exc:
+            raise _infrastructure_error("Redis poll reservation failed.") from exc
+        raise SourceAccessError(
+            code="source_poll_interval_reserved",
+            category="transient",
+            detail="Source polling is reserved by another operation.",
+            remediation="Retry after the source poll interval reservation expires.",
+            retryable=True,
+            retry_after_seconds=max(1, int(delay) if isinstance(delay, int) else 1),
+        )
+
+    def before_request(self, *, max_requests: int) -> int:
+        now_ms = int(time.time() * 1000)
+        lease_expiry = now_ms + self._lease_seconds * 1000
+        try:
+            lease = self._redis.eval(
+                self._LEASE_SCRIPT,
+                1,
+                f"{self._prefix}:leases",
+                now_ms,
+                lease_expiry,
+                self._max_concurrency,
+                self._operation_id,
+            )
+            if not lease or int(lease[0]) != 1:
+                raise SourceAccessError(
+                    code="source_concurrency_limited",
+                    category="transient",
+                    detail="Source concurrency limit is currently exhausted.",
+                    remediation="Retry after an active source operation lease expires.",
+                    retryable=True,
+                    retry_after_seconds=max(1, int(lease[1]) if lease else 1),
+                )
+            rate = self._redis.eval(
+                self._RATE_SCRIPT,
+                1,
+                f"{self._prefix}:rate",
+                time.time(),
+                self._rpm / 60,
+                self._burst,
+                max(60, int(120 * self._burst / max(self._rpm, 1))),
+            )
+            if not rate or int(rate[0]) != 1:
+                raise SourceAccessError(
+                    code="source_rate_limited",
+                    category="transient",
+                    detail="Source rate limit is currently exhausted.",
+                    remediation="Retry after the source rate limit refills.",
+                    retryable=True,
+                    retry_after_seconds=max(1, int(rate[1]) if rate else 1),
+                )
+            budget_key = (
+                f"{self._prefix}:budget:"
+                + hashlib.sha256(
+                    self._operation_id.encode("utf-8")
+                ).hexdigest()
+            )
+            request_count = int(self._redis.incr(budget_key))
+            if request_count == 1:
+                self._redis.expire(
+                    budget_key,
+                    max(self._lease_seconds * 2, 3600),
+                )
+            if request_count > max_requests:
+                raise SourceAccessError(
+                    code="source_request_budget_exhausted",
+                    category="policy",
+                    detail="Durable source request budget was exhausted.",
+                    remediation=(
+                        "Reduce the source operation scope or approve a "
+                        "larger request budget."
+                    ),
+                )
+            return request_count
+        except SourceAccessError:
+            raise
+        except RedisError as exc:
+            raise _infrastructure_error("Redis request limiter failed.") from exc
+
+    def release(self) -> None:
+        try:
+            self._redis.zrem(
+                f"{self._prefix}:leases",
+                self._operation_id,
+            )
+        except RedisError as exc:
+            raise _infrastructure_error(
+                "Redis concurrency lease release failed."
+            ) from exc
+
+
+def _infrastructure_error(detail: str) -> SourceAccessError:
+    return SourceAccessError(
+        code="source_limiter_infrastructure_unavailable",
+        category="infrastructure",
+        detail=detail,
+        remediation="Restore the configured Redis service before retrying.",
+        retryable=True,
+    )
+
+
 class HttpSourceAdapter:
     def __init__(self, *, source, config):
         self.source = source
         self.config = config
+        self._access_policy = self._load_access_policy(config)
+        expected_access_policy_hash = config.get(
+            "accessPolicyHash"
+        )
+        if (
+            not isinstance(expected_access_policy_hash, str)
+            or expected_access_policy_hash
+            != _frozen_material_hash(self._access_policy)
+        ):
+            raise SourceAccessError(
+                code="source_access_policy_hash_mismatch",
+                category="security",
+                detail="Frozen source access policy hash is inconsistent.",
+                remediation=(
+                    "Re-approve the source snapshot before collection."
+                ),
+            )
+        self._access_policy_hash = expected_access_policy_hash
+        self._runtime_mode = str(config.get("_runtimeMode", "collection"))
+        runtime_scope_mode = {
+            "collection": "collection",
+            "attachment": "collection",
+            "source_check": "source_check",
+        }.get(self._runtime_mode)
+        allowed_runtime_modes = {
+            "collection": {"collection"},
+            "source_check": {"source_check"},
+            "collection_and_source_check": {"collection", "source_check"},
+        }.get(self._access_policy["trafficScope"], set())
+        if runtime_scope_mode not in allowed_runtime_modes:
+            raise self._policy_error(
+                "Source runtime mode is outside the frozen traffic scope."
+            )
+        self._operation_id = str(
+            config.get("_operationId")
+            or config.get("operationId")
+            or hashlib.sha256(
+                f"{source.id}:{time.time_ns()}".encode("utf-8")
+            ).hexdigest()
+        )
         entrypoints = config.get("entrypoints")
         if (
             not isinstance(entrypoints, list)
@@ -683,14 +935,18 @@ class HttpSourceAdapter:
             host.rstrip(".").encode("idna").decode("ascii").lower()
             for host in record_hosts
         )
+        self.allowed_hosts.update(
+            str(origin["host"]).rstrip(".").encode("idna").decode("ascii").lower()
+            for origin in self._access_policy["originPolicies"]
+        )
         self.timeout = httpx.Timeout(20, connect=10)
         self.max_requests = _bounded_positive_int(
-            config.get("maxRequests", 500),
+            self._access_policy["maxRequests"],
             field_name="maxRequests",
             maximum=20000,
         )
         self.max_elapsed_seconds = _bounded_positive_int(
-            config.get("maxElapsedSeconds", 900),
+            self._access_policy["maxElapsedSeconds"],
             field_name="maxElapsedSeconds",
             maximum=3600,
         )
@@ -700,6 +956,97 @@ class HttpSourceAdapter:
         )
         self._secret_resolver: SecretResolver | None = None
         self._resolved_secret: str | None = None
+        self._robots_checked: dict[str, robotparser.RobotFileParser] = {}
+        rate_policy = config.get("rateLimitPolicy")
+        if not isinstance(rate_policy, Mapping):
+            raise self._policy_error("Source rate limit policy is missing.")
+        rpm = rate_policy.get("rateLimitPerMinute", rate_policy.get("requestsPerMinute"))
+        burst = rate_policy.get("burst")
+        concurrency = rate_policy.get("maxConcurrency")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (rpm, burst, concurrency)):
+            raise self._policy_error("Source rate limit policy is invalid.")
+        self._limiter = _RedisSourceLimiter(
+            source_id=source.id,
+            traffic_scope=self._access_policy["trafficScope"],
+            requests_per_minute=int(rpm),
+            burst=int(burst),
+            max_concurrency=int(concurrency),
+            lease_seconds=self.max_elapsed_seconds,
+            operation_id=self._operation_id,
+        )
+        if self._runtime_mode == "collection":
+            poll_interval = config.get("pollIntervalSeconds")
+            if isinstance(poll_interval, bool) or not isinstance(poll_interval, int) or poll_interval < 1:
+                raise self._policy_error("Source poll interval is invalid.")
+            self._limiter.reserve_poll(poll_interval)
+
+    @property
+    def request_count(self) -> int:
+        return self._request_count
+
+    @property
+    def access_policy_hash(self) -> str:
+        return self._access_policy_hash
+
+    def close(self) -> None:
+        self._limiter.release()
+
+    def _policy_error(self, detail: str) -> SourceAccessError:
+        return SourceAccessError(
+            code="source_access_policy_denied",
+            category="policy",
+            detail=detail,
+            remediation="Approve a complete frozen source access policy before collection.",
+        )
+
+    def _load_access_policy(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        raw = config.get("accessPolicyV1", config.get("accessPolicy"))
+        if not isinstance(raw, Mapping):
+            raise self._policy_error("Source access policy is missing.")
+        policy = dict(raw)
+        if policy.get("schemaVersion") != "source-access-policy-v1" or policy.get("decision") != "approved":
+            raise self._policy_error("Source access policy is not approved.")
+        if not isinstance(policy.get("reviewedAt"), str) or not isinstance(policy.get("userAgent"), str) or not policy["userAgent"].strip():
+            raise self._policy_error("Source access policy review metadata is invalid.")
+        if policy.get("trafficScope") not in {
+            "collection",
+            "source_check",
+            "collection_and_source_check",
+        }:
+            raise self._policy_error("Source access policy traffic scope is invalid.")
+        legal_decisions = {
+            "approved",
+            "not_applicable",
+            "not_applicable_official_api",
+        }
+        if (
+            policy.get("termsDecision") not in legal_decisions
+            or policy.get("licenseDecision") not in legal_decisions
+        ):
+            raise self._policy_error("Source terms or license decision is not approved.")
+        for field_name, minimum, maximum in (
+            ("maxHttpAttempts", 1, 5),
+            ("maxRetryDelaySeconds", 0, 3600),
+            ("maxRedirects", 0, 20),
+            ("maxRequests", 1, 20000),
+            ("maxElapsedSeconds", 1, 3600),
+        ):
+            value = policy.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise self._policy_error(f"Source access policy {field_name} is invalid.")
+        origins = policy.get("originPolicies")
+        if not isinstance(origins, list) or not origins:
+            raise self._policy_error("Source access policy has no origin policies.")
+        for origin in origins:
+            if not isinstance(origin, Mapping):
+                raise self._policy_error("Source origin policy is invalid.")
+            if not isinstance(origin.get("host"), str) or not origin["host"].strip():
+                raise self._policy_error("Source origin host is invalid.")
+            if not isinstance(origin.get("purposes"), list) or not isinstance(origin.get("methods"), list) or not isinstance(origin.get("pathPrefixes"), list):
+                raise self._policy_error("Source origin policy is incomplete.")
+            if origin.get("robotsMode") not in {"runtime_fetch", "not_applicable_official_api"}:
+                raise self._policy_error("Source origin robots mode is invalid.")
+        return policy
 
     def _get(
         self,
@@ -710,61 +1057,58 @@ class HttpSourceAdapter:
         credential_parameter: str | None = None,
         expected_content_types: Collection[str] | None = None,
         url_validator=None,
+        purpose: str | None = None,
     ) -> httpx.Response:
         remaining = self._request_deadline - time.monotonic()
         if remaining <= 0:
-            raise SourceSchemaError(
-                "Source elapsed-time budget was exhausted."
-            )
+            self._remaining_budget()
         request_url = self._request_url(
             url,
             params=params,
             authenticated=authenticated,
             credential_parameter=credential_parameter,
         )
-        headers = {"User-Agent": "WisdomeSuperWriter/0.1 (+admin-managed research bot)"}
-        response = safe_get(
-            request_url,
-            max_bytes=MAX_RESPONSE_BYTES,
-            timeout=self.timeout,
-            allowed_hosts=self.allowed_hosts,
-            headers=headers,
-            max_elapsed_seconds=min(20.0, remaining),
-            https_only=authenticated or bool(
-                getattr(self, "_https_only", False)
+        selected_purpose = purpose or self._default_purpose()
+        allowed_types = self._approved_mime_types(expected_content_types)
+        return self._with_retries(
+            lambda: safe_get(
+                request_url,
+                max_bytes=MAX_RESPONSE_BYTES,
+                timeout=self.timeout,
+                allowed_hosts=self.allowed_hosts,
+                headers={"User-Agent": self._access_policy["userAgent"]},
+                max_redirects=self._access_policy["maxRedirects"],
+                max_elapsed_seconds=min(20.0, self._remaining_budget()),
+                https_only=True,
+                before_request=self._consume_request_budget,
+                url_validator=self._hop_validator(
+                    purpose=selected_purpose,
+                    method="GET",
+                    extra_validator=url_validator,
+                ),
+                allowed_content_types=allowed_types,
             ),
-            before_request=self._consume_request_budget,
-            url_validator=url_validator,
+            request_url=request_url,
         )
-        response.raise_for_status()
-        if expected_content_types is not None:
-            allowed_types = {
-                str(value).split(";", 1)[0].strip().lower()
-                for value in expected_content_types
-            }
-            actual_type = (
-                response.headers.get("Content-Type", "")
-                .split(";", 1)[0]
-                .strip()
-                .lower()
-            )
-            if actual_type not in allowed_types:
-                raise SourceSchemaError(
-                    "Source response MIME type is outside the approved "
-                    "request contract."
-                )
-        return response
 
     def _consume_request_budget(self) -> None:
         if self._request_count >= self.max_requests:
-            raise SourceSchemaError(
-                "Source request budget was exhausted."
+            raise SourceAccessError(
+                code="source_request_budget_exhausted",
+                category="policy",
+                detail="Source request budget was exhausted.",
+                remediation="Reduce the source operation scope or approve a larger request budget.",
             )
         if time.monotonic() >= self._request_deadline:
-            raise SourceSchemaError(
-                "Source elapsed-time budget was exhausted."
+            raise SourceAccessError(
+                code="source_elapsed_budget_exhausted",
+                category="policy",
+                detail="Source elapsed-time budget was exhausted.",
+                remediation="Reduce the source operation scope or approve a larger time budget.",
             )
-        self._request_count += 1
+        self._request_count = self._limiter.before_request(
+            max_requests=self.max_requests
+        )
 
     def _post_form(
         self,
@@ -773,50 +1117,269 @@ class HttpSourceAdapter:
         data: Mapping[str, Any],
         expected_content_types: Collection[str] | None = None,
         url_validator=None,
+        purpose: str | None = None,
     ) -> httpx.Response:
         remaining = self._request_deadline - time.monotonic()
         if remaining <= 0:
-            raise SourceSchemaError("Source elapsed-time budget was exhausted.")
-        response = safe_post_form(
-            self._request_url(
-                url,
-                params=None,
-                authenticated=False,
-                credential_parameter=None,
-            ),
-            data=data,
-            max_bytes=MAX_RESPONSE_BYTES,
-            timeout=self.timeout,
-            allowed_hosts=self.allowed_hosts,
-            headers={
-                "User-Agent": (
-                    "WisdomeSuperWriter/0.1 "
-                    "(+admin-managed research bot)"
-                )
-            },
-            max_elapsed_seconds=min(20.0, remaining),
-            before_request=self._consume_request_budget,
-            https_only=bool(getattr(self, "_https_only", False)),
-            url_validator=url_validator,
+            self._remaining_budget()
+        request_url = self._request_url(
+            url,
+            params=None,
+            authenticated=False,
+            credential_parameter=None,
         )
-        response.raise_for_status()
-        if expected_content_types is not None:
-            allowed = {
-                str(value).split(";", 1)[0].strip().lower()
-                for value in expected_content_types
-            }
-            actual = (
-                response.headers.get("Content-Type", "")
-                .split(";", 1)[0]
-                .strip()
-                .lower()
+        selected_purpose = purpose or self._default_purpose()
+        return self._with_retries(
+            lambda: safe_post_form(
+                request_url,
+                data=data,
+                max_bytes=MAX_RESPONSE_BYTES,
+                timeout=self.timeout,
+                allowed_hosts=self.allowed_hosts,
+                headers={"User-Agent": self._access_policy["userAgent"]},
+                max_redirects=0,
+                max_elapsed_seconds=min(20.0, self._remaining_budget()),
+                before_request=self._consume_request_budget,
+                https_only=True,
+                url_validator=self._hop_validator(
+                    purpose=selected_purpose,
+                    method="POST",
+                    extra_validator=url_validator,
+                ),
+                allowed_content_types=self._approved_mime_types(expected_content_types),
+            ),
+            request_url=request_url,
+        )
+
+    def _default_purpose(self) -> str:
+        return "source_check" if self._runtime_mode == "source_check" else "collection"
+
+    def _remaining_budget(self) -> float:
+        remaining = self._request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise SourceAccessError(
+                code="source_elapsed_budget_exhausted",
+                category="policy",
+                detail="Source elapsed-time budget was exhausted.",
+                remediation="Reduce the source operation scope or approve a larger budget.",
             )
-            if actual not in allowed:
-                raise SourceSchemaError(
-                    "Source response MIME type is outside the approved "
-                    "request contract."
+        return remaining
+
+    def _approved_mime_types(
+        self,
+        expected_content_types: Collection[str] | None,
+    ) -> Collection[str]:
+        raw = expected_content_types
+        if raw is None:
+            raw = self.config.get("allowedContentTypes")
+        if not isinstance(raw, Collection) or isinstance(raw, (str, bytes)):
+            raise self._policy_error("Source request MIME contract is missing.")
+        normalized = tuple(
+            str(value).split(";", 1)[0].strip().lower()
+            for value in raw
+            if isinstance(value, str) and value.strip()
+        )
+        if not normalized:
+            raise self._policy_error("Source request MIME contract is empty.")
+        return normalized
+
+    def _hop_validator(self, *, purpose: str, method: str, extra_validator):
+        def validate(url: str) -> None:
+            self._enforce_access_policy(url, purpose=purpose, method=method)
+            if extra_validator is not None:
+                extra_validator(url)
+
+        return validate
+
+    def _enforce_access_policy(
+        self,
+        url: str,
+        *,
+        purpose: str,
+        method: str,
+    ) -> None:
+        try:
+            parsed = urlsplit(url)
+            hostname = (parsed.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+        except (TypeError, ValueError, UnicodeError):
+            raise self._policy_error("Source request URL is invalid.") from None
+        if parsed.scheme.lower() != "https" or not hostname or parsed.username or parsed.password:
+            raise self._policy_error("Source request must use approved HTTPS without userinfo.")
+        matches = []
+        for origin in self._access_policy["originPolicies"]:
+            origin_host = str(origin["host"]).rstrip(".").encode("idna").decode("ascii").lower()
+            prefixes = tuple(str(prefix) for prefix in origin["pathPrefixes"] if isinstance(prefix, str))
+            if (
+                hostname == origin_host
+                and purpose in origin["purposes"]
+                and method in origin["methods"]
+                and any((parsed.path or "/").startswith(prefix) for prefix in prefixes)
+            ):
+                matches.append(origin)
+        if len(matches) != 1:
+            raise self._policy_error("Source request is outside the approved origin policy.")
+        origin = matches[0]
+        if purpose != "robots" and origin["robotsMode"] == "runtime_fetch":
+            self._ensure_robots(origin, hostname, url)
+
+    def _ensure_robots(
+        self,
+        origin: Mapping[str, Any],
+        hostname: str,
+        requested_url: str,
+    ) -> None:
+        if hostname in self._robots_checked:
+            parser = self._robots_checked[hostname]
+        else:
+            robots_url = origin.get("robotsUrl") or f"https://{hostname}/robots.txt"
+            try:
+                robots_parsed = urlsplit(str(robots_url))
+            except (TypeError, ValueError):
+                raise self._policy_error("Source robots URL is invalid.") from None
+            if robots_parsed.scheme.lower() != "https" or (robots_parsed.hostname or "").rstrip(".").lower() != hostname:
+                raise self._policy_error("Source robots URL is outside its approved origin.")
+            response = self._with_retries(
+                lambda: safe_get(
+                    str(robots_url),
+                    max_bytes=128 * 1024,
+                    timeout=self.timeout,
+                    allowed_hosts={hostname},
+                    headers={"User-Agent": self._access_policy["userAgent"]},
+                    max_redirects=self._access_policy["maxRedirects"],
+                    max_elapsed_seconds=min(20.0, self._remaining_budget()),
+                    https_only=True,
+                    before_request=self._consume_request_budget,
+                    url_validator=lambda value: self._validate_robots_hop(value, hostname),
+                    allowed_content_types=("text/plain", "text/html"),
+                ),
+                request_url=str(robots_url),
+            )
+            parser = robotparser.RobotFileParser()
+            parser.set_url(str(robots_url))
+            parser.parse(response.text.splitlines())
+            self._robots_checked[hostname] = parser
+        if not parser.can_fetch(self._access_policy["userAgent"], requested_url):
+            raise self._policy_error("Source robots policy disallows this user agent.")
+
+    def _validate_robots_hop(self, url: str, hostname: str) -> None:
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            raise self._policy_error("Source robots redirect URL is invalid.") from None
+        if parsed.scheme.lower() != "https" or (parsed.hostname or "").rstrip(".").lower() != hostname:
+            raise self._policy_error("Source robots redirect is outside its approved origin.")
+
+    def _with_retries(self, request, *, request_url: str) -> httpx.Response:
+        attempts = self._access_policy["maxHttpAttempts"]
+        for attempt in range(1, attempts + 1):
+            try:
+                response = request()
+            except SourceAccessError as exc:
+                failure = exc
+            except OutboundResponseMimeRejected:
+                raise SourceAccessError(
+                    code="source_response_mime_rejected",
+                    category="policy",
+                    detail="Source response MIME type is outside the approved request contract.",
+                    remediation="Approve the expected response MIME type before retrying.",
+                ) from None
+            except (UnsafeOutboundUrl, OutboundResponseTooLarge):
+                raise SourceAccessError(
+                    code="source_outbound_security_rejected",
+                    category="security",
+                    detail="Source outbound request failed a transport safety check.",
+                    remediation="Review the frozen origin policy and source URL.",
+                ) from None
+            except (OutboundRequestFailed, HttpSafetyError):
+                failure = SourceAccessError(
+                    code="source_transport_unavailable",
+                    category="transient",
+                    detail="Source transport request failed.",
+                    remediation="Retry the source operation after the remote service recovers.",
+                    retryable=True,
                 )
-        return response
+            else:
+                if response.status_code < 400:
+                    return response
+                failure = self._http_failure(response)
+            if not failure.retryable:
+                raise failure
+            if attempt == attempts:
+                raise failure
+            retry_after = failure.retry_after_seconds
+            short_limit = min(5, self._access_policy["maxRetryDelaySeconds"])
+            if retry_after is not None and retry_after > short_limit:
+                raise failure
+            delay = retry_after if retry_after is not None else min(
+                short_limit,
+                (2 ** (attempt - 1)) + random.uniform(0, 0.5),
+            )
+            if delay > 0:
+                time.sleep(delay)
+        raise SourceAccessError(
+            code="source_transport_unavailable",
+            category="transient",
+            detail=f"Source transport request failed for {redact_url(request_url)}.",
+            remediation="Retry the source operation.",
+            retryable=True,
+        )
+
+    def _http_failure(self, response: httpx.Response) -> SourceAccessError:
+        status = response.status_code
+        if status in {401, 403}:
+            return SourceAccessError(
+                code="source_authentication_failed",
+                category="authentication",
+                detail="Source authentication was rejected.",
+                remediation="Review the approved source credential and access grant.",
+                http_status=status,
+            )
+        if status in {429, 502, 503, 504}:
+            return SourceAccessError(
+                code="source_http_transient_failure",
+                category="transient",
+                detail=f"Source returned transient HTTP status {status}.",
+                remediation="Retry after the source service recovers.",
+                retryable=True,
+                retry_after_seconds=self._retry_after_seconds(response),
+                http_status=status,
+            )
+        return SourceAccessError(
+            code="source_http_permanent_failure",
+            category="policy",
+            detail=f"Source returned HTTP status {status}.",
+            remediation="Review the source endpoint and approved access policy.",
+            http_status=status,
+        )
+
+    def _retry_after_seconds(self, response: httpx.Response) -> int | None:
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
+        maximum = self._access_policy["maxRetryDelaySeconds"]
+        try:
+            return min(maximum, max(0, int(value.strip())))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(value)
+            except (TypeError, ValueError):
+                return None
+            if retry_at is None:
+                return None
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return min(
+                maximum,
+                max(
+                    0,
+                    int(
+                        (
+                            retry_at.astimezone(UTC)
+                            - datetime.now(UTC)
+                        ).total_seconds()
+                    ),
+                ),
+            )
 
     def _request_url(
         self,
@@ -925,12 +1488,81 @@ class HttpSourceAdapter:
             )
 
 
+def download_source_attachment(
+    source_snapshot,
+    url: str,
+    operation_id: str | None = None,
+    expected_content_types: Collection[str] | None = None,
+) -> httpx.Response:
+    """Download an approved attachment through the source HTTP boundary."""
+
+    material = getattr(source_snapshot, "frozen_config", None)
+    if not isinstance(material, Mapping):
+        raise SourceAccessError(
+            code="source_snapshot_invalid",
+            category="schema",
+            detail="Frozen source snapshot is unavailable for attachment download.",
+            remediation="Use a valid frozen source snapshot.",
+        )
+    external_config = material.get("externalConfig")
+    if not isinstance(external_config, Mapping):
+        raise SourceAccessError(
+            code="source_snapshot_invalid",
+            category="schema",
+            detail="Frozen source attachment access configuration is unavailable.",
+            remediation="Approve a source snapshot with access configuration.",
+        )
+    config = dict(external_config)
+    config.update(
+        {
+            "entrypoints": [url],
+            "allowedContentTypes": list(material.get("allowedMimeTypes") or []),
+            "pollIntervalSeconds": material.get("pollIntervalSeconds"),
+            "rateLimitPolicy": dict(material.get("rateLimitPolicy") or {}),
+            "accessPolicy": dict(
+                material.get("accessPolicy") or {}
+            ),
+            "accessPolicyHash": material.get("accessPolicyHash"),
+            "_runtimeMode": "attachment",
+            "_operationId": operation_id,
+        }
+    )
+    adapter = HttpSourceAdapter(
+        source=SimpleNamespace(
+            id=getattr(source_snapshot, "source_id", None),
+            base_url=material.get("baseUrl", ""),
+        ),
+        config=config,
+    )
+    try:
+        response = adapter._get(
+            url,
+            purpose="attachment",
+            expected_content_types=expected_content_types
+            if expected_content_types is not None
+            else config["allowedContentTypes"],
+        )
+    except BaseException:
+        try:
+            adapter.close()
+        except SourceAccessError:
+            pass
+        raise
+    else:
+        adapter.close()
+        return response
+
+
 class PublicHtmlAdapter(HttpSourceAdapter):
     def collect(self, *, since: datetime, until: datetime) -> list[CollectedSourceRecord]:
         now = datetime.now(UTC)
         records: list[CollectedSourceRecord] = []
         for entrypoint in self.entrypoints:
-            response = self._get(entrypoint)
+            response = self._get(
+                entrypoint,
+                purpose=self._default_purpose(),
+                expected_content_types=self.config.get("allowedContentTypes"),
+            )
             safe_entrypoint = canonical_public_url(entrypoint)
             parser = _PageParser()
             parser.feed(response.text)
@@ -981,7 +1613,13 @@ class RssAdapter(HttpSourceAdapter):
         now = datetime.now(UTC)
         records: list[CollectedSourceRecord] = []
         for entrypoint in self.entrypoints:
-            root = ElementTree.fromstring(self._get(entrypoint).content)
+            root = ElementTree.fromstring(
+                self._get(
+                    entrypoint,
+                    purpose=self._default_purpose(),
+                    expected_content_types=self.config.get("allowedContentTypes"),
+                ).content
+            )
             for item in root.findall(".//item"):
                 link = (item.findtext("link") or "").strip()
                 safe_link = canonical_public_url(link)
@@ -1036,6 +1674,7 @@ class OpenDataJsonAdapter(HttpSourceAdapter):
                     entrypoint,
                     params=params,
                     authenticated=bool(self.config.get("secretRef")),
+                    purpose=self._default_purpose(),
                     expected_content_types=self.config.get(
                         "apiContentTypes",
                         ("application/json",),

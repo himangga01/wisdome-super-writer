@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -106,6 +107,8 @@ _ADAPTER_CONFIG_KEYS = {
                 "detailContentTypes",
                 "attachmentContentTypes",
                 "mediaDownloadPolicy",
+                "accessPolicy",
+                "rightsPolicy",
                 *(("issuerCodes",) if key == "semiconductor_krx_kind" else ()),
             }
         )
@@ -130,6 +133,8 @@ _ADAPTER_CONFIG_KEYS = {
             "apiContentTypes",
             "detailContentTypes",
             "attachmentContentTypes",
+            "accessPolicy",
+            "rightsPolicy",
         }
     ),
     "housing_lh": frozenset(
@@ -147,6 +152,8 @@ _ADAPTER_CONFIG_KEYS = {
             "apiContentTypes",
             "detailContentTypes",
             "attachmentContentTypes",
+            "accessPolicy",
+            "rightsPolicy",
         }
     ),
     "open_data_json": frozenset(
@@ -160,10 +167,12 @@ _ADAPTER_CONFIG_KEYS = {
             "sourceCheckDays",
             "apiContentTypes",
             "attachmentContentTypes",
+            "accessPolicy",
+            "rightsPolicy",
         }
     ),
-    "public_html": frozenset({"entrypoints"}),
-    "rss": frozenset({"entrypoints"}),
+    "public_html": frozenset({"entrypoints", "accessPolicy", "rightsPolicy"}),
+    "rss": frozenset({"entrypoints", "accessPolicy", "rightsPolicy"}),
 }
 _MOTIR_ATTACHMENT_MIMES = frozenset(
     {
@@ -479,6 +488,38 @@ _SOURCE_CONTRACT_FIELDS = (
     "enabled",
 )
 
+_ACCESS_POLICY_SCHEMA = "source-access-policy-v1"
+_RIGHTS_POLICY_SCHEMA = "source-rights-policy-v1"
+_ACCESS_POLICY_CONFIG_KEY = "accessPolicy"
+_RIGHTS_POLICY_CONFIG_KEY = "rightsPolicy"
+_ACCESS_POLICY_DECISIONS = frozenset({"approved"})
+_POLICY_DECISIONS = frozenset(
+    {"approved", "not_applicable", "not_applicable_official_api"}
+)
+_ACCESS_PURPOSES = frozenset(
+    {
+        "collection",
+        "source_check",
+        "record_fetch",
+        "attachment",
+        "attachment_metadata",
+    }
+)
+_ACCESS_METHODS = frozenset({"GET", "HEAD", "POST"})
+_RIGHTS_SCOPES = (
+    "record",
+    "documentAttachment",
+    "mediaAttachment",
+)
+_RIGHTS_BASIS = frozenset({"license", "terms", "none"})
+_RIGHTS_STATUS_ORDER = {
+    "prohibited": 0,
+    "unknown": 1,
+    "internal_analysis_only": 2,
+    "attribution_required": 3,
+    "allowed": 4,
+}
+
 
 @dataclass(frozen=True)
 class RegistryImportResult:
@@ -669,12 +710,15 @@ def _validate_external_config(
                 raise InvalidInput(
                     "externalConfig must not contain credential fields."
                 )
-            normalized[key] = _validate_external_config(
-                item,
-                base_url=base_url,
-                depth=depth + 1,
-                path=f"{path}.{key}",
-            )
+            if key in {_ACCESS_POLICY_CONFIG_KEY, _RIGHTS_POLICY_CONFIG_KEY}:
+                normalized[key] = item
+            else:
+                normalized[key] = _validate_external_config(
+                    item,
+                    base_url=base_url,
+                    depth=depth + 1,
+                    path=f"{path}.{key}",
+                )
         return normalized
     if isinstance(value, list):
         if len(value) > 500:
@@ -938,6 +982,171 @@ def _source_projection_material(source: SourceDefinition) -> dict[str, Any]:
     }
 
 
+def _normalize_access_policy(
+    value: Any,
+    *,
+    access_method: str,
+    base_url: str,
+    record_hosts: Iterable[str],
+) -> dict[str, Any]:
+    required = {
+        "schemaVersion", "decision", "reviewedAt", "userAgent",
+        "trafficScope", "maxHttpAttempts", "maxRetryDelaySeconds",
+        "maxRedirects", "maxRequests", "maxElapsedSeconds",
+        "originPolicies", "termsDecision", "licenseDecision",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise InvalidInput("externalConfig.accessPolicy is incomplete.")
+    if value["schemaVersion"] != _ACCESS_POLICY_SCHEMA:
+        raise InvalidInput("accessPolicy schemaVersion is invalid.")
+    if value["decision"] not in _ACCESS_POLICY_DECISIONS:
+        raise InvalidInput("accessPolicy decision must be approved.")
+    reviewed_at = value["reviewedAt"]
+    if not isinstance(reviewed_at, str):
+        raise InvalidInput("accessPolicy reviewedAt must be ISO-8601.")
+    try:
+        if datetime.fromisoformat(reviewed_at.replace("Z", "+00:00")).tzinfo is None:
+            raise ValueError
+    except ValueError as exc:
+        raise InvalidInput("accessPolicy reviewedAt must be ISO-8601.") from exc
+    user_agent = value["userAgent"]
+    if not isinstance(user_agent, str) or not user_agent.strip() or len(user_agent) > 300:
+        raise InvalidInput("accessPolicy userAgent is invalid.")
+    traffic_scope = value["trafficScope"]
+    if traffic_scope not in {"collection", "source_check", "collection_and_source_check"}:
+        raise InvalidInput("accessPolicy trafficScope is invalid.")
+    numeric_limits = {
+        "maxHttpAttempts": (1, 5),
+        "maxRetryDelaySeconds": (0, 3600),
+        "maxRedirects": (0, 20),
+        "maxRequests": (1, 20000),
+        "maxElapsedSeconds": (1, 3600),
+    }
+    normalized: dict[str, Any] = {
+        "schemaVersion": _ACCESS_POLICY_SCHEMA,
+        "decision": "approved",
+        "reviewedAt": reviewed_at,
+        "userAgent": user_agent.strip(),
+        "trafficScope": traffic_scope,
+    }
+    for field_name, (minimum, maximum) in numeric_limits.items():
+        item = value[field_name]
+        if isinstance(item, bool) or not isinstance(item, int) or not minimum <= item <= maximum:
+            raise InvalidInput(f"accessPolicy {field_name} is invalid.")
+        normalized[field_name] = item
+    if value["termsDecision"] not in _POLICY_DECISIONS or value["licenseDecision"] not in _POLICY_DECISIONS:
+        raise InvalidInput("accessPolicy legal decisions are invalid.")
+    for decision_name in ("termsDecision", "licenseDecision"):
+        decision = value[decision_name]
+        if decision == "not_applicable_official_api" and access_method not in {"open_data_api", "public_api"}:
+            raise InvalidInput("Official API not-applicable decisions require an API access method.")
+        normalized[decision_name] = decision
+    allowed_hosts = {
+        (urlsplit(base_url).hostname or "").rstrip(".").lower(),
+        *(str(host).rstrip(".").lower() for host in record_hosts),
+    }
+    origin_policies = value["originPolicies"]
+    if not isinstance(origin_policies, list) or not origin_policies:
+        raise InvalidInput("accessPolicy originPolicies are required.")
+    normalized_origins: list[dict[str, Any]] = []
+    for index, origin in enumerate(origin_policies):
+        if not isinstance(origin, Mapping) or set(origin) != {"host", "purposes", "methods", "pathPrefixes", "robotsMode", "robotsUrl"}:
+            raise InvalidInput("accessPolicy origin policy is invalid.")
+        host = origin["host"]
+        if not isinstance(host, str) or host.rstrip(".").lower() not in allowed_hosts:
+            raise InvalidInput("accessPolicy origin host is outside source scope.")
+        purposes = origin["purposes"]
+        methods = origin["methods"]
+        prefixes = origin["pathPrefixes"]
+        robots_mode = origin["robotsMode"]
+        if (not isinstance(purposes, list) or not purposes
+                or any(not isinstance(purpose, str) or purpose not in _ACCESS_PURPOSES for purpose in purposes)
+                or not isinstance(methods, list) or not methods
+                or any(not isinstance(method, str) or method not in _ACCESS_METHODS for method in methods)
+                or not isinstance(prefixes, list) or not prefixes
+                or any(not isinstance(prefix, str) or not prefix.startswith("/") for prefix in prefixes)
+                or robots_mode not in {"runtime_fetch", "not_applicable_official_api"}):
+            raise InvalidInput("accessPolicy origin policy is invalid.")
+        robots_url = origin["robotsUrl"]
+        if robots_mode == "runtime_fetch":
+            robots_url = _validate_public_url(robots_url, field_name=f"accessPolicy.originPolicies[{index}].robotsUrl")
+            if (
+                urlsplit(robots_url).scheme.lower() != "https"
+                or (urlsplit(robots_url).hostname or "").rstrip(".").lower()
+                != host.rstrip(".").lower()
+            ):
+                raise InvalidInput("runtime_fetch robotsUrl must use HTTPS.")
+        elif robots_url is not None:
+            raise InvalidInput("Official API origin policy must not include robotsUrl.")
+        normalized_origins.append({
+            "host": host.rstrip(".").lower(), "purposes": sorted(set(purposes)),
+            "methods": sorted(set(methods)), "pathPrefixes": sorted(set(prefixes)),
+            "robotsMode": robots_mode, "robotsUrl": robots_url,
+        })
+    primary_purposes = {
+        purpose
+        for origin in normalized_origins
+        for purpose in origin["purposes"]
+        if purpose in {"collection", "source_check"}
+    }
+    required_primary_purposes = {
+        "collection": {"collection"},
+        "source_check": {"source_check"},
+        "collection_and_source_check": {"collection", "source_check"},
+    }[traffic_scope]
+    if primary_purposes != required_primary_purposes:
+        raise InvalidInput(
+            "accessPolicy trafficScope does not match origin purposes."
+        )
+    if len({(item["host"], tuple(item["pathPrefixes"])) for item in normalized_origins}) != len(normalized_origins):
+        raise InvalidInput("accessPolicy originPolicies must not duplicate scopes.")
+    normalized["originPolicies"] = normalized_origins
+    return normalized
+
+
+def _normalize_rights_policy(
+    value: Any,
+    *,
+    default_rights_status: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"schemaVersion", *_RIGHTS_SCOPES}:
+        raise InvalidInput("externalConfig.rightsPolicy is incomplete.")
+    if value["schemaVersion"] != _RIGHTS_POLICY_SCHEMA:
+        raise InvalidInput("rightsPolicy schemaVersion is invalid.")
+    normalized: dict[str, Any] = {"schemaVersion": _RIGHTS_POLICY_SCHEMA}
+    for scope in _RIGHTS_SCOPES:
+        item = value[scope]
+        if not isinstance(item, Mapping) or set(item) != {"status", "basis", "basisUrl", "attributionText", "publishable"}:
+            raise InvalidInput(f"rightsPolicy {scope} is invalid.")
+        status, basis = item["status"], item["basis"]
+        if status not in _RIGHTS_STATUS_ORDER or basis not in _RIGHTS_BASIS or not isinstance(item["publishable"], bool):
+            raise InvalidInput(f"rightsPolicy {scope} is invalid.")
+        basis_url = _validate_public_url(item["basisUrl"], field_name=f"rightsPolicy.{scope}.basisUrl", nullable=True)
+        attribution = item["attributionText"]
+        if attribution is not None and (not isinstance(attribution, str) or not attribution.strip() or len(attribution) > 1000):
+            raise InvalidInput(f"rightsPolicy {scope} attributionText is invalid.")
+        if basis == "none":
+            if basis_url is not None or attribution is not None or status not in {"unknown", "internal_analysis_only"} or item["publishable"]:
+                raise InvalidInput("Rights without a basis must remain non-publishable.")
+        elif basis_url is None:
+            raise InvalidInput(f"rightsPolicy {scope} requires a basisUrl.")
+        if status == "attribution_required" and (basis_url is None or attribution is None):
+            raise InvalidInput("Attribution-required rights need basisUrl and attributionText.")
+        normalized[scope] = {
+            "status": status, "basis": basis, "basisUrl": basis_url,
+            "attributionText": attribution.strip() if isinstance(attribution, str) else None,
+            "publishable": item["publishable"],
+        }
+    if normalized["record"]["status"] != default_rights_status:
+        raise InvalidInput("rightsPolicy.record status must match defaultRightsStatus.")
+    record_level = _RIGHTS_STATUS_ORDER[normalized["record"]["status"]]
+    for scope in ("documentAttachment", "mediaAttachment"):
+        item = normalized[scope]
+        if _RIGHTS_STATUS_ORDER[item["status"]] > record_level or (item["publishable"] and not normalized["record"]["publishable"]):
+            raise InvalidInput("Attachment rights cannot be broader than record rights.")
+    return normalized
+
+
 def _normalize_source_material(
     data: Mapping[str, Any],
     *,
@@ -1192,6 +1401,33 @@ def _normalize_source_material(
     ):
         raise InvalidInput("defaultRightsStatus is invalid.")
 
+    access_policy = _normalize_access_policy(
+        external_config.get(_ACCESS_POLICY_CONFIG_KEY),
+        access_method=material["accessMethod"],
+        base_url=base_url,
+        record_hosts=external_config.get("recordHosts", []),
+    )
+    for decision_name, source_url in (
+        ("termsDecision", material["termsUrl"]),
+        ("licenseDecision", material["licenseUrl"]),
+    ):
+        decision = access_policy[decision_name]
+        if decision == "approved" and source_url is None:
+            raise InvalidInput(f"accessPolicy {decision_name} requires source evidence.")
+        if decision == "not_applicable_official_api" and (
+            material["accessMethod"] not in {"open_data_api", "public_api"}
+            or (material["termsUrl"] is None and material["licenseUrl"] is None)
+        ):
+            raise InvalidInput("Official API legal exceptions require source evidence.")
+    rights_policy = _normalize_rights_policy(
+        external_config.get(_RIGHTS_POLICY_CONFIG_KEY),
+        default_rights_status=material["defaultRightsStatus"],
+    )
+    external_config[_ACCESS_POLICY_CONFIG_KEY] = access_policy
+    external_config[_RIGHTS_POLICY_CONFIG_KEY] = rights_policy
+    if material["enabled"] and not external_config.get("attachmentContentTypes"):
+        raise InvalidInput("Enabled sources require explicit attachment MIME types.")
+
     poll_interval = material["pollIntervalSeconds"]
     if (
         isinstance(poll_interval, bool)
@@ -1241,9 +1477,16 @@ def source_snapshot_material(
         str(source_material["adapterKey"]),
         access_method=str(source_material["accessMethod"]),
     )
+    external_config = source_material["externalConfig"]
+    access_policy = external_config[_ACCESS_POLICY_CONFIG_KEY]
+    rights_policy = external_config[_RIGHTS_POLICY_CONFIG_KEY]
     return {
         "schemaVersion": SOURCE_SNAPSHOT_SCHEMA_V3,
         **{field: source_material[field] for field in _SOURCE_CONTRACT_FIELDS},
+        "accessPolicy": access_policy,
+        "accessPolicyHash": _hash(access_policy),
+        "rightsPolicy": rights_policy,
+        "rightsPolicyHash": _hash(rights_policy),
         "adapterVersion": implementation_manifest["adapterVersion"],
         "adapterImplementationManifestHash": (
             adapter_execution_manifest_hash(implementation_manifest)
@@ -1274,6 +1517,12 @@ def _is_verifiable_source_snapshot(
             ),
             str,
         )
+        and isinstance(snapshot.frozen_config.get("accessPolicy"), dict)
+        and isinstance(snapshot.frozen_config.get("rightsPolicy"), dict)
+        and snapshot.frozen_config.get("accessPolicyHash")
+        == _hash(snapshot.frozen_config["accessPolicy"])
+        and snapshot.frozen_config.get("rightsPolicyHash")
+        == _hash(snapshot.frozen_config["rightsPolicy"])
         and (
             expected_config_hash is None
             or snapshot.config_hash == expected_config_hash
@@ -2186,7 +2435,49 @@ def _lock_and_validate_approval_sources(
             raise Conflict(
                 "A selected source snapshot is not a current verifiable snapshot."
             )
+        _require_current_successful_source_check(source, snapshot)
     return locked_sources, locked_snapshots
+
+
+def _require_current_successful_source_check(
+    source: SourceDefinition,
+    snapshot: SourceDefinitionSnapshot,
+) -> None:
+    """Fail closed unless health is a current, policy-bound successful check."""
+
+    health = source.last_health
+    frozen = snapshot.frozen_config
+    if not isinstance(health, Mapping) or not isinstance(frozen, Mapping):
+        raise StateConflict("A current successful source check is required before approval.")
+    required = {
+        "taxonomyVersion", "snapshotId", "configHash", "accessPolicyHash",
+        "rightsPolicyHash", "status", "checkedAt", "recordCount",
+        "etag", "lastModified", "contentHash", "rightsDecision", "errorCode",
+    }
+    if set(health) != required or health.get("taxonomyVersion") != "source-check-taxonomy-v1":
+        raise StateConflict("The source check result is not a current taxonomy result.")
+    if (
+        health.get("status") != "passed"
+        or health.get("snapshotId") != str(snapshot.id)
+        or health.get("configHash") != snapshot.config_hash
+        or health.get("accessPolicyHash") != frozen.get("accessPolicyHash")
+        or health.get("rightsPolicyHash") != frozen.get("rightsPolicyHash")
+        or health.get("rightsDecision") != frozen.get("defaultRightsStatus")
+    ):
+        raise StateConflict("The source check is not successful for this frozen source policy.")
+    try:
+        checked_at = datetime.fromisoformat(str(health["checkedAt"]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise StateConflict("The source check timestamp is invalid.") from exc
+    source_check_days = (frozen.get("externalConfig") or {}).get("sourceCheckDays")
+    if (
+        isinstance(source_check_days, bool)
+        or not isinstance(source_check_days, int)
+        or checked_at.tzinfo is None
+        or checked_at < timezone.now() - timedelta(days=source_check_days)
+        or checked_at > timezone.now()
+    ):
+        raise StateConflict("A recent successful source check is required before approval.")
 
 
 def decide_source_registry(
@@ -2587,6 +2878,26 @@ def decide_source_registry(
 
 
 def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, Mapping) or any(
+        field not in data
+        for field in ("topicCode", "title", "policyVersion", "freshnessMinutes", "policy", "sources")
+    ):
+        raise InvalidInput("Registry imports require explicit topic policy material.")
+    freshness_minutes = data["freshnessMinutes"]
+    if isinstance(freshness_minutes, bool) or not isinstance(freshness_minutes, int) or not 1 <= freshness_minutes <= 525_600:
+        raise InvalidInput("freshnessMinutes is invalid.")
+    topic_policy = data["policy"]
+    if not isinstance(topic_policy, Mapping):
+        raise InvalidInput("Topic policy must be an object.")
+    allowed_authority_tiers = topic_policy.get("allowedAuthorityTiers")
+    valid_tiers = set(SourceDefinition.AuthorityTier.values) | {"primary_regulatory", "trusted_industry"}
+    if (not isinstance(allowed_authority_tiers, list) or not allowed_authority_tiers
+            or any(not isinstance(tier, str) or tier not in valid_tiers for tier in allowed_authority_tiers)):
+        raise InvalidInput("Topic policy requires allowedAuthorityTiers.")
+    normalized_topic_policy = dict(topic_policy)
+    normalized_topic_policy["allowedAuthorityTiers"] = sorted(set(allowed_authority_tiers))
+    if not isinstance(data["sources"], list) or not data["sources"]:
+        raise InvalidInput("Registry imports require sources.")
     sources: list[dict[str, Any]] = []
     for raw in data["sources"]:
         if not isinstance(raw, Mapping):
@@ -2602,6 +2913,26 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
             raise InvalidInput(
                 "Repository source keys must be lowercase slugs."
             )
+        required_source_fields = {
+            "displayName", "ownerName", "authorityTier",
+            "baseUrl", "accessMethod", "independenceGroup", "adapter", "entrypoints",
+            "recordHosts", "attachmentContentTypes", "allowedContentTypes",
+            "accessPolicy", "rightsPolicy", "pollMinutes",
+            "rateLimitPerMinute", "maxConcurrency", "burst", "rightsStatus", "enabled",
+        }
+        adapter_key = raw.get("adapter")
+        if adapter_key in {"housing_applyhome", "housing_lh"}:
+            required_source_fields.update({"apiContentTypes", "detailContentTypes"})
+        elif adapter_key == "open_data_json":
+            required_source_fields.add("apiContentTypes")
+        elif raw.get("accessMethod") == "rss_atom":
+            required_source_fields.update({"feedContentTypes", "detailContentTypes"})
+        else:
+            required_source_fields.update({"listContentTypes", "detailContentTypes"})
+        if not required_source_fields.issubset(raw):
+            raise InvalidInput("Registry sources require explicit policy and MIME material.")
+        if raw.get("authorityTier") not in normalized_topic_policy["allowedAuthorityTiers"]:
+            raise InvalidInput("Source authorityTier is not allowed by topic policy.")
         material = _normalize_source_material(
             {
                 "topic": data["topicCode"],
@@ -2639,6 +2970,8 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
                             "identityNamespace",
                             "mediaDownloadPolicy",
                             "issuerCodes",
+                            "accessPolicy",
+                            "rightsPolicy",
                         )
                         if field_name in raw
                     },
@@ -2648,27 +2981,17 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
                     "allowedContentTypes",
                     [],
                 ),
-                "defaultRightsStatus": raw.get(
-                    "rightsStatus",
-                    "internal_analysis_only",
-                ),
+                "defaultRightsStatus": raw["rightsStatus"],
                 "termsUrl": raw.get("termsUrl"),
                 "robotsUrl": raw.get("robotsUrl"),
                 "licenseUrl": raw.get("licenseUrl"),
-                "pollIntervalSeconds": int(
-                    raw.get("pollMinutes", 60)
-                )
-                * 60,
+                "pollIntervalSeconds": int(raw["pollMinutes"]) * 60,
                 "rateLimitPolicy": {
-                    "maxConcurrency": int(
-                        raw.get("maxConcurrency", 1)
-                    ),
-                    "requestsPerMinute": int(
-                        raw.get("rateLimitPerMinute", 10)
-                    ),
-                    "burst": int(raw.get("burst", 1)),
+                    "maxConcurrency": int(raw["maxConcurrency"]),
+                    "requestsPerMinute": int(raw["rateLimitPerMinute"]),
+                    "burst": int(raw["burst"]),
                 },
-                "enabled": raw.get("enabled", True),
+                "enabled": raw["enabled"],
             }
         )
         sources.append({"key": source_key, "material": material})
@@ -2680,9 +3003,9 @@ def normalize_registry_import(data: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "topic_code": data["topicCode"],
         "title": data["title"],
-        "policy_version": int(data.get("policyVersion", 1)),
-        "freshness_minutes": int(data.get("freshnessMinutes", 1440)),
-        "policy": data.get("policy", {}),
+        "policy_version": int(data["policyVersion"]),
+        "freshness_minutes": freshness_minutes,
+        "policy": normalized_topic_policy,
         "sources": sources,
     }
 
@@ -3159,6 +3482,10 @@ def record_source_check_result(
     status: str,
     record_count: int,
     error_code: str | None,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    content_hash: str | None = None,
+    rights_decision: str | None = None,
 ) -> dict[str, Any]:
     if status not in {"passed", "failed"}:
         raise ValueError("Unsupported source check status.")
@@ -3178,12 +3505,33 @@ def record_source_check_result(
         if snapshot.config_hash != source_config_hash:
             raise Conflict("The source check snapshot hash is inconsistent.")
         current_snapshot = _source_check_snapshot(source, using="default")
+        frozen = snapshot.frozen_config
+        if not _is_verifiable_source_snapshot(snapshot):
+            raise Conflict("The source check snapshot is not policy-verifiable.")
+        if content_hash is not None and (
+            not isinstance(content_hash, str)
+            or re.fullmatch(r"[a-f0-9]{64}", content_hash) is None
+        ):
+            raise ValueError("Source check content_hash must be a SHA-256 hash.")
+        for field_name, value in (("etag", etag), ("last_modified", last_modified)):
+            if value is not None and (not isinstance(value, str) or len(value) > 500):
+                raise ValueError(f"Source check {field_name} is invalid.")
+        expected_rights = frozen["defaultRightsStatus"]
+        if rights_decision is not None and rights_decision != expected_rights:
+            raise Conflict("Source check rights decision is inconsistent.")
         result = {
+            "taxonomyVersion": "source-check-taxonomy-v1",
             "snapshotId": str(snapshot.id),
             "configHash": snapshot.config_hash,
+            "accessPolicyHash": frozen["accessPolicyHash"],
+            "rightsPolicyHash": frozen["rightsPolicyHash"],
             "status": status,
             "checkedAt": timezone.now().isoformat(),
             "recordCount": max(0, min(int(record_count), 1_000_000)),
+            "etag": etag,
+            "lastModified": last_modified,
+            "contentHash": content_hash,
+            "rightsDecision": expected_rights,
             "errorCode": safe_error_code,
         }
         if current_snapshot.id == snapshot.id:

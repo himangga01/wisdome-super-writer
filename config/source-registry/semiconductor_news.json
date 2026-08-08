@@ -4,6 +4,7 @@
   "policyVersion": 1,
   "freshnessMinutes": 720,
   "policy": {
+    "allowedAuthorityTiers": ["primary_official", "primary_regulatory", "primary_corporate", "trusted_industry"],
     "breakingCategories": ["government_control", "factory_disruption", "major_ma", "material_earnings", "technology_production"],
     "breakingVerification": "one_primary_or_two_independent",
     "articleTypes": ["semiconductor_daily_digest", "semiconductor_breaking"]
@@ -24,6 +25,8 @@
         "https://www.motir.go.kr/kor/article/ATCL3f49a5a8c",
         "https://www.motir.go.kr/kor/article/ATCLe0854704d"
       ],
+      "accessPolicy": {"schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 1000, "maxElapsedSeconds": 900, "originPolicies": [{"host": "www.motir.go.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment", "attachment_metadata"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://www.motir.go.kr/robots.txt"}], "termsDecision": "approved", "licenseDecision": "not_applicable"},
+      "rightsPolicy": {"schemaVersion": "source-rights-policy-v1", "record": {"status": "attribution_required", "basis": "terms", "basisUrl": "https://www.motir.go.kr/kor/contents/81", "attributionText": "Source: MOTIR", "publishable": true}, "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}, "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}},
       "maxPages": 10,
       "pageSize": 50,
       "recordHosts": ["www.motir.go.kr"],
@@ -40,6 +43,8 @@
       "termsUrl": "https://www.motir.go.kr/kor/contents/81",
       "pollMinutes": 30,
       "rateLimitPerMinute": 5,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     },
     {
@@ -53,6 +58,8 @@
       "adapter": "semiconductor_krx_kind",
       "identityNamespace": "krx-kind",
       "entrypoints": ["https://kind.krx.co.kr/disclosure/details.do?method=searchDetailsMain"],
+      "accessPolicy": {"schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 1000, "maxElapsedSeconds": 900, "originPolicies": [{"host": "kind.krx.co.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment", "attachment_metadata"], "methods": ["GET", "POST"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://kind.krx.co.kr/robots.txt"}], "termsDecision": "approved", "licenseDecision": "not_applicable"},
+      "rightsPolicy": {"schemaVersion": "source-rights-policy-v1", "record": {"status": "internal_analysis_only", "basis": "terms", "basisUrl": "https://info.krx.co.kr/contents/KRX/06/06070200/KRX06070200.jsp", "attributionText": null, "publishable": false}, "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}, "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}},
       "issuerCodes": ["A005930", "A000660"],
       "maxPages": 10,
       "pageSize": 100,
@@ -70,6 +77,8 @@
       "termsUrl": "https://info.krx.co.kr/contents/KRX/06/06070200/KRX06070200.jsp",
       "pollMinutes": 30,
       "rateLimitPerMinute": 5,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     },
     {
@@ -83,6 +92,8 @@
       "adapter": "semiconductor_samsung_newsroom",
       "identityNamespace": "samsung-global:wp-post",
       "entrypoints": ["https://news.samsung.com/global/category/products/semiconductors/feed", "https://news.samsung.com/global/category/products/semiconductors/feed/atom"],
+      "accessPolicy": {"schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 1000, "maxElapsedSeconds": 900, "originPolicies": [{"host": "news.samsung.com", "purposes": ["collection", "source_check", "record_fetch", "attachment", "attachment_metadata"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://news.samsung.com/robots.txt"}], "termsDecision": "approved", "licenseDecision": "not_applicable"},
+      "rightsPolicy": {"schemaVersion": "source-rights-policy-v1", "record": {"status": "internal_analysis_only", "basis": "terms", "basisUrl": "https://news.samsung.com/global/terms", "attributionText": null, "publishable": false}, "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}, "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}},
       "maxPages": 10,
       "pageSize": 50,
       "recordHosts": ["news.samsung.com", "img.global.news.samsung.com"],
@@ -99,6 +110,8 @@
       "termsUrl": "https://news.samsung.com/global/terms",
       "pollMinutes": 30,
       "rateLimitPerMinute": 10,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     },
     {
@@ -112,6 +125,8 @@
       "adapter": "semiconductor_skhynix_newsroom",
       "identityNamespace": "skhynix:wp-post",
       "entrypoints": ["https://news.skhynix.com/en/feed/", "https://news.skhynix.com/en/feed/atom/"],
+      "accessPolicy": {"schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 1000, "maxElapsedSeconds": 900, "originPolicies": [{"host": "news.skhynix.com", "purposes": ["collection", "source_check", "record_fetch", "attachment", "attachment_metadata"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://news.skhynix.com/robots.txt"}], "termsDecision": "approved", "licenseDecision": "not_applicable"},
+      "rightsPolicy": {"schemaVersion": "source-rights-policy-v1", "record": {"status": "prohibited", "basis": "terms", "basisUrl": "https://news.skhynix.com/en/terms-of-use/", "attributionText": null, "publishable": false}, "documentAttachment": {"status": "prohibited", "basis": "terms", "basisUrl": "https://news.skhynix.com/en/terms-of-use/", "attributionText": null, "publishable": false}, "mediaAttachment": {"status": "prohibited", "basis": "terms", "basisUrl": "https://news.skhynix.com/en/terms-of-use/", "attributionText": null, "publishable": false}},
       "maxPages": 10,
       "pageSize": 10,
       "recordHosts": ["news.skhynix.com", "d18r0a86za96sg.cloudfront.net"],
@@ -128,6 +143,8 @@
       "termsUrl": "https://news.skhynix.com/en/terms-of-use/",
       "pollMinutes": 30,
       "rateLimitPerMinute": 10,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": false
     },
     {
@@ -141,6 +158,8 @@
       "adapter": "semiconductor_sia_latest",
       "identityNamespace": "sia:wp-post",
       "entrypoints": ["https://www.semiconductors.org/news-events/latest-news/"],
+      "accessPolicy": {"schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 1000, "maxElapsedSeconds": 900, "originPolicies": [{"host": "www.semiconductors.org", "purposes": ["collection", "source_check", "record_fetch", "attachment", "attachment_metadata"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://www.semiconductors.org/robots.txt"}], "termsDecision": "approved", "licenseDecision": "not_applicable"},
+      "rightsPolicy": {"schemaVersion": "source-rights-policy-v1", "record": {"status": "internal_analysis_only", "basis": "terms", "basisUrl": "https://www.semiconductors.org/terms-of-use/", "attributionText": null, "publishable": false}, "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}, "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}},
       "maxPages": 10,
       "pageSize": 12,
       "recordHosts": ["www.semiconductors.org"],
@@ -157,6 +176,8 @@
       "termsUrl": "https://www.semiconductors.org/terms-of-use/",
       "pollMinutes": 60,
       "rateLimitPerMinute": 5,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     }
   ]

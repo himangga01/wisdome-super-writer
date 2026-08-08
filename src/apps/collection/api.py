@@ -22,6 +22,15 @@ def _run_payload(run):
         "state": run.state,
         "windowStart": run.window_start.isoformat(),
         "windowEnd": run.window_end.isoformat(),
+        "sourceRegistrySnapshotId": str(run.source_registry_id),
+        "registryVersion": run.source_registry.version,
+        "registryManifestHash": run.registry_manifest_hash,
+        "topicPolicyId": str(run.topic_policy_id),
+        "policyVersion": run.policy_version,
+        "policyHash": run.policy_hash,
+        "freshnessMinutes": run.freshness_minutes,
+        "allowedAuthorityTiers": run.allowed_authority_tiers,
+        "freshnessCutoff": run.freshness_cutoff.isoformat(),
         "counters": run.counters,
         "errorSummary": run.error_summary,
         "correlationId": str(run.correlation_id),
@@ -48,11 +57,103 @@ def _run_payload(run):
     }
 
 
+def _timestamp(value):
+    return value.isoformat() if value else None
+
+
+def _observation_payload(observation):
+    return {
+        "id": str(observation.id),
+        "deliveryAttemptNo": observation.delivery_attempt_no,
+        "outcome": observation.outcome,
+        "failureCategory": observation.failure_category or None,
+        "errorCode": observation.error_code,
+        # This field is redacted before it is persisted; never expose a raw
+        # exception message or request material from this read API.
+        "errorDetail": observation.error_detail_redacted,
+        "httpStatus": observation.http_status,
+        "retryCount": observation.retry_count,
+        "retryAt": _timestamp(observation.retry_at),
+        "retryAfterSeconds": observation.retry_after_seconds,
+        "requestCount": observation.request_count,
+        "freshnessExcludedCount": (
+            observation.freshness_excluded_count
+        ),
+        "durationMs": observation.duration_ms,
+        "accessPolicyHash": observation.access_policy_hash or None,
+        "authorityTier": observation.authority_tier or None,
+        "freshnessCutoff": _timestamp(observation.freshness_cutoff),
+        "recordedAt": observation.recorded_at.isoformat(),
+    }
+
+
+def _attempt_payload(attempt):
+    return {
+        "id": str(attempt.id),
+        "sourceSnapshotId": str(attempt.source_snapshot_id),
+        "adapterName": attempt.adapter_name,
+        "adapterVersion": attempt.adapter_version,
+        "adapterImplementationManifestHash": (
+            attempt.adapter_implementation_manifest_hash
+        ),
+        "adapterConfigHash": attempt.adapter_config_hash,
+        "requestFingerprint": attempt.request_fingerprint,
+        "requestWindowStart": _timestamp(attempt.request_window_start),
+        "requestWindowEnd": _timestamp(attempt.request_window_end),
+        "state": attempt.state,
+        "failureCategory": attempt.failure_category or None,
+        "errorCode": attempt.error_code,
+        "errorDetail": attempt.error_detail_redacted,
+        "httpStatus": attempt.http_status,
+        "retryCount": attempt.retry_count,
+        "retryAt": _timestamp(attempt.retry_at),
+        "retryAfterSeconds": attempt.retry_after_seconds,
+        "requestCount": attempt.request_count,
+        "responseCount": attempt.response_count,
+        "responseChecksum": attempt.response_checksum,
+        "durationMs": attempt.duration_ms,
+        "accessPolicyHash": attempt.access_policy_hash or None,
+        "rightsPolicyHash": attempt.rights_policy_hash or None,
+        "authorityTier": attempt.authority_tier or None,
+        "freshnessCutoff": _timestamp(attempt.freshness_cutoff),
+        "freshnessExcludedCount": attempt.freshness_excluded_count,
+        "startedAt": _timestamp(attempt.started_at),
+        "finishedAt": _timestamp(attempt.finished_at),
+        "observations": [
+            _observation_payload(observation)
+            for observation in attempt.observations.all()
+        ],
+    }
+
+
+def _step_payload(step):
+    return {
+        "name": step.name,
+        "attemptNo": step.attempt_no,
+        "state": step.state,
+        "inputCount": step.input_count,
+        "outputCount": step.output_count,
+        "errorCode": step.error_code,
+        "errorDetail": step.error_detail_redacted,
+        "startedAt": _timestamp(step.started_at),
+        "fanoutCompletedAt": _timestamp(step.fanout_completed_at),
+        "finishedAt": _timestamp(step.finished_at),
+        "durationMs": step.duration_ms,
+        "retryCount": step.retry_count,
+        "retryAt": _timestamp(step.retry_at),
+        "terminalImpact": step.terminal_impact,
+        "recoveryState": step.recovery_state,
+    }
+
+
 @login_required
 @require_http_methods(["GET", "POST"])
 def runs(request):
     if request.method == "GET":
-        queryset = CollectionRun.objects.all()[:100]
+        queryset = CollectionRun.objects.select_related(
+            "source_registry",
+            "topic_policy",
+        )[:100]
         return JsonResponse({"items": [_run_payload(run) for run in queryset]})
     body = json.loads(request.body or b"{}")
     now = timezone.now()
@@ -89,7 +190,17 @@ def runs(request):
 
 @login_required
 def run_detail(request, run_id):
-    run = get_object_or_404(CollectionRun, id=run_id)
+    run = get_object_or_404(
+        CollectionRun.objects.select_related(
+            "source_registry",
+            "topic_policy",
+        ).prefetch_related(
+            "steps",
+            "run_source_items__source_item",
+            "collection_attempts__observations",
+        ),
+        id=run_id,
+    )
     payload = _run_payload(run)
     payload["sources"] = [
         {
@@ -108,6 +219,16 @@ def run_detail(request, run_id):
             ),
         }
         for link in run.run_source_items.select_related("source_item")
+    ]
+    payload["steps"] = [
+        _step_payload(step)
+        for step in run.steps.all().order_by("name", "attempt_no")
+    ]
+    payload["sourceAttempts"] = [
+        _attempt_payload(attempt)
+        for attempt in run.collection_attempts.all().order_by(
+            "source_snapshot_id"
+        )
     ]
     return JsonResponse(payload)
 

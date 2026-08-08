@@ -2,7 +2,10 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from wisdome_writer.infrastructure.outbox import PermanentEventError
+from wisdome_writer.infrastructure.outbox import (
+    PermanentEventError,
+    current_event_consumer_attempt,
+)
 
 from .models import (
     CollectionRun,
@@ -14,7 +17,10 @@ from .models import (
     SourceItemStatus,
 )
 from .services import (
-    collect_run,
+    collect_source_attempt,
+    dispatch_collection_run,
+    finalize_collection_run_state,
+    finalize_source_attempt_delivery_failure as finalize_source_attempt_failure_service,
     project_run_terminal_observation,
     project_step_terminal_observation,
 )
@@ -33,7 +39,54 @@ def execute_collection_run(run_id: str):
         )
     if run.state not in {RunState.QUEUED, RunState.COLLECTING}:
         return {"runId": str(run.id), "state": run.state}
-    run = collect_run(run)
+    run = dispatch_collection_run(run)
+    return {"runId": str(run.id), "state": run.state}
+
+
+@shared_task(
+    name="apps.collection.tasks.execute_source_collection_attempt"
+)
+def execute_source_collection_attempt(
+    source_collection_attempt_id: str,
+):
+    attempt = collect_source_attempt(
+        source_collection_attempt_id,
+        delivery_attempt_no=current_event_consumer_attempt(),
+    )
+    return {
+        "sourceCollectionAttemptId": str(attempt.id),
+        "runId": str(attempt.run_id),
+        "state": attempt.state,
+        "errorCode": attempt.error_code,
+    }
+
+
+@shared_task(
+    name=(
+        "apps.collection.tasks."
+        "finalize_source_collection_attempt_delivery_failure"
+    )
+)
+def finalize_source_collection_attempt_delivery_failure(
+    source_collection_attempt_id: str,
+    error_code: str,
+):
+    attempt = finalize_source_attempt_failure_service(
+        source_collection_attempt_id,
+        error_code,
+        delivery_attempt_no=current_event_consumer_attempt(),
+    )
+    return {
+        "sourceCollectionAttemptId": str(attempt.id),
+        "runId": str(attempt.run_id),
+        "state": attempt.state,
+        "errorCode": attempt.error_code,
+    }
+
+
+@shared_task(name="apps.collection.tasks.finalize_collection_run")
+def finalize_collection_run(run_id: str):
+    run = finalize_collection_run_state(run_id)
     return {"runId": str(run.id), "state": run.state}
 
 

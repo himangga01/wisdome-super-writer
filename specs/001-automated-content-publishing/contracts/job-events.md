@@ -44,9 +44,11 @@
 
 | 이벤트 | Payload | 소비자 동작 |
 |---|---|---|
+| `source.check_requested` | `source_id`, `source_snapshot_id`, `source_config_hash`, `check_id` | 정확한 frozen snapshot과 접근·권리 정책을 재조회해 비게시 source check 수행 |
 | `run.requested` | `run_id` | 실행이 `queued`일 때 수집 시작 |
 | `run.stop_requested` | `run_id`, `reason_code` | 새 하위 작업을 만들지 않고 안전 지점에서 중지 |
-| `source.collect_requested` | `source_collection_attempt_id` | DB의 run/source snapshot/window와 adapter name/version/implementation/config manifest를 재조회해 조건부 수집 |
+| `source.collect_requested` | `source_collection_attempt_id` | DB의 run/TopicPolicy/source snapshot/window와 adapter·access-policy manifest를 재조회해 source 하나를 독립 수집 |
+| `run.collection_finalize_requested` | `run_id` | 모든 source attempt가 terminal인지 재평가하고 0성공 실패 또는 부분/전체 성공의 extraction 전이를 원자 집계 |
 | `source.item_changed` | `source_collection_attempt_id`, `run_id`, `run_source_item_id`, `source_item_id`, `change_kind=new_version/corrected/retracted/unavailable/restored` | succeeded attempt의 adapter/response provenance와 불변 RunSourceItem 계보·활성 registry membership·kind/status 매핑을 검증; new/corrected/restored는 추출·검증, retracted/unavailable/restored는 전체 계보 기반 정정·철회·복원 영향 평가; unchanged에는 이벤트 없음 |
 | `evidence.document_extract_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `input_kind`, `document_extraction_id`, `extraction_run_id`, `retry_of_run_id?`, `profile_snapshot_id`, `profile_material_hash`, `profile_key`, `profile_version`, `page_set_hash`, `fingerprint_schema_version` | PDF 또는 가상 1페이지 독립 이미지의 결정적 child run; run/source 계보와 snapshot ID/material hash로 DB의 승인 profile 재조회 |
 | `evidence.document_ready` | `run_id`, `run_source_item_id`, `source_item_id`, `document_extraction_id`, `input_page_count`, `coverage_manifest_hash`, `selected_evidence_manifest_hash`, `document_complete=true` | run/source 계보와 상위 ID로 routing manifest와 선택 child/EvidenceAsset 전체를 DB에서 조회해 page coverage·권리·신뢰·중복을 재확인; 단일 child ID를 완료 대표로 사용하지 않음 |
@@ -131,6 +133,10 @@ revert/delete를 실행한다.
 | 오류 | 기본 처리 |
 |---|---|
 | connect/read timeout, 429, 502/503/504 | 최대 5회, Retry-After 우선, 지수 백오프+지터 |
+| source access policy/robots/path/method/MIME 거부 | 영구 source 실패; 외부 요청 또는 후속 evidence 없음 |
+| source poll/rate/concurrency 제한, Redis/DNS/transport 일시 오류 | attempt=`retry_scheduled`; Retry-After 또는 bounded backoff 뒤 동일 source event만 최대 5회 전달 |
+| source authentication 실패 | 영구 source 실패; 승인 snapshot·secret 참조를 수정하고 새 source check/registry 승인을 요구 |
+| source freshness/authority/rights 제외 | 분류된 제외 관측을 남기고 해당 record/evidence 생성 금지 |
 | parser schema mismatch | GenericExtractionAttempt/RunStep을 1회 재확인 후 `failed`; EvidenceAsset·other_ready 없음, 출처 health 저하 |
 | calibrated generic 저신뢰 | GenericExtractionAttempt=`low_confidence`; EvidenceAsset=`manual_required/publishable=false`, 교차 근거로 자동 승인 금지 |
 | PaddleOCR/표 저신뢰 | 원 run=`low_confidence`; 승인된 대체 profile run 1회 후에도 저신뢰이면 DocumentExtraction=`low_confidence`, EvidenceAsset=`manual_required/publishable=false` |
@@ -217,6 +223,7 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 
 | 내부 이벤트 | v1 최소 Payload | 용도 |
 |---|---|---|
+| `run.collection_finalize_requested` | `run_id` | source fan-out 및 각 terminal 결과 뒤 collection 종료 조건 재평가 |
 | `run.evidence_requested` | `run_id` | 수집 종료 후 run 단위 evidence fan-out 시작 |
 | `evidence.document_route_requested` | `run_id`, `run_source_item_id`, `source_item_id`, `input_asset_id?`, `input_kind`, `document_extraction_id`, `input_checksum` | 상위 DocumentExtraction이 page route와 child run을 결정하도록 요청 |
 | `evidence.finalize_requested` | `run_id` | ready 또는 terminal 결과 뒤 run evidence 종료 조건 재평가 |
@@ -297,6 +304,28 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   `publication.preflight_requested=4`, target canary=2, 그 밖의 route=5로 모두 5회
   이하이다.
 
+## T012 구현 보충: 출처 단위 수집과 정책 실패
+
+- `run.requested`는 활성 registry membership마다 SourceCollectionAttempt와
+  `source.collect_requested`를 한 트랜잭션에서 만든다. 이벤트 payload는 attempt ID만 전달하며
+  worker는 run의 TopicPolicy/registry hash, source frozen config, access/rights policy hash,
+  adapter 구현 hash를 DB에서 다시 대조한다.
+- 각 전달은 outbox consumer receipt의 실제 attempt 번호로 append-only
+  SourceCollectionObservation을 남긴다. retryable 오류는
+  `retry_scheduled`와 `retry_at`을 기록한 뒤 원 오류를 다시 던져 outbox receipt route의 동일
+  최대 5회 예산만 사용한다. 영구 오류와 전달 소진 callback은 attempt를 terminal `failed`로
+  만든다. worker 종료로 결과 정산이 실행되지 않은 앞선 receipt 번호는 다음 전달 시작 또는
+  소진 callback에서 `source_delivery_interrupted` infrastructure 관측으로 보충한다.
+- source 하나의 실패는 다른 source attempt를 취소하지 않는다. dispatch 직후와 각 source
+  terminal 결과 뒤 서로 다른 dedupe cause의 finalizer를 깨운다. 아직 non-terminal attempt가
+  있으면 no-op이며 모두 끝난 시점에만 집계한다.
+- 성공 source가 0개이면 run/collect step을 `failed`로 끝내고
+  `run.evidence_requested`를 만들지 않는다. 하나 이상 성공하면 실패·freshness 제외 수를
+  counters/error summary에 보존하고 `extracting`으로 전진한다.
+- source check는 같은 snapshot/config/access-policy/rights-policy hash의 최근 `passed`
+  taxonomy 결과만 registry 승인 근거로 인정한다. 새 draft나 정책 변경은 기존 health를
+  재사용할 수 없다.
+
 ## English — T005 Versioned Internal Event Addendum
 
 ### Strict routing and validation
@@ -331,6 +360,7 @@ event version.
 
 | Event key | Exact v1 payload |
 |---|---|
+| `run.collection_finalize_requested@1` | `run_id` |
 | `run.evidence_requested@1` | `run_id` |
 | `evidence.document_route_requested@1` | `run_id`, `run_source_item_id`, `source_item_id`, optional `input_asset_id`, `input_kind`, `document_extraction_id`, `input_checksum` |
 | `evidence.finalize_requested@1` | `run_id` |
@@ -414,3 +444,20 @@ withdrawal, unavailability, or restoration impact. Unchanged observations emit n
 7. Routed leaf tasks have no Celery retry loop. Receipt routes are the sole delivery
    retry authority, with budgets of four for collection run, three for evidence parent,
    four for preflight, two for canary, and five for all remaining routes.
+
+### T012 source-level collection state machine
+
+`run.requested@1` atomically creates one SourceCollectionAttempt and
+`source.collect_requested@1` event per enabled registry membership. The payload carries
+only the attempt ID; the consumer reloads and verifies the pinned TopicPolicy, registry,
+source snapshot, access/rights-policy hashes, adapter implementation, and time window.
+
+Every delivery appends a SourceCollectionObservation keyed by the actual outbox consumer
+receipt attempt. Retryable access failures persist
+`retry_scheduled` plus `retry_at` and re-enter only the receipt route's five-delivery
+budget. Permanent failures and exhausted-delivery callbacks terminalize that source
+without cancelling sibling sources. A later delivery or exhaustion callback backfills any
+missing prior receipt generation as an interrupted infrastructure observation. Finalizer
+wake-ups are safe no-ops until every source
+attempt is terminal. Zero successes fail collection without evidence fan-out; partial
+success advances to extraction with durable failure and freshness-exclusion summaries.

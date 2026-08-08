@@ -205,10 +205,7 @@ def source_attachment_content_types(
     external_config = material.get("externalConfig")
     if not isinstance(external_config, dict):
         external_config = {}
-    raw_types = external_config.get(
-        "attachmentContentTypes",
-        material.get("allowedMimeTypes", []),
-    )
+    raw_types = external_config.get("attachmentContentTypes")
     if not isinstance(raw_types, list) or any(
         not isinstance(value, str) or not value.strip()
         for value in raw_types
@@ -305,6 +302,10 @@ def _snapshot_adapter_input(
             "licenseUrl": material.get("licenseUrl"),
             "pollIntervalSeconds": material.get("pollIntervalSeconds"),
             "rateLimitPolicy": dict(material.get("rateLimitPolicy") or {}),
+            "accessPolicy": dict(material.get("accessPolicy") or {}),
+            "accessPolicyHash": material.get("accessPolicyHash"),
+            "rightsPolicy": dict(material.get("rightsPolicy") or {}),
+            "rightsPolicyHash": material.get("rightsPolicyHash"),
             "secretRef": material.get("secretRef"),
         }
     )
@@ -315,6 +316,8 @@ def build_source_adapter(
     source_snapshot,
     *,
     runtime_mode: str = "collection",
+    operation_id: str | None = None,
+    request_operation_id: str | None = None,
     reconciliation_external_ids: tuple[str, ...] = (),
     reconciliation_records: tuple[ReconciliationSourceRecord, ...] = (),
 ) -> SourceAdapter:
@@ -327,6 +330,11 @@ def build_source_adapter(
     source_adapter_version(source_snapshot)
     source, config = _snapshot_adapter_input(source_snapshot)
     config["_runtimeMode"] = runtime_mode
+    effective_operation_id = operation_id or request_operation_id
+    if effective_operation_id is not None:
+        if not isinstance(effective_operation_id, str) or not effective_operation_id:
+            raise ValueError("Source adapter operation_id must be a non-empty string.")
+        config["operationId"] = effective_operation_id
     config["_reconciliationExternalIds"] = list(
         reconciliation_external_ids
     )

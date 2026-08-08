@@ -82,11 +82,11 @@
 - Produces: `dispatch_collection_run(run)`, `collect_source_attempt(attempt_id, delivery_attempt_no)`, `finalize_collection_run_state(run)`, append-only `SourceCollectionObservation`.
 - Failure contract: `SourceAccessError(code, category, detail, remediation, retryable, retry_after_seconds, http_status)`.
 
-- [ ] **Step 1: 현재 T012 변경을 리뷰 기준선으로 고정한다.**
+- [X] **Step 1: 현재 T012 변경을 리뷰 기준선으로 고정한다.**
 
   `git diff --name-status 7d04126`과 `git diff --stat 7d04126`으로 대상 파일만 기록한다. 이 단계에서는 코드를 수정하지 않는다.
 
-- [ ] **Step 2: 1차 리뷰를 세 관점으로 병렬 수행한다.**
+- [X] **Step 2: 1차 리뷰를 세 관점으로 병렬 수행한다.**
 
   - Reviewer A: HTTP·SSRF·robots·redirect·MIME·rate limit·Retry-After·응답 크기
   - Reviewer B: source fanout·retry·terminal aggregation·migration·append-only·동시성
@@ -94,7 +94,7 @@
 
   각 reviewer는 심각도, 파일/행, 재현 가능한 코드 경로, 명세 근거를 반환하고 수정은 하지 않는다.
 
-- [ ] **Step 3: 메인 세션에서 1차 지적을 재검증한다.**
+- [X] **Step 3: 메인 세션에서 1차 지적을 재검증한다.**
 
   다음 판정 형식을 사용한다.
 
@@ -105,7 +105,7 @@
   required_change: exact invariant or none
   ```
 
-- [ ] **Step 4: 승인된 접근 오류를 evidence 실패 계약으로 변환한다.**
+- [X] **Step 4: 승인된 접근 오류를 evidence 실패 계약으로 변환한다.**
 
   `src/apps/evidence/tasks.py`의 첨부 다운로드 경계에서 `SourceAccessError`가 분류 없이 worker 밖으로 빠지지 않게 한다.
 
@@ -117,14 +117,15 @@
           exc.code,
           exc.detail,
           retryable=exc.retryable,
+          retry_after_seconds=exc.retry_after_seconds,
       ) from exc
   ```
 
   영구 policy/schema/security 오류는 attachment 단위 실패로 기록하고, transient/infrastructure 오류만 승인된 delivery budget 안에서 재시도한다.
 
-- [ ] **Step 5: append-only와 HTTP 계약의 확인된 차이를 수정한다.**
+- [X] **Step 5: append-only와 HTTP 계약의 확인된 차이를 수정한다.**
 
-  `SourceCollectionObservation`에 instance 경로뿐 아니라 bulk 변경 차단 queryset/manager를 적용한다.
+  `SourceCollectionObservation`에 instance 경로뿐 아니라 bulk 변경 차단 queryset/base manager와 PostgreSQL update/delete 거부 trigger를 적용한다.
 
   ```python
   class SourceCollectionObservationQuerySet(models.QuerySet):
@@ -137,19 +138,19 @@
 
   동시에 3xx without `Location`, OpenAPI nullable/enum, HTTP status 100~599 제약, freshness 제외 관측과 retry exhaustion의 durable 분류를 1차 판정 결과대로 맞춘다.
 
-- [ ] **Step 6: 2차 리뷰를 새 컨텍스트의 세 reviewer로 반복한다.**
+- [X] **Step 6: 2차 리뷰를 새 컨텍스트의 세 reviewer로 반복한다.**
 
   1차 reviewer 결과를 정답으로 전달하지 않는다. 현재 코드와 spec/contracts만 제공해 독립 검토하게 한다.
 
-- [ ] **Step 7: 2차 지적을 재검증하고 차단 항목을 닫는다.**
+- [X] **Step 7: 2차 지적을 재검증하고 차단 항목을 닫는다.**
 
   CRITICAL/HIGH 항목은 모두 코드 또는 계약으로 해소한다. MEDIUM/LOW 항목을 보류할 경우 `tasks.md`의 기존 task가 추적하는지 명시하고, 추적되지 않을 때만 convergence task를 추가한다.
 
-- [ ] **Step 8: T012 문서와 상태를 갱신한다.**
+- [X] **Step 8: T012 문서와 상태를 갱신한다.**
 
   `tasks.md`는 리뷰와 승인된 검증이 끝난 뒤에만 T012를 `[X]`로 바꾼다. `REMAINING_WORK.md`에는 한국어 구현 상태를 먼저, 영문 AI handoff를 뒤에 기록한다.
 
-- [ ] **Step 9: 사용자에게 T012 검증 승인을 요청한다.**
+- [X] **Step 9: 사용자에게 T012 검증 승인을 요청한다.**
 
   승인 후 실행할 명령과 기대 결과:
 
@@ -161,7 +162,14 @@
 
   기대 결과는 Django error 0건, 새 migration drift 0건, compile error 0건이다.
 
-- [ ] **Step 10: T012만 커밋한다.**
+  2026-08-08 승인 실행 결과: `compileall`은 exit 0으로 성공했다. Django check와
+  migration drift 검사는 모두 settings import 중 `WISDOME_ENVIRONMENT` 미설정으로 exit 1에서
+  중단됐다. 개발 환경을 명시한 승인 재실행에서는 settings를 통과했지만 두 명령 모두
+  `createSource` 요청 계약의 `format: hostname`이 OpenAPI 검증기 허용 목록에 없어서 exit 1로
+  중단됐다. 설치된 `jsonschema[format-nongpl]`/`fqdn` 지원과 `_SUPPORTED_FORMATS`를 정합화한
+  승인 재검증 결과 Django check는 issue 0건, migration drift는 0건, compileall은 exit 0이다.
+
+- [X] **Step 10: T012만 커밋한다.**
 
   ```powershell
   git add config/source-registry specs/001-automated-content-publishing src/adapters/sources src/apps/collection src/apps/evidence/tasks.py src/apps/topics src/wisdome_writer/infrastructure

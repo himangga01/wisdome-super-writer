@@ -44,6 +44,7 @@ _SUPPORTED_FORMATS = frozenset(
     {
         "date",
         "date-time",
+        "hostname",
         "uri",
         "uri-reference",
         "uuid",

@@ -5,6 +5,7 @@
   "freshnessMinutes": 1440,
   "policy": {
     "requiredAuthority": "primary_official",
+    "allowedAuthorityTiers": ["primary_official"],
     "highImpactFields": ["application_start", "application_end", "supply_count", "price", "eligibility"],
     "articleTypes": ["housing_notice", "housing_correction"]
   },
@@ -26,6 +27,21 @@
         "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getPblPvtRentLttotPblancDetail",
         "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getOPTLttotPblancDetail"
       ],
+      "accessPolicy": {
+        "schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 11000, "maxElapsedSeconds": 3600,
+        "originPolicies": [
+          {"host": "api.odcloud.kr", "purposes": ["collection", "source_check", "record_fetch"], "methods": ["GET"], "pathPrefixes": ["/api/"], "robotsMode": "not_applicable_official_api", "robotsUrl": null},
+          {"host": "applyhome.co.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://applyhome.co.kr/robots.txt"},
+          {"host": "www.applyhome.co.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://www.applyhome.co.kr/robots.txt"}
+        ],
+        "termsDecision": "not_applicable_official_api", "licenseDecision": "approved"
+      },
+      "rightsPolicy": {
+        "schemaVersion": "source-rights-policy-v1",
+        "record": {"status": "attribution_required", "basis": "license", "basisUrl": "https://www.data.go.kr/data/15098547/openapi.do", "attributionText": "Source: data.go.kr", "publishable": true},
+        "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false},
+        "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}
+      },
       "maxPages": 20,
       "pageSize": 100,
       "recordHosts": [
@@ -67,6 +83,8 @@
       "rightsStatus": "attribution_required",
       "pollMinutes": 60,
       "rateLimitPerMinute": 5,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     },
     {
@@ -82,6 +100,20 @@
       "entrypoints": [
         "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1"
       ],
+      "accessPolicy": {
+        "schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 700, "maxElapsedSeconds": 1800,
+        "originPolicies": [
+          {"host": "apis.data.go.kr", "purposes": ["collection", "source_check", "record_fetch"], "methods": ["GET"], "pathPrefixes": ["/B552555/"], "robotsMode": "not_applicable_official_api", "robotsUrl": null},
+          {"host": "apply.lh.or.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://apply.lh.or.kr/robots.txt"}
+        ],
+        "termsDecision": "not_applicable_official_api", "licenseDecision": "approved"
+      },
+      "rightsPolicy": {
+        "schemaVersion": "source-rights-policy-v1",
+        "record": {"status": "attribution_required", "basis": "license", "basisUrl": "https://www.data.go.kr/data/15058530/openapi.do", "attributionText": "Source: data.go.kr", "publishable": true},
+        "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false},
+        "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}
+      },
       "detailEntrypoint": "https://apis.data.go.kr/B552555/lhLeaseNoticeDtlInfo1/getLeaseNoticeDtlInfo1",
       "supplyEntrypoint": "https://apis.data.go.kr/B552555/lhLeaseNoticeSplInfo1/getLeaseNoticeSplInfo1",
       "maxPages": 4,
@@ -124,6 +156,8 @@
       "rightsStatus": "attribution_required",
       "pollMinutes": 60,
       "rateLimitPerMinute": 5,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": true
     },
     {
@@ -139,6 +173,21 @@
       "entrypoints": [
         "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail"
       ],
+      "accessPolicy": {
+        "schemaVersion": "source-access-policy-v1", "decision": "approved", "reviewedAt": "2026-07-29T00:00:00+09:00", "userAgent": "WisdomeSuperWriter/1.0", "trafficScope": "collection_and_source_check", "maxHttpAttempts": 3, "maxRetryDelaySeconds": 30, "maxRedirects": 3, "maxRequests": 25, "maxElapsedSeconds": 300,
+        "originPolicies": [
+          {"host": "api.odcloud.kr", "purposes": ["collection", "source_check", "record_fetch"], "methods": ["GET"], "pathPrefixes": ["/api/"], "robotsMode": "not_applicable_official_api", "robotsUrl": null},
+          {"host": "applyhome.co.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://applyhome.co.kr/robots.txt"},
+          {"host": "www.applyhome.co.kr", "purposes": ["collection", "source_check", "record_fetch", "attachment"], "methods": ["GET"], "pathPrefixes": ["/"], "robotsMode": "runtime_fetch", "robotsUrl": "https://www.applyhome.co.kr/robots.txt"}
+        ],
+        "termsDecision": "not_applicable_official_api", "licenseDecision": "approved"
+      },
+      "rightsPolicy": {
+        "schemaVersion": "source-rights-policy-v1",
+        "record": {"status": "attribution_required", "basis": "license", "basisUrl": "https://www.data.go.kr/data/15098547/openapi.do", "attributionText": "Source: data.go.kr", "publishable": true},
+        "documentAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false},
+        "mediaAttachment": {"status": "internal_analysis_only", "basis": "none", "basisUrl": null, "attributionText": null, "publishable": false}
+      },
       "maxPages": 20,
       "pageSize": 100,
       "recordHosts": [
@@ -166,6 +215,8 @@
       "rightsStatus": "attribution_required",
       "pollMinutes": 120,
       "rateLimitPerMinute": 10,
+      "maxConcurrency": 1,
+      "burst": 1,
       "enabled": false
     }
   ]

@@ -77,6 +77,7 @@ SOURCE_CHANGE_VALUES = frozenset(
         "restored",
     }
 )
+SOURCE_COLLECTION_MAX_ATTEMPTS = 5
 
 EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ("source.check_requested", 1): EventRoute(
@@ -89,12 +90,46 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
             "source_config_hash",
             "check_id",
         ),
-        max_attempts=3,
+        (
+            "apps.topics.tasks."
+            "finalize_source_check_delivery_failure"
+        ),
+        (
+            "source_id",
+            "source_snapshot_id",
+            "source_config_hash",
+            "check_id",
+        ),
+        max_attempts=5,
     ),
     ("run.requested", 1): EventRoute(
         "collection-run",
         "collect.housing",
         "apps.collection.tasks.execute_collection_run",
+        ("run_id",),
+        (
+            "apps.collection.tasks."
+            "finalize_collection_run_delivery_failure"
+        ),
+        ("run_id",),
+        max_attempts=4,
+    ),
+    ("source.collect_requested", 1): EventRoute(
+        "source-collection",
+        "collect.housing",
+        "apps.collection.tasks.execute_source_collection_attempt",
+        ("source_collection_attempt_id",),
+        (
+            "apps.collection.tasks."
+            "finalize_source_collection_attempt_delivery_failure"
+        ),
+        ("source_collection_attempt_id",),
+        max_attempts=SOURCE_COLLECTION_MAX_ATTEMPTS,
+    ),
+    ("run.collection_finalize_requested", 1): EventRoute(
+        "collection-finalize",
+        "collect.housing",
+        "apps.collection.tasks.finalize_collection_run",
         ("run_id",),
         (
             "apps.collection.tasks."
@@ -274,6 +309,16 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
         },
     ),
     ("run.requested", 1): _schema(
+        {"run_id": STR},
+        formats={"run_id": UUID_FORMAT},
+    ),
+    ("source.collect_requested", 1): _schema(
+        {"source_collection_attempt_id": STR},
+        formats={
+            "source_collection_attempt_id": UUID_FORMAT,
+        },
+    ),
+    ("run.collection_finalize_requested", 1): _schema(
         {"run_id": STR},
         formats={"run_id": UUID_FORMAT},
     ),
@@ -577,12 +622,24 @@ def queue_for(route: EventRoute, envelope: dict[str, Any]) -> str:
     event_type = envelope["event_type"]
     payload = envelope["payload"]
     try:
-        if event_type == "run.requested":
+        if event_type in {
+            "run.requested",
+            "run.collection_finalize_requested",
+        }:
             from apps.collection.models import CollectionRun
 
-            topic_code = CollectionRun.objects.values_list("topic_code", flat=True).get(
-                id=payload["run_id"]
-            )
+            topic_code = CollectionRun.objects.values_list(
+                "topic_code",
+                flat=True,
+            ).get(id=payload["run_id"])
+            return _collection_queue(topic_code)
+        if event_type == "source.collect_requested":
+            from apps.collection.models import SourceCollectionAttempt
+
+            topic_code = SourceCollectionAttempt.objects.values_list(
+                "run__topic_code",
+                flat=True,
+            ).get(id=payload["source_collection_attempt_id"])
             return _collection_queue(topic_code)
         if event_type == "publication.preflight_requested":
             from apps.publishing.models import PublicationTarget

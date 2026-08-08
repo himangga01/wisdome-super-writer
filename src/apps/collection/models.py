@@ -2,7 +2,28 @@ import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
+
+
+sha256_validator = RegexValidator(
+    r"^[a-f0-9]{64}$",
+    "Expected a lowercase SHA-256 digest",
+)
+
+
+def allowed_authority_tiers_for_policy(policy) -> list[str]:
+    """Return the frozen authority allow-list encoded by a topic policy."""
+    material = policy.policy if hasattr(policy, "policy") else policy
+    if not isinstance(material, dict):
+        return []
+    tiers = material.get("allowedAuthorityTiers")
+    if isinstance(tiers, list) and all(
+        isinstance(tier, str) and tier for tier in tiers
+    ):
+        return list(dict.fromkeys(tiers))
+    required_tier = material.get("requiredAuthority")
+    return [required_tier] if isinstance(required_tier, str) and required_tier else []
 
 
 class RunState(models.TextChoices):
@@ -26,6 +47,27 @@ class RecoveryState(models.TextChoices):
     RECONCILING = "reconciling", "Reconciling"
     MANUAL_REQUIRED = "manual_required", "Manual required"
     STOPPED = "stopped", "Stopped"
+
+
+class SourceCollectionAttemptState(models.TextChoices):
+    QUEUED = "queued", "Queued"
+    RUNNING = "running", "Running"
+    RETRY_SCHEDULED = "retry_scheduled", "Retry scheduled"
+    SUCCEEDED = "succeeded", "Succeeded"
+    FAILED = "failed", "Failed"
+    SKIPPED = "skipped", "Skipped"
+
+
+class SourceCollectionFailureCategory(models.TextChoices):
+    POLICY = "policy", "Policy"
+    SCHEMA = "schema", "Schema"
+    AUTHENTICATION = "authentication", "Authentication"
+    TRANSIENT = "transient", "Transient"
+    SECURITY = "security", "Security"
+    INFRASTRUCTURE = "infrastructure", "Infrastructure"
+    FRESHNESS = "freshness", "Freshness"
+    AUTHORITY = "authority", "Authority"
+    RIGHTS = "rights", "Rights"
 
 
 class SourceItemStatus(models.TextChoices):
@@ -110,6 +152,59 @@ class RunSourceItemManager(
     pass
 
 
+class SourceCollectionObservationQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("SourceCollectionObservation is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    def bulk_create(
+        self,
+        objs,
+        batch_size=None,
+        ignore_conflicts=False,
+        update_conflicts=False,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        if update_conflicts:
+            self._reject_mutation()
+        return super().bulk_create(
+            objs,
+            batch_size=batch_size,
+            ignore_conflicts=ignore_conflicts,
+            update_conflicts=update_conflicts,
+            update_fields=update_fields,
+            unique_fields=unique_fields,
+        )
+
+
+class SourceCollectionObservationManager(
+    models.Manager.from_queryset(SourceCollectionObservationQuerySet)
+):
+    pass
+
+
 class CollectionRun(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     correlation_id = models.UUIDField(default=uuid.uuid4, editable=False, db_index=True)
@@ -121,6 +216,16 @@ class CollectionRun(models.Model):
     window_end = models.DateTimeField()
     source_registry = models.ForeignKey("topics.SourceRegistrySnapshot", on_delete=models.PROTECT)
     registry_manifest_hash = models.CharField(max_length=64)
+    topic_policy = models.ForeignKey(
+        "topics.TopicPolicy",
+        on_delete=models.PROTECT,
+        related_name="collection_runs",
+    )
+    policy_version = models.PositiveIntegerField()
+    policy_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    freshness_minutes = models.PositiveIntegerField()
+    allowed_authority_tiers = models.JSONField(default=list)
+    freshness_cutoff = models.DateTimeField()
     requested_target_ids = models.JSONField(default=list)
     request_fingerprint = models.CharField(max_length=64, unique=True)
     state = models.CharField(max_length=32, choices=RunState.choices, default=RunState.QUEUED, db_index=True)
@@ -144,6 +249,43 @@ class CollectionRun(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(policy_version__gt=0),
+                name="ck_collection_run_policy_version_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(freshness_minutes__gt=0),
+                name="ck_collection_run_freshness_minutes_positive",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if not self.topic_policy_id:
+            errors["topic_policy"] = "A frozen topic policy is required."
+        if not isinstance(self.allowed_authority_tiers, list) or not all(
+            isinstance(tier, str) and tier
+            for tier in self.allowed_authority_tiers
+        ):
+            errors["allowed_authority_tiers"] = (
+                "Allowed authority tiers must be a list of non-empty strings."
+            )
+        if self.topic_policy_id:
+            policy = self._state.fields_cache.get("topic_policy")
+            if policy is None or policy.pk != self.topic_policy_id:
+                policy = self.topic_policy
+            if policy.code != self.topic_code:
+                errors["topic_policy"] = "Topic policy must match the run topic."
+            if self.policy_version != policy.version:
+                errors["policy_version"] = "Must match the frozen topic policy."
+            if self.policy_hash != policy.policy_hash:
+                errors["policy_hash"] = "Must match the frozen topic policy."
+            if self.freshness_minutes != policy.freshness_minutes:
+                errors["freshness_minutes"] = "Must match the frozen topic policy."
+        if errors:
+            raise ValidationError(errors)
 
 
 class SourceCollectionAttempt(models.Model):
@@ -153,29 +295,44 @@ class SourceCollectionAttempt(models.Model):
     adapter_name = models.CharField(max_length=120)
     adapter_version = models.CharField(max_length=40, default="v1")
     adapter_implementation_manifest_hash = models.CharField(
-        max_length=64,
-        null=True,
-        blank=True,
+        max_length=64, null=True, blank=True,
     )
-    adapter_config_hash = models.CharField(
-        max_length=64,
-        null=True,
-        blank=True,
-    )
-    request_fingerprint = models.CharField(
-        max_length=64,
-        null=True,
-        blank=True,
-    )
+    adapter_config_hash = models.CharField(max_length=64, null=True, blank=True)
+    request_fingerprint = models.CharField(max_length=64, null=True, blank=True)
     request_window_start = models.DateTimeField(null=True, blank=True)
     request_window_end = models.DateTimeField(null=True, blank=True)
-    state = models.CharField(max_length=20, default="queued")
+    state = models.CharField(
+        max_length=20,
+        choices=SourceCollectionAttemptState.choices,
+        default=SourceCollectionAttemptState.QUEUED,
+    )
+    failure_category = models.CharField(
+        max_length=32,
+        choices=SourceCollectionFailureCategory.choices,
+        blank=True,
+        default="",
+    )
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    retry_at = models.DateTimeField(null=True, blank=True)
+    retry_after_seconds = models.PositiveIntegerField(null=True, blank=True)
+    request_count = models.PositiveIntegerField(default=0)
+    access_policy_hash = models.CharField(
+        max_length=64, blank=True, default="", validators=[sha256_validator],
+    )
+    rights_policy_hash = models.CharField(
+        max_length=64, blank=True, default="", validators=[sha256_validator],
+    )
+    authority_tier = models.CharField(max_length=32, blank=True, default="")
+    freshness_cutoff = models.DateTimeField(null=True, blank=True)
+    freshness_excluded_count = models.PositiveIntegerField(default=0)
     response_count = models.PositiveIntegerField(default=0)
     response_checksum = models.CharField(max_length=64, null=True, blank=True)
     error_code = models.CharField(max_length=100, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=500, null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -185,7 +342,107 @@ class SourceCollectionAttempt(models.Model):
                 condition=models.Q(request_fingerprint__isnull=False),
                 name="uq_collection_attempt_request_fingerprint",
             ),
+            models.CheckConstraint(condition=models.Q(retry_count__gte=0), name="ck_collection_attempt_retry_count_nonnegative"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(http_status__isnull=True)
+                    | (
+                        models.Q(http_status__gte=100)
+                        & models.Q(http_status__lte=599)
+                    )
+                ),
+                name="ck_collection_attempt_http_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(models.Q(retry_after_seconds__isnull=True) | models.Q(retry_after_seconds__gte=0)),
+                name="ck_collection_attempt_retry_after_nonnegative",
+            ),
+            models.CheckConstraint(condition=models.Q(request_count__gte=0), name="ck_collection_attempt_request_count_nonnegative"),
+            models.CheckConstraint(
+                condition=(models.Q(duration_ms__isnull=True) | models.Q(duration_ms__gte=0)),
+                name="ck_collection_attempt_duration_nonnegative",
+            ),
         ]
+        indexes = [
+            models.Index(
+                fields=["run", "state", "retry_at"],
+                name="collection__run_id_4ed4f3_idx",
+            )
+        ]
+
+
+class SourceCollectionObservation(models.Model):
+    """Append-only delivery-attempt history for a source collection attempt."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt = models.ForeignKey(
+        SourceCollectionAttempt, on_delete=models.CASCADE, related_name="observations",
+    )
+    delivery_attempt_no = models.PositiveIntegerField()
+    outcome = models.CharField(max_length=20, choices=SourceCollectionAttemptState.choices)
+    failure_category = models.CharField(
+        max_length=32, choices=SourceCollectionFailureCategory.choices,
+        blank=True, default="",
+    )
+    error_code = models.CharField(max_length=100, null=True, blank=True)
+    error_detail_redacted = models.CharField(max_length=500, null=True, blank=True)
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    retry_at = models.DateTimeField(null=True, blank=True)
+    retry_after_seconds = models.PositiveIntegerField(null=True, blank=True)
+    request_count = models.PositiveIntegerField(default=0)
+    freshness_excluded_count = models.PositiveIntegerField(default=0)
+    duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
+    access_policy_hash = models.CharField(
+        max_length=64, blank=True, default="", validators=[sha256_validator],
+    )
+    authority_tier = models.CharField(max_length=32, blank=True, default="")
+    freshness_cutoff = models.DateTimeField(null=True, blank=True)
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        constraints = [
+            models.UniqueConstraint(fields=["attempt", "delivery_attempt_no"], name="uq_collection_observation_delivery_attempt"),
+            models.CheckConstraint(condition=models.Q(delivery_attempt_no__gt=0), name="ck_collection_observation_delivery_attempt_positive"),
+            models.CheckConstraint(condition=models.Q(retry_count__gte=0), name="ck_collection_observation_retry_count_nonnegative"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(http_status__isnull=True)
+                    | (
+                        models.Q(http_status__gte=100)
+                        & models.Q(http_status__lte=599)
+                    )
+                ),
+                name="ck_collection_observation_http_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(models.Q(retry_after_seconds__isnull=True) | models.Q(retry_after_seconds__gte=0)),
+                name="ck_collection_observation_retry_after_nonnegative",
+            ),
+            models.CheckConstraint(condition=models.Q(request_count__gte=0), name="ck_collection_observation_request_count_nonnegative"),
+            models.CheckConstraint(
+                condition=(models.Q(duration_ms__isnull=True) | models.Q(duration_ms__gte=0)),
+                name="ck_collection_observation_duration_nonnegative",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["attempt", "recorded_at"],
+                name="collection__attempt_2c7c03_idx",
+            )
+        ]
+
+    objects = SourceCollectionObservationManager()
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("SourceCollectionObservation is append-only")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("SourceCollectionObservation is append-only")
 
 
 class SourceItem(models.Model):

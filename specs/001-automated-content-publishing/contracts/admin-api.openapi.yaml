@@ -1452,6 +1452,112 @@ components:
         maxConcurrency: { type: integer, minimum: 1, maximum: 50 }
         requestsPerMinute: { type: integer, minimum: 1, maximum: 10000 }
         burst: { type: integer, minimum: 1, maximum: 1000 }
+    SourceAccessOriginPolicy:
+      type: object
+      additionalProperties: false
+      required: [host, purposes, methods, pathPrefixes, robotsMode, robotsUrl]
+      properties:
+        host: { type: string, format: hostname }
+        purposes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [collection, source_check, record_fetch, attachment, attachment_metadata]
+        methods:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [GET, HEAD, POST]
+        pathPrefixes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, pattern: '^/' }
+        robotsMode:
+          type: string
+          enum: [runtime_fetch, not_applicable_official_api]
+        robotsUrl: { type: [string, 'null'], format: uri }
+    SourceAccessPolicy:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, decision, reviewedAt, userAgent, trafficScope, maxHttpAttempts, maxRetryDelaySeconds, maxRedirects, maxRequests, maxElapsedSeconds, originPolicies, termsDecision, licenseDecision]
+      properties:
+        schemaVersion: { type: string, const: source-access-policy-v1 }
+        decision: { type: string, const: approved }
+        reviewedAt: { type: string, format: date-time }
+        userAgent: { type: string, minLength: 1, maxLength: 300 }
+        trafficScope:
+          type: string
+          enum: [collection, source_check, collection_and_source_check]
+        maxHttpAttempts: { type: integer, minimum: 1, maximum: 5 }
+        maxRetryDelaySeconds: { type: integer, minimum: 0, maximum: 3600 }
+        maxRedirects: { type: integer, minimum: 0, maximum: 20 }
+        maxRequests: { type: integer, minimum: 1, maximum: 20000 }
+        maxElapsedSeconds: { type: integer, minimum: 1, maximum: 3600 }
+        originPolicies:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/SourceAccessOriginPolicy' }
+        termsDecision:
+          type: string
+          enum: [approved, not_applicable, not_applicable_official_api]
+        licenseDecision:
+          type: string
+          enum: [approved, not_applicable, not_applicable_official_api]
+    SourceRightsDecision:
+      type: object
+      additionalProperties: false
+      required: [status, basis, basisUrl, attributionText, publishable]
+      properties:
+        status: { $ref: '#/components/schemas/RightsStatus' }
+        basis:
+          type: string
+          enum: [license, terms, none]
+        basisUrl: { type: [string, 'null'], format: uri }
+        attributionText: { type: [string, 'null'], maxLength: 1000 }
+        publishable: { type: boolean }
+    SourceRightsPolicy:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, record, documentAttachment, mediaAttachment]
+      properties:
+        schemaVersion: { type: string, const: source-rights-policy-v1 }
+        record: { $ref: '#/components/schemas/SourceRightsDecision' }
+        documentAttachment: { $ref: '#/components/schemas/SourceRightsDecision' }
+        mediaAttachment: { $ref: '#/components/schemas/SourceRightsDecision' }
+    SourceExternalConfig:
+      type: object
+      required: [accessPolicy, rightsPolicy]
+      properties:
+        accessPolicy: { $ref: '#/components/schemas/SourceAccessPolicy' }
+        rightsPolicy: { $ref: '#/components/schemas/SourceRightsPolicy' }
+      additionalProperties: true
+      description: >-
+        Adapter-specific non-secret parameters plus mandatory frozen access and rights
+        policies. Authorization headers, cookies, tokens, passwords, and secret-looking
+        keys or values are rejected; secretRef is the only credential pointer.
+    SourceHealthCheck:
+      type: object
+      additionalProperties: false
+      required: [taxonomyVersion, snapshotId, configHash, accessPolicyHash, rightsPolicyHash, status, checkedAt, recordCount, etag, lastModified, contentHash, rightsDecision, errorCode]
+      properties:
+        taxonomyVersion: { type: string, const: source-check-taxonomy-v1 }
+        snapshotId: { type: string, format: uuid }
+        configHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        accessPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        rightsPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        status: { type: string, enum: [passed, failed] }
+        checkedAt: { type: string, format: date-time }
+        recordCount: { type: integer, minimum: 0, maximum: 1000000 }
+        etag: { type: [string, 'null'], maxLength: 500 }
+        lastModified: { type: [string, 'null'], maxLength: 500 }
+        contentHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        rightsDecision: { $ref: '#/components/schemas/RightsStatus' }
+        errorCode: { type: [string, 'null'], maxLength: 120 }
     SourceDefinitionInput:
       type: object
       required: [topic, name, publisher, authorityTier, independenceGroupId, ownerName, editorialControlName, baseUrl, accessMethod, adapterKey, externalConfig, secretRef, allowedMimeTypes, defaultRightsStatus, termsUrl, robotsUrl, licenseUrl, pollIntervalSeconds, rateLimitPolicy, enabled]
@@ -1470,13 +1576,7 @@ components:
           type: string
           enum: [public_api, open_data_api, rss_atom, public_html, public_file]
         adapterKey: { type: string, pattern: '^[a-z0-9_.-]+$' }
-        externalConfig:
-          type: object
-          additionalProperties: true
-          description: >-
-            Non-secret adapter parameters validated against the registered adapterKey schema.
-            Authorization headers, cookies, tokens, passwords and secret-looking keys/values are
-            rejected; secretRef is the only credential pointer.
+        externalConfig: { $ref: '#/components/schemas/SourceExternalConfig' }
         secretRef: { type: [string, 'null'], maxLength: 300 }
         allowedMimeTypes:
           type: array
@@ -1517,10 +1617,7 @@ components:
           type: string
           enum: [public_api, open_data_api, rss_atom, public_html, public_file]
         adapterKey: { type: string, pattern: '^[a-z0-9_.-]+$' }
-        externalConfig:
-          type: object
-          additionalProperties: true
-          description: Same non-secret, adapter-schema-validated rules as create.
+        externalConfig: { $ref: '#/components/schemas/SourceExternalConfig' }
         secretRef: { type: [string, 'null'], maxLength: 300 }
         allowedMimeTypes:
           type: array
@@ -1544,7 +1641,10 @@ components:
             latestDraftSnapshotVersion: { type: [integer, 'null'], minimum: 1 }
             latestDraftConfigHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
             status: { type: string, enum: [draft, approved, retired] }
-            lastHealth: { type: [object, 'null'], additionalProperties: true }
+            lastHealth:
+              oneOf:
+                - $ref: '#/components/schemas/SourceHealthCheck'
+                - type: 'null'
       unevaluatedProperties: false
 
     SourceRegistryDraftRequest:
@@ -1728,7 +1828,7 @@ components:
       description: >-
         Server-computed immutable run snapshot. In validated_auto mode, requested target,
         target-snapshot, validation and activation target sets are equal and one-to-one.
-      required: [id, displayId, topic, trigger, sourceRegistrySnapshotId, registryVersion, registryManifestHash, policyVersion, requestedTargetIds, requestedTargetSnapshots, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, scheduleSnapshotHash, autoValidationSnapshotHash, requestFingerprint, state, createdAt]
+      required: [id, displayId, topic, trigger, sourceRegistrySnapshotId, registryVersion, registryManifestHash, topicPolicyId, policyVersion, policyHash, freshnessMinutes, allowedAuthorityTiers, freshnessCutoff, requestedTargetIds, requestedTargetSnapshots, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, scheduleSnapshotHash, autoValidationSnapshotHash, requestFingerprint, state, createdAt]
       properties:
         id: { type: string, format: uuid }
         displayId: { type: string }
@@ -1739,7 +1839,18 @@ components:
         registryManifestHash:
           type: string
           pattern: '^[a-f0-9]{64}$'
+        topicPolicyId: { type: string, format: uuid }
         policyVersion: { type: integer, minimum: 1 }
+        policyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        freshnessMinutes: { type: integer, minimum: 1 }
+        allowedAuthorityTiers:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [primary_official, primary_regulatory, primary_corporate, trusted_industry, trusted_secondary, discovery_only]
+        freshnessCutoff: { type: string, format: date-time }
         requestedTargetIds:
           type: array
           items: { type: string, format: uuid }
@@ -1776,8 +1887,16 @@ components:
         windowStart: { type: string, format: date-time }
         windowEnd: { type: string, format: date-time }
         counters: { type: object, additionalProperties: { type: integer } }
+        errorSummary: { type: [object, 'null'], additionalProperties: true }
+        correlationId: { type: string, format: uuid }
+        durationMs: { type: [integer, 'null'], minimum: 0 }
+        retryCount: { type: integer, minimum: 0 }
+        terminalImpact: { type: object, additionalProperties: true }
+        recoveryState: { type: string }
+        nextRecoveryAt: { type: [string, 'null'], format: date-time }
         stopRequestedAt: { type: [string, 'null'], format: date-time }
         createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, 'null'], format: date-time }
         completedAt: { type: [string, 'null'], format: date-time }
       allOf:
         - if:
@@ -1811,23 +1930,102 @@ components:
                 pattern: '^[a-f0-9]{64}$'
     RunStep:
       type: object
-      required: [name, attempt, state]
+      required: [name, attemptNo, state, inputCount, outputCount, errorCode, errorDetail, startedAt, fanoutCompletedAt, finishedAt, durationMs, retryCount, retryAt, terminalImpact, recoveryState]
       properties:
         name: { type: string }
-        attempt: { type: integer, minimum: 1 }
+        attemptNo: { type: integer, minimum: 1 }
         state: { type: string }
+        inputCount: { type: integer, minimum: 0 }
+        outputCount: { type: integer, minimum: 0 }
+        errorCode: { type: [string, 'null'] }
+        errorDetail: { type: [string, 'null'] }
+        startedAt: { type: [string, 'null'], format: date-time }
+        fanoutCompletedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        durationMs: { type: [integer, 'null'], minimum: 0 }
+        retryCount: { type: integer, minimum: 0 }
+        retryAt: { type: [string, 'null'], format: date-time }
+        terminalImpact: { type: object, additionalProperties: true }
+        recoveryState: { type: string }
+    SourceCollectionFailureCategory:
+      type: string
+      enum: [policy, schema, authentication, transient, security, infrastructure, freshness, authority, rights]
+    SourceCollectionObservation:
+      type: object
+      required: [id, deliveryAttemptNo, outcome, failureCategory, errorCode, errorDetail, httpStatus, retryCount, retryAt, retryAfterSeconds, requestCount, freshnessExcludedCount, durationMs, accessPolicyHash, authorityTier, freshnessCutoff, recordedAt]
+      properties:
+        id: { type: string, format: uuid }
+        deliveryAttemptNo: { type: integer, minimum: 1 }
+        outcome: { type: string, enum: [retry_scheduled, succeeded, failed, skipped] }
+        failureCategory:
+          oneOf:
+            - $ref: '#/components/schemas/SourceCollectionFailureCategory'
+            - type: 'null'
+        errorCode: { type: [string, 'null'] }
+        errorDetail: { type: [string, 'null'] }
+        httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        retryCount: { type: integer, minimum: 0 }
+        retryAt: { type: [string, 'null'], format: date-time }
+        retryAfterSeconds: { type: [integer, 'null'], minimum: 0 }
+        requestCount: { type: integer, minimum: 0 }
+        freshnessExcludedCount: { type: integer, minimum: 0 }
+        durationMs: { type: [integer, 'null'], minimum: 0 }
+        accessPolicyHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        authorityTier: { type: [string, 'null'] }
+        freshnessCutoff: { type: [string, 'null'], format: date-time }
+        recordedAt: { type: string, format: date-time }
+    SourceCollectionAttempt:
+      type: object
+      required: [id, sourceSnapshotId, adapterName, adapterVersion, adapterImplementationManifestHash, adapterConfigHash, requestFingerprint, requestWindowStart, requestWindowEnd, state, failureCategory, errorCode, errorDetail, httpStatus, retryCount, retryAt, retryAfterSeconds, requestCount, responseCount, responseChecksum, durationMs, accessPolicyHash, rightsPolicyHash, authorityTier, freshnessCutoff, freshnessExcludedCount, startedAt, finishedAt, observations]
+      properties:
+        id: { type: string, format: uuid }
+        sourceSnapshotId: { type: string, format: uuid }
+        adapterName: { type: string }
+        adapterVersion: { type: string }
+        adapterImplementationManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        adapterConfigHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        requestFingerprint: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        requestWindowStart: { type: [string, 'null'], format: date-time }
+        requestWindowEnd: { type: [string, 'null'], format: date-time }
+        state:
+          type: string
+          enum: [queued, running, retry_scheduled, succeeded, failed, skipped]
+        failureCategory:
+          oneOf:
+            - $ref: '#/components/schemas/SourceCollectionFailureCategory'
+            - type: 'null'
+        errorCode: { type: [string, 'null'] }
+        errorDetail: { type: [string, 'null'] }
+        httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        retryCount: { type: integer, minimum: 0 }
+        retryAt: { type: [string, 'null'], format: date-time }
+        retryAfterSeconds: { type: [integer, 'null'], minimum: 0 }
+        requestCount: { type: integer, minimum: 0 }
+        responseCount: { type: integer, minimum: 0 }
+        responseChecksum: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        durationMs: { type: [integer, 'null'], minimum: 0 }
+        accessPolicyHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        rightsPolicyHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        authorityTier: { type: [string, 'null'] }
+        freshnessCutoff: { type: [string, 'null'], format: date-time }
+        freshnessExcludedCount: { type: integer, minimum: 0 }
         startedAt: { type: [string, 'null'], format: date-time }
         finishedAt: { type: [string, 'null'], format: date-time }
-        errorCode: { type: [string, 'null'] }
-        retryAt: { type: [string, 'null'], format: date-time }
+        observations:
+          type: array
+          items: { $ref: '#/components/schemas/SourceCollectionObservation' }
     CollectionRunDetail:
       allOf:
         - $ref: '#/components/schemas/CollectionRun'
         - type: object
+          required: [steps, sourceAttempts]
           properties:
             steps:
               type: array
               items: { $ref: '#/components/schemas/RunStep' }
+            sourceAttempts:
+              type: array
+              items: { $ref: '#/components/schemas/SourceCollectionAttempt' }
             errorSummary: { type: [object, 'null'], additionalProperties: true }
     RunPage:
       type: object

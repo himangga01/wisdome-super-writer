@@ -31,8 +31,9 @@ from adapters.extractors.spreadsheet import SpreadsheetExtractor
 from adapters.extractors.structured import StructuredDataExtractor
 from adapters.sources import (
     source_attachment_content_types,
-    source_record_hosts,
 )
+from adapters.sources.http import download_source_attachment
+from adapters.sources.errors import SourceAccessError
 from adapters.storage import ObjectInfo, S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
 from apps.collection.models import (
@@ -47,13 +48,7 @@ from apps.collection.services import (
     project_run_terminal_observation,
     project_step_terminal_observation,
 )
-from wisdome_writer.infrastructure.http_safety import (
-    HttpSafetyError,
-    OutboundResponseTooLarge,
-    UnsafeOutboundUrl,
-    redact_url,
-    safe_get,
-)
+from wisdome_writer.infrastructure.http_safety import redact_url
 from wisdome_writer.infrastructure.outbox import PermanentEventError, enqueue_event
 
 from .models import (
@@ -87,7 +82,6 @@ from .services import (
     route_pdf_pages,
 )
 
-MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 _GENERIC_BINARY_MIME_TYPES = frozenset(
     {"application/octet-stream", "binary/octet-stream"}
 )
@@ -393,16 +387,84 @@ def _storage() -> S3ObjectStorage:
     return S3ObjectStorage()
 
 
-def _rights(run_source_item) -> dict[str, Any]:
-    config = run_source_item.source_snapshot.config or {}
-    status = config.get("rightsStatus", RightsStatus.UNKNOWN)
+_RIGHTS_RESTRICTIVENESS = {
+    RightsStatus.PROHIBITED: 0,
+    RightsStatus.UNKNOWN: 1,
+    RightsStatus.INTERNAL_ONLY: 2,
+    RightsStatus.ATTRIBUTION_REQUIRED: 3,
+    RightsStatus.ALLOWED: 4,
+}
+
+
+def _rights(
+    run_source_item,
+    *,
+    scope: str = "record",
+    attachment: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    frozen = run_source_item.source_snapshot.frozen_config
+    if not isinstance(frozen, dict):
+        raise PermanentEventError(
+            "source_rights_policy_invalid",
+            "Frozen source material is not an object.",
+        )
+    policy = frozen.get("rightsPolicy")
+    if (
+        not isinstance(policy, dict)
+        or policy.get("schemaVersion") != "source-rights-policy-v1"
+        or frozen.get("rightsPolicyHash") != canonical_hash(policy)
+    ):
+        raise PermanentEventError(
+            "source_rights_policy_missing",
+            "Frozen source rights policy is missing.",
+        )
+    decision = policy.get(scope)
+    if not isinstance(decision, dict):
+        raise PermanentEventError(
+            "source_rights_scope_missing",
+            "Frozen source rights scope is missing.",
+        )
+    status = decision.get("status")
     if status not in RightsStatus.values:
-        status = RightsStatus.UNKNOWN
-    source = run_source_item.source_snapshot.source
+        raise PermanentEventError(
+            "source_rights_status_invalid",
+            "Frozen source rights status is invalid.",
+        )
+    if attachment is not None:
+        attachment_status = (
+            attachment.get("rights_status")
+            or attachment.get("rightsStatus")
+        )
+        if (
+            attachment_status in RightsStatus.values
+            and _RIGHTS_RESTRICTIVENESS[attachment_status]
+            < _RIGHTS_RESTRICTIVENESS[status]
+        ):
+            status = attachment_status
+    basis_url = decision.get("basisUrl")
+    attribution = decision.get("attributionText")
+    policy_publishable = bool(decision.get("publishable", False))
+    if status in {
+        RightsStatus.ALLOWED,
+        RightsStatus.ATTRIBUTION_REQUIRED,
+    } and not basis_url:
+        raise PermanentEventError(
+            "source_rights_basis_missing",
+            "Publishable source rights require an explicit frozen basis URL.",
+        )
+    if (
+        status == RightsStatus.ATTRIBUTION_REQUIRED
+        and not attribution
+    ):
+        raise PermanentEventError(
+            "source_attribution_missing",
+            "Attribution-required rights need frozen attribution text.",
+        )
     return {
         "rights_status": status,
-        "rights_basis_url": config.get("rightsBasisUrl") or source.base_url,
-        "attribution_text": config.get("attributionText") or f"출처: {source.owner_name}",
+        "rights_basis_url": basis_url or None,
+        "attribution_text": attribution or None,
+        "manual_review_required": not policy_publishable,
     }
 
 
@@ -453,7 +515,7 @@ def _create_raw_evidence(run_source_item) -> EvidenceAsset:
         input_kind="source_record",
         input_hash=content_hash,
     )
-    rights = _rights(run_source_item)
+    rights = _rights(run_source_item, scope="record")
     with transaction.atomic():
         evidence, created = EvidenceAsset.objects.get_or_create(
             raw_input_fingerprint=fingerprint,
@@ -504,34 +566,25 @@ def _create_raw_evidence(run_source_item) -> EvidenceAsset:
 def _download_attachment(run_source_item, attachment: Mapping[str, Any]) -> tuple[bytes, str, str]:
     url = str(attachment.get("url", ""))
     parsed = urlparse(url)
-    allowed_hosts = source_record_hosts(
-        run_source_item.source_snapshot
-    )
     try:
-        response = safe_get(
+        response = download_source_attachment(
+            run_source_item.source_snapshot,
             url,
-            max_bytes=MAX_ATTACHMENT_BYTES,
-            timeout=httpx.Timeout(60, connect=10),
-            allowed_hosts=allowed_hosts,
-            headers={"User-Agent": "WisdomeSuperWriter/0.1 (+admin-managed research bot)"},
-            max_elapsed_seconds=60.0,
+            operation_id=(
+                f"attachment:{run_source_item.id}:"
+                f"{hashlib.sha256(url.encode()).hexdigest()[:24]}"
+            ),
+            expected_content_types=source_attachment_content_types(
+                run_source_item.source_snapshot
+            ),
         )
-        response.raise_for_status()
-    except OutboundResponseTooLarge:
+    except SourceAccessError as exc:
         raise ExtractorError(
-            "attachment_limit_exceeded",
-            "Attachment exceeds the configured byte limit",
-        ) from None
-    except UnsafeOutboundUrl:
-        raise ExtractorError(
-            "attachment_url_not_allowed",
-            "Attachment URL is outside the approved public source hosts",
-        ) from None
-    except HttpSafetyError as exc:
-        raise ExtractorError(
-            "attachment_download_failed",
-            str(exc),
-        ) from None
+            exc.code,
+            exc.detail,
+            retryable=exc.retryable,
+            retry_after_seconds=exc.retry_after_seconds,
+        ) from exc
     mime_type = (
         response.headers.get("content-type", "application/octet-stream")
         .split(";", 1)[0]
@@ -585,6 +638,13 @@ def _approved_attachment_mime(
     return effective
 
 
+def _attachment_rights_scope(mime_type: str) -> str:
+    normalized = _normalized_attachment_mime(mime_type)
+    if normalized.startswith(("image/", "audio/", "video/")):
+        return "mediaAttachment"
+    return "documentAttachment"
+
+
 def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: bytes, mime_type: str, filename: str):
     checksum = hashlib.sha256(data).hexdigest()
     key = content_addressed_key(namespace="evidence/raw", checksum_sha256=checksum, filename=filename)
@@ -598,7 +658,11 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
             "run_source_item_id": str(run_source_item.id),
         },
     )
-    rights = _rights(run_source_item)
+    rights = _rights(
+        run_source_item,
+        scope=_attachment_rights_scope(mime_type),
+        attachment=attachment,
+    )
     content_hash = evidence_content_hash(text=None, structured_data={"title": attachment.get("title")}, checksum=checksum)
     fingerprint = _raw_input_fingerprint(
         run_source_item_id=run_source_item.id,
@@ -679,6 +743,144 @@ def _persist_attachment(run_source_item, attachment: Mapping[str, Any], data: by
             )
         )
         return evidence, info
+
+
+_MEDIA_ATTACHMENT_SUFFIXES = frozenset(
+    {
+        ".avif",
+        ".gif",
+        ".jpeg",
+        ".jpg",
+        ".m4a",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".png",
+        ".svg",
+        ".tif",
+        ".tiff",
+        ".wav",
+        ".webm",
+        ".webp",
+    }
+)
+
+
+def _metadata_only_attachment(
+    run_source_item,
+    attachment: Mapping[str, Any],
+) -> bool:
+    frozen = run_source_item.source_snapshot.frozen_config
+    external = (
+        frozen.get("externalConfig")
+        if isinstance(frozen, dict)
+        else None
+    )
+    if (
+        not isinstance(external, dict)
+        or external.get("mediaDownloadPolicy") != "metadata_only"
+    ):
+        return False
+    declared = _normalized_attachment_mime(
+        attachment.get("mime_type")
+        or attachment.get("mimeType")
+        or "application/octet-stream"
+    )
+    if declared.startswith(("image/", "audio/", "video/")):
+        return True
+    if declared not in _GENERIC_BINARY_MIME_TYPES:
+        return False
+    suffix = Path(
+        urlparse(str(attachment.get("url", ""))).path
+    ).suffix.lower()
+    return not suffix or suffix in _MEDIA_ATTACHMENT_SUFFIXES
+
+
+def _persist_metadata_only_attachment(
+    run_source_item,
+    attachment: Mapping[str, Any],
+) -> EvidenceAsset:
+    declared = _normalized_attachment_mime(
+        attachment.get("mime_type")
+        or attachment.get("mimeType")
+        or "application/octet-stream"
+    )
+    structured = {
+        "title": attachment.get("title"),
+        "source_url": redact_url(str(attachment.get("url", ""))),
+        "declared_mime_type": declared,
+        "metadata_only": True,
+        "download_block_reason": "source_media_download_policy",
+    }
+    content_hash = evidence_content_hash(
+        text=None,
+        structured_data=structured,
+        checksum=None,
+    )
+    fingerprint = _raw_input_fingerprint(
+        run_source_item_id=run_source_item.id,
+        source_item_id=run_source_item.source_item_id,
+        input_kind="attachment_metadata",
+        input_hash=canonical_hash(structured),
+    )
+    rights = _rights(
+        run_source_item,
+        scope="mediaAttachment",
+        attachment=attachment,
+    )
+    with transaction.atomic():
+        evidence, created = EvidenceAsset.objects.get_or_create(
+            raw_input_fingerprint=fingerprint,
+            defaults={
+                "source_item": run_source_item.source_item,
+                "origin_run_source_item": run_source_item,
+                "derivation_type": EvidenceDerivationType.RAW,
+                "kind": EvidenceKind.ATTACHMENT,
+                "locator_type": LocatorType.STRUCTURED_PATH,
+                "locator": {
+                    "locator_type": "structured_path",
+                    "path_type": "record_key",
+                    "path": "attachments",
+                },
+                "mime_type": declared,
+                "structured_data": structured,
+                "extraction_method": "source_attachment_metadata",
+                "extractor_version": "v1",
+                "evidence_content_hash": content_hash,
+                "review_subject_hash": "0" * 64,
+                "review_state": ReviewState.PASSED,
+                **rights,
+            },
+        )
+        if not created:
+            if (
+                evidence.source_item_id
+                != run_source_item.source_item_id
+                or evidence.origin_run_source_item_id
+                != run_source_item.id
+                or evidence.derivation_type != EvidenceDerivationType.RAW
+                or evidence.kind != EvidenceKind.ATTACHMENT
+                or evidence.object_key is not None
+                or evidence.evidence_content_hash != content_hash
+            ):
+                raise PermanentEventError(
+                    "raw_input_identity_conflict"
+                )
+            return evidence
+        evidence.review_subject_hash = calculate_review_subject_hash(
+            evidence
+        )
+        evidence.publishable = calculate_publishable(evidence)
+        evidence.full_clean()
+        evidence.save(
+            update_fields=(
+                "review_subject_hash",
+                "publishable",
+                "updated_at",
+            )
+        )
+        return evidence
 
 
 def _store_result(namespace: str, aggregate_id: Any, output: Mapping[str, Any]):
@@ -1220,6 +1422,12 @@ def _run_generic_extraction(attempt_id: Any) -> GenericExtractionAttempt:
 
 
 def _process_attachment(run_source_item, attachment: Mapping[str, Any]) -> None:
+    if _metadata_only_attachment(run_source_item, attachment):
+        _persist_metadata_only_attachment(
+            run_source_item,
+            attachment,
+        )
+        return
     data, declared_mime, filename = _download_attachment(run_source_item, attachment)
     with tempfile.TemporaryDirectory(prefix="wisdome-sniff-") as temp_dir:
         temp_path = Path(temp_dir) / filename
@@ -2349,6 +2557,8 @@ def process_run_evidence(run_id: str):
                     _process_attachment(run_source_item, attachment)
                     output_count += 1
                 except (ExtractorError, httpx.HTTPError, OSError) as exc:
+                    if isinstance(exc, ExtractorError) and exc.retryable:
+                        raise
                     failures.append({
                         "runSourceItemId": str(run_source_item.id),
                         "attachment": str(attachment.get("title", "attachment"))[:120],
@@ -2357,6 +2567,8 @@ def process_run_evidence(run_id: str):
         except (DatabaseError, SoftTimeLimitExceeded):
             raise
         except (ExtractorError, httpx.HTTPError, OSError) as exc:
+            if isinstance(exc, ExtractorError) and exc.retryable:
+                raise
             failures.append({
                 "runSourceItemId": str(run_source_item.id),
                 "attachment": "source-record",

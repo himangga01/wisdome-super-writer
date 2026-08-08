@@ -19,43 +19,43 @@ ADAPTER_IMPLEMENTATION_MANIFEST_SCHEMA_V1 = (
 
 _ADAPTER_EXECUTIONS: dict[str, tuple[str, str]] = {
     "semiconductor_motir": (
-        "v2",
+        "v3",
         "adapters.sources.semiconductor.adapters.MotirAdapter",
     ),
     "semiconductor_krx_kind": (
-        "v2",
+        "v3",
         "adapters.sources.semiconductor.adapters.KrxKindAdapter",
     ),
     "semiconductor_samsung_newsroom": (
-        "v2",
+        "v3",
         "adapters.sources.semiconductor.adapters.SamsungNewsroomAdapter",
     ),
     "semiconductor_skhynix_newsroom": (
-        "v2",
+        "v3",
         "adapters.sources.semiconductor.adapters.SkHynixNewsroomAdapter",
     ),
     "semiconductor_sia_latest": (
-        "v2",
+        "v3",
         "adapters.sources.semiconductor.adapters.SiaLatestAdapter",
     ),
     "housing_applyhome": (
-        "v2",
+        "v3",
         "adapters.sources.housing.applyhome.ApplyHomeAdapter",
     ),
     "housing_lh": (
-        "v2",
+        "v3",
         "adapters.sources.housing.lh.LhApplyAdapter",
     ),
     "open_data_json": (
-        "v2",
+        "v3",
         "adapters.sources.http.OpenDataJsonAdapter",
     ),
     "public_html": (
-        "v2",
+        "v3",
         "adapters.sources.http.PublicHtmlAdapter",
     ),
     "rss": (
-        "v2",
+        "v3",
         "adapters.sources.http.RssAdapter",
     ),
 }
@@ -63,12 +63,20 @@ _SHARED_IMPLEMENTATION_FILES = (
     "adapters/sources/manifests.py",
     "wisdome_writer/domain/hashing.py",
 )
+_T012_EXECUTION_BOUNDARY_FILES = (
+    "apps/collection/services.py",
+    "apps/topics/tasks.py",
+    "wisdome_writer/infrastructure/event_routes.py",
+    "apps/evidence/tasks.py",
+    "wisdome_writer/infrastructure/http_safety.py",
+)
 _HTTP_IMPLEMENTATION_FILES = (
     *_SHARED_IMPLEMENTATION_FILES,
     "adapters/sources/base.py",
+    "adapters/sources/errors.py",
     "adapters/sources/http.py",
-    "wisdome_writer/infrastructure/http_safety.py",
     "wisdome_writer/infrastructure/secrets.py",
+    *_T012_EXECUTION_BOUNDARY_FILES,
 )
 _ADAPTER_IMPLEMENTATION_FILES = {
     **{
@@ -78,8 +86,6 @@ _ADAPTER_IMPLEMENTATION_FILES = {
             "adapters/sources/semiconductor/__init__.py",
             "adapters/sources/semiconductor/common.py",
             "adapters/sources/semiconductor/adapters.py",
-            "apps/collection/services.py",
-            "apps/topics/tasks.py",
         )
         for key in (
             "semiconductor_motir",
@@ -132,7 +138,7 @@ def adapter_execution_manifest(
         adapter_key in {"housing_applyhome", "housing_lh"}
         and access_method == "public_html"
     ):
-        version = "v2"
+        version = "v3"
         implementation = "adapters.sources.http.PublicHtmlAdapter"
         implementation_files = _ADAPTER_IMPLEMENTATION_FILES[
             "public_html"
