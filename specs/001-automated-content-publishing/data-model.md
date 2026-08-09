@@ -1223,14 +1223,22 @@ manual_required인 blocking check가 하나라도 있으면 revision은 review-r
 | `mode` | ApprovalMode | 수동/검증 자동 |
 | `decision` | `approved/rejected/revoked` | 결과 |
 | `approval_subject_hash` | SHA-256 | intent/revision/target action+subject/target/policy/quality/source manifest 지문 |
+| `approval_material_version` | string | 현재 신규 결정은 `approval-subject-v3`; subject hash 정규화 버전 |
+| `head_version` | positive integer | 이 결정을 insert한 뒤 intent/target head version |
 | `supersedes_approval_id` | self FK nullable | 같은 target/current subject의 직전 결정 |
-| `request_key` | string | target별 관리자 요청 멱등 키 |
-| `reauth_proof_id` | FK nullable | unpublish 승인에서 필수인 소비된 재인증 증명 |
+| `request_key` | string | target별 관리자 또는 validated-auto worker 결정 요청 멱등 키 |
+| `request_hash` | SHA-256 | exact request replay 판별 지문 |
+| `decision_hash` | unique SHA-256 | 결정·head·요청·actor·사유를 결속한 `approval-decision-v1` 지문 |
+| `decision_reason` | string | 관리자가 제출했거나 validated-auto worker가 정책에서 생성한 불변 결정 사유 |
+| `decision_actor_type` | `admin/worker` | 결정 hash에 결속한 actor 종류 |
+| `decision_actor_id` | UUID nullable | admin이면 실제 actor ID, worker이면 null |
+| `decision_event_key` | UUID string nullable | worker이면 소비한 outbox event key, admin이면 null; API 응답에는 노출하지 않음 |
+| `reauth_proof_id` | FK nullable | revoke 또는 approved-unpublish에서 소비한 용도 결속 재인증 증명 |
 | `policy_snapshot_hash` | SHA-256 | 승인 당시 정책 묶음 |
 | `quality_report_hash` | SHA-256 | 검사 결과 지문 |
 | `render_template_hash` | SHA-256 nullable | content action 미리보기 템플릿 지문; unpublish는 null |
 | `source_manifest_hash` | SHA-256 | 승인한 근거 또는 철회 근거 지문 |
-| `admin_id` | FK nullable | 자동 모드에서는 활성화 관리자 기록 참조 |
+| `admin_id` | FK non-null | API `decidedBy`; 수동 결정 관리자 또는 자동 모드 activation/schedule 승인 관리자 |
 | `decided_at` | datetime | 시각 |
 
 승인 트랜잭션은 current PublicationIntent의 해당 target command, target snapshot ref와 current
@@ -1242,10 +1250,43 @@ subject는 current remote post ID/state, 사유, 영향 target과 correction evi
 승인된 `render_template_hash`에서 WordPress URL과 승인된 asset ID의 원격 media URL 자리만
 결합한 경우에만 같은 승인을 사용할 수 있다.
 Approval은 수정·삭제하지 않는다. `(publication_intent_id, target_id, request_key)`가
-고유하고 intent/target별 latest approval projection을 잠가
-`expected_latest_approval_id` CAS를 검사한다. insert, latest projection, intent aggregate와
-outbox를 한 트랜잭션으로 갱신하며 stale subject/intent/render/snapshot은 409다. publisher는
-current intent의 target별 current-subject latest `approved` 한 건만 사용할 수 있다.
+고유하고 intent/target별 `PublicationApprovalHead` 한 행을 잠가
+`expected_latest_approval_id`와 `expected_head_version`을 함께 CAS 검사한다. 최초 head 기대값은
+`(null, 0)`이다. 허용 전이는 `none→approved|rejected`, `rejected→approved`,
+`approved→revoked`뿐이다. `approved→approved|rejected`, `rejected→rejected|revoked`,
+`none→revoked`와 revoked 이후 전이는 409이며, 같은 의미의 중복 결정도 exact request-key replay가
+아니면 새 행을 만들지 않는다.
+
+`decision_hash`는 `schemaVersion=approval-decision-v1`, `subjectHash`, `decision`,
+`headVersion`, `supersedesApprovalId`, `requestHash`, `actorType`, `actorId`, `eventKey`,
+`reason`을 정규화해 계산한다. API의 `decisionReason` 값이 이 hash material의 `reason`으로
+들어간다. revoked는 action 종류와 무관하게
+`approval_revoke` scope 재인증이 필수이고, approved-unpublish는 `unpublish` scope 재인증이
+필수다. 나머지 조합은 `reauth_proof_id=null`이어야 한다. 필수 proof의 누락/null/UUID 형식 오류는
+요청 schema 위반 422이고, 형식상 유효하지만 만료됐거나 scope/entity가 다른 proof는 403이다.
+
+insert, latest projection, intent aggregate와 동기 `AuditEvent` 기록을 한 트랜잭션으로 갱신하며 stale
+subject/intent/render/snapshot이나 두 CAS 중 하나의 불일치는 409다. publisher는 current intent의
+target별 current-subject latest `approved` 한 건만 사용할 수 있다. 과거 결정 replay 응답의
+`isCurrent`와 `dispatchEligible`는 그 과거 행으로 추론하지 않고 현재 head를 read-only로 다시
+조회해 계산한다. approval decision 전용 outbox event는 발행하지 않는다.
+
+### PublicationApprovalHead
+
+| 필드 | 타입/제약 | 설명 |
+|---|---|---|
+| `id` | UUID PK | projection 식별자 |
+| `publication_intent_id` | FK PublicationIntent | 결정 집합 |
+| `target_id` | FK PublicationTarget | 대상 채널 |
+| `latest_approval_id` | FK Approval PROTECT | 현재 append-only 결정 |
+| `version` | positive integer | 현재 head version, 1부터 단조 증가 |
+| `subject_hash` | SHA-256 | latest Approval의 `approval_subject_hash` 복제 검증값 |
+| `updated_at` | datetime | head가 마지막으로 전진한 시각 |
+
+`(publication_intent_id, target_id)`는 고유하다. head의 latest Approval은 같은 intent/target이고
+`Approval.head_version == PublicationApprovalHead.version`이어야 한다. API는 현재 head의 approval
+ID/version/decision/subject hash/decision hash/updatedAt과 요청 행의 `isCurrent`,
+`dispatchEligible`를 함께 반환한다.
 
 ### PublicationTarget
 
@@ -1963,3 +2004,30 @@ is 422.
 Revalidation resolves the current release policy, checks current evidence publish eligibility, and
 rebuilds every claim, relation, and quality result from the new body blocks. It never copies the
 prior revision's claims, checks, approvals, or publication intents.
+
+## English / AI-readable — T019 approval decision and head contract
+
+`Approval` is append-only. Each decision persists `approval-subject-v3` subject material, its head
+version, exact request hash, immutable decision reason, and an `approval-decision-v1` hash over the
+subject hash, decision, head version, superseded approval ID, request hash, actor type/ID, worker
+event key, and reason.
+One `PublicationApprovalHead` row per publication intent and target points to the current decision and
+monotonically increasing version.
+
+Every non-replay request compares both `expectedLatestApprovalId` and `expectedHeadVersion`; the
+initial expected pair is `(null, 0)`. The only legal transitions are no head to approved or rejected,
+rejected to approved, and approved to revoked. Revoked is terminal. Same-key exact replay returns the
+existing decision; changed replay, stale CAS, or any other transition returns 409.
+
+A revoked decision always consumes a purpose-bound `approval_revoke` reauthentication proof. An
+approved unpublish consumes an `unpublish` proof. Every other decision/action combination requires a
+null proof. A missing, null, or malformed UUID in a proof-required request is a schema-level 422;
+a syntactically valid but expired or scope/entity-mismatched proof is 403. The request key and immutable
+reason come from either the administrator request or the validated-auto worker policy decision.
+Decision insertion, head advancement, intent aggregate change, and synchronous
+`AuditEvent` recording are atomic. No approval-decision outbox event is emitted. Dispatch and execution
+recheck the current approved head and frozen subject. API replay of
+a historical row derives `currentHead`, `isCurrent`, and `dispatchEligible` from the shared read-only
+head projection, never from the replayed row itself. `decidedBy` is always the non-null approval owner
+(including the activation/schedule administrator for worker auto mode). `decisionActorType` identifies
+admin versus worker execution; `decisionActorId` is the administrator UUID and is null for workers.

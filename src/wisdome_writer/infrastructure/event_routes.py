@@ -308,6 +308,8 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "publish.wordpress",
         "apps.publishing.tasks.dispatch_scheduled_run_publication",
         ("run_id",),
+        "apps.publishing.tasks.finalize_scheduled_publication_delivery_failure",
+        ("run_id",),
     ),
     ("publication.preflight_requested", 1): EventRoute(
         "target-preflight",

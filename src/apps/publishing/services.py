@@ -290,6 +290,42 @@ def _request_hash(payload: dict[str, Any]) -> str:
     return sha256_hex(payload)
 
 
+def _approval_request_hash(
+    *,
+    article_id,
+    target_id,
+    payload: dict[str, Any],
+) -> str:
+    """Bind approval idempotency to both route identity and canonical body."""
+
+    return sha256_hex(
+        {
+            "schemaVersion": "approval-request-v2",
+            "path": {
+                "articleId": str(article_id),
+                "targetId": str(target_id),
+            },
+            "body": payload,
+        }
+    )
+
+
+def _approval_replay_request_hash(
+    *,
+    stored_hash: str,
+    current_hash: str,
+    payload: dict[str, Any],
+) -> str:
+    """Admit exact v2 replay first, then the historical body-only identity."""
+
+    if stored_hash == current_hash:
+        return current_hash
+    legacy_hash = _request_hash(payload)
+    if stored_hash == legacy_hash:
+        return legacy_hash
+    raise Conflict("request key was reused for a different approval decision")
+
+
 def _legacy_admin_request_hash(
     *,
     actor_id: Any,
@@ -421,17 +457,67 @@ _CONTENT_PUBLICATION_ACTIONS = {
     PublicationAction.CREATE,
     PublicationAction.UPDATE,
 }
-_APPROVAL_MATERIAL_VERSION = "approval-subject-v2"
+_APPROVAL_MATERIAL_VERSION = "approval-subject-v3"
+_APPROVAL_DECISION_MATERIAL_VERSION = "approval-decision-v1"
 
 _STALEABLE_INTENT_STATES = {
     PublicationIntent.State.DRAFT,
     PublicationIntent.State.AWAITING_APPROVAL,
     PublicationIntent.State.APPROVED,
 }
+_REVOKE_BLOCKING_ATTEMPT_STATES = frozenset(
+    {
+        PublicationAttempt.State.RUNNING,
+        PublicationAttempt.State.UNKNOWN_OUTCOME,
+        PublicationAttempt.State.RECONCILING,
+    }
+)
+_REVOKE_STALEABLE_ATTEMPT_STATES = frozenset(
+    {
+        PublicationAttempt.State.QUEUED,
+        PublicationAttempt.State.RETRYABLE_FAILED,
+    }
+)
 
 
 def _intent_state_can_be_marked_stale(state: str) -> bool:
     return state in _STALEABLE_INTENT_STATES
+
+
+def _lock_revoke_attempts_for_article_target(
+    *,
+    article_id,
+    target_id,
+) -> tuple[list[PublicationAttempt], list[PublicationAttempt]]:
+    scope = {
+        "publication_intent__article_id": article_id,
+        "publication__target_id": target_id,
+        "state__in": (
+            _REVOKE_BLOCKING_ATTEMPT_STATES
+            | _REVOKE_STALEABLE_ATTEMPT_STATES
+        ),
+    }
+    publication_ids = list(
+        PublicationAttempt.objects.filter(**scope)
+        .order_by("publication_id")
+        .values_list("publication_id", flat=True)
+        .distinct()
+    )
+    list(
+        Publication.objects.select_for_update()
+        .filter(id__in=publication_ids)
+        .order_by("id")
+    )
+    rows = list(
+        PublicationAttempt.objects.select_for_update()
+        .select_related("publication")
+        .filter(**scope)
+        .order_by("id")
+    )
+    return (
+        [row for row in rows if row.state in _REVOKE_BLOCKING_ATTEMPT_STATES],
+        [row for row in rows if row.state in _REVOKE_STALEABLE_ATTEMPT_STATES],
+    )
 
 
 def _latest_approvals_allow_dispatch(
@@ -446,33 +532,298 @@ def _latest_approvals_allow_dispatch(
     )
 
 
+def _render_approval_material(
+    render: ArticleChannelRender,
+    *,
+    intent: PublicationIntent,
+    target: PublicationTarget,
+) -> dict[str, Any]:
+    expected_content_hash = sha256_hex(
+        {"title": render.title, "body": render.body_html}
+    )
+    expected_template_hash = sha256_hex(
+        {
+            "channel": target.channel,
+            "title": render.title,
+            "body": render.body_html,
+            "revision": str(intent.article_revision_id),
+        }
+    )
+    expected_source_manifest_hash = sha256_hex(
+        {
+            "inputEvidenceManifestHash": intent.input_evidence_manifest_hash,
+            "sourceLinks": render.source_links,
+        }
+    )
+    if (
+        render.content_hash != expected_content_hash
+        or render.template_hash != expected_template_hash
+        or render.source_manifest_hash != expected_source_manifest_hash
+    ):
+        raise Conflict("approval render material is stale")
+    return {
+        "renderId": str(render.id),
+        "contentHash": render.content_hash,
+        "templateHash": render.template_hash,
+        "sourceManifestHash": render.source_manifest_hash,
+        "mediaManifestHash": sha256_hex(render.media_manifest),
+    }
+
+
+def _validate_approval_action_subject(
+    *,
+    intent: PublicationIntent,
+    target: PublicationTarget,
+    command: dict[str, Any],
+    subject: dict[str, Any],
+    render: ArticleChannelRender | None,
+    publication: Publication | None,
+    decision_reason: str,
+    using: str = "default",
+) -> None:
+    action = command["resolvedAction"]
+    common = {
+        "targetId": str(target.id),
+        "targetSnapshotId": str(command["targetSnapshotId"]),
+        "targetConfigHash": command["targetConfigHash"],
+        "action": action,
+    }
+    if action == PublicationAction.UNPUBLISH:
+        allowed = {
+            "kind",
+            "action",
+            "targetId",
+            "targetSnapshotId",
+            "targetConfigHash",
+            "remotePostId",
+            "observedRemoteState",
+            "reason",
+            "affectedTargetIds",
+            "correctionEvidenceManifestHash",
+        }
+        if set(subject) != allowed or subject.get("kind") != "unpublish_command":
+            raise InvalidInput("unpublish approval subject has an invalid shape")
+        if any(subject.get(key) != value for key, value in common.items()):
+            raise Conflict("unpublish approval subject differs from the frozen command")
+        if render is not None:
+            raise Conflict("unpublish approval cannot reference a content render")
+        if publication is None or publication.remote_post_id != subject.get("remotePostId"):
+            raise Conflict("unpublish approval differs from the current remote post")
+        observed_remote_state = (
+            Publication.State.MARKED_WITHDRAWN
+            if publication.state == Publication.State.MARKED_WITHDRAWN
+            else publication.remote_state
+        )
+        if subject.get("observedRemoteState") != observed_remote_state:
+            raise Conflict("unpublish approval remote state is stale")
+        expected_targets = sorted(
+            str(row["targetId"])
+            for row in intent.target_commands
+            if isinstance(row, dict) and row.get("targetId")
+        )
+        affected_targets = subject.get("affectedTargetIds")
+        if (
+            not isinstance(affected_targets, list)
+            or len(affected_targets) != len(set(affected_targets))
+            or sorted(str(value) for value in affected_targets) != expected_targets
+        ):
+            raise Conflict("unpublish approval affected target set is stale")
+        unpublish_reason = str(subject.get("reason", ""))
+        if (
+            unpublish_reason != unpublish_reason.strip()
+            or len(unpublish_reason) < 3
+            or len(unpublish_reason) > 500
+        ):
+            raise InvalidInput("unpublish reason must contain 3 to 500 characters")
+        if not intent.correction_case_id:
+            raise Conflict("unpublish approval requires a frozen correction case")
+        CorrectionCase = apps.get_model("editorial", "CorrectionCase")
+        case = (
+            CorrectionCase.objects.using(using)
+            .filter(id=intent.correction_case_id)
+            .first()
+        )
+        if (
+            case is None
+            or case.article_id != intent.article_id
+            or case.state not in {"verified", "applying"}
+            or case.subject_hash != subject.get("correctionEvidenceManifestHash")
+        ):
+            raise Conflict("unpublish correction evidence is stale")
+        return
+
+    allowed = {
+        "kind",
+        "action",
+        "renderId",
+        "targetId",
+        "targetSnapshotId",
+        "targetConfigHash",
+        "templateHash",
+        "sourceManifestHash",
+    }
+    if set(subject) != allowed or subject.get("kind") != "content_preview":
+        raise InvalidInput("content approval subject has an invalid shape")
+    if any(subject.get(key) != value for key, value in common.items()):
+        raise Conflict("content approval subject differs from the frozen command")
+    if render is None:
+        raise Conflict("content approval requires an exact preview render")
+    if (
+        str(subject.get("renderId")) != str(render.id)
+        or render.publication_intent_id != intent.id
+        or render.article_revision_id != intent.article_revision_id
+        or str(render.target_id) != str(target.id)
+        or str(render.target_snapshot_id) != str(command["targetSnapshotId"])
+        or render.target_config_hash != command["targetConfigHash"]
+        or render.render_stage != ArticleChannelRender.Stage.PREVIEW
+        or subject.get("templateHash") != render.template_hash
+        or subject.get("sourceManifestHash") != render.source_manifest_hash
+    ):
+        raise Conflict("content approval render differs from the frozen subject")
+    _render_approval_material(render, intent=intent, target=target)
+
+
 def _approval_subject_hash(
     *,
     intent: PublicationIntent,
-    target_id,
-    action: str,
+    target: PublicationTarget,
     command: dict[str, Any],
     subject: dict[str, Any],
-    decision: str,
-    head_version: int,
-    supersedes_approval_id,
+    render: ArticleChannelRender | None,
+    publication: Publication | None,
+    using: str = "default",
 ) -> str:
+    _validate_approval_action_subject(
+        intent=intent,
+        target=target,
+        command=command,
+        subject=subject,
+        render=render,
+        publication=publication,
+        decision_reason=(
+            str(subject.get("reason", ""))
+            if command["resolvedAction"] == PublicationAction.UNPUBLISH
+            else ""
+        ),
+        using=using,
+    )
+    revision = intent.article_revision
+    if (
+        revision.id != intent.article_revision_id
+        or revision.revision_no != intent.revision_no
+        or revision.content_hash != intent.revision_content_hash
+    ):
+        raise Conflict("approval revision material differs from the frozen intent")
     return sha256_hex(
         {
             "schemaVersion": _APPROVAL_MATERIAL_VERSION,
             "intentId": str(intent.id),
+            "intentHash": intent.intent_hash,
             "articleRevisionId": str(intent.article_revision_id),
-            "targetId": str(target_id),
-            "targetAction": action,
+            "revisionNo": intent.revision_no,
+            "revisionContentHash": intent.revision_content_hash,
+            "editorialPolicyHash": revision.editorial_policy_hash,
+            "qualityGateManifestHash": intent.quality_gate_manifest_hash,
+            "qualityReportHash": intent.quality_report_hash,
+            "inputEvidenceManifestHash": intent.input_evidence_manifest_hash,
+            "targetId": str(target.id),
+            "targetAction": command["resolvedAction"],
             "targetSnapshotId": str(command["targetSnapshotId"]),
             "targetConfigHash": command["targetConfigHash"],
-            "subject": subject,
-            "qualityReportHash": intent.quality_report_hash,
+            "targetCommandHash": command["targetCommandHash"],
+            "actionSubject": subject,
+            "renderMaterial": (
+                _render_approval_material(
+                    render,
+                    intent=intent,
+                    target=target,
+                )
+                if render is not None
+                else None
+            ),
+        }
+    )
+
+
+def _approval_decision_hash(
+    *,
+    subject_hash: str,
+    decision: str,
+    head_version: int,
+    supersedes_approval_id,
+    request_hash: str,
+    actor_type: str,
+    actor_id,
+    event_key,
+    decision_reason: str,
+) -> str:
+    return sha256_hex(
+        {
+            "schemaVersion": _APPROVAL_DECISION_MATERIAL_VERSION,
+            "subjectHash": subject_hash,
             "decision": decision,
             "headVersion": head_version,
             "supersedesApprovalId": _id(supersedes_approval_id),
+            "requestHash": request_hash,
+            "actorType": actor_type,
+            "actorId": _id(actor_id),
+            "eventKey": _id(event_key),
+            "reason": decision_reason,
         }
     )
+
+
+def _validate_approval_transition(
+    previous_decision: str | None,
+    requested_decision: str,
+) -> None:
+    allowed = {
+        None: {Approval.Decision.APPROVED, Approval.Decision.REJECTED},
+        Approval.Decision.REJECTED: {Approval.Decision.APPROVED},
+        Approval.Decision.APPROVED: {Approval.Decision.REVOKED},
+        Approval.Decision.REVOKED: set(),
+    }
+    if requested_decision not in allowed.get(previous_decision, set()):
+        raise Conflict("approval decision transition is not allowed")
+
+
+def _validate_approval_mode_actor(
+    *,
+    mode: str,
+    decision: str,
+    audit_context: AuditContext,
+) -> None:
+    actor_type = audit_context.actor_type
+    if mode == ApprovalMode.MANUAL:
+        if actor_type != "admin":
+            raise Conflict("manual approval decisions require an administrator")
+        return
+    if mode != ApprovalMode.VALIDATED_AUTO:
+        raise Conflict("approval mode is unsupported")
+    if decision == Approval.Decision.APPROVED:
+        if actor_type != "worker":
+            raise Conflict("validated-auto approval requires a worker decision")
+        return
+    if decision in {Approval.Decision.REJECTED, Approval.Decision.REVOKED}:
+        if actor_type != "admin":
+            raise Conflict("validated-auto safety decisions require an administrator")
+        return
+    raise Conflict("approval decision is unsupported")
+
+
+def _validate_approval_cas(
+    latest: Approval | None,
+    *,
+    expected_latest_approval_id,
+    expected_head_version: int,
+) -> None:
+    observed_id = _id(latest.id if latest else None)
+    observed_version = latest.head_version if latest else 0
+    if (
+        observed_id != _id(expected_latest_approval_id)
+        or observed_version != expected_head_version
+    ):
+        raise Conflict("approval head changed; reload the current decision")
 
 
 def _approval_matches_frozen_subject(
@@ -481,22 +832,77 @@ def _approval_matches_frozen_subject(
     intent: PublicationIntent,
     target_id,
     command: dict[str, Any],
+    using: str = "default",
 ) -> bool:
-    if approval.approval_material_version == "approval-subject-v1":
-        return bool(approval.approval_subject_hash)
-    if approval.approval_material_version != _APPROVAL_MATERIAL_VERSION:
+    if (
+        getattr(approval, "publication_intent_id", None) != intent.id
+        or str(getattr(approval, "article_revision_id", ""))
+        != str(intent.article_revision_id)
+        or str(getattr(approval, "target_id", "")) != str(target_id)
+        or getattr(approval, "target_action", None) != command["resolvedAction"]
+        or str(getattr(approval, "target_snapshot_id", ""))
+        != str(command["targetSnapshotId"])
+        or getattr(approval, "target_config_hash", None)
+        != command["targetConfigHash"]
+        or getattr(approval, "quality_report_hash", None)
+        != intent.quality_report_hash
+    ):
         return False
-    expected = _approval_subject_hash(
-        intent=intent,
-        target_id=target_id,
-        action=command["resolvedAction"],
-        command=command,
-        subject=approval.action_subject,
-        decision=approval.decision,
-        head_version=approval.head_version,
-        supersedes_approval_id=approval.supersedes_approval_id,
-    )
-    return approval.approval_subject_hash == expected
+    try:
+        if approval.approval_material_version == "approval-subject-v1":
+            expected = sha256_hex(
+                {
+                    "intentId": str(intent.id),
+                    "articleRevisionId": str(intent.article_revision_id),
+                    "targetId": str(target_id),
+                    "targetAction": command["resolvedAction"],
+                    "targetSnapshotId": str(command["targetSnapshotId"]),
+                    "targetConfigHash": command["targetConfigHash"],
+                    "subject": approval.action_subject,
+                    "qualityReportHash": intent.quality_report_hash,
+                }
+            )
+            return approval.approval_subject_hash == expected
+        if approval.approval_material_version == "approval-subject-v2":
+            expected = sha256_hex(
+                {
+                    "schemaVersion": "approval-subject-v2",
+                    "intentId": str(intent.id),
+                    "articleRevisionId": str(intent.article_revision_id),
+                    "targetId": str(target_id),
+                    "targetAction": command["resolvedAction"],
+                    "targetSnapshotId": str(command["targetSnapshotId"]),
+                    "targetConfigHash": command["targetConfigHash"],
+                    "subject": approval.action_subject,
+                    "qualityReportHash": intent.quality_report_hash,
+                    "decision": approval.decision,
+                    "headVersion": approval.head_version,
+                    "supersedesApprovalId": _id(approval.supersedes_approval_id),
+                }
+            )
+            return approval.approval_subject_hash == expected
+        if approval.approval_material_version != _APPROVAL_MATERIAL_VERSION:
+            return False
+        target = approval.target
+        render = approval.article_channel_render
+        publication = None
+        if command["resolvedAction"] == PublicationAction.UNPUBLISH:
+            publication = Publication.objects.using(using).filter(
+                article_id=intent.article_id,
+                target_id=target_id,
+            ).first()
+        expected = _approval_subject_hash(
+            intent=intent,
+            target=target,
+            command=command,
+            subject=approval.action_subject,
+            render=render,
+            publication=publication,
+            using=using,
+        )
+        return approval.approval_subject_hash == expected
+    except (AttributeError, Conflict, InvalidInput, TypeError, ValueError):
+        return False
 
 
 def _latest_approval_locked(
@@ -506,42 +912,199 @@ def _latest_approval_locked(
 ) -> Approval | None:
     head = (
         PublicationApprovalHead.objects.select_for_update()
-        .select_related("latest_approval")
         .filter(publication_intent=intent, target_id=target_id)
         .first()
     )
     if head is not None:
-        latest = head.latest_approval
+        latest = Approval.objects.select_for_update().get(
+            id=head.latest_approval_id
+        )
         if (
             latest.publication_intent_id != intent.id
             or str(latest.target_id) != str(target_id)
+            or latest.admin_id is None
             or latest.head_version != head.version
+            or latest.approval_subject_hash != head.subject_hash
+            or latest.decision_hash
+            != _approval_decision_hash(
+                subject_hash=latest.approval_subject_hash,
+                decision=latest.decision,
+                head_version=latest.head_version,
+                supersedes_approval_id=latest.supersedes_approval_id,
+                request_hash=latest.request_hash,
+                actor_type=latest.decision_actor_type,
+                actor_id=latest.decision_actor_id,
+                event_key=latest.decision_event_key,
+                decision_reason=latest.decision_reason,
+            )
         ):
             raise Conflict("approval head does not match its immutable decision")
         return latest
-    rows = list(
-        Approval.objects.select_for_update()
-        .filter(publication_intent=intent, target_id=target_id)
-        .order_by("id")
-    )
-    if not rows:
-        return None
-    superseded_ids = {
-        row.supersedes_approval_id
-        for row in rows
-        if row.supersedes_approval_id is not None
-    }
-    leaves = [row for row in rows if row.id not in superseded_ids]
-    if len(leaves) != 1:
-        raise Conflict("approval supersession chain is ambiguous")
-    latest = leaves[0]
-    PublicationApprovalHead.objects.create(
+    if not Approval.objects.filter(
         publication_intent=intent,
         target_id=target_id,
-        latest_approval=latest,
-        version=latest.head_version,
+    ).exists():
+        return None
+    raise Conflict("approval head is missing; migration or manual repair is required")
+
+
+@dataclass(frozen=True)
+class ApprovalDecisionProjection:
+    current_head_approval_id: uuid.UUID
+    current_head_version: int
+    current_head_decision: str
+    current_head_subject_hash: str
+    current_head_decision_hash: str
+    current_head_updated_at: Any
+    is_current: bool
+    dispatch_eligible: bool
+
+
+def evaluate_approval_decision_readonly(
+    *,
+    approval_id,
+    using: str = "default",
+) -> ApprovalDecisionProjection:
+    """Recompute the current-head and dispatch projection without taking locks."""
+
+    approval = (
+        Approval.objects.using(using)
+        .select_related(
+            "article_revision__generation_attempt",
+            "publication_intent__article_revision__generation_attempt",
+            "target",
+            "article_channel_render",
+        )
+        .get(id=approval_id)
     )
-    return latest
+    head = (
+        PublicationApprovalHead.objects.using(using)
+        .select_related("latest_approval")
+        .filter(
+            publication_intent_id=approval.publication_intent_id,
+            target_id=approval.target_id,
+        )
+        .first()
+    )
+    if head is None:
+        raise Conflict("approval head is missing; migration or manual repair is required")
+    current = head.latest_approval
+    head_integrity = (
+        current.publication_intent_id == approval.publication_intent_id
+        and current.target_id == approval.target_id
+        and current.admin_id is not None
+        and current.head_version == head.version
+        and current.approval_subject_hash == head.subject_hash
+        and current.decision_hash
+        == _approval_decision_hash(
+            subject_hash=current.approval_subject_hash,
+            decision=current.decision,
+            head_version=current.head_version,
+            supersedes_approval_id=current.supersedes_approval_id,
+            request_hash=current.request_hash,
+            actor_type=current.decision_actor_type,
+            actor_id=current.decision_actor_id,
+            event_key=current.decision_event_key,
+            decision_reason=current.decision_reason,
+        )
+    )
+    if not head_integrity:
+        raise Conflict("approval head does not match its immutable decision")
+    is_current = current.id == approval.id
+    dispatch_eligible = False
+    if is_current and current.decision == Approval.Decision.APPROVED:
+        intent = approval.publication_intent
+        revision = intent.article_revision
+        command = next(
+            (
+                row
+                for row in intent.target_commands
+                if isinstance(row, dict)
+                and str(row.get("targetId")) == str(approval.target_id)
+            ),
+            None,
+        )
+        try:
+            if command is None:
+                raise Conflict("publication intent has no command for this target")
+            material = _intent_material_data(intent, revision)
+            refs = _target_ref_map(intent.target_snapshot_refs)
+            commands = _command_map(intent.target_commands)
+            latest_intent_id = (
+                PublicationIntent.objects.using(using)
+                .filter(article_id=intent.article_id)
+                .order_by("-created_at")
+                .values_list("id", flat=True)
+                .first()
+            )
+            content_action = command["resolvedAction"] in _CONTENT_PUBLICATION_ACTIONS
+            intent_integrity = (
+                intent.revision_no == revision.revision_no
+                and intent.revision_content_hash == material["revisionContentHash"]
+                and _id(intent.generation_attempt_id)
+                == material["generationAttemptId"]
+                and intent.input_evidence_manifest_hash
+                == material["inputEvidenceManifestHash"]
+                and intent.generation_pipeline_manifest_hash
+                == material["generationPipelineManifestHash"]
+                and intent.quality_gate_manifest_hash
+                == material["qualityGateManifestHash"]
+                and intent.quality_report_hash == material["qualityReportHash"]
+                and intent.intent_hash
+                == _intent_hash(material, revision, refs, commands)
+            )
+            target = approval.target
+            target_integrity = (
+                str(target.current_snapshot_id)
+                == str(command["targetSnapshotId"])
+                and target.current_config_hash == command["targetConfigHash"]
+                and str(approval.target_snapshot_id)
+                == str(command["targetSnapshotId"])
+                and approval.target_config_hash == command["targetConfigHash"]
+                and approval.target_action == command["resolvedAction"]
+            )
+            live_target_eligible = _validated_auto_live_eligible(
+                intent=intent,
+                target=target,
+                using=using,
+            )
+            approval_integrity = (
+                approval.policy_snapshot_hash == revision.editorial_policy_hash
+                and approval.quality_report_hash == intent.quality_report_hash
+                and _approval_matches_frozen_subject(
+                    approval,
+                    intent=intent,
+                    target_id=target.id,
+                    command=command,
+                    using=using,
+                )
+            )
+            _require_revision_for_commands(revision, intent.target_commands)
+            dispatch_eligible = bool(
+                intent_integrity
+                and target_integrity
+                and live_target_eligible
+                and approval_integrity
+                and intent.state
+                in {
+                    PublicationIntent.State.APPROVED,
+                    PublicationIntent.State.DISPATCHED,
+                }
+                and (not content_action or latest_intent_id == intent.id)
+                and not _kill_switch_enabled()
+            )
+        except (AttributeError, Conflict, InvalidInput, TypeError, ValueError):
+            dispatch_eligible = False
+    return ApprovalDecisionProjection(
+        current_head_approval_id=current.id,
+        current_head_version=head.version,
+        current_head_decision=current.decision,
+        current_head_subject_hash=current.approval_subject_hash,
+        current_head_decision_hash=current.decision_hash,
+        current_head_updated_at=head.updated_at,
+        is_current=is_current,
+        dispatch_eligible=dispatch_eligible,
+    )
 
 
 def _require_exact_dispatch_targets(
@@ -915,12 +1478,26 @@ def _project_origin_run_terminal_locked(
     if run.state != "publishing":
         return
     _terminalize_unreachable_dependents_locked(attempt)
-    attempts = list(
-        PublicationAttempt.objects.select_for_update()
-        .filter(publication_intent=attempt.publication_intent)
+    dispatched_intents = list(
+        PublicationIntent.objects.select_for_update()
+        .filter(
+            origin_collection_run_id=run_id,
+            state=PublicationIntent.State.DISPATCHED,
+        )
         .order_by("id")
     )
-    expected_count = len(attempt.publication_intent.target_commands)
+    attempts = list(
+        PublicationAttempt.objects.select_for_update()
+        .filter(
+            publication_intent_id__in=[
+                row.id for row in dispatched_intents
+            ]
+        )
+        .order_by("id")
+    )
+    expected_count = sum(
+        len(row.target_commands) for row in dispatched_intents
+    )
     if len(attempts) != expected_count:
         return
     projection = _publication_run_terminal_state(
@@ -965,6 +1542,53 @@ def _project_origin_run_terminal_locked(
             "next_recovery_at",
         )
     )
+
+
+def _converge_revoked_attempt_redelivery_locked(
+    attempt: PublicationAttempt,
+    *,
+    audit_context: AuditContext,
+) -> None:
+    if not (
+        attempt.state == PublicationAttempt.State.STALE
+        and attempt.error_code == "approval_revoked"
+    ):
+        raise Conflict("terminal publication attempt has no matching audit event")
+    identity_key = (
+        f"{audit_context.event_key}:attempt-skipped:{attempt.attempt_no}"
+    )
+    replay = _worker_audit_replay(
+        audit_context,
+        entity=attempt,
+        candidates=(
+            (
+                "publication_attempt.skipped",
+                identity_key,
+                {
+                    "attempt": attempt.attempt_no,
+                    "error_code": "approval_revoked",
+                },
+            ),
+        ),
+    )
+    if replay is None:
+        state = _audit_state(attempt)
+        _record_publishing_audit(
+            audit_context=audit_context,
+            action="publication_attempt.skipped",
+            entity=attempt,
+            identity_key=identity_key,
+            before_material=state,
+            after_material=state,
+            metadata={
+                "publication_attempt_id": str(attempt.id),
+                "attempt": attempt.attempt_no,
+                "result": "skipped",
+                "error_code": attempt.error_code,
+                "state": attempt.state,
+            },
+        )
+    _release_article_external_write_fence_locked(attempt)
 
 
 def _release_article_external_write_fence_locked(
@@ -3114,6 +3738,7 @@ def _create_publication_intent_atomic(
             if dependency not in wordpress_ids:
                 prior_wordpress = Publication.objects.filter(
                     article_id=article.id,
+                    target_id=dependency,
                     target__channel=ChannelCode.WORDPRESS,
                     state=Publication.State.PUBLISHED,
                     canonical_ready_at__isnull=False,
@@ -3428,15 +4053,87 @@ def _decide_approval_atomic(
     audit_context: AuditContext,
     request=None,
 ) -> tuple[Approval, bool]:
+    if user is None or getattr(user, "pk", None) is None:
+        raise Forbidden("approval requires an accountable administrator")
     if audit_context.actor_type not in {"admin", "worker"}:
         raise Forbidden("admin or worker audit provenance is required")
     if audit_context.actor_type == "admin" and audit_context.actor_id != user.pk:
         raise Forbidden("approval audit actor differs from the administrator")
+    if audit_context.actor_type == "admin" and audit_context.event_key is not None:
+        raise Forbidden("admin approval cannot carry worker event provenance")
+    if audit_context.actor_type == "worker" and (
+        audit_context.actor_id is not None or not audit_context.event_key
+    ):
+        raise Forbidden("worker approval requires an exact event key")
+    canonical_reason_present = "decisionReason" in data
+    decision_reason = str(
+        data.get("decisionReason")
+        if canonical_reason_present
+        else data.get("reason", "")
+    ).strip()
     if audit_context.actor_type == "admin" and (
         data.get("requestKey") != audit_context.request_key
-        or data.get("reason") != audit_context.reason_code
+        or (
+            canonical_reason_present
+            and decision_reason != audit_context.reason_code
+        )
     ):
         raise Forbidden("approval provenance differs from the audit context")
+    if data.get("decision") not in Approval.Decision.values:
+        raise InvalidInput("approval decision is invalid")
+
+    request_hash = _approval_request_hash(
+        article_id=article_id,
+        target_id=target_id,
+        payload=data,
+    )
+    existing = (
+        Approval.objects.filter(
+            publication_intent_id=data["publicationIntentId"],
+            publication_intent__article_id=article_id,
+            target_id=target_id,
+            request_key=data["requestKey"],
+        )
+        .select_related("publication_intent", "target")
+        .first()
+    )
+    if existing:
+        if (
+            audit_context.actor_type == "admin"
+            and decision_reason != audit_context.reason_code
+        ):
+            raise Forbidden("approval provenance differs from the audit context")
+        _validate_approval_mode_actor(
+            mode=existing.mode,
+            decision=existing.decision,
+            audit_context=audit_context,
+        )
+        matched_request_hash = _approval_replay_request_hash(
+            stored_hash=existing.request_hash,
+            current_hash=request_hash,
+            payload=data,
+        )
+        if (
+            existing.admin_id != user.pk
+            or existing.decision_actor_type != audit_context.actor_type
+            or _id(existing.decision_actor_id) != _id(audit_context.actor_id)
+            or _id(existing.decision_event_key) != _id(audit_context.event_key)
+        ):
+            raise Conflict("request key was reused for a different approval decision")
+        require_audit_replay(
+            context=audit_context,
+            action="publication_approval.decided",
+            entity=existing,
+            identity_key=f"publication-approval:{existing.id}",
+            request_hash=matched_request_hash,
+        )
+        return existing, False
+
+    if not canonical_reason_present or "reason" in data:
+        raise InvalidInput("decisionReason is required for a new approval decision")
+    if len(decision_reason) < 3 or len(decision_reason) > 500:
+        raise InvalidInput("decisionReason must contain 3 to 500 characters")
+
     intent_candidate = PublicationIntent.objects.select_related(
         "article_revision__generation_attempt"
     ).get(id=data["publicationIntentId"], article_id=article_id)
@@ -3448,89 +4145,179 @@ def _decide_approval_atomic(
         ),
         None,
     )
-    if not command:
+    if command is None:
         raise InvalidInput("publication intent has no command for this target")
-    _require_intent_revision_publishable(
-        intent_candidate,
+    _lock_article_external_write_fence(article_id)
+    _lock_target_intent_fences(_intent_target_ids(intent_candidate))
+    intent = (
+        PublicationIntent.objects.select_for_update()
+        .select_related("article_revision__generation_attempt")
+        .get(id=data["publicationIntentId"], article_id=article_id)
+    )
+    _validate_approval_mode_actor(
+        mode=intent.approval_mode,
+        decision=data["decision"],
+        audit_context=audit_context,
+    )
+    intent = _require_intent_revision_publishable(
+        intent,
         approval_decision=data["decision"],
     )
-    intent = PublicationIntent.objects.select_for_update().get(
-        id=data["publicationIntentId"], article_id=article_id
-    )
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
-    request_hash = _request_hash(data)
     existing = Approval.objects.select_for_update().filter(
         publication_intent=intent,
         target_id=target_id,
         request_key=data["requestKey"],
     ).first()
     if existing:
+        _validate_approval_mode_actor(
+            mode=existing.mode,
+            decision=existing.decision,
+            audit_context=audit_context,
+        )
+        matched_request_hash = _approval_replay_request_hash(
+            stored_hash=existing.request_hash,
+            current_hash=request_hash,
+            payload=data,
+        )
         if (
-            existing.request_hash != request_hash
-            or existing.admin_id != user.pk
+            existing.admin_id != user.pk
+            or existing.decision_actor_type != audit_context.actor_type
+            or _id(existing.decision_actor_id) != _id(audit_context.actor_id)
+            or _id(existing.decision_event_key) != _id(audit_context.event_key)
         ):
-            raise Conflict("같은 request key가 다른 승인 대상에 사용되었습니다.")
+            raise Conflict("request key was reused for a different approval decision")
         require_audit_replay(
             context=audit_context,
             action="publication_approval.decided",
             entity=existing,
             identity_key=f"publication-approval:{existing.id}",
-            request_hash=request_hash,
+            request_hash=matched_request_hash,
         )
         return existing, False
-    latest_intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
+
+    if int(data.get("revisionNo", 0)) != intent.revision_no:
+        raise Conflict("approval revision number differs from the frozen intent")
+    command = next(
+        (
+            row
+            for row in intent.target_commands
+            if str(row["targetId"]) == str(target_id)
+        ),
+        None,
+    )
+    if command is None:
+        raise InvalidInput("publication intent has no command for this target")
+    latest_intent = (
+        PublicationIntent.objects.filter(article_id=article_id)
+        .order_by("-created_at")
+        .first()
+    )
     safety_transition = (
         data["decision"]
-        in {
-            Approval.Decision.REJECTED,
-            Approval.Decision.REVOKED,
-        }
+        in {Approval.Decision.REJECTED, Approval.Decision.REVOKED}
         or command["resolvedAction"]
-        in {
-            PublicationAction.UNPUBLISH,
-            PublicationAction.MARK_WITHDRAWN,
-        }
+        in {PublicationAction.UNPUBLISH, PublicationAction.MARK_WITHDRAWN}
     )
     if not safety_transition and (
-        not latest_intent
+        latest_intent is None
         or latest_intent.id != intent.id
         or intent.state == PublicationIntent.State.STALE
     ):
-        raise Conflict("current 발행 의도만 승인할 수 있습니다.")
-    intent_before_material = _audit_state(intent)
-    command = next(
-        (row for row in intent.target_commands if str(row["targetId"]) == str(target_id)), None
-    )
-    if not command:
-        raise InvalidInput("발행 의도에 해당 target command가 없습니다.")
+        raise Conflict("only the current publication intent can be approved")
     if (
         _approval_requires_current_target_snapshot(
             data["decision"], command["resolvedAction"]
         )
-        and str(target.current_snapshot_id)
-        != str(command["targetSnapshotId"])
+        and (
+            str(target.current_snapshot_id) != str(command["targetSnapshotId"])
+            or target.current_config_hash != command["targetConfigHash"]
+        )
     ):
-        raise Conflict("target snapshot이 변경되어 새 미리보기가 필요합니다.")
-    latest = _latest_approval_locked(
-        intent=intent,
-        target_id=target.id,
+        raise Conflict("target snapshot changed after the preview was frozen")
+
+    latest = _latest_approval_locked(intent=intent, target_id=target.id)
+    try:
+        expected_head_version = int(data["expectedHeadVersion"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidInput("expectedHeadVersion is required") from exc
+    _validate_approval_cas(
+        latest,
+        expected_latest_approval_id=data.get("expectedLatestApprovalId"),
+        expected_head_version=expected_head_version,
     )
-    if _id(latest.id if latest else None) != _id(data.get("expectedLatestApprovalId")):
-        raise Conflict("승인 상태가 갱신되었습니다. 다시 불러오세요.")
+    _validate_approval_transition(
+        latest.decision if latest else None,
+        data["decision"],
+    )
+
+    intent_before_material = _audit_state(intent)
     subject = data["actionSubject"]
     action = command["resolvedAction"]
     render = None
+    publication = None
     render_template_hash = None
     if action == PublicationAction.UNPUBLISH:
-        if subject.get("kind") != "unpublish_command" or subject.get("action") != action:
-            raise InvalidInput("철회 승인 대상 형식이 올바르지 않습니다.")
-        if not data.get("reauthProofId"):
-            raise Forbidden("철회에는 최근 재인증이 필요합니다.")
-        publication = Publication.objects.filter(article_id=article_id, target=target).first()
-        if not publication or publication.remote_post_id != subject.get("remotePostId"):
-            raise Conflict("현재 원격 게시물과 철회 승인 대상이 다릅니다.")
-        if request is None:
-            raise Forbidden("철회에는 관리자 session 재인증이 필요합니다.")
+        publication = (
+            Publication.objects.select_for_update()
+            .filter(article_id=article_id, target=target)
+            .first()
+        )
+        source_manifest_hash = subject.get("correctionEvidenceManifestHash", "")
+    else:
+        render = ArticleChannelRender.objects.select_for_update().get(
+            id=subject.get("renderId"),
+            publication_intent=intent,
+            target=target,
+            render_stage=ArticleChannelRender.Stage.PREVIEW,
+        )
+        render_template_hash = render.template_hash
+        source_manifest_hash = render.source_manifest_hash
+    _validate_approval_action_subject(
+        intent=intent,
+        target=target,
+        command=command,
+        subject=subject,
+        render=render,
+        publication=publication,
+        decision_reason=decision_reason,
+    )
+
+    requires_reauthentication = (
+        data["decision"] == Approval.Decision.REVOKED
+        or (
+            action == PublicationAction.UNPUBLISH
+            and data["decision"] == Approval.Decision.APPROVED
+        )
+    )
+    if not requires_reauthentication and data.get("reauthProofId") is not None:
+        raise InvalidInput("reauthProofId must be null for this decision")
+
+    staleable_revoke_attempts: list[PublicationAttempt] = []
+    if data["decision"] == Approval.Decision.REVOKED:
+        if request is None or not data.get("reauthProofId"):
+            raise Forbidden("approval revoke requires recent reauthentication")
+        blocking_attempts, staleable_revoke_attempts = (
+            _lock_revoke_attempts_for_article_target(
+                article_id=article_id,
+                target_id=target.id,
+            )
+        )
+        if blocking_attempts:
+            raise Conflict("approval cannot be revoked during an active attempt")
+        consume_reauthentication_proof(
+            request=request,
+            proof_id=data["reauthProofId"],
+            action_scope="approval_revoke",
+            entity_type="publication_approval",
+            entity_id=latest.id,
+        )
+    elif (
+        action == PublicationAction.UNPUBLISH
+        and data["decision"] == Approval.Decision.APPROVED
+    ):
+        if request is None or not data.get("reauthProofId"):
+            raise Forbidden("unpublish approval requires recent reauthentication")
         consume_reauthentication_proof(
             request=request,
             proof_id=data["reauthProofId"],
@@ -3538,32 +4325,28 @@ def _decide_approval_atomic(
             entity_type="publication",
             entity_id=publication.id,
         )
-        source_manifest_hash = subject["correctionEvidenceManifestHash"]
-    else:
-        if subject.get("kind") != "content_preview" or subject.get("action") != action:
-            raise InvalidInput("콘텐츠 승인 대상 형식이 올바르지 않습니다.")
-        render = ArticleChannelRender.objects.get(
-            id=subject["renderId"],
-            publication_intent=intent,
-            target=target,
-            render_stage=ArticleChannelRender.Stage.PREVIEW,
-        )
-        if render.template_hash != subject["templateHash"]:
-            raise Conflict("미리보기 template hash가 다릅니다.")
-        if render.source_manifest_hash != subject["sourceManifestHash"]:
-            raise Conflict("미리보기 source manifest가 다릅니다.")
-        render_template_hash = render.template_hash
-        source_manifest_hash = render.source_manifest_hash
+
     head_version = (latest.head_version if latest else 0) + 1
     approval_subject_hash = _approval_subject_hash(
         intent=intent,
-        target_id=target.id,
-        action=action,
+        target=target,
         command=command,
         subject=subject,
+        render=render,
+        publication=publication,
+    )
+    if latest is not None and latest.approval_subject_hash != approval_subject_hash:
+        raise Conflict("approval decision cannot change the frozen subject")
+    decision_hash = _approval_decision_hash(
+        subject_hash=approval_subject_hash,
         decision=data["decision"],
         head_version=head_version,
         supersedes_approval_id=latest.id if latest else None,
+        request_hash=request_hash,
+        actor_type=audit_context.actor_type,
+        actor_id=audit_context.actor_id,
+        event_key=audit_context.event_key,
+        decision_reason=decision_reason,
     )
     approval = Approval.objects.create(
         article_revision_id=intent.article_revision_id,
@@ -3579,35 +4362,79 @@ def _decide_approval_atomic(
         decision=data["decision"],
         approval_subject_hash=approval_subject_hash,
         approval_material_version=_APPROVAL_MATERIAL_VERSION,
+        decision_hash=decision_hash,
+        decision_reason=decision_reason,
+        decision_actor_type=audit_context.actor_type,
+        decision_actor_id=audit_context.actor_id,
+        decision_event_key=audit_context.event_key,
         head_version=head_version,
         supersedes_approval_id=latest.id if latest else None,
         request_key=data["requestKey"],
         request_hash=request_hash,
         reauth_proof_id=data.get("reauthProofId"),
-        policy_snapshot_hash=intent.quality_gate_manifest_hash,
+        policy_snapshot_hash=intent.article_revision.editorial_policy_hash,
         quality_report_hash=intent.quality_report_hash,
         render_template_hash=render_template_hash,
         source_manifest_hash=source_manifest_hash,
         admin=user,
     )
-    head = (
-        PublicationApprovalHead.objects.select_for_update()
-        .filter(publication_intent=intent, target=target)
-        .first()
+    head = PublicationApprovalHead.objects.select_for_update().get(
+        publication_intent=intent,
+        target=target,
     )
-    if head is None:
-        PublicationApprovalHead.objects.create(
-            publication_intent=intent,
-            target=target,
-            latest_approval=approval,
-            version=head_version,
-        )
-    else:
-        if latest is None or head.latest_approval_id != latest.id:
-            raise Conflict("approval head changed during decision")
-        head.latest_approval = approval
-        head.version = head_version
-        head.save(update_fields=("latest_approval", "version", "updated_at"))
+    if (
+        head.latest_approval_id != approval.id
+        or head.version != head_version
+        or head.subject_hash != approval_subject_hash
+    ):
+        raise Conflict("database approval head did not advance to the new decision")
+
+    if data["decision"] == Approval.Decision.REVOKED:
+        reset_publication_ids: set[uuid.UUID] = set()
+        for attempt in staleable_revoke_attempts:
+            attempt.state = PublicationAttempt.State.STALE
+            attempt.finished_at = timezone.now()
+            attempt.error_code = "approval_revoked"
+            attempt.terminal_impact = _publication_terminal_impact(
+                stage="approval_revoke",
+                final_state=attempt.state,
+                error_code=attempt.error_code,
+            )
+            attempt.recovery_state = PublicationRecoveryState.STOPPED
+            attempt.next_recovery_at = None
+            attempt.next_retry_at = None
+            attempt.save(
+                update_fields=(
+                    "state",
+                    "finished_at",
+                    "error_code",
+                    "terminal_impact",
+                    "recovery_state",
+                    "next_recovery_at",
+                    "next_retry_at",
+                )
+            )
+            if attempt.publication_id not in reset_publication_ids:
+                publication_row = attempt.publication
+                publication_row.state = (
+                    Publication.State.PUBLISHED
+                    if publication_row.remote_post_id
+                    else Publication.State.PENDING
+                )
+                publication_row.scheduled_for = None
+                publication_row.last_error_code = ""
+                publication_row.save(
+                    update_fields=(
+                        "state",
+                        "scheduled_for",
+                        "last_error_code",
+                        "updated_at",
+                    )
+                )
+                reset_publication_ids.add(attempt.publication_id)
+        for attempt in staleable_revoke_attempts:
+            _project_origin_run_terminal_locked(attempt)
+
     target_ids = {str(row["targetId"]) for row in intent.target_commands}
     decisions_by_target: dict[str, str] = {}
     for command_row in intent.target_commands:
@@ -3623,6 +4450,7 @@ def _decide_approval_atomic(
     elif intent.state == PublicationIntent.State.APPROVED:
         intent.state = PublicationIntent.State.AWAITING_APPROVAL
         intent.save(update_fields=["state"])
+
     _record_publishing_audit(
         audit_context=audit_context,
         action="publication_approval.decided",
@@ -3637,11 +4465,14 @@ def _decide_approval_atomic(
                 approval,
                 decision=approval.decision,
                 approvalSubjectHash=approval.approval_subject_hash,
+                decisionHash=approval.decision_hash,
+                headVersion=approval.head_version,
             ),
             "intent": _audit_state(intent),
         },
         metadata={
             "approval_hash": approval.approval_subject_hash,
+            "decision_hash": approval.decision_hash,
             "decision": approval.decision,
             "decision_id": str(approval.id),
             "intent_id": str(intent.id),
@@ -3976,13 +4807,41 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
     )
 
 
-def _wordpress_dependency_ready(attempt: PublicationAttempt) -> bool:
+def _canonical_dependency_target_id(attempt: PublicationAttempt) -> uuid.UUID:
+    command = next(
+        (
+            row
+            for row in attempt.publication_intent.target_commands
+            if isinstance(row, dict)
+            and str(row.get("targetId"))
+            == str(attempt.publication.target.id)
+        ),
+        None,
+    )
+    try:
+        dependency_id = uuid.UUID(
+            str((command or {}).get("canonicalDependencyTargetId"))
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise Conflict(
+            "Blogger publication has no exact WordPress dependency target"
+        ) from exc
+    return dependency_id
+
+
+def _wordpress_dependency_queryset(attempt: PublicationAttempt):
+    dependency_id = _canonical_dependency_target_id(attempt)
     return Publication.objects.filter(
         article_id=attempt.publication.article_id,
+        target_id=dependency_id,
         target__channel=ChannelCode.WORDPRESS,
         state=Publication.State.PUBLISHED,
         canonical_ready_at__isnull=False,
-    ).exists()
+    )
+
+
+def _wordpress_dependency_ready(attempt: PublicationAttempt) -> bool:
+    return _wordpress_dependency_queryset(attempt).exists()
 
 
 def _kill_switch_enabled() -> bool:
@@ -3991,12 +4850,110 @@ def _kill_switch_enabled() -> bool:
     return is_external_write_blocked()
 
 
+def _validated_auto_live_eligible(
+    *,
+    intent: PublicationIntent,
+    target: PublicationTarget,
+    attempt: PublicationAttempt | None = None,
+    using: str = "default",
+) -> bool:
+    if target.connection_state != PublicationTarget.ConnectionState.VERIFIED:
+        return False
+    if intent.approval_mode != ApprovalMode.VALIDATED_AUTO:
+        return True
+    if not target.auto_publish_enabled:
+        return False
+    activation_ref = next(
+        (
+            row
+            for row in intent.auto_publish_activation_refs
+            if isinstance(row, dict)
+            and str(row.get("targetId")) == str(target.id)
+        ),
+        None,
+    )
+    if activation_ref is None:
+        return False
+    activation_id = activation_ref.get("activationId")
+    if (
+        str(target.latest_auto_publish_activation_id) != str(activation_id)
+        or (
+            attempt is not None
+            and (
+                str(attempt.auto_publish_activation_id) != str(activation_id)
+                or attempt.auto_publish_activation_hash
+                != activation_ref.get("activationHash")
+            )
+        )
+    ):
+        return False
+    activation = (
+        AutoPublishActivation.objects.using(using)
+        .filter(
+            id=activation_id,
+            target_id=target.id,
+            decision=AutoPublishActivation.Decision.ENABLED,
+        )
+        .first()
+    )
+    if (
+        activation is None
+        or activation.activation_hash != activation_ref.get("activationHash")
+        or activation.version != int(activation_ref.get("version", 0))
+        or str(activation.target_snapshot_id)
+        != str(activation_ref.get("targetSnapshotId"))
+        or str(target.current_snapshot_id)
+        != str(activation_ref.get("targetSnapshotId"))
+    ):
+        return False
+    validation_ids = [
+        str(row.get("validationId"))
+        for row in activation.validation_refs
+        if isinstance(row, dict) and row.get("validationId")
+    ]
+    if len(validation_ids) != len(activation.validation_refs):
+        return False
+    if (
+        AutoPublishValidation.objects.using(using)
+        .filter(
+            id__in=validation_ids,
+            status=AutoPublishValidation.State.PASSED,
+        )
+        .count()
+        != len(validation_ids)
+    ):
+        return False
+    if target.environment == TargetEnvironment.PRODUCTION:
+        if (
+            not target.canary_target_id
+            or target.canary_target.canary_state != ValidationState.PASSED
+            or target.pilot_state != ValidationState.PASSED
+        ):
+            return False
+    return True
+
+
+def _require_attempt_origin_run_active(attempt: PublicationAttempt) -> None:
+    run_id = attempt.publication_intent.origin_collection_run_id
+    if run_id is None:
+        raise Conflict("publication attempt has no frozen origin run")
+    CollectionRun = apps.get_model("collection", "CollectionRun")
+    run = CollectionRun.objects.filter(pk=run_id).first()
+    if run is None:
+        raise Conflict("publication attempt origin run is missing")
+    if attempt.resolved_action in _CONTENT_PUBLICATION_ACTIONS and (
+        run.state != "publishing" or run.stop_requested_at is not None
+    ):
+        raise Conflict("publication attempt origin run is not active")
+
+
 def _assert_external_writes_allowed() -> None:
     if _kill_switch_enabled():
         raise PublisherError("global_kill_switch_enabled", category="retryable")
 
 
 def validate_attempt_gate(attempt: PublicationAttempt) -> None:
+    _require_attempt_origin_run_active(attempt)
     if _kill_switch_enabled():
         raise Conflict("전역 kill switch가 활성화되어 외부 쓰기가 차단되었습니다.")
     intent = attempt.publication_intent
@@ -4046,6 +5003,14 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
         )
     ):
         raise Conflict("현재 action-specific 승인과 attempt가 다릅니다.")
+    if not _validated_auto_live_eligible(
+        intent=intent,
+        target=target,
+        attempt=attempt,
+    ):
+        raise Conflict(
+            "publication target or validated-auto material is no longer eligible"
+        )
     if intent.approval_mode == ApprovalMode.VALIDATED_AUTO:
         if not target.auto_publish_enabled:
             raise Conflict("자동발행이 비활성화되었습니다.")
@@ -4079,31 +5044,74 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
     approval_render = attempt.approval.article_channel_render
     if not approval_render:
         raise Conflict("콘텐츠 action에는 승인된 preview render가 필요합니다.")
-    existing = ArticleChannelRender.objects.filter(
-        publication_intent=attempt.publication_intent,
-        target=attempt.publication.target,
-        render_stage=ArticleChannelRender.Stage.FINAL,
-    ).first()
-    if existing:
-        if existing.template_hash != approval_render.template_hash:
-            raise Conflict("final render template가 승인된 preview와 다릅니다.")
-        return existing
     target = attempt.publication.target
     body = approval_render.body_html
     canonical_url = None
     canonical_state = ArticleChannelRender.CanonicalState.NOT_APPLICABLE
     if target.channel == ChannelCode.BLOGGER:
-        wordpress = Publication.objects.filter(
-            article_id=attempt.publication.article_id,
-            target__channel=ChannelCode.WORDPRESS,
-            state=Publication.State.PUBLISHED,
-            canonical_ready_at__isnull=False,
-        ).order_by("-last_success_at").first()
+        wordpress = _wordpress_dependency_queryset(attempt).first()
         if not wordpress or not wordpress.remote_url:
             raise Conflict("검증된 WordPress 대표 URL이 없습니다.")
         canonical_url = wordpress.remote_url
         canonical_state = ArticleChannelRender.CanonicalState.RESOLVED
-        body = body.replace("{{CANONICAL_WORDPRESS_URL}}", html.escape(canonical_url, quote=True))
+        body = body.replace(
+            "{{CANONICAL_WORDPRESS_URL}}",
+            html.escape(canonical_url, quote=True),
+        )
+    expected_content_hash = sha256_hex(
+        {"title": approval_render.title, "body": body}
+    )
+    existing = ArticleChannelRender.objects.filter(
+        publication_intent=attempt.publication_intent,
+        target=target,
+        render_stage=ArticleChannelRender.Stage.FINAL,
+    ).first()
+    if existing:
+        expected = {
+            "publicationIntentId": str(attempt.publication_intent.id),
+            "articleRevisionId": str(approval_render.article_revision_id),
+            "targetId": str(target.id),
+            "targetSnapshotId": str(approval_render.target_snapshot_id),
+            "targetConfigHash": approval_render.target_config_hash,
+            "channelRole": approval_render.channel_role,
+            "renderStage": ArticleChannelRender.Stage.FINAL,
+            "title": approval_render.title,
+            "bodyHtml": body,
+            "labels": approval_render.labels,
+            "sourceLinks": approval_render.source_links,
+            "includedClaimIds": approval_render.included_claim_ids,
+            "canonicalSourceUrl": canonical_url,
+            "canonicalLinkState": canonical_state,
+            "templateHash": approval_render.template_hash,
+            "contentHash": expected_content_hash,
+            "sourceManifestHash": approval_render.source_manifest_hash,
+            "mediaManifest": approval_render.media_manifest,
+            "correctionHistory": approval_render.correction_history,
+        }
+        observed = {
+            "publicationIntentId": str(existing.publication_intent_id),
+            "articleRevisionId": str(existing.article_revision_id),
+            "targetId": str(existing.target_id),
+            "targetSnapshotId": str(existing.target_snapshot_id),
+            "targetConfigHash": existing.target_config_hash,
+            "channelRole": existing.channel_role,
+            "renderStage": existing.render_stage,
+            "title": existing.title,
+            "bodyHtml": existing.body_html,
+            "labels": existing.labels,
+            "sourceLinks": existing.source_links,
+            "includedClaimIds": existing.included_claim_ids,
+            "canonicalSourceUrl": existing.canonical_source_url,
+            "canonicalLinkState": existing.canonical_link_state,
+            "templateHash": existing.template_hash,
+            "contentHash": existing.content_hash,
+            "sourceManifestHash": existing.source_manifest_hash,
+            "mediaManifest": existing.media_manifest,
+            "correctionHistory": existing.correction_history,
+        }
+        if observed != expected:
+            raise Conflict("final render differs from the approved frozen material")
+        return existing
     return ArticleChannelRender.objects.create(
         publication_intent=attempt.publication_intent,
         article_revision_id=approval_render.article_revision_id,
@@ -4120,7 +5128,7 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
         canonical_source_url=canonical_url,
         canonical_link_state=canonical_state,
         template_hash=approval_render.template_hash,
-        content_hash=sha256_hex({"title": approval_render.title, "body": body}),
+        content_hash=expected_content_hash,
         source_manifest_hash=approval_render.source_manifest_hash,
         media_manifest=approval_render.media_manifest,
         correction_history=approval_render.correction_history,
@@ -4677,6 +5685,8 @@ def begin_attempt(
         Approval.objects.select_for_update().get(id=preliminary.approval_id)
         Publication.objects.select_for_update().get(id=preliminary.publication_id)
         PublicationAttempt.objects.select_for_update().get(id=preliminary.id)
+    else:
+        _lock_publication_attempt_domain(preliminary)
     return _begin_attempt_locked(attempt_id, audit_context=audit_context)
 
 
@@ -4726,8 +5736,9 @@ def _begin_attempt_locked(
             ),
         )
         if replay is None:
-            raise Conflict(
-                "terminal publication attempt has no matching audit event"
+            _converge_revoked_attempt_redelivery_locked(
+                attempt,
+                audit_context=audit_context,
             )
         return attempt, None
     if attempt.state == PublicationAttempt.State.RUNNING:
@@ -5463,6 +6474,15 @@ def finalize_publication_delivery_failure(
         ),
     )
     if replay is not None:
+        return attempt
+    if (
+        attempt.state == PublicationAttempt.State.STALE
+        and attempt.error_code == "approval_revoked"
+    ):
+        _converge_revoked_attempt_redelivery_locked(
+            attempt,
+            audit_context=audit_context,
+        )
         return attempt
     if attempt.state in {
         PublicationAttempt.State.SUCCEEDED,

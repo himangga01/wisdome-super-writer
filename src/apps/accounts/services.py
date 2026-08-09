@@ -33,6 +33,7 @@ ALLOWED_ACTION_SCOPES = frozenset(
         "profile_decision",
         "validation_decision",
         "credential_disconnect",
+        "approval_revoke",
     }
 )
 

@@ -213,6 +213,59 @@ target 집합이 정확히 같고 target별 하나씩이어야 한다. activatio
 되살리지 않고 새 superseding intent를 요구한다. concurrent enable/revoke 중 CAS 하나만 성공하고
 동일 request key replay는 결정 한 건이어야 한다.
 
+### 3.2 T019 target 승인 결정 확인
+
+현재 PublicationIntent의 target command와 preview subject를 조회한 뒤 기존
+`POST /api/v1/articles/{articleId}/approvals`에 다음 exact shape를 보낸다. 최초 결정은
+`expectedLatestApprovalId=null`, `expectedHeadVersion=0`이다. 이후 결정은 응답의
+`currentHead.latestApprovalId`와 `currentHead.version`을 그대로 CAS 값으로 사용한다.
+
+```json
+{
+  "revisionNo": 3,
+  "publicationIntentId": "22222222-2222-4222-8222-222222222222",
+  "expectedLatestApprovalId": null,
+  "expectedHeadVersion": 0,
+  "requestKey": "approval-request-0001",
+  "reauthProofId": null,
+  "actionSubject": {
+    "kind": "content_preview",
+    "action": "create",
+    "renderId": "55555555-5555-4555-8555-555555555555",
+    "targetId": "33333333-3333-4333-8333-333333333333",
+    "targetSnapshotId": "44444444-4444-4444-8444-444444444444",
+    "targetConfigHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "templateHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "sourceManifestHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "decision": "approved",
+  "decisionReason": "동결된 미리보기와 근거를 확인했습니다."
+}
+```
+
+응답은 결정 행의 `targetId`, `approvalSubjectHash`, `decisionHash`,
+`approvalMaterialVersion`, `headVersion`, `decisionReason`과 현재
+`currentHead={latestApprovalId,version,decision,approvalSubjectHash,decisionHash,updatedAt}`,
+`isCurrent`, `dispatchEligible`를 반환해야 한다. `decidedBy`는 수동 결정 관리자 또는 자동
+모드 activation/schedule 승인 관리자의 non-null UUID다. `decisionActorType`은
+`admin|worker`, `decisionActorId`는 admin UUID이고 worker이면 null이다. 신규 결정은 201,
+같은 request key와 exact
+payload replay는 200이다. stale head/불법 전이/같은 key의 다른 payload는 409, 스키마 밖 필드나
+본문 불일치는 422다. proof가 필수인 조합에서 `reauthProofId` 누락/null/UUID 형식 오류도 422다.
+형식상 유효한 proof가 만료됐거나 요구 scope/entity와 다르면 403이다.
+수동 결정의 `requestKey`/`decisionReason`은 관리자가 제출하고, validated-auto worker 결정에서는
+worker 결정 요청 멱등 키와 정책이 생성한 불변 사유를 사용한다. 두 값은 공백을 잘라 저장하지
+않으며 처음부터 nonblank·trimmed·audit-safe 형식이어야 한다.
+
+허용 전이는 최초 approved/rejected, rejected→approved, approved→revoked뿐이다. revoked는
+terminal이다. revoked는 action과 무관하게 `approval_revoke` scope 재인증을 소비하고,
+approved-unpublish는 `unpublish` scope 재인증을 소비한다. 그 밖의 조합은
+`reauthProofId=null`이어야 한다. reject/revoke 뒤 dispatch와 이미 만들어진 attempt 실행 직전
+외부 호출이 0건인지 확인한다. 이 절차는 T019 domain/API 계약 확인이며 새 route, 승인 이력
+pagination과 관리자 UI 검증은 T026에서 수행한다. 그때까지 `PublicationIntent` 응답은 unbounded
+`renders`/`approvals` 배열을 포함하지 않는다. T018과 외부 blocker가 남아 있으면 T019를 완료
+표시하지 않는다.
+
 ## 4. 관리자·보안 검증
 
 1. 익명 사용자가 `/admin/`과 `/api/v1/*`에 접근하면 로그인 또는 401/403을 받는다.
@@ -739,6 +792,28 @@ fact/company_claim bindings in the same request. Persisted and response graphs u
 `input_evidence_manifest_hash`, and `excluded_material_manifest_hash`.
 Validate exact claimBindings and CreateRevisionResult against OpenAPI: create/replay is 201/200, stale or
 changed-key material is 409, and structural or semantic input errors are 422.
+
+## English / AI-readable — T019 approval decision procedure
+
+The existing approval POST accepts an exact, closed request with both CAS fields,
+`expectedLatestApprovalId` and `expectedHeadVersion`, plus `decisionReason`. The initial expected head
+version is zero. New decisions return 201 and exact request-key replay returns 200. Reauthentication
+proof omission, nullability violations, and malformed UUIDs are 422. A syntactically valid but expired
+or scope/entity-mismatched proof is 403. Stale or illegal transition/CAS conflict is 409, and any other
+inconsistent body is 422.
+
+Legal transitions are no head to approved or rejected, rejected to approved, and approved to revoked;
+revoked is terminal. Revocation always consumes an `approval_revoke` proof. Approved unpublish consumes
+an `unpublish` proof. All other combinations require a null proof. The response returns immutable
+decision material and the current head projection, including `isCurrent` and `dispatchEligible`, so a
+historical replay cannot masquerade as the current decision. `decidedBy` remains the non-null approval
+owner, while `decisionActorType/decisionActorId` expose the actual admin/worker execution provenance;
+worker actor IDs are null. Manual decisions use the administrator-supplied request key and reason;
+validated-auto worker decisions use the worker decision idempotency key and policy-generated immutable
+reason. Both values must arrive nonblank, already trimmed, and audit-safe. Until T026 adds
+cursor-paginated approval history, the contracted
+`PublicationIntent` response omits unbounded `renders` and `approvals` arrays. T026 owns route/history/UI
+completion.
 
 ## English / AI-readable — Legacy HWP deployment
 

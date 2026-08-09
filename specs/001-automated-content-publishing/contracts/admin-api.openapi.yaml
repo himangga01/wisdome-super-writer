@@ -686,6 +686,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Approval' }
+        '403': { $ref: '#/components/responses/Problem' }
         '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
@@ -3860,6 +3861,9 @@ components:
     PublicationIntent:
       type: object
       additionalProperties: false
+      description: >-
+        Exact intent projection only. It does not embed render or approval histories; T026 adds
+        separately cursor-paginated history endpoints.
       required: [id, articleId, revisionNo, revisionContentHash, generationAttemptId, inputEvidenceManifestHash, generationPipelineManifestHash, qualityGateManifestHash, qualityReportHash, correctionCaseId, targetSnapshots, targetCommands, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, supersedesIntentId, intentHash, requestKey, state, createdAt]
       properties:
         id: { type: string, format: uuid }
@@ -3935,42 +3939,101 @@ components:
     ApprovalRequest:
       type: object
       additionalProperties: false
-      required: [revisionNo, publicationIntentId, expectedLatestApprovalId, requestKey, reauthProofId, actionSubject, decision, reason]
+      required: [revisionNo, publicationIntentId, expectedLatestApprovalId, expectedHeadVersion, requestKey, reauthProofId, actionSubject, decision, decisionReason]
       properties:
         revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         publicationIntentId: { type: string, format: uuid }
         expectedLatestApprovalId: { type: [string, 'null'], format: uuid }
-        requestKey: { type: string, minLength: 8, maxLength: 200 }
-        reauthProofId: { type: [string, 'null'], format: uuid }
+        expectedHeadVersion:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: Zero is required for the initial decision; otherwise this is the current head version.
+        requestKey:
+          type: string
+          minLength: 8
+          maxLength: 200
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:+/@~-]{7,199}$'
+          description: >-
+            Audit-safe, whitespace-free decision idempotency key supplied by the administrator or
+            validated-auto worker.
+        reauthProofId:
+          type: [string, 'null']
+          format: uuid
+          description: >-
+            Missing, null, or malformed proof values in proof-required combinations are 422.
+            Syntactically valid but expired or scope/entity-mismatched proofs are 403.
         actionSubject:
           oneOf:
             - $ref: '#/components/schemas/ContentApprovalSubject'
             - $ref: '#/components/schemas/UnpublishApprovalSubject'
         decision: { type: string, enum: [approved, rejected, revoked] }
-        reason: { type: string, minLength: 3, maxLength: 500 }
+        decisionReason:
+          type: string
+          minLength: 3
+          maxLength: 500
+          pattern: '^\S(?:[^\x00-\x1f]*\S)?$'
+          description: >-
+            Nonblank, already-trimmed immutable reason supplied by the administrator or generated
+            from the validated-auto worker policy decision. Audit-sensitive material is rejected.
       allOf:
         - if:
-            required: [actionSubject]
+            required: [expectedLatestApprovalId]
             properties:
-              actionSubject:
-                type: object
-                required: [kind]
-                properties:
-                  kind: { const: unpublish_command }
+              expectedLatestApprovalId: { type: 'null' }
+          then:
+            properties:
+              expectedHeadVersion: { const: 0 }
+          else:
+            properties:
+              expectedHeadVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        - if:
+            required: [decision]
+            properties:
+              decision: { const: revoked }
           then:
             properties:
               reauthProofId: { type: string, format: uuid }
           else:
-            properties:
-              reauthProofId: { type: 'null' }
+            if:
+              required: [decision, actionSubject]
+              properties:
+                decision: { const: approved }
+                actionSubject:
+                  type: object
+                  required: [kind]
+                  properties:
+                    kind: { const: unpublish_command }
+            then:
+              properties:
+                reauthProofId: { type: string, format: uuid }
+            else:
+              properties:
+                reauthProofId: { type: 'null' }
+    ApprovalHead:
+      type: object
+      additionalProperties: false
+      required: [latestApprovalId, version, decision, approvalSubjectHash, decisionHash, updatedAt]
+      properties:
+        latestApprovalId: { type: string, format: uuid }
+        version: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        decision: { type: string, enum: [approved, rejected, revoked] }
+        approvalSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        updatedAt: { type: string, format: date-time }
     Approval:
       type: object
-      required: [id, revisionNo, publicationIntentId, approvalSubjectHash, supersedesApprovalId, requestKey, reauthProofId, actionSubject, mode, decision, decidedAt]
+      additionalProperties: false
+      required: [id, revisionNo, publicationIntentId, targetId, approvalSubjectHash, decisionHash, approvalMaterialVersion, headVersion, supersedesApprovalId, requestKey, reauthProofId, actionSubject, mode, decision, decisionReason, decidedBy, decisionActorType, decisionActorId, currentHead, isCurrent, dispatchEligible, decidedAt]
       properties:
         id: { type: string, format: uuid }
-        revisionNo: { type: integer }
+        revisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         publicationIntentId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
         approvalSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        decisionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        approvalMaterialVersion: { type: string, const: approval-subject-v3 }
+        headVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
         supersedesApprovalId: { type: [string, 'null'], format: uuid }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         reauthProofId: { type: [string, 'null'], format: uuid }
@@ -3980,7 +4043,25 @@ components:
             - $ref: '#/components/schemas/UnpublishApprovalSubject'
         mode: { type: string, enum: [manual, validated_auto] }
         decision: { type: string, enum: [approved, rejected, revoked] }
+        decisionReason: { type: string, minLength: 3, maxLength: 500 }
+        decidedBy: { type: string, format: uuid }
+        decisionActorType: { type: string, enum: [admin, worker] }
+        decisionActorId: { type: [string, 'null'], format: uuid }
+        currentHead: { $ref: '#/components/schemas/ApprovalHead' }
+        isCurrent: { type: boolean }
+        dispatchEligible: { type: boolean }
         decidedAt: { type: string, format: date-time }
+      allOf:
+        - if:
+            required: [decisionActorType]
+            properties:
+              decisionActorType: { const: admin }
+          then:
+            properties:
+              decisionActorId: { type: string, format: uuid }
+          else:
+            properties:
+              decisionActorId: { type: 'null' }
     PublishRequest:
       type: object
       additionalProperties: false

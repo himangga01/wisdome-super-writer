@@ -89,14 +89,14 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 존재해야 한다. 승인 철회는 다음 외부 쓰기를 즉시 막고, update/unpublish reconcile은 실제
 원격 action·상태·본문 hash가 맞을 때만 성공해야 한다.
 
-- [ ] T019 [US2] Approval의 latest-decision projection과 approve/reject/revoke 전이를 구현하고 reject/revoke가 intent·dispatch·실행 직전 gate를 즉시 차단하도록 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`를 정비 (depends on T004, T006, T018)
+- [ ] T019 [US2] Approval을 append-only 결정으로 유지하면서 `(expectedLatestApprovalId, expectedHeadVersion)` 이중 CAS의 latest-decision projection과 approve/reject/revoke 전이를 구현한다. 결정 사유·결정 hash·material version·head version, non-null 결정 소유 관리자와 실제 admin/worker actor provenance를 불변 저장하고, revoked와 approved-unpublish에만 용도 결속 재인증을 요구하며, reject/revoke가 intent·dispatch·실행 직전 gate를 즉시 차단하게 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/automation.py`를 정비한다. 기존 approval POST의 exact request/response serializer·OpenAPI status(신규 201, 동일 replay 200, 재인증 403, stale/불법 전이/CAS 409, 본문 불일치 422)와 집중 계약 테스트는 이 작업에 포함하되 새 route, 결정 이력 pagination과 관리자 UI는 T026에 남긴다. (depends on T004, T006, T018; T018 및 선행 외부 blocker가 해소되기 전에는 완료 표시 금지)
 - [ ] T020 [US2] intent 생성과 dispatch의 idempotency lookup을 CAS보다 먼저 수행하고 request-key payload hash, 동일 replay, 다른 payload 409, target ID 중복 거부와 target별 정확히 한 attempt 생성을 `src/apps/publishing/services.py`, `src/apps/publishing/api.py`에 구현 (depends on T005, T019)
 - [ ] T021 [US2] PublicationAttempt generation·lease·worker fencing·terminal retry aggregation과 action/content/state-aware reconcile을 구현해 중복 worker와 늦은 응답이 외부 쓰기나 최신 상태를 변경하지 못하도록 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/wordpress/client.py`, `src/adapters/publishers/blogger/client.py`를 정비 (depends on T020)
 - [ ] T022 [US2] `VisualPlacement`, `PublishedEvidenceSnapshot`, `PublishedVisualizationSnapshot`과 immutable revision binding, channel media manifest, WordPress media·Blogger public delivery, lease generation CAS와 orphan cleanup을 `src/apps/editorial/models.py`, `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`에 구현 (depends on T002, T018, T020, T021)
 - [ ] T023 [US2] Blogger OAuth connect·token persistence·refresh·scope verification·revoke와 WordPress credential disconnect의 remote reconciliation을 `src/wisdome_writer/infrastructure/secrets.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/blogger/client.py`, `src/adapters/publishers/wordpress/client.py`에 구현 (depends on T001, T003, T004)
 - [ ] T024 [US2] intent에 동결된 정확한 WordPress target/environment/publication URL만 Blogger render·dependency release·reconcile에서 사용하고 다른 target 또는 test URL 선택을 차단하도록 `src/apps/publishing/services.py`, `src/apps/publishing/automation.py`, `src/apps/publishing/corrections.py`를 정비 (depends on T020, T021, T022, T023)
 - [ ] T025 [US2] registry/profile/generator/editorial/publisher/credential material을 서버에서 직접 조회·검증하고 실제 implementation·secret version hash, 지정 pilot 결과, canary 원격 정리 reference와 recovery를 포함하는 자동발행 validation·activation gate를 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/apps/publishing/api.py`에 구현 (depends on T004, T009, T014, T018, T019, T021, T022, T023, T024)
-- [ ] T026 [US2] target 연결·preflight·OAuth·validation·activation·preview·approve/reject/revoke·dispatch·retry/reconcile·disconnect API와 관리자 UI를 OpenAPI의 path·schema·status·pagination에 맞춰 `src/apps/publishing/api.py`, `src/apps/publishing/urls.py`, `src/templates/admin_console/publishing/`, `src/static/admin_console/`에 완성 (depends on T007, T019, T020, T021, T022, T023, T024, T025)
+- [ ] T026 [US2] target 연결·preflight·OAuth·validation·activation·preview·approve/reject/revoke·dispatch·retry/reconcile·disconnect의 route 등록, approval 결정 이력 pagination, 관리자 UI와 E2E를 OpenAPI의 path·schema·status·pagination에 맞춰 `src/apps/publishing/api.py`, `src/apps/publishing/urls.py`, `src/templates/admin_console/publishing/`, `src/static/admin_console/`에 완성한다. T019가 고정한 approval domain/POST serializer 계약을 재정의하지 않는다. (depends on T007, T019, T020, T021, T022, T023, T024, T025)
 
 **Checkpoint**: US1 초안을 입력으로 받아 두 채널을 중복 없이 발행하고 승인 철회·부분 실패·
 unknown outcome을 안전하게 복구할 수 있다.
@@ -188,6 +188,14 @@ evidence, and excluded/duplicate/conflict snapshots. They distinguish only `fact
 `interpretation`, and `outlook`, pass the ten exact editorial gates plus the conditional visual gate,
 and recheck current policy/evidence eligibility. Manual edits remain pending behind
 `editorial.revalidate_requested` until the entire claim graph and gate report are rebuilt.
+
+T019 owns the immutable approval decision domain and the exact existing approval-POST contract. It
+uses both `expectedLatestApprovalId` and `expectedHeadVersion`, persists decision reason/hash and
+material/head versions, and returns the current head projection without inferring it from the replayed
+row. `decidedBy` is the non-null approval owner; actual admin/worker actor provenance is stored
+separately and worker actor IDs are null. Revocation and approved unpublish require purpose-bound reauthentication. T026, not T019, owns
+new route registration, approval-history pagination, admin UI, and E2E coverage. T019 remains unchecked
+until T018 and its external blockers are complete.
 
 ```yaml
 schema_version: "1.0"

@@ -762,36 +762,61 @@ administrator can inspect every included and excluded source before publication.
 **Files:**
 - Modify: `src/apps/publishing/models.py`
 - Modify: `src/apps/publishing/services.py`
+- Modify: `src/apps/publishing/automation.py`
 - Modify: `src/apps/publishing/api.py`
-- Modify: `src/apps/publishing/tasks.py`
-- Create: `src/apps/publishing/migrations/0008_approval_projection.py`
+- Modify: `src/apps/accounts/services.py` (`approval_revoke` 재인증 scope만)
+- Create: `src/apps/publishing/migrations/0009_approval_decision_integrity.py`
 - Modify: `specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml`
-- Deferred unit test: `tests/unit/test_publication_approval.py`
+- Create: `tests/unit/test_publication_approval_contract.py`
 
 **Interfaces:**
-- Consumes: `PublicationIntent`, target snapshot, revision quality hash, reauthentication proof.
-- Produces: immutable `Approval` decisions and one CAS-controlled `PublicationApprovalHead` per intent/target.
+- Consumes: `PublicationIntent`, exact target command/snapshot, frozen revision quality material, purpose-bound reauthentication proof.
+- Produces: immutable `Approval` decisions, decision hash/material version, and one CAS-controlled `PublicationApprovalHead` per intent/target.
 - Gate: approve/reject/revoke is rechecked at intent dispatch and attempt execution.
+- Boundary: T019 owns the existing approval POST serializer/schema only. New route registration,
+  approval history pagination, admin UI, and E2E belong to T026. 그때까지 `PublicationIntent`
+  계약 serializer는 unbounded render/approval history를 포함하지 않는다.
 
 - [ ] **Step 1: latest approval projection 모델을 추가한다.**
 
   ```python
   class PublicationApprovalHead(models.Model):
-      publication_intent = models.ForeignKey(PublicationIntent, on_delete=models.PROTECT)
+      publication_intent = models.ForeignKey(PublicationIntent, on_delete=models.CASCADE)
       target = models.ForeignKey(PublicationTarget, on_delete=models.PROTECT)
       latest_approval = models.ForeignKey(Approval, on_delete=models.PROTECT)
       version = models.PositiveIntegerField()
       subject_hash = models.CharField(max_length=64)
+      updated_at = models.DateTimeField(auto_now=True)
 
       class Meta:
-          constraints = [models.UniqueConstraint(
-              fields=["publication_intent", "target"], name="uq_intent_target_approval_head"
-          )]
+          constraints = [
+              models.UniqueConstraint(
+                  fields=["publication_intent", "target"],
+                  name="uq_publication_approval_head",
+              ),
+              models.CheckConstraint(
+                  condition=models.Q(version__gte=1),
+                  name="ck_publication_approval_head_version_positive",
+              ),
+          ]
   ```
 
-- [ ] **Step 2: approve/reject/revoke를 append-only decision + head CAS transaction으로 통합한다.**
+  head는 intent 수명에 종속된 교체 가능 projection이므로 intent 삭제 시 CASCADE한다. target과
+  latest Approval은 PROTECT하고, append-only Approval이 intent를 PROTECT하므로 결정 정본의 수명은
+  projection 삭제와 분리된다. `subject_hash`는 latest Approval의 subject hash와 항상 같아야 한다.
 
-  `decide_approval()`은 `expectedLatestApprovalId`와 `expectedVersion`을 확인하고, decision·head·AuditEvent를 한 transaction에 저장한다. 같은 request key와 payload replay는 같은 `Approval`을 반환한다.
+- [ ] **Step 2: approve/reject/revoke를 append-only decision + 이중 head CAS transaction으로 통합한다.**
+
+  `decide_approval()`은 `expectedLatestApprovalId`와 `expectedHeadVersion`을 모두 확인하고,
+  decision·head·AuditEvent를 한 transaction에 저장한다. 최초 요청의 head version은 0이다.
+  같은 request key와 exact payload replay만 같은 `Approval`을 반환한다. 전이는
+  `none→approved|rejected`, `rejected→approved`, `approved→revoked`만 허용한다.
+  `approved→approved|rejected`, `rejected→rejected|revoked`, `none→revoked`, revoked 이후 전이는 409다.
+
+  `decisionHash`는 `schemaVersion=approval-decision-v1`, `subjectHash`, `decision`,
+  `headVersion`, `supersedesApprovalId`, `requestHash`, `actorType`, `actorId`, worker 전용
+  `eventKey`, canonical `reason`을 결속한다. API의 `decisionReason`은 hash material의 `reason`으로
+  정규화하며, admin 결정의 `eventKey`는 null이다. 결정 사유와 hash는 Approval 행에 불변 저장한다.
 
 - [ ] **Step 3: revoke/reject가 모든 쓰기 gate를 즉시 차단하게 한다.**
 
@@ -805,16 +830,28 @@ administrator can inspect every included and excluded source before publication.
 
   `dispatch_publication()`과 `validate_attempt_gate()`는 attempt에 저장된 과거 approval만 보지 않고 현재 head가 같은 approved subject인지 확인한다.
 
-- [ ] **Step 4: OpenAPI 응답에 head version과 supersedes를 반영한다.**
+  revoked는 action 종류와 무관하게 `approval_revoke` scope의 최근 재인증을 소비한다.
+  approved+unpublish는 `unpublish` scope를 소비한다. 나머지 decision/action 조합의
+  `reauthProofId`는 null이어야 한다.
 
-  nullable, UUID, enum과 409 stale CAS problem response를 실제 API와 일치시킨다.
+- [ ] **Step 4: 기존 approval POST의 exact 입력·출력과 상태를 맞춘다.**
 
-- [ ] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+  요청은 `additionalProperties=false`, nullable `expectedLatestApprovalId`,
+  `expectedHeadVersion`, `decisionReason`, 조건부 `reauthProofId`를 강제한다. 응답은 target,
+  subject/decision hash, material/head version, supersedes, decision reason, current head,
+  non-null `decidedBy`, 실제 `decisionActorType/decisionActorId`, `isCurrent`,
+  `dispatchEligible`를 반환한다. worker actor ID만 null이다. 신규 결정은 201, exact replay는 200,
+  proof 필수 조합의 누락/null/UUID 형식 오류는 422, 형식상 유효하지만 만료·scope/entity가 다른
+  proof는 403, stale/불법 전이/CAS는 409, 그 밖의 불일치 본문은 422다.
+  관리자 결정은 제출된 `requestKey`/`decisionReason`, validated-auto worker 결정은 worker 요청
+  멱등 키/정책 생성 사유를 사용하며 둘 다 nonblank·trimmed·audit-safe 값만 허용한다.
 
-  ```powershell
-  git add src/apps/publishing specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml
-  git commit -m "feat: add publication approval decision projection"
-  ```
+- [ ] **Step 5: focused 계약 테스트를 통과시키고 선행 blocker를 재확인한다.**
+
+  serializer가 replay된 과거 행에서 current 여부를 추론하지 않고 read-only head projection을
+  사용하는지, exact request와 200/201/403/409/422 계약을 검증한다. T018 및 외부 blocker가
+  남아 있으므로 이 단계의 코드가 존재해도 T019는 완료 표시하지 않는다. 현재 승인 범위에서는
+  commit하지 않는다.
 
 ### Task 9: T020 publication intent와 target attempt 멱등성
 
@@ -822,7 +859,7 @@ administrator can inspect every included and excluded source before publication.
 - Modify: `src/apps/publishing/models.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/api.py`
-- Create: `src/apps/publishing/migrations/0009_intent_request_identity.py`
+- Create: `src/apps/publishing/migrations/0010_intent_request_identity.py`
 - Modify: `specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml`
 - Deferred unit test: `tests/unit/test_publication_intent_idempotency.py`
 
@@ -872,7 +909,7 @@ administrator can inspect every included and excluded source before publication.
 - Modify: `src/apps/publishing/tasks.py`
 - Modify: `src/adapters/publishers/wordpress/client.py`
 - Modify: `src/adapters/publishers/blogger/client.py`
-- Create: `src/apps/publishing/migrations/0010_publication_attempt_fencing.py`
+- Create: `src/apps/publishing/migrations/0011_publication_attempt_fencing.py`
 - Modify: `specs/001-automated-content-publishing/contracts/publisher-adapter.md`
 - Deferred contract test: `tests/contract/test_publishers.py`
 
@@ -928,7 +965,7 @@ administrator can inspect every included and excluded source before publication.
 - Modify: `src/apps/editorial/models.py`
 - Create: `src/apps/editorial/migrations/0004_visual_placement.py`
 - Modify: `src/apps/publishing/models.py`
-- Create: `src/apps/publishing/migrations/0011_published_asset_snapshots.py`
+- Create: `src/apps/publishing/migrations/0012_published_asset_snapshots.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/tasks.py`
 - Modify: `src/adapters/storage/s3.py`
@@ -1039,7 +1076,7 @@ administrator can inspect every included and excluded source before publication.
 - Modify: `src/apps/publishing/automation.py`
 - Modify: `src/apps/publishing/corrections.py`
 - Modify: `src/apps/publishing/tasks.py`
-- Create: `src/apps/publishing/migrations/0012_publication_dependency.py`
+- Create: `src/apps/publishing/migrations/0013_publication_dependency.py`
 - Deferred contract test: `tests/contract/test_publishers.py`
 
 **Interfaces:**
@@ -1754,6 +1791,27 @@ administrator can inspect every included and excluded source before publication.
 ---
 
 # English — AI Execution Metadata
+
+## T019 approval boundary
+
+T019 owns immutable approval decisions, dual CAS over the expected latest approval ID and head
+version, the legal transition graph, purpose-bound reauthentication, and the exact existing approval
+POST request/response/status contract. A decision hash binds the subject hash, decision, head,
+supersession, request identity, actor type/ID, worker event key, and canonical `reason`; API
+`decisionReason` maps to that `reason`. The mutable head projection stores the latest approval,
+monotonic version, and copied subject hash, and its lifetime follows the intent while append-only
+approvals remain protected. Serialization obtains the current head,
+`isCurrent`, and `dispatchEligible` from a shared read-only projection; it never infers current state
+from a replayed historical row. `decidedBy` is the non-null approval owner, while
+`decisionActorType/decisionActorId` expose actual admin/worker execution and worker actor IDs are null.
+Missing, null, or malformed proof UUIDs in proof-required requests are 422; syntactically valid but
+expired or scope/entity-mismatched proofs are 403.
+Administrator decisions use submitted request keys and reasons; validated-auto worker decisions use
+worker request idempotency keys and policy-generated reasons. Both must be nonblank, already trimmed,
+and audit-safe.
+The contracted `PublicationIntent` serializer omits unbounded render and approval histories. T026 owns
+new routes, cursor-paginated approval history, admin UI, and E2E.
+T019 remains unchecked while T018 and its external blockers remain incomplete.
 
 ```yaml
 schema_version: "1.0"

@@ -380,9 +380,10 @@ def disable_schedule(
 
         before_material = _schedule_material(schedule)
         schedule.enabled = False
+        schedule.version += 1
         schedule.updated_by = user
         schedule.save(
-            update_fields=("enabled", "updated_by", "updated_at"),
+            update_fields=("enabled", "version", "updated_by", "updated_at"),
             using=alias,
         )
         record_audit_event(

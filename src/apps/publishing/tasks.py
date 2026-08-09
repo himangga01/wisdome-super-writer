@@ -90,6 +90,22 @@ def dispatch_scheduled_run_publication(run_id: str):
 
 
 @shared_task(
+    name="apps.publishing.tasks.finalize_scheduled_publication_delivery_failure"
+)
+def finalize_scheduled_publication_delivery_failure(
+    run_id: str,
+    error_code: str,
+):
+    from .automation import finalize_scheduled_publication_delivery_failure as finalize
+
+    return finalize(
+        run_id,
+        error_code,
+        audit_context=_worker_audit_context(),
+    )
+
+
+@shared_task(
     name="apps.publishing.tasks.run_target_preflight",
     acks_late=True,
 )

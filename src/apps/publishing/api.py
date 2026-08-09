@@ -10,10 +10,12 @@ from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.http import require_http_methods
 
 from adapters.storage import S3ObjectStorage
-from apps.audit.services import AuditContext
+from apps.audit.redaction import AuditRedactionError
+from apps.audit.services import AuditContext, AuditContextError
 from wisdome_writer.api.openapi import openapi_operation, openapi_operations
 from wisdome_writer.api.problems import problem_response
 from wisdome_writer.domain.errors import (
+    Conflict,
     InvalidInput,
     RequestValidationError,
     ValidationIssue,
@@ -42,6 +44,7 @@ from .services import (
     decide_auto_publish_validation,
     disconnect_target,
     dispatch_publication,
+    evaluate_approval_decision_readonly,
     get_article_preview,
     request_target_preflight,
     retry_publication_attempt as retry_publication_attempt_service,
@@ -103,6 +106,30 @@ def _admin_audit_context(
         reason_code=data.get("reason"),
         request_key=data.get("requestKey"),
     )
+
+
+def _approval_audit_context(
+    request: HttpRequest,
+    data: dict[str, Any],
+) -> AuditContext:
+    decision_reason = data.get("decisionReason")
+    request_key = data.get("requestKey")
+    if (
+        not isinstance(decision_reason, str)
+        or not decision_reason
+        or decision_reason != decision_reason.strip()
+        or not isinstance(request_key, str)
+        or not request_key
+    ):
+        raise InvalidInput("decisionReason and requestKey are required")
+    try:
+        return AuditContext.for_admin(
+            request=request,
+            reason_code=decision_reason,
+            request_key=request_key,
+        )
+    except (AuditContextError, AuditRedactionError) as exc:
+        raise InvalidInput("decisionReason or requestKey is invalid") from exc
 
 
 def target_json(row: PublicationTarget) -> dict[str, Any]:
@@ -231,24 +258,45 @@ def intent_json(row: PublicationIntent) -> dict[str, Any]:
         "requestKey": row.request_key,
         "state": row.state,
         "createdAt": row.created_at.isoformat(),
-        "renders": [render_json(render_row) for render_row in row.renders.all()],
-        "approvals": [approval_json(approval_row) for approval_row in row.approvals.all()],
     }
 
 
-def approval_json(row: Approval) -> dict[str, Any]:
+def approval_json(row: Approval, *, projection=None) -> dict[str, Any]:
+    if row.admin_id is None:
+        raise Conflict("approval decision owner is missing")
+    if projection is None:
+        projection = evaluate_approval_decision_readonly(approval_id=row.id)
     return {
         "id": str(row.id),
         "revisionNo": row.revision_no,
         "publicationIntentId": str(row.publication_intent_id),
         "targetId": str(row.target_id),
         "approvalSubjectHash": row.approval_subject_hash,
+        "decisionHash": row.decision_hash,
+        "approvalMaterialVersion": row.approval_material_version,
+        "headVersion": row.head_version,
         "supersedesApprovalId": str(row.supersedes_approval_id) if row.supersedes_approval_id else None,
         "requestKey": row.request_key,
         "reauthProofId": str(row.reauth_proof_id) if row.reauth_proof_id else None,
         "actionSubject": row.action_subject,
         "mode": row.mode,
         "decision": row.decision,
+        "decisionReason": row.decision_reason,
+        "decidedBy": str(row.admin_id),
+        "decisionActorType": row.decision_actor_type,
+        "decisionActorId": (
+            str(row.decision_actor_id) if row.decision_actor_id else None
+        ),
+        "currentHead": {
+            "latestApprovalId": str(projection.current_head_approval_id),
+            "version": projection.current_head_version,
+            "decision": projection.current_head_decision,
+            "approvalSubjectHash": projection.current_head_subject_hash,
+            "decisionHash": projection.current_head_decision_hash,
+            "updatedAt": projection.current_head_updated_at.isoformat(),
+        },
+        "isCurrent": projection.is_current,
+        "dispatchEligible": projection.dispatch_eligible,
         "decidedAt": row.decided_at.isoformat(),
     }
 
@@ -550,7 +598,7 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
         data,
         user=request.user,
         request=request,
-        audit_context=_admin_audit_context(request, data),
+        audit_context=_approval_audit_context(request, data),
     )
     return JsonResponse(approval_json(row), status=201 if created else 200)
 

@@ -333,6 +333,56 @@ class PublicationIntent(models.Model):
         ]
 
 
+class ArticleChannelRenderQuerySet(models.QuerySet):
+    def _reject_if_frozen(self) -> None:
+        if self.filter(
+            Q(render_stage="final") | Q(approval__isnull=False)
+        ).exists():
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+
+    def update(self, **kwargs):
+        self._reject_if_frozen()
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        if await self.filter(
+            Q(render_stage="final") | Q(approval__isnull=False)
+        ).aexists():
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        self._reject_if_frozen()
+        return super().delete()
+
+    async def adelete(self):
+        if await self.filter(
+            Q(render_stage="final") | Q(approval__isnull=False)
+        ).aexists():
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+        return await super().adelete()
+
+    def _raw_delete(self, using):
+        self._reject_if_frozen()
+        return super()._raw_delete(using)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        objects = list(objs)
+        object_ids = [obj.pk for obj in objects if obj.pk is not None]
+        self.model.objects.filter(pk__in=object_ids)._reject_if_frozen()
+        return super().bulk_update(objects, fields, batch_size=batch_size)
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        objects = list(objs)
+        object_ids = [obj.pk for obj in objects if obj.pk is not None]
+        if await self.model.objects.filter(
+            Q(render_stage="final") | Q(approval__isnull=False),
+            pk__in=object_ids,
+        ).aexists():
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+        return await super().abulk_update(objects, fields, batch_size=batch_size)
+
+
 class ArticleChannelRender(models.Model):
     class Stage(models.TextChoices):
         PREVIEW = "preview", "미리보기"
@@ -366,6 +416,7 @@ class ArticleChannelRender(models.Model):
     media_manifest = models.JSONField(default=list)
     correction_history = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(ArticleChannelRenderQuerySet)()
 
     class Meta:
         constraints = [
@@ -374,6 +425,27 @@ class ArticleChannelRender(models.Model):
                 name="uq_intent_target_render_stage",
             )
         ]
+
+    def save(self, *args, **kwargs):
+        if (
+            not self._state.adding
+            and type(self).objects.filter(
+                pk=self.pk,
+            ).filter(
+                Q(render_stage="final") | Q(approval__isnull=False)
+            ).exists()
+        ):
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if type(self).objects.filter(
+            pk=self.pk,
+        ).filter(
+            Q(render_stage="final") | Q(approval__isnull=False)
+        ).exists():
+            raise TypeError("Frozen ArticleChannelRender is append-only")
+        return super().delete(*args, **kwargs)
 
 
 class ApprovalQuerySet(models.QuerySet):
@@ -443,16 +515,31 @@ class Approval(models.Model):
         max_length=40,
         default="approval-subject-v1",
     )
+    decision_hash = models.CharField(max_length=64, unique=True)
+    decision_reason = models.CharField(max_length=500)
+    decision_actor_type = models.CharField(
+        max_length=16,
+        choices=(("admin", "Admin"), ("worker", "Worker")),
+    )
+    decision_actor_id = models.UUIDField(null=True, blank=True)
+    decision_event_key = models.CharField(max_length=255, null=True, blank=True)
     head_version = models.PositiveIntegerField(default=1)
-    supersedes_approval_id = models.UUIDField(null=True, blank=True)
+    supersedes_approval = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        db_column="supersedes_approval_id",
+        on_delete=models.PROTECT,
+        related_name="superseded_by",
+    )
     request_key = models.CharField(max_length=200)
-    request_hash = models.CharField(max_length=64, null=True, blank=True)
+    request_hash = models.CharField(max_length=64)
     reauth_proof_id = models.UUIDField(null=True, blank=True)
     policy_snapshot_hash = models.CharField(max_length=64)
     quality_report_hash = models.CharField(max_length=64)
     render_template_hash = models.CharField(max_length=64, null=True, blank=True)
     source_manifest_hash = models.CharField(max_length=64)
-    admin = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT)
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
     decided_at = models.DateTimeField(auto_now_add=True)
     objects = models.Manager.from_queryset(ApprovalQuerySet)()
 
@@ -466,6 +553,52 @@ class Approval(models.Model):
             models.CheckConstraint(
                 condition=Q(head_version__gte=1),
                 name="ck_approval_head_version_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    approval_material_version="approval-subject-v3",
+                    decision__in=("approved", "rejected", "revoked"),
+                ),
+                name="ck_approval_v3_decision_material",
+            ),
+            models.CheckConstraint(
+                condition=~Q(id=models.F("supersedes_approval_id")),
+                name="ck_approval_not_self_superseding",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        decision_actor_type="admin",
+                        decision_actor_id=models.F("admin_id"),
+                        decision_event_key__isnull=True,
+                    )
+                    | Q(
+                        decision_actor_type="worker",
+                        decision_actor_id__isnull=True,
+                        decision_event_key__isnull=False,
+                    )
+                ),
+                name="ck_approval_decision_actor_provenance",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(mode=ApprovalMode.MANUAL, decision_actor_type="admin")
+                    | Q(
+                        mode=ApprovalMode.VALIDATED_AUTO,
+                        decision="approved",
+                        decision_actor_type="worker",
+                    )
+                    | Q(
+                        mode=ApprovalMode.VALIDATED_AUTO,
+                        decision__in=("rejected", "revoked"),
+                        decision_actor_type="admin",
+                    )
+                ),
+                name="ck_approval_mode_actor_decision",
+            ),
+            models.UniqueConstraint(
+                fields=("publication_intent", "target", "head_version"),
+                name="uq_approval_intent_target_head_version",
             ),
         ]
 
@@ -621,6 +754,7 @@ class PublicationApprovalHead(models.Model):
         related_name="headed_by",
     )
     version = models.PositiveIntegerField()
+    subject_hash = models.CharField(max_length=64)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
