@@ -825,6 +825,18 @@ def mark_extraction_object_uploaded(
     byte_size: int,
     content_type: str = "application/octet-stream",
 ) -> ExtractionObjectWriteReservation:
+    if not isinstance(object_version, str) or not object_version.strip():
+        raise EvidenceInvariantError("Uploaded extraction objects require an immutable version")
+    if (
+        not isinstance(checksum, str)
+        or len(checksum) != 64
+        or any(character not in "0123456789abcdef" for character in checksum)
+        or type(byte_size) is not int
+        or byte_size < 0
+        or not isinstance(content_type, str)
+        or not content_type.strip()
+    ):
+        raise EvidenceInvariantError("Uploaded extraction object provenance is incomplete")
     with transaction.atomic():
         reservation = ExtractionObjectWriteReservation.objects.select_for_update().get(
             pk=reservation_id
@@ -952,6 +964,11 @@ def extraction_fingerprint(
         "runtime_version": profile.runtime_version,
         "model_manifest_hash": profile.model_manifest_hash,
         "config_hash": profile.config_hash,
+        "safety_material_hash": (
+            document.routing_manifest.get("safety_material_hash")
+            if isinstance(document.routing_manifest, dict)
+            else None
+        ),
     }
     return page_set_hash, canonical_hash(material)
 
@@ -1223,6 +1240,132 @@ def document_evidence_manifest_entry(
         "locator_hash": canonical_hash(locator),
         "evidence_content_hash": evidence_content_hash_value,
     }
+
+
+def generic_evidence_manifest_entry(evidence: EvidenceAsset) -> dict[str, Any]:
+    attempt = evidence.generic_extraction_attempt
+    return {
+        "evidence_asset_id": str(evidence.id),
+        "source_item_id": str(evidence.source_item_id),
+        "origin_run_source_item_id": str(evidence.origin_run_source_item_id),
+        "parent_asset_id": str(evidence.parent_asset_id) if evidence.parent_asset_id else None,
+        "generic_extraction_attempt_id": str(evidence.generic_extraction_attempt_id),
+        "extraction_profile_snapshot_id": str(attempt.extraction_profile_snapshot_id),
+        "profile_material_hash": attempt.profile_material_hash,
+        "kind": evidence.kind,
+        "locator_type": evidence.locator_type,
+        "locator_hash": canonical_hash(evidence.locator),
+        "extraction_method": evidence.extraction_method,
+        "extractor_version": evidence.extractor_version,
+        "extraction_config_hash": evidence.extraction_config_hash,
+        "validation_mode": evidence.validation_mode,
+        "result_checksum": evidence.extraction_result_checksum,
+        "evidence_content_hash": evidence.evidence_content_hash,
+        "review_subject_hash": evidence.review_subject_hash,
+        "calibration_profile_key": evidence.calibration_profile_key,
+        "calibration_profile_version": evidence.calibration_profile_version,
+        "calibration_profile_hash": evidence.calibration_profile_hash,
+        "confidence": str(evidence.confidence) if evidence.confidence is not None else None,
+        "object_key": evidence.object_key,
+        "object_version": evidence.object_version,
+        "checksum": evidence.checksum,
+    }
+
+
+def generic_evidence_manifest(evidence_assets: Sequence[EvidenceAsset]) -> list[dict[str, Any]]:
+    return [
+        generic_evidence_manifest_entry(evidence)
+        for evidence in sorted(evidence_assets, key=lambda item: str(item.id))
+    ]
+
+
+def generic_evidence_manifest_hash(evidence_assets: Sequence[EvidenceAsset]) -> str:
+    return canonical_hash(generic_evidence_manifest(evidence_assets))
+
+
+def validate_generic_evidence_set(
+    attempt: GenericExtractionAttempt,
+    evidence_assets: Sequence[EvidenceAsset],
+    *,
+    allow_legacy_missing_manifest: bool = False,
+) -> tuple[list[str], str]:
+    """Recompute the authoritative generic evidence set from locked database rows."""
+    attempt.full_clean()
+    if (
+        attempt.state not in {
+            ExtractionState.SUCCEEDED,
+            ExtractionState.LOW_CONFIDENCE,
+        }
+        or attempt.terminal_state != "ready"
+        or not attempt.terminal_event_key
+        or not attempt.result_checksum
+    ):
+        raise ValidationError("Generic attempt terminal envelope is incomplete")
+    assets = sorted(evidence_assets, key=lambda item: str(item.id))
+    if not assets:
+        raise ValidationError("Generic evidence set is empty")
+    manifest_missing = (
+        attempt.expected_evidence_count is None
+        or not attempt.expected_evidence_manifest_hash
+    )
+    if manifest_missing and not (
+        allow_legacy_missing_manifest and len(assets) == 1
+    ):
+        raise ValidationError("Generic evidence manifest envelope is missing")
+    if not manifest_missing and attempt.expected_evidence_count != len(assets):
+        raise ValidationError("Generic evidence count differs from the frozen manifest")
+    if attempt.evidence_asset_id is None or sum(
+        item.id == attempt.evidence_asset_id for item in assets
+    ) != 1:
+        raise ValidationError("Generic evidence primary anchor is missing or ambiguous")
+    if attempt.engine == ExtractionEngine.LEGACY_HWP and len(assets) != 1:
+        raise ValidationError("Legacy HWP requires exactly one converted PDF evidence")
+    profile = attempt.extraction_profile_snapshot
+    if (
+        attempt.profile_material_hash != profile.profile_material_hash
+        or attempt.engine != profile.engine
+        or attempt.extractor_version != profile.extractor_version
+        or attempt.config_hash != profile.config_hash
+        or attempt.validation_mode != profile.validation_mode
+        or attempt.calibration_profile_key != profile.calibration_profile_key
+        or attempt.calibration_profile_version != profile.calibration_profile_version
+        or attempt.calibration_profile_hash != profile.calibration_profile_hash
+    ):
+        raise ValidationError("Generic attempt differs from its frozen profile")
+    for evidence in assets:
+        if (
+            evidence.generic_extraction_attempt_id != attempt.id
+            or evidence.source_item_id != attempt.source_item_id
+            or evidence.origin_run_source_item_id != attempt.run_source_item_id
+            or evidence.parent_asset_id != attempt.input_asset_id
+            or evidence.derivation_type != EvidenceDerivationType.OTHER
+            or evidence.extraction_method != attempt.engine
+            or evidence.extractor_version != attempt.extractor_version
+            or evidence.extraction_config_hash != attempt.config_hash
+            or evidence.validation_mode != attempt.validation_mode
+            or evidence.extraction_result_checksum != attempt.result_checksum
+            or evidence.calibration_profile_key != attempt.calibration_profile_key
+            or evidence.calibration_profile_version != attempt.calibration_profile_version
+            or evidence.calibration_profile_hash != attempt.calibration_profile_hash
+        ):
+            raise ValidationError("Generic evidence lineage differs from its attempt")
+        observed_content_hash = evidence_content_hash(
+            text=evidence.extracted_text,
+            structured_data=evidence.structured_data,
+            checksum=evidence.checksum,
+        )
+        if observed_content_hash != evidence.evidence_content_hash:
+            raise ValidationError("Generic evidence content hash is stale")
+        observed_review_hash = calculate_review_subject_hash(evidence)
+        if observed_review_hash != evidence.review_subject_hash:
+            raise ValidationError("Generic evidence review hash is stale")
+        if calculate_publishable(evidence) != evidence.publishable:
+            raise ValidationError("Generic evidence publishability projection is stale")
+        evidence.full_clean()
+    observed_hash = generic_evidence_manifest_hash(assets)
+    if not manifest_missing and observed_hash != attempt.expected_evidence_manifest_hash:
+        raise ValidationError("Generic evidence manifest differs from the frozen attempt")
+    return [str(item.id) for item in assets], observed_hash
 
 
 def _selected_runs(

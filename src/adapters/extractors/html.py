@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -65,13 +64,9 @@ class HtmlExtractor:
                         text=text,
                         structured_data={"html_tag": tag},
                     ))
-        try:
-            version = importlib.metadata.version("selectolax")
-        except importlib.metadata.PackageNotFoundError:
-            version = "unknown"
         return GenericExtractionOutput(
             engine=self.engine,
-            extractor_version=version,
+            extractor_version="1.0.0",
             validation_mode="deterministic",
             records=records,
             metadata={"record_count": len(records), "network_fetches": 0},

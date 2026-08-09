@@ -18,6 +18,12 @@ from adapters.extractors.base import (
     sha256_file,
     sniff_mime,
 )
+from adapters.extractors.media import (
+    MAX_IMAGE_DECOMPRESSED_BYTES,
+    MAX_IMAGE_DIMENSION,
+    MAX_IMAGE_PIXELS,
+    inspect_static_image,
+)
 
 
 class PaddleOCRExtractor:
@@ -89,23 +95,35 @@ class PaddleOCRExtractor:
             raise ExtractorError("config_mismatch", "PaddleOCR pipeline must be PPStructureV3")
 
     def _verify_runtime(self) -> str:
-        try:
-            installed = importlib.metadata.version("paddleocr")
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise ExtractorError("paddleocr_dependency_missing", "PaddleOCR is not installed") from exc
-        if installed != self.package_version:
-            raise ExtractorError("model_manifest_mismatch", "Installed PaddleOCR version is not 3.7.0")
-        try:
-            runtime = importlib.metadata.version("paddlepaddle")
-        except importlib.metadata.PackageNotFoundError:
+        expected_dependencies = {
+            "paddleocr": "3.7.0",
+            "paddlepaddle": "3.2.2",
+            "PyMuPDF": "1.28.0",
+            "Pillow": "12.3.0",
+        }
+        if self.config.get("dependency_versions") != expected_dependencies:
+            raise ExtractorError(
+                "model_manifest_mismatch",
+                "PaddleOCR dependency set is not frozen in the profile",
+            )
+        observed: dict[str, str] = {}
+        for package, expected in expected_dependencies.items():
             try:
-                runtime = importlib.metadata.version("paddlepaddle-gpu")
+                installed = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError as exc:
-                raise ExtractorError("paddle_runtime_missing", "PaddlePaddle runtime is not installed") from exc
-        if not runtime.startswith("3."):
-            raise ExtractorError("model_manifest_mismatch", "PaddlePaddle runtime must be pinned to 3.x")
+                raise ExtractorError(
+                    "paddleocr_dependency_missing",
+                    f"Required PaddleOCR dependency is missing: {package}",
+                ) from exc
+            if installed != expected:
+                raise ExtractorError(
+                    "model_manifest_mismatch",
+                    f"PaddleOCR dependency version differs: {package}",
+                )
+            observed[package] = installed
+        runtime = observed["paddlepaddle"]
         expected_runtime = str(self.config.get("runtime_version", ""))
-        if expected_runtime and runtime != expected_runtime:
+        if expected_runtime != runtime:
             raise ExtractorError("model_manifest_mismatch", "PaddlePaddle runtime version differs from profile")
         return runtime
 
@@ -252,6 +270,17 @@ class PaddleOCRExtractor:
         indices = sorted(set(int(index) for index in page_indices))
         if not indices:
             raise ExtractorError("page_incomplete", "PaddleOCR received an empty page set")
+        max_pages = min(int(self.config.get("max_pages", 300)), 300)
+        if len(indices) > max_pages:
+            raise ExtractorError("page_limit_exceeded", "PaddleOCR page set exceeds the hard limit")
+        started_at = time.monotonic()
+        max_total_seconds = min(float(self.config.get("max_total_seconds", 120)), 120.0)
+        max_output_blocks = min(int(self.config.get("max_output_blocks", 100_000)), 100_000)
+        max_prediction_results = min(
+            int(self.config.get("max_prediction_results_per_page", 10_000)),
+            10_000,
+        )
+        output_blocks = 0
         pipeline = self._build_pipeline()
         pages: list[PageExtraction] = []
         all_confidences: list[float] = []
@@ -260,19 +289,55 @@ class PaddleOCRExtractor:
             inputs = self._prepare_inputs(path, indices, input_kind=input_kind, temp_dir=Path(temp_dir))
             for page_index, image_path, width, height, scale in inputs:
                 try:
-                    raw_results = list(pipeline.predict(input=str(image_path)))
+                    if time.monotonic() - started_at > max_total_seconds:
+                        raise ExtractorError("paddleocr_timeout", "PaddleOCR exceeded its wall deadline")
+                    raw_results = pipeline.predict(input=str(image_path))
+                    blocks: list[ExtractionBlock] = []
+                    observed_results = 0
+                    for raw_result in raw_results:
+                        observed_results += 1
+                        if observed_results > max_prediction_results:
+                            raise ExtractorError(
+                                "paddleocr_output_limit_exceeded",
+                                "PaddleOCR result count exceeds the per-page limit",
+                            )
+                        if time.monotonic() - started_at > max_total_seconds:
+                            raise ExtractorError(
+                                "paddleocr_timeout",
+                                "PaddleOCR exceeded its wall deadline",
+                            )
+                        payload = self._result_payload(raw_result)
+                        remaining = max_output_blocks - output_blocks - len(blocks)
+                        if remaining <= 0:
+                            raise ExtractorError(
+                                "paddleocr_output_limit_exceeded",
+                                "PaddleOCR output blocks exceed the hard limit",
+                            )
+                        blocks.extend(
+                            self._normalize_blocks(
+                                payload,
+                                page_index,
+                                scale,
+                                len(blocks),
+                                max_blocks=remaining,
+                            )
+                        )
+                except ExtractorError:
+                    raise
                 except Exception as exc:
                     message = str(exc).lower()
                     code = "out_of_memory" if "memory" in message else "paddleocr_inference_failed"
                     raise ExtractorError(code, "PPStructureV3 inference failed", retryable=code != "out_of_memory") from exc
-                if not raw_results:
+                if observed_results == 0:
                     raise ExtractorError("page_incomplete", "PPStructureV3 returned no page result")
-                blocks: list[ExtractionBlock] = []
-                for raw_result in raw_results:
-                    payload = self._result_payload(raw_result)
-                    blocks.extend(self._normalize_blocks(payload, page_index, scale, len(blocks)))
                 if not blocks:
                     raise ExtractorError("page_incomplete", "PPStructureV3 returned no normalized blocks")
+                output_blocks += len(blocks)
+                if output_blocks > max_output_blocks:
+                    raise ExtractorError(
+                        "paddleocr_output_limit_exceeded",
+                        "PaddleOCR output blocks exceed the hard limit",
+                    )
                 thresholds = self.config.get("confidence_thresholds", {})
                 for block in blocks:
                     if block.confidence is not None:
@@ -297,6 +362,10 @@ class PaddleOCRExtractor:
                     blocks=blocks,
                     preprocessing_hash=sha256_file(image_path),
                 ))
+                if time.monotonic() - started_at > max_total_seconds:
+                    raise ExtractorError("paddleocr_timeout", "PaddleOCR exceeded its wall deadline")
+                if input_kind == "pdf":
+                    image_path.unlink(missing_ok=True)
         summary = {
             "minimum": min(all_confidences) if all_confidences else None,
             "mean": sum(all_confidences) / len(all_confidences) if all_confidences else None,
@@ -321,28 +390,39 @@ class PaddleOCRExtractor:
         *,
         input_kind: str,
         temp_dir: Path,
-    ) -> list[tuple[int, Path, float, float, float]]:
+    ) -> Iterable[tuple[int, Path, float, float, float]]:
         if input_kind == "standalone_image":
             if indices != [0] or sniff_mime(path) not in {"image/png", "image/jpeg", "image/tiff"}:
                 raise ExtractorError("unsupported_image", "Standalone image input is invalid")
-            try:
-                from PIL import Image
-                with Image.open(path) as image:
-                    if getattr(image, "n_frames", 1) != 1:
-                        raise ExtractorError("unsupported_multiframe_image", "Animated/multi-frame images are rejected")
-                    return [(0, path, float(image.width), float(image.height), 1.0)]
-            except ExtractorError:
-                raise
-            except Exception as exc:
-                raise ExtractorError("unsupported_image", "Image decoder rejected the input") from exc
+            metadata = inspect_static_image(path, self.config)
+            yield (0, path, float(metadata["width"]), float(metadata["height"]), 1.0)
+            return
         try:
             import fitz
         except ImportError as exc:
             raise ExtractorError("native_pdf_dependency_missing", "PyMuPDF is required to render OCR pages") from exc
         document = fitz.open(path)
-        outputs = []
+        render_started_total = time.monotonic()
+        total_rendered_bytes = 0
         dpi = int(self.config.get("render_dpi", 200))
         scale = dpi / 72.0
+        max_dimension = min(
+            int(self.config.get("max_page_dimension_points", MAX_IMAGE_DIMENSION)),
+            MAX_IMAGE_DIMENSION,
+        )
+        max_pixels = min(
+            int(self.config.get("max_render_pixels", MAX_IMAGE_PIXELS)), MAX_IMAGE_PIXELS
+        )
+        max_bytes = min(
+            int(self.config.get("max_render_decompressed_bytes", MAX_IMAGE_DECOMPRESSED_BYTES)),
+            MAX_IMAGE_DECOMPRESSED_BYTES,
+        )
+        max_render_seconds = min(float(self.config.get("max_render_seconds", 30)), 30.0)
+        max_total_render_bytes = min(
+            int(self.config.get("max_total_render_bytes", 64 * 1024 * 1024)),
+            64 * 1024 * 1024,
+        )
+        max_total_seconds = min(float(self.config.get("max_total_seconds", 120)), 120.0)
         try:
             if document.needs_pass:
                 raise ExtractorError("encrypted_pdf", "Encrypted PDFs are not processed")
@@ -350,13 +430,46 @@ class PaddleOCRExtractor:
                 if index < 0 or index >= document.page_count:
                     raise ExtractorError("page_incomplete", "Requested OCR page is outside the PDF")
                 page = document.load_page(index)
+                width = float(page.rect.width)
+                height = float(page.rect.height)
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > max_dimension
+                    or height > max_dimension
+                ):
+                    raise ExtractorError("pdf_dimension_exceeded", "PDF page dimensions exceed the OCR limit")
+                expected_width = math.ceil(width * scale)
+                expected_height = math.ceil(height * scale)
+                expected_pixels = expected_width * expected_height
+                if expected_pixels > max_pixels or expected_pixels * 3 > max_bytes:
+                    raise ExtractorError(
+                        "pdf_render_limit_exceeded", "PDF page render exceeds the OCR memory limit"
+                    )
                 image_path = temp_dir / f"page-{index}.png"
+                render_started_at = time.monotonic()
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                actual_pixels = int(pixmap.width) * int(pixmap.height)
+                samples = int(getattr(pixmap, "stride", pixmap.width * 3)) * int(pixmap.height)
+                total_rendered_bytes += samples
+                if (
+                    actual_pixels > max_pixels
+                    or samples > max_bytes
+                    or total_rendered_bytes > max_total_render_bytes
+                ):
+                    raise ExtractorError(
+                        "pdf_render_limit_exceeded", "Rendered PDF page exceeds the OCR memory limit"
+                    )
                 pixmap.save(image_path)
-                outputs.append((index, image_path, float(page.rect.width), float(page.rect.height), scale))
+                if (
+                    time.monotonic() - render_started_at > max_render_seconds
+                    or time.monotonic() - render_started_total > max_total_seconds
+                ):
+                    image_path.unlink(missing_ok=True)
+                    raise ExtractorError("pdf_render_timeout", "PDF rendering exceeded the deadline")
+                yield (index, image_path, float(page.rect.width), float(page.rect.height), scale)
         finally:
             document.close()
-        return outputs
 
     @staticmethod
     def _result_payload(result: Any) -> Mapping[str, Any]:
@@ -376,25 +489,37 @@ class PaddleOCRExtractor:
 
     @classmethod
     def _normalize_blocks(
-        cls, payload: Mapping[str, Any], page_index: int, scale: float, offset: int
+        cls,
+        payload: Mapping[str, Any],
+        page_index: int,
+        scale: float,
+        offset: int,
+        *,
+        max_blocks: int = 100_000,
     ) -> list[ExtractionBlock]:
         candidates = payload.get("parsing_res_list") or payload.get("layout_parsing_result") or payload.get("blocks")
         if isinstance(candidates, Mapping):
             candidates = candidates.get("blocks") or candidates.get("parsing_res_list")
         if not isinstance(candidates, list):
-            candidates = []
             texts = payload.get("rec_texts") or []
             scores = payload.get("rec_scores") or []
             boxes = payload.get("rec_boxes") or []
-            for index, text in enumerate(texts):
-                candidates.append({
+            candidates = (
+                {
                     "block_label": "text",
                     "block_content": text,
                     "block_bbox": boxes[index] if index < len(boxes) else None,
                     "confidence": scores[index] if index < len(scores) else None,
-                })
+                }
+                for index, text in enumerate(texts)
+            )
         blocks: list[ExtractionBlock] = []
         for local_index, candidate in enumerate(candidates):
+            if local_index >= max_blocks:
+                raise ExtractorError(
+                    "paddleocr_output_limit_exceeded",
+                    "PaddleOCR normalized block count exceeds the hard limit",
+                )
             if not isinstance(candidate, Mapping):
                 continue
             block_type = cls._block_type(candidate.get("block_label") or candidate.get("label") or candidate.get("type"))

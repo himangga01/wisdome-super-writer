@@ -510,8 +510,9 @@
 **Files:**
 - Modify: `src/apps/evidence/tasks.py`
 - Modify: `src/apps/evidence/services.py`
-- Create: `src/adapters/extractors/manual.py`
-- Modify: `src/adapters/extractors/browser_capture.py`
+- Modify: `src/apps/evidence/models.py`
+- Create: `src/apps/evidence/migrations/0006_generic_evidence_manifest.py`
+- Modify: `src/wisdome_writer/infrastructure/event_routes.py`
 - Modify: `src/adapters/extractors/media.py`
 - Modify: `src/adapters/extractors/hwpx.py`
 - Modify: `src/adapters/extractors/native_pdf/adapter.py`
@@ -532,54 +533,77 @@
       "structured_parser": StructuredExtractor,
       "spreadsheet_parser": SpreadsheetExtractor,
       "hwpx_parser": HwpxExtractor,
-      "browser_capture": BrowserCaptureExtractor,
-      "media_parser": MediaExtractor,
-      "manual_entry": ManualEntryExtractor,
+      "legacy_hwp_converter": LegacyHwpConverter,
   }
   ```
 
-  계약에 있으나 실행되지 않는 profile이 없도록 하고, 지원하지 않을 엔진은 manifest와 계약에서 함께 제거한다.
-
-  `ManualEntryExtractor`는 관리자가 생성한 JSON 입력의 text, source URL, locator, rights decision과 actor를 검증하고 `validation_mode=manual` evidence만 생성한다.
-
-  ```python
-  class ManualEntryExtractor:
-      engine = "manual_entry"
-
-      def extract(self, path: Path) -> GenericExtractionOutput:
-          payload = json.loads(path.read_text(encoding="utf-8"))
-          record = validate_manual_evidence_payload(payload)
-          return GenericExtractionOutput(
-              engine=self.engine,
-              extractor_version="manual-entry-v1",
-              validation_mode="manual",
-              records=[record],
-              metadata={"actor_id": payload["actorId"]},
-          )
-  ```
+  계약에 있으나 실행되지 않는 profile이 없도록 한다. `browser_capture`, `media_parser`,
+  `manual_entry`는 안전한 producer 경계가 없어 신규 manifest·승인·routing 계약에서 제거하고
+  historical DB enum으로만 유지한다. extractor의 복수 record는 record별 EvidenceAsset으로
+  저장하며 attempt와 신규 ready payload의 count+canonical provenance manifest hash가 exact DB
+  집합을 동결한다. 신규 payload에는 전체 UUID 목록을 싣지 않는다. 과거 v1의 optional ID 목록은
+  있으면 exact 비교하고, 확장 필드가 없는 단일 evidence payload는 실제 파생 evidence가 하나일
+  때만 호환한다. finalizer와 ready consumer는 저장된 hash를 신뢰하지 않고 content/review/
+  publishability/locator/lineage를 다시 계산한다.
 
 - [ ] **Step 2: HWPX/XML parser를 fail-closed로 만든다.**
 
-  external entity, DTD, path traversal, duplicate ZIP entry, 압축 비율·entry 수·총 크기 초과를 입력 거부로 분류한다.
+  external entity, DTD, path traversal, duplicate/ZIP64/비허용 압축 entry, exact first mimetype,
+  content.hpf spine·namespace·media type, 압축 비율·entry 수·총 크기 초과를 입력 거부로 분류한다.
+  EOCD·central directory·offset·entry count를 `ZipFile` 생성 전에 bounded preflight하고,
+  물리 offset 0의 stored `mimetype`만 신뢰한다. `content.hpf`는 공식 OPF namespace를 허용하되
+  모든 manifest item을 section으로 오인하지 않고 spine 참조만 canonical
+  `Contents/section[0-9]+.xml`로 선택한다. section XML은 defused incremental event로 읽고
+  depth·node·text·deadline을 DOM 전체 생성 전에 강제한다.
 
 - [ ] **Step 3: PDF와 image decoder 한도를 강제한다.**
 
-  page count, dimension, pixel count, frame count, decompressed byte와 render time 한도를 검사하며 다중 frame 이미지는 거부한다.
+  page count, dimension, pixel count, frame count, decompressed byte와 render time 한도를 검사하며
+  다중 frame 이미지는 거부한다. PaddleOCR는 전체 페이지를 선렌더하지 않고 한 페이지씩
+  render→검증→추론→삭제한다.
 
 - [ ] **Step 4: S3 read를 object version과 bounded stream으로 제한한다.**
 
-  `S3ObjectStorage.get_bytes()`의 무제한 read 대신 `get_bounded_bytes(key, version_id, max_bytes)`를 만들고 추출 task가 frozen object version만 읽게 한다.
+  `S3ObjectStorage.get_bytes()`의 무제한 read 대신 `get_bounded_bytes(key, version_id, max_bytes)`를
+  만들고 추출 task가 frozen object version만 읽게 한다. 응답 VersionId와 ContentLength를 첫 byte
+  전에 확인하고 versionless upload는 Evidence/ledger에 bind하지 않는다.
 
 - [ ] **Step 5: locator와 confidence 규칙을 강제한다.**
 
-  모든 evidence는 locator type별 필수 필드를 검증한다. 숫자 confidence는 calibrated profile에만 허용하고 deterministic extractor는 pass/fail validation만 기록한다.
+  모든 evidence는 locator type별 허용 필드와 필수 필드를 검증한다. HTML selector/xpath와 HWPX
+  paragraph/table-cell/embedded locator는 서로 배타적이어야 한다. 숫자 confidence는 complete
+  calibrated profile에만 허용하고 deterministic extractor는 pass/fail validation만 기록한다.
+  terminal generic attempt는 expected evidence count/hash도 terminal identity와 함께 DB trigger로
+  불변이며, migration은 증명할 수 없는 locator·confidence·legacy conversion provenance를
+  quarantine한다. manifest 재검증 실패 시 finalizer는 같은 run의 active document/generic/child와
+  현재 generation의 unbound object-write ledger를 모두 닫은 뒤 run/step을 manual-required failed로
+  수렴시킨다.
 
 - [ ] **Step 6: 사용자 승인 후 extractor 계약을 검증하고 커밋한다.**
+
+  in-process timeout은 C parser hang/OOM의 완전한 격리가 아니다. bounded subprocess/container
+  CPU·memory 경계와 적대 corpus 검증, T015 외부 활성화가 해소되기 전에는 T017을 완료 표시하지
+  않는다.
 
   ```powershell
   git add src/apps/evidence src/adapters/extractors src/adapters/storage/s3.py specs/001-automated-content-publishing/contracts
   git commit -m "feat: close generic extraction routing and safety gaps"
   ```
+
+#### English / AI-readable T017 remediation
+
+- Active in-process release profiles pin Python 3.12.10 and exact package dependency sets.
+  Legacy HWP is a sidecar protocol and intentionally does not use the host-Python gate.
+- HWPX performs a bounded EOCD/central/local-header preflight before `ZipFile`, accepts the official
+  OPF package shape, selects only canonical spine section XML, and parses manifest/sections with
+  defused incremental events under byte/depth/node/text/deadline ceilings.
+- Generic terminal evidence count/hash is immutable. Runtime and migration rederive locator,
+  confidence, content, review, publishability, lineage, and legacy conversion provenance.
+  Invalid material closes every active extraction aggregate and unbound current-generation ledger.
+- Structured JSON has a lexical allocation guard before `json.loads`; PaddleOCR bounds prediction
+  and normalized-block iteration and verifies PaddleOCR/PaddlePaddle/PyMuPDF/Pillow exact versions.
+- T017 remains unchecked until bounded subprocess/container CPU-memory isolation, adversarial
+  corpus validation, and the T015 external activation dependency are resolved.
 
 ### Task 7: T018 불변 editorial policy와 차단형 품질 gate
 

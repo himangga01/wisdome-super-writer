@@ -195,6 +195,23 @@ reading order를 잃지 않아야 한다.
 
 ## 보안·운영 불변조건
 
+- 추출 task는 non-empty `input_object_version`으로만 S3 `GetObject`를 호출한다. 응답
+  `VersionId`가 frozen version과 정확히 같아야 하며 `ContentLength`를 read 전에 검사한다.
+  bounded chunk read 후 실제 byte size와 SHA-256을 다시 비교하고 성공·실패 모두 body를 닫는다.
+- 외부 원문은 12 MiB, 검증된 내부 파생 문서는 64 MiB를 넘지 않는다. PDF는 최대 300 pages,
+  250,000 xrefs, 페이지 dimension 16,384 points, 렌더 40M pixels/page, text 32 MiB,
+  blocks 100,000, 전체 inspect 120초, page 30초 hard ceiling을 적용한다.
+- 독립 이미지는 dimension 16,384, 40M pixels, decoded 160 MiB, frame 1, decode 30초를 넘으면
+  거부한다. PaddleOCR PDF render도 같은 pixel/decoded 한도를 pixmap 생성 전후에 검사하고,
+  한 페이지씩 render→검증→추론→삭제하여 전체 문서를 선렌더하지 않는다.
+- 최초 document claim은 inspection profile과 가능한 routing profile 집합을 material hash로 먼저
+  동결한다. replay는 최신 profile을 재선택하지 않으며 profile 변경은 명시적 새 retry만 허용한다.
+- 업로드 응답에 non-empty VersionId가 없으면 object-write ledger와 EvidenceAsset에 bind하지 않는다.
+- native deterministic PDF block에는 숫자 confidence를 기록하지 않는다. 숫자 confidence는
+  승인된 calibrated profile material이 완전한 경우에만 EvidenceAsset에 기록한다.
+- 위 elapsed-time 검사는 in-process fail-closed 경계이며 C parser의 hang/OOM을 완전히 격리하지
+  않는다. bounded subprocess/container CPU·memory isolation과 실제 적대 corpus 검증은 T017의
+  외부 activation blocker로 남고, 해소 전 T017을 완료로 표시하지 않는다.
 - OCR 워커는 non-root, 읽기 전용 root filesystem과 제한된 임시 디렉터리에서 실행한다.
 - 발행/OAuth/수집 자격 증명에 접근하지 않고 운영 추론 중 외부 네트워크를 사용하지 않는다.
 - 모델은 빌드·배포 단계에서 공식 배포본으로 준비하고 SBOM, 라이선스와 SHA-256을 보존한다.
@@ -220,3 +237,21 @@ reading order를 잃지 않아야 한다.
   ID/content·result checksum/locator hash가 변조되면 document ready 이벤트 0건
 - 골든 30페이지의 핵심 날짜·금액·자격·고유명사 정확도와 locator 완전성
 - 다른 OCR 엔진 호출 0건, 런타임 모델 다운로드와 외부 네트워크 요청 0건
+
+## English / AI-readable — T017 document and object-read safety
+
+- Extraction workers require a non-empty frozen S3 VersionId. They reject a mismatched response
+  VersionId, validate ContentLength before reading, stream within a hard byte bound, verify actual
+  size and SHA-256, and close the response body on every path.
+- External inputs are capped at 12 MiB and verified internal derived documents at 64 MiB. PDF
+  inspection caps pages, xrefs, dimensions, render pixels, text, blocks, and elapsed time.
+- Static images are limited to one frame, 16,384 pixels per dimension, 40 million pixels,
+  160 MiB decoded size, and a 30-second in-process decode deadline. PaddleOCR applies equivalent
+  pre-render and post-render pixel/byte checks and processes one rendered page at a time.
+- The first document claim freezes inspection and possible routing profile material. Replays never
+  select a newer profile, and versionless uploads cannot bind to the object ledger or evidence.
+- Native deterministic PDF extraction stores no numeric confidence. Numeric EvidenceAsset
+  confidence requires a complete approved calibrated profile.
+- These in-process deadlines do not claim isolation from hostile C-parser hangs or OOM. Bounded
+  subprocess/container CPU and memory isolation plus an adversarial corpus remain external T017
+  activation blockers, so T017 stays unchecked.

@@ -3,8 +3,11 @@
 ## 범위
 
 이 계약은 PDF·독립 이미지가 아닌 HTML, 구조화 데이터, 스프레드시트, HWPX, legacy HWP의
-격리 PDF 변환, 허용된 브라우저 캡처, 미디어 메타데이터와 수동 입력을 `other_derived`
-EvidenceAsset으로 만드는 경로다.
+격리 PDF 변환을 `other_derived` EvidenceAsset으로 만드는 경로다. `browser_capture`,
+`media_parser`, `manual_entry` enum은 과거 행을 읽기 위한 호환 값일 뿐 신규 profile catalog,
+승인 필수 집합, 실행 routing, OpenAPI 지원 목록에 포함하지 않는다. 브라우저 sandbox와 캡처
+객체 저장 경계, 감사 가능한 관리자 수동 입력 producer, 시간축 미디어 parser가 구현되기 전에는
+해당 엔진을 활성화할 수 없다.
 문서·이미지 OCR은 이 계약에서 실행하지 않고 `evidence-extractor.md`의 PaddleOCR 계약만
 사용한다.
 
@@ -28,11 +31,24 @@ EvidenceAsset으로 만드는 경로다.
 성공·저신뢰 소비자는 attempt와 EvidenceAsset을 같은 트랜잭션에 저장하고 outbox로
 `evidence.other_ready`를 만든다. ready payload는 `run_id`, `run_source_item_id`,
 `source_item_id`, `generic_extraction_attempt_id`,
-`evidence_asset_id`, `engine`, `locator_type`, `validation_mode`, `result_checksum`,
+legacy primary인 `evidence_asset_id`,
+`evidence_count`, `evidence_manifest_hash`, `engine`, `locator_type`, `validation_mode`, `result_checksum`,
 `low_confidence_reasons_hash?`, `calibration_profile_key/version/hash?`,
 `extraction_fingerprint`를 가진다.
 소비자는 DB의 provenance와 아래 매트릭스를 다시 검증한다. 실패 attempt는 ready 이벤트나
-EvidenceAsset을 만들지 않는다.
+EvidenceAsset을 만들지 않는다. extractor record 하나마다 EvidenceAsset 하나를 만들며,
+신규 producer는 64 KiB 경계를 지키기 위해 전체 `evidence_asset_ids`를 보내지 않고
+`evidence_count/evidence_manifest_hash`만 보낸다. historical v1 payload의 ID 목록은 있으면 exact
+비교한다. `GenericExtractionAttempt.expected_evidence_count/expected_evidence_manifest_hash`와 ready payload가
+ID·source/run-source·parent·attempt·profile·engine/version/config·validation/calibration·result·
+content·locator·object provenance 전체를 정렬된 canonical manifest로 exact 결속한다. 과거 v1
+단일 `evidence_asset_id` payload는 실제 파생 evidence가 정확히 하나일 때만 호환한다. ready
+consumer와 run finalizer는 각 EvidenceAsset의 content hash, review subject hash, publishable,
+locator와 전체 계보를 다시 계산하고 manifest가 다르면 run을 `manual_required/failed`로 닫는다.
+이때 이미 잠근 run→step→document→attempt→child/evidence 순서를 유지하면서 같은 run의 모든
+queued/running document·generic·child를 failed terminal로 닫고 retry/lease를 제거한다. fanout과
+각 aggregate의 현재 generation에 남은 reserved/uploaded object-write는 orphaned로 수렴시키며
+bound object와 shared content-addressed key를 즉시 삭제하지 않는다.
 요청·ready의 `run_id`, `run_source_item_id`, `source_item_id`는 attempt가 참조하는
 RunSourceItem 계보와 정확히 같아야 하며 payload 값만으로 실행 소유권을 정하지 않는다.
 
@@ -45,11 +61,8 @@ RunSourceItem 계보와 정확히 같아야 하며 payload 값만으로 실행 �
 | `spreadsheet_parser` | `spreadsheet_cell` | `deterministic/calibrated` |
 | `hwpx_parser` | `hwpx_path` | `deterministic` |
 | `legacy_hwp_converter` | `hwp_conversion` | `deterministic` |
-| `browser_capture` | `html_dom/image_region` | `deterministic/calibrated` |
-| `media_parser` | `media_time/image_region` | `deterministic/calibrated` |
-| `manual_entry` | `manual` | `manual` |
 
-`deterministic/manual`은 confidence가 null이다. `calibrated`는 승인된 골든 표본 ID, metric,
+`deterministic`은 confidence가 null이다. `calibrated`는 승인된 골든 표본 ID, metric,
 임계값과 평가 결과를 담은 불변 manifest의 key/version/SHA-256이 모두 있어야 하며 그때만
 0..1 confidence를 기록한다. enum 선언만으로 calibrated가 될 수 없고, 비활성·누락·hash
 불일치 profile은 실행 전에 `failed/calibration_profile_invalid`로 끝난다.
@@ -60,9 +73,27 @@ extractor/package/runtime/pipeline version, implementation manifest, config와 c
 key/version/hash, 저장된 manifest checksum과 로컬 parser 설정을 대조한다. 불일치는
 추론·파싱 전에 실패하며 event 값만으로 profile을 승인하지 않는다.
 
-HWPX는 ZIP central directory를 먼저 검사해 압축 폭탄/경로 탈출/중첩 archive/허용 밖 MIME과
-active content를 차단한 뒤 로컬 XML만 파싱한다. locator는 section XML path, paragraph ID,
+HWPX는 raw 12 MiB, 2,048 entries, expanded 64 MiB, member 8 MiB, XML 32 MiB,
+compression ratio 100, 256 sections, depth 64, 200,000 elements, text 16 MiB,
+50,000 records, 10초의 code-level hard ceiling을 넘지 못한다. ZIP central directory를 먼저
+검사해 경로 탈출·정규화 중복·중첩 archive·Scripts/encryption/OLE/external relationship·DTD·
+entity를 차단하고 `defusedxml==0.7.1`로 로컬 XML만 파싱한다. locator는 section XML path, paragraph ID,
 table/row/column/cell과 embedded object ID를 보존하고 외부 link를 따라가지 않는다.
+HWPX는 첫 uncompressed `mimetype=application/hwp+zip`, stored/deflated entry, 비-ZIP64,
+승인 package/section namespace와 `content.hpf` spine의 section path/media type만 허용한다.
+파일 끝 EOCD와 central directory의 disk/count/size/offset/file bound를 `ZipFile`보다 먼저 검사하고,
+central 정렬과 무관하게 물리 local header offset 0의 exact mimetype을 요구한다. 공식 OPF
+`http://www.idpf.org/2007/opf/` package에서 header/image/settings 등 안전한 manifest item은
+허용하지만 spine itemref가 참조한 canonical section XML만 본문으로 처리한다. section과 manifest는
+defused incremental event로 읽어 전체 DOM 할당 전에 node/depth/text/deadline을 제한한다.
+OPF `href`는 패키지 루트 기준 canonical 경로(`Contents/header.xml`, `BinData/...`,
+`Contents/sectionN.xml`, `settings.xml`)로 검증하고 실제 ZIP 항목과 일치해야 한다. 본문 의미 요소는
+승인된 paragraph namespace만 추출하며 같은 local name을 가진 foreign namespace 요소는 거부한다.
+
+구조화 JSON은 `json.loads` 전에 input/depth/node/string/deadline lexical preflight를 통과해야 한다.
+PaddleOCR는 page별 prediction iterable과 normalized block 수를 materialization 전에 제한하고,
+`paddleocr==3.7.0`, `paddlepaddle==3.2.2`, `PyMuPDF==1.28.0`, `Pillow==12.3.0`을 profile material과
+runtime에서 exact 비교한다. legacy HWP sidecar profile은 host Python runtime gate 대상이 아니다.
 
 legacy HWP는 원본을 직접 해석 결과로 게시하지 않는다. 승인된 `legacy-hwp-v1` profile의 pinned
 converter binary/implementation checksum을 no-network, read-only input, disposable filesystem,
@@ -184,7 +215,7 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
 ## 계약 테스트
 
 - 각 engine의 허용 locator 양성 예와 모든 교차 불일치 음성 예
-- `manual_entry+calibrated`, calibrated profile 누락/비활성/hash 불일치 거절
+- 비활성 browser/media/manual profile의 manifest·승인·routing 노출 거절
 - 존재하지 않거나 draft/retired인 profile snapshot, event/config hint 불일치 거절
 - deterministic/manual confidence 숫자 거절, deterministic/manual `low_confidence` 상태 거절,
   calibrated confidence 누락 거절
@@ -198,6 +229,32 @@ FK는 null이다. locator의 render/input/transform hash는 DB join과 같아야
 - HWPX zip-slip/zip-bomb/active-content fixture 거절, paragraph/table/cell locator 재현
 - legacy HWP sandbox의 network/process escape 0건, output PDF/report checksum 변조 거절,
   변환 성공 뒤 인식 엔진은 native PDF 또는 PaddleOCR뿐이며 converter 실패 시 자동게시 0건
+
+## English / AI-readable — T017 generic extraction safety
+
+- The active generic catalog and single runtime factory table contain only HTML, structured data,
+  spreadsheet, HWPX, and legacy HWP conversion. Browser, media, and manual engines remain historical
+  enum values and are not advertised or routable in the MVP.
+- Every extractor record creates one EvidenceAsset. The attempt freezes the exact evidence count
+  and canonical full-provenance manifest. New `evidence.other_ready@1` payloads carry count+manifest
+  hash without a UUID list; historical optional IDs are exact-compared when present. A legacy
+  single-ID payload is accepted only for exactly one asset.
+- The ready consumer and run finalizer lock and rederive the whole evidence set, including content,
+  review subject, publishability, locator, profile and lineage. Stored hashes alone are never trusted.
+  A mismatch terminalizes all active sibling document/generic/child rows, clears leases/retries,
+  orphans unbound current-generation writes, and then projects run/step manual failure.
+- Output engine, extractor version, and validation mode exactly match the approved profile.
+  Engine/locator/mode and locator-required fields are validated before commit. Numeric confidence
+  requires complete calibrated profile key/version/hash material.
+- HWPX and XML reject DTD/entity input and enforce hard byte, entry, expansion, ratio, section,
+  depth, node, text, record, and elapsed-time ceilings. A bounded EOCD/central/local-header preflight
+  precedes `ZipFile`; official OPF manifests select only canonical spine section XML and use
+  incremental defused parsing. OPF hrefs are canonical package-root paths bound to real ZIP entries,
+  and extracted body elements require an approved paragraph namespace. `defusedxml==0.7.1` is mandatory.
+- JSON is lexically bounded before decoding. Paddle prediction/block streams are bounded and the
+  exact PaddleOCR, PaddlePaddle, PyMuPDF, and Pillow dependency set is release-verified.
+- In-process deadlines are fail-closed checks, not full CPU/memory isolation. A bounded subprocess
+  or container for hostile parser hangs remains an explicit T017 activation blocker.
 
 ## English / AI-readable — T015 legacy HWP isolation
 

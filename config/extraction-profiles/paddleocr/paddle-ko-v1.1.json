@@ -1,0 +1,25 @@
+{
+  "profile_key": "paddle-ko-v1", "profile_version": "1.1.0",
+  "engine": "paddleocr_ppstructurev3", "extractor_version": "1.0.0",
+  "package_version": "3.7.0", "runtime_version": "3.2.2", "pipeline_name": "PPStructureV3",
+  "validation_mode": null,
+  "implementation_files": ["src/adapters/extractors/base.py", "src/adapters/extractors/paddleocr/adapter.py", "src/adapters/extractors/media.py"],
+  "model_manifest_file": "${PADDLEOCR_MODEL_MANIFEST_ROOT}/manifest.json",
+  "config": {
+    "pipeline_name": "PPStructureV3", "runtime_version": "3.2.2", "python_runtime_version": "3.12.10", "network_access": false,
+    "device": "cpu", "render_dpi": 200, "text_recognition_model": "korean_PP-OCRv5_mobile_rec",
+    "use_doc_orientation_classify": true, "use_doc_unwarping": true,
+    "use_textline_orientation": true, "enable_table_recognition": true,
+    "enable_formula_recognition": true, "enable_chart_recognition": true,
+    "enable_seal_recognition": false, "enable_region_detection": false,
+    "max_image_width": 16384, "max_image_height": 16384, "max_image_pixels": 40000000,
+    "max_image_decompressed_bytes": 167772160, "max_image_frames": 1,
+    "max_image_decode_seconds": 30, "max_page_dimension_points": 16384,
+    "max_render_pixels": 40000000, "max_render_decompressed_bytes": 167772160,
+    "max_render_seconds": 30, "max_pages": 300, "max_total_seconds": 120,
+    "max_output_blocks": 100000, "max_total_render_bytes": 67108864,
+    "max_prediction_results_per_page": 10000,
+    "dependency_versions": {"paddleocr": "3.7.0", "paddlepaddle": "3.2.2", "PyMuPDF": "1.28.0", "Pillow": "12.3.0"},
+    "confidence_thresholds": {"default": 0.78, "table": 0.82, "formula": 0.85, "chart": 0.82}
+  }
+}

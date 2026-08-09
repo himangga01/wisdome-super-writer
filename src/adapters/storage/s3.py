@@ -31,7 +31,12 @@ class S3ObjectStorage:
                 region_name=settings.AWS_S3_REGION_NAME,
                 aws_access_key_id=settings.AWS_ACCESS_KEY_ID or None,
                 aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY or None,
-                config=Config(s3={"addressing_style": settings.AWS_S3_ADDRESSING_STYLE}),
+                config=Config(
+                    connect_timeout=5,
+                    read_timeout=30,
+                    retries={"mode": "standard", "max_attempts": 3},
+                    s3={"addressing_style": settings.AWS_S3_ADDRESSING_STYLE},
+                ),
             )
         return self._client
 
@@ -148,6 +153,56 @@ class S3ObjectStorage:
             params["VersionId"] = version_id
         return self.client.get_object(**params)["Body"].read()
 
+    def get_bounded_bytes(
+        self,
+        *,
+        key: str,
+        version_id: str,
+        max_bytes: int,
+        chunk_size: int = 1024 * 1024,
+    ) -> bytes:
+        """Read one immutable object version without trusting the response stream size."""
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("a frozen object version is required")
+        if not isinstance(max_bytes, int) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        if not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
+        params = {
+            "Bucket": self.bucket,
+            "Key": _validate_key(key),
+            "VersionId": version_id,
+        }
+        response = self.client.get_object(**params)
+        body = response["Body"]
+        content_length = response.get("ContentLength")
+        try:
+            if type(content_length) is not int or content_length < 0:
+                raise ValueError("object ContentLength is missing or invalid")
+            if content_length > max_bytes:
+                raise ValueError("object exceeds the configured byte limit")
+            if response.get("VersionId") != version_id:
+                raise ValueError("object version differs from frozen provenance")
+            chunks: list[bytes] = []
+            observed = 0
+            while True:
+                chunk = body.read(min(chunk_size, max_bytes - observed + 1))
+                if not chunk:
+                    break
+                if not isinstance(chunk, bytes):
+                    raise ValueError("object body did not return bytes")
+                observed += len(chunk)
+                if observed > max_bytes:
+                    raise ValueError("object exceeds the configured byte limit")
+                chunks.append(chunk)
+            if observed != content_length:
+                raise ValueError("object ContentLength differs from streamed bytes")
+            return b"".join(chunks)
+        finally:
+            close = getattr(body, "close", None)
+            if close is not None:
+                close()
+
     def get_file(
         self,
         *,
@@ -158,14 +213,22 @@ class S3ObjectStorage:
         expected_size: int,
     ) -> ObjectInfo:
         """Download an exact object to a new file using bounded chunks."""
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("a frozen object version is required")
         params = {"Bucket": self.bucket, "Key": _validate_key(key)}
-        if version_id:
-            params["VersionId"] = version_id
+        params["VersionId"] = version_id
         response = self.client.get_object(**params)
         body = response["Body"]
         digest = hashlib.sha256()
         size = 0
         try:
+            content_length = response.get("ContentLength")
+            if type(content_length) is not int or content_length < 0:
+                raise ValueError("object ContentLength is missing or invalid")
+            if content_length != expected_size:
+                raise ValueError("object ContentLength differs from frozen provenance")
+            if response.get("VersionId") != version_id:
+                raise ValueError("object version differs from frozen provenance")
             with destination.open("xb") as output:
                 while True:
                     chunk = body.read(1024 * 1024)
@@ -189,19 +252,14 @@ class S3ObjectStorage:
         if (
             size != expected_size
             or observed_checksum != expected_checksum_sha256
-            or response.get("ContentLength", size) != size
-            or (
-                version_id
-                and response.get("VersionId")
-                and response.get("VersionId") != version_id
-            )
+            or response["ContentLength"] != size
         ):
             destination.unlink(missing_ok=True)
             raise ValueError("downloaded object identity differs from provenance")
         destination.chmod(0o400)
         return ObjectInfo(
             key=params["Key"],
-            version_id=response.get("VersionId") or version_id,
+            version_id=response["VersionId"],
             checksum_sha256=observed_checksum,
             size=size,
             content_type=response.get("ContentType", "application/octet-stream"),

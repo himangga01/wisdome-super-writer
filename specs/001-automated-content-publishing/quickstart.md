@@ -96,9 +96,13 @@ PPStructureV3와 로컬 model checksum이 모두 일치하지 않으면 승인�
 
 MVP manifest의 필수 key는 `native-pdf-v1`, `paddle-ko-v1`, `paddle-en-v1`,
 `html-deterministic-v1`, `structured-deterministic-v1`, `spreadsheet-deterministic-v1`,
-`hwpx-deterministic-v1`, `legacy-hwp-v1`, `browser-capture-deterministic-v1`,
-`media-deterministic-v1`, `manual-entry-v1`이다. 초기 generic
-profile은 deterministic/manual이고 calibrated generic key는 MVP 필수 집합이 아니다.
+`hwpx-deterministic-v1`, `legacy-hwp-v1`이다. browser/media/manual enum은 historical
+DB 호환용이며 신규 manifest·승인·routing 지원 목록이 아니다. 초기 generic profile은
+deterministic이고 calibrated generic key는 MVP 필수 집합이 아니다.
+현재 v1.1 release는 Python 3.12.10과 PyMuPDF 1.28.0, selectolax 0.4.11,
+openpyxl 3.1.5, defusedxml 0.7.1을 exact pin한다. worker는 DB snapshot의 self-consistent hash만
+확인하지 않고 manifest의 같은 key/version, 현재 implementation file hash와 설치 package/runtime를
+다시 비교한다. 이전 v1.0 in-flight snapshot은 현재 코드에서 자동 재해석하지 않고 fail-closed한다.
 
 ```powershell
 uv run python src/manage.py verify_extraction_profile_snapshots --require-approved-mvp
@@ -462,6 +466,12 @@ uv run pytest tests/contract/test_evidence_extractor.py tests/integration/test_p
 
 청약/MOTIE fixture에 HWPX 문단·병합 표·embedded image와 legacy HWP 한 건씩 포함한다.
 HWPX는 section/paragraph/table/row/column locator를 보존하고 zip-slip, 과도한 압축비,
+ZIP64·multi-disk·EOCD/central offset 불일치, 물리 첫 entry가 아닌 mimetype,
+foreign OPF item/itemref를 거부한다. 공식 OPF manifest의 header/image/settings item은 허용하되
+spine이 가리킨 canonical section XML만 incremental parse한다.
+fixture의 OPF 경로는 `Contents/header.xml`, `BinData/...`, `Contents/section0.xml`, `settings.xml`처럼
+패키지 루트 기준이어야 하고 실제 ZIP 항목과 exact 일치해야 한다. paragraph/table/text는 승인된
+paragraph namespace만 허용하며 foreign namespace가 같은 local name을 사용하면 거부한다.
 중첩 archive, macro/OLE와 외부 link 실행을 거절해야 한다. legacy HWP는 승인된 pinned converter를
 no-network/read-only-input/resource-limited sandbox에서만 실행한다. PDF output과 conversion report
 checksum이 맞으면 새 DocumentExtraction으로 넘기고 실제 PDF 인식은 native extraction 또는
@@ -636,6 +646,18 @@ uv run python src/manage.py check --deploy
 
 WordPress와 Blogger target이 각각 공식 연결·계약 검증을 통과하고 위 시나리오가 성공하면
 FR-012, FR-023, FR-024와 전체 수용 결과는 PASS다.
+
+## English / AI-readable — T017 active extraction release pins
+
+The active in-process v1.1 extraction release requires Python 3.12.10, PyMuPDF 1.28.0,
+selectolax 0.4.11, openpyxl 3.1.5, and defusedxml 0.7.1 exactly. Paddle profiles additionally pin
+PaddleOCR 3.7.0, PaddlePaddle 3.2.2, and Pillow 12.3.0. Workers compare the DB snapshot
+with the same key/version release document, current implementation-file hashes, and installed
+package/runtime material. Browser, media, and manual engines remain historical values and are not
+new-producer catalog entries. Old v1.0 in-flight snapshots fail closed under the changed release.
+Legacy HWP uses its sidecar protocol/converter trust chain and is not subject to the host-Python gate.
+HWPX performs EOCD/central/local-header preflight before `ZipFile`, accepts official OPF package
+manifests, and incrementally parses only canonical spine section XML.
 
 ## English / AI-readable — Legacy HWP deployment
 

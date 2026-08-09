@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import platform
 import stat
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
@@ -29,9 +30,6 @@ MVP_PROFILE_KEYS = frozenset({
     "spreadsheet-deterministic-v1",
     "hwpx-deterministic-v1",
     "legacy-hwp-v1",
-    "browser-capture-deterministic-v1",
-    "media-deterministic-v1",
-    "manual-entry-v1",
 })
 
 PADDLEOCR_VERSION = "3.7.0"
@@ -268,6 +266,51 @@ def load_profile_documents(root: Path) -> list[dict[str, Any]]:
     return documents
 
 
+def release_profile_snapshot_values(
+    profile: ExtractionProfileSnapshot,
+    *,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve the one currently shipped profile document for an execution snapshot."""
+    root = root or settings.REPOSITORY_ROOT / "config" / "extraction-profiles"
+    try:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("Extraction release manifest is missing or invalid") from exc
+    matches: list[dict[str, Any]] = []
+    for entry in manifest.get("profiles", []):
+        relative = Path(str(entry.get("file", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValidationError("Profile paths must remain within the profile root")
+        try:
+            document = json.loads((root / relative).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValidationError("Extraction release profile is missing or invalid") from exc
+        if (
+            document.get("profile_key") == profile.profile_key
+            and str(document.get("profile_version")) == profile.profile_version
+        ):
+            matches.append(_resolve_deployment_material(_expand(document)))
+    if len(matches) != 1:
+        raise ValidationError("Frozen profile is not the unique active release document")
+    document = matches[0]
+    engine = str(document.get("engine"))
+    if _requires_host_python(engine):
+        expected_python = str(
+            (document.get("config") or {}).get("python_runtime_version", "")
+        )
+        if expected_python != platform.python_version():
+            raise ValidationError("Python runtime differs from the active extraction release")
+    for package, expected in _dependencies_for_engine(engine):
+        try:
+            installed = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise ValidationError(f"Required extraction package is not installed: {package}") from exc
+        if expected is not None and installed != expected:
+            raise ValidationError(f"Extraction package version differs: {package}")
+    return profile_snapshot_values(document)
+
+
 def implementation_manifest(document: Mapping[str, Any], repository_root: Path | None = None) -> dict[str, Any]:
     repository_root = repository_root or settings.REPOSITORY_ROOT
     entries = []
@@ -357,15 +400,15 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
         })
 
     stage("config.hash", canonical_hash(profile.config) == profile.config_hash)
-    dependency = _dependency_for_engine(profile.engine)
-    if dependency:
-        package, expected = dependency
-        try:
-            installed = importlib.metadata.version(package)
-            passed = expected is None or installed == expected or installed.startswith(expected)
-            stage("dependency.version", passed, f"{package}={installed}")
-        except importlib.metadata.PackageNotFoundError:
-            stage("dependency.version", False, f"{package} is not installed")
+    dependencies = _dependencies_for_engine(profile.engine)
+    if dependencies:
+        for package, expected in dependencies:
+            try:
+                installed = importlib.metadata.version(package)
+                passed = expected is None or installed == expected
+                stage(f"dependency.version.{package}", passed, f"{package}={installed}")
+            except importlib.metadata.PackageNotFoundError:
+                stage(f"dependency.version.{package}", False, f"{package} is not installed")
     else:
         stage("dependency.version", True, "stdlib/local wrapper")
     if profile.engine == ExtractionEngine.PADDLEOCR:
@@ -457,13 +500,28 @@ def verify_local_profile(profile: ExtractionProfileSnapshot) -> dict[str, Any]:
     }
 
 
-def _dependency_for_engine(engine: str) -> tuple[str, str | None] | None:
+def _requires_host_python(engine: str) -> bool:
+    return engine in {
+        ExtractionEngine.NATIVE_PDF,
+        ExtractionEngine.PADDLEOCR,
+        ExtractionEngine.HTML,
+        ExtractionEngine.STRUCTURED,
+        ExtractionEngine.SPREADSHEET,
+        ExtractionEngine.HWPX,
+    }
+
+
+def _dependencies_for_engine(engine: str) -> tuple[tuple[str, str | None], ...]:
     return {
-        ExtractionEngine.NATIVE_PDF: ("PyMuPDF", None),
-        ExtractionEngine.PADDLEOCR: ("paddleocr", "3.7.0"),
-        ExtractionEngine.HTML: ("selectolax", None),
-        ExtractionEngine.SPREADSHEET: ("openpyxl", None),
-        ExtractionEngine.HWPX: ("defusedxml", None),
-        ExtractionEngine.BROWSER_CAPTURE: ("playwright", None),
-        ExtractionEngine.MEDIA: ("Pillow", None),
-    }.get(engine)
+        ExtractionEngine.NATIVE_PDF: (("PyMuPDF", "1.28.0"),),
+        ExtractionEngine.PADDLEOCR: (
+            ("paddleocr", "3.7.0"),
+            ("paddlepaddle", "3.2.2"),
+            ("PyMuPDF", "1.28.0"),
+            ("Pillow", "12.3.0"),
+        ),
+        ExtractionEngine.HTML: (("selectolax", "0.4.11"),),
+        ExtractionEngine.STRUCTURED: (("defusedxml", "0.7.1"),),
+        ExtractionEngine.SPREADSHEET: (("openpyxl", "3.1.5"),),
+        ExtractionEngine.HWPX: (("defusedxml", "0.7.1"),),
+    }.get(engine, ())

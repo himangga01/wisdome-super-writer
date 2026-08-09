@@ -17,11 +17,14 @@ import django
 
 django.setup()
 
+from django.core.exceptions import ValidationError
 from django.db import DatabaseError, IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from celery.exceptions import SoftTimeLimitExceeded
 from django.test import TransactionTestCase
 from django.utils import timezone
+
+from adapters.extractors.base import GenericEvidenceRecord, GenericExtractionOutput
 
 from apps.collection.models import (
     CollectionRun,
@@ -38,6 +41,9 @@ from apps.evidence.models import (
     EvidenceDerivationType,
     EvidenceKind,
     ExtractionEngine,
+    ExtractionObjectWritePurpose,
+    ExtractionObjectWriteReservation,
+    ExtractionObjectWriteState,
     ExtractionProfileSnapshot,
     ExtractionRun,
     ExtractionState,
@@ -637,7 +643,11 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             generic_extraction_attempt=attempt,
             kind=EvidenceKind.TEXT,
             locator_type=LocatorType.HTML_DOM,
-            locator={"selector": "main"},
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main",
+                "xpath": None,
+            },
             extraction_result_checksum=checksum,
             evidence_content_hash="6" * 64,
             review_subject_hash="7" * 64,
@@ -645,6 +655,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         attempt.state = ExtractionState.SUCCEEDED
         attempt.result_checksum = checksum
         attempt.evidence_asset = evidence
+        attempt.expected_evidence_count = 1
+        attempt.expected_evidence_manifest_hash = services.generic_evidence_manifest_hash([evidence])
         attempt.terminal_state = "ready"
         attempt.terminal_event_key = f"evidence.other_ready:{attempt.id}:{checksum}"
         attempt.save()
@@ -689,6 +701,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         attempt.state = ExtractionState.SUCCEEDED
         attempt.result_checksum = checksum
         attempt.evidence_asset = evidence
+        attempt.expected_evidence_count = 1
+        attempt.expected_evidence_manifest_hash = services.generic_evidence_manifest_hash([evidence])
         attempt.terminal_state = "ready"
         attempt.terminal_event_key = f"evidence.other_ready:{attempt.id}:{checksum}"
         attempt.save()
@@ -1242,6 +1256,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         attempt.engine = ExtractionEngine.LEGACY_HWP
         attempt.state = ExtractionState.SUCCEEDED
         attempt.result_checksum = "a" * 64
+        attempt.expected_evidence_count = 0
+        attempt.expected_evidence_manifest_hash = services.canonical_hash([])
         attempt.terminal_event_key = f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
         attempt.terminal_state = "ready"
         attempt.save()
@@ -1411,6 +1427,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         attempt.engine = ExtractionEngine.LEGACY_HWP
         attempt.state = ExtractionState.SUCCEEDED
         attempt.result_checksum = "a" * 64
+        attempt.expected_evidence_count = 0
+        attempt.expected_evidence_manifest_hash = services.canonical_hash([])
         attempt.terminal_event_key = f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
         attempt.terminal_state = "ready"
         attempt.save()
@@ -1828,7 +1846,9 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             locator_type=LocatorType.STRUCTURED_PATH,
             locator={"path": "attachments"},
             checksum="a" * 64,
-            evidence_content_hash="b" * 64,
+            evidence_content_hash=services.evidence_content_hash(
+                text=None, structured_data=None, checksum=None
+            ),
             review_subject_hash="c" * 64,
         )
         GenericExtractionAttempt.objects.filter(pk=ready.id).update(input_asset=raw)
@@ -1842,21 +1862,33 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             parent_asset=raw,
             kind=EvidenceKind.TEXT,
             locator_type=LocatorType.HTML_DOM,
-            locator={"selector": "main"},
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main",
+                "xpath": None,
+            },
             extraction_method=ready.engine,
             extractor_version=ready.extractor_version,
             extraction_config_hash=ready.config_hash,
             validation_mode=ready.validation_mode,
             extraction_result_checksum=checksum,
-            evidence_content_hash="e" * 64,
+            evidence_content_hash=services.evidence_content_hash(
+                text=None, structured_data=None, checksum=None
+            ),
             review_subject_hash="f" * 64,
         )
         evidence.refresh_from_db()
         ready.state = ExtractionState.SUCCEEDED
         ready.result_checksum = checksum
         ready.evidence_asset = evidence
+        ready.expected_evidence_count = 1
         ready.terminal_event_key = f"evidence.other_ready:{ready.id}:{checksum}"
         ready.terminal_state = "ready"
+        evidence.generic_extraction_attempt = ready
+        evidence.review_subject_hash = services.calculate_review_subject_hash(evidence)
+        evidence.publishable = services.calculate_publishable(evidence)
+        evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
+        ready.expected_evidence_manifest_hash = services.generic_evidence_manifest_hash([evidence])
         ready.save()
         tasks.enqueue_event(
             topic="evidence.other_ready",
@@ -1968,7 +2000,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         )
         unproven = _generic_attempt()
 
-        latest = [("evidence", "0005_extraction_generation_fencing")]
+        under_test = [("evidence", "0005_extraction_generation_fencing")]
+        latest = [("evidence", "0006_generic_evidence_manifest")]
         executor = MigrationExecutor(connection)
         try:
             executor.migrate([("evidence", "0004_extractionprofiledecision_report_envelope")])
@@ -1981,7 +2014,7 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             OldAttempt.objects.filter(pk=invalid_delivery.id).update(state="running")
             OldAttempt.objects.filter(pk=unproven.id).update(state="succeeded")
             executor = MigrationExecutor(connection)
-            executor.migrate(latest)
+            executor.migrate(under_test)
         finally:
             executor = MigrationExecutor(connection)
             executor.migrate(latest)
@@ -2017,8 +2050,13 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
         self.assertEqual(invalid_event.immutable_material_hash, "0" * 64)
         self.assertEqual(ready.state, ExtractionState.SUCCEEDED)
         self.assertEqual(ready.terminal_event_key, f"evidence.other_ready:{ready.id}:{checksum}")
+        self.assertEqual(ready.expected_evidence_count, 1, ready.error_detail_redacted)
         self.assertEqual(unproven.state, ExtractionState.FAILED)
         self.assertEqual(unproven.error_code, "legacy_ready_identity_unproven")
+        services.validate_generic_evidence_set(
+            ready,
+            list(ready.derived_evidence_assets.order_by("id")),
+        )
         with _routed_context():
             result = tasks.consume_other_ready.run(
                 str(ready.run_source_item.run_id),
@@ -2069,7 +2107,8 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             lease_generation=1,
         )
         old_target = [("evidence", "0004_extractionprofiledecision_report_envelope")]
-        latest = [("evidence", "0005_extraction_generation_fencing")]
+        under_test = [("evidence", "0005_extraction_generation_fencing")]
+        latest = [("evidence", "0006_generic_evidence_manifest")]
         executor = MigrationExecutor(connection)
         try:
             executor.migrate(old_target)
@@ -2079,7 +2118,7 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             ).update(state="running")
             executor = MigrationExecutor(connection)
             with self.assertRaisesRegex(RuntimeError, "drain"):
-                executor.migrate(latest)
+                executor.migrate(under_test)
             OutboxConsumerReceipt.objects.filter(pk=receipt.id).update(
                 state="retry",
                 claimed_at=None,
@@ -2143,7 +2182,7 @@ class ExtractionGenerationPersistenceTests(TransactionTestCase):
             ("evidence", "0004_extractionprofiledecision_report_envelope"),
             ("collection", "0009_run_step_generation_fencing"),
         ]
-        latest = [("evidence", "0005_extraction_generation_fencing")]
+        latest = [("evidence", "0006_generic_evidence_manifest")]
         executor = MigrationExecutor(connection)
         try:
             executor.migrate(old_targets)
@@ -2277,3 +2316,637 @@ class SelectedPageCoverageTests(TestCase):
             ("infrastructure", "0002_outboxconsumerreceipt_and_more"),
             migration.dependencies,
         )
+
+
+class GenericMultiRecordEvidenceTests(TransactionTestCase):
+    def _terminal_generic_evidence(
+        self,
+        attempt,
+        *,
+        checksum="a" * 64,
+        state=ExtractionState.SUCCEEDED,
+    ):
+        # Keep the in-memory relation used by review hashing aligned with the
+        # terminal envelope that is persisted below.
+        attempt.state = state
+        attempt.result_checksum = checksum
+        evidence = EvidenceAsset.objects.create(
+            source_item=attempt.source_item,
+            origin_run_source_item=attempt.run_source_item,
+            derivation_type=EvidenceDerivationType.OTHER,
+            generic_extraction_attempt=attempt,
+            kind=EvidenceKind.TEXT,
+            locator_type=LocatorType.HTML_DOM,
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main > p",
+                "xpath": None,
+            },
+            extracted_text="original",
+            structured_data={"record_index": 0},
+            extraction_method=attempt.engine,
+            extractor_version=attempt.extractor_version,
+            extraction_config_hash=attempt.config_hash,
+            validation_mode=attempt.validation_mode,
+            extraction_result_checksum=checksum,
+            rights_status="allowed",
+            rights_basis_url="https://example.com/rights",
+            review_state="passed",
+            evidence_content_hash=services.evidence_content_hash(
+                text="original", structured_data={"record_index": 0}, checksum=None
+            ),
+            review_subject_hash=SHA,
+        )
+        evidence.review_subject_hash = services.calculate_review_subject_hash(evidence)
+        evidence.publishable = services.calculate_publishable(evidence)
+        evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
+        manifest_hash = services.generic_evidence_manifest_hash([evidence])
+        GenericExtractionAttempt.objects.filter(pk=attempt.id).update(
+            state=state,
+            result_checksum=checksum,
+            evidence_asset=evidence,
+            expected_evidence_count=1,
+            expected_evidence_manifest_hash=manifest_hash,
+            terminal_event_key=f"evidence.other_ready:{attempt.id}:{checksum}",
+            terminal_state="ready",
+        )
+        attempt.refresh_from_db()
+        return evidence
+
+    def test_document_replay_uses_frozen_inspection_profile_without_latest_selection(self):
+        document = _document_extraction()
+        token = uuid.uuid4()
+        claimed = services.begin_document_extraction(
+            document.id,
+            source_event_id=uuid.uuid4(),
+            delivery_count=1,
+            lease_generation=1,
+            lease_owner="worker",
+            lease_token=token,
+        )
+        frozen = ExtractionProfileSnapshot.objects.create(
+            profile_key="native-pdf-v1",
+            profile_version="1.1.0",
+            engine=ExtractionEngine.NATIVE_PDF,
+            extractor_version="1.0.0",
+            package_version="1.28.0",
+            runtime_version="Python-3.12.10",
+            implementation_manifest_hash=SHA,
+            config={"python_runtime_version": "3.12.10"},
+            config_hash=SHA,
+            profile_material_hash="2" * 64,
+        )
+        safety = {
+            "engine": frozen.engine,
+            "profile_snapshot_id": str(frozen.id),
+            "profile_material_hash": frozen.profile_material_hash,
+            "config_hash": frozen.config_hash,
+        }
+        DocumentExtraction.objects.filter(pk=document.id).update(
+            routing_manifest={
+                "schema_version": "extraction-routing-v2",
+                "safety": safety,
+                "safety_material_hash": services.canonical_hash(safety),
+                "pages": [],
+            }
+        )
+        with patch.object(tasks, "_profile", side_effect=AssertionError("latest profile selected")), patch.object(
+            tasks, "_verify_profile"
+        ):
+            observed = tasks._frozen_document_safety_profile(
+                document.id,
+                engine=ExtractionEngine.NATIVE_PDF,
+                expected_generation=claimed.lease_generation,
+                expected_lease_owner=claimed.lease_owner,
+                expected_lease_token=claimed.lease_token,
+            )
+        self.assertEqual(observed.id, frozen.id)
+
+    def test_terminal_generic_attempt_requires_persisted_manifest_envelope(self):
+        attempt = _generic_attempt()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            GenericExtractionAttempt.objects.filter(pk=attempt.id).update(
+                state=ExtractionState.SUCCEEDED,
+                result_checksum="a" * 64,
+                terminal_event_key=f"evidence.other_ready:{attempt.id}:{'a' * 64}",
+                terminal_state="ready",
+                expected_evidence_count=None,
+                expected_evidence_manifest_hash=None,
+            )
+
+    def test_generic_records_create_exact_authoritative_evidence_manifest(self):
+        attempt = _generic_attempt()
+        raw = b"<html><main><p>A</p><p>B</p></main></html>"
+        raw_checksum = __import__("hashlib").sha256(raw).hexdigest()
+        input_asset = EvidenceAsset.objects.create(
+            source_item=attempt.source_item,
+            origin_run_source_item=attempt.run_source_item,
+            derivation_type=EvidenceDerivationType.RAW,
+            raw_input_fingerprint=uuid.uuid4().hex + uuid.uuid4().hex,
+            kind=EvidenceKind.ATTACHMENT,
+            locator={},
+            object_key="evidence/raw/input.html",
+            object_version="frozen-v1",
+            mime_type="text/html",
+            byte_size=len(raw),
+            checksum=raw_checksum,
+            structured_data={"source_url": "https://example.com/input.html"},
+            evidence_content_hash=raw_checksum,
+            review_subject_hash=SHA,
+        )
+        attempt.input_asset = input_asset
+        attempt.save(update_fields=("input_asset", "updated_at"))
+        token = uuid.uuid4()
+        claimed = services.begin_generic_extraction(
+            attempt.id,
+            source_event_id=uuid.uuid4(),
+            delivery_count=1,
+            lease_generation=1,
+            lease_owner="worker",
+            lease_token=token,
+        )
+        output = GenericExtractionOutput(
+            engine=attempt.engine,
+            extractor_version=attempt.extractor_version,
+            validation_mode=attempt.validation_mode,
+            records=[
+                GenericEvidenceRecord(
+                    kind="text",
+                    locator_type="html_dom",
+                    locator={
+                        "locator_type": "html_dom",
+                        "css_selector": "main > p:nth-of-type(1)",
+                        "xpath": None,
+                    },
+                    text="A",
+                ),
+                GenericEvidenceRecord(
+                    kind="text",
+                    locator_type="html_dom",
+                    locator={
+                        "locator_type": "html_dom",
+                        "css_selector": "main > p:nth-of-type(2)",
+                        "xpath": None,
+                    },
+                    text="B",
+                ),
+            ],
+            metadata={"record_count": 2},
+        )
+
+        def put_bytes(**kwargs):
+            return tasks.ObjectInfo(
+                key=kwargs["key"],
+                version_id="result-v1",
+                checksum_sha256=kwargs["checksum_sha256"],
+                size=len(kwargs["data"]),
+                content_type=kwargs["content_type"],
+                etag="result-etag",
+            )
+
+        rights = {
+            "rights_status": "allowed",
+            "rights_basis_url": "https://example.com/rights",
+            "attribution_text": None,
+        }
+        with patch.object(tasks, "_verify_profile"), patch.object(
+            tasks, "_generic_extractor"
+        ) as extractor_factory, patch.object(tasks, "_storage") as storage_factory, patch.object(
+            tasks, "_rights", return_value=rights
+        ):
+            extractor_factory.return_value.extract.return_value = output
+            storage_factory.return_value.get_bounded_bytes.return_value = raw
+            storage_factory.return_value.put_bytes.side_effect = put_bytes
+            tasks._run_generic_extraction(
+                attempt.id,
+                expected_generation=claimed.lease_generation,
+                expected_lease_owner=claimed.lease_owner,
+                expected_lease_token=claimed.lease_token,
+            )
+
+        attempt.refresh_from_db()
+        evidence = list(attempt.derived_evidence_assets.order_by("id"))
+        self.assertEqual(len(evidence), 2)
+        self.assertNotEqual(evidence[0].locator, evidence[1].locator)
+        self.assertEqual(attempt.expected_evidence_count, 2)
+        self.assertEqual(
+            attempt.expected_evidence_manifest_hash,
+            services.generic_evidence_manifest_hash(evidence),
+        )
+        ready = OutboxMessage.objects.get(
+            topic="evidence.other_ready", aggregate_id=attempt.id
+        )
+        self.assertNotIn("evidence_asset_ids", ready.payload)
+        self.assertEqual(ready.payload["evidence_count"], 2)
+        self.assertEqual(
+            ready.payload["evidence_manifest_hash"],
+            attempt.expected_evidence_manifest_hash,
+        )
+
+        evidence[1].structured_data = {"records": [{"text": "tampered"}]}
+        evidence[1].save(update_fields=("structured_data", "updated_at"))
+        tampered = dict(ready.payload)
+        route = route_for("evidence.other_ready", 1)
+        args = outbox.routed_event_arguments(
+            event_type="evidence.other_ready",
+            event_version=1,
+            argument_keys=route.argument_keys,
+            payload=tampered,
+        )
+        with self.assertRaises(PermanentEventError):
+            tasks.consume_other_ready.run(*args)
+
+    def test_finalizer_fail_closes_terminal_attempt_when_evidence_material_changed(self):
+        attempt = _generic_attempt()
+        run = attempt.run_source_item.run
+        step = RunStep.objects.create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+            state="queued",
+            input_count=1,
+            fanout_completed_at=timezone.now(),
+        )
+        checksum = "a" * 64
+        evidence = EvidenceAsset.objects.create(
+            source_item=attempt.source_item,
+            origin_run_source_item=attempt.run_source_item,
+            derivation_type=EvidenceDerivationType.OTHER,
+            generic_extraction_attempt=attempt,
+            kind=EvidenceKind.TEXT,
+            locator_type=LocatorType.HTML_DOM,
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main > p",
+                "xpath": None,
+            },
+            extracted_text="original",
+            structured_data={"record_index": 0},
+            extraction_method=attempt.engine,
+            extractor_version=attempt.extractor_version,
+            extraction_config_hash=attempt.config_hash,
+            validation_mode=attempt.validation_mode,
+            extraction_result_checksum=checksum,
+            rights_status="allowed",
+            rights_basis_url="https://example.com/rights",
+            review_state="passed",
+            evidence_content_hash=services.evidence_content_hash(
+                text="original", structured_data={"record_index": 0}, checksum=None
+            ),
+            review_subject_hash=SHA,
+        )
+        evidence.review_subject_hash = services.calculate_review_subject_hash(evidence)
+        evidence.publishable = services.calculate_publishable(evidence)
+        evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
+        attempt.state = ExtractionState.SUCCEEDED
+        attempt.result_checksum = checksum
+        attempt.evidence_asset = evidence
+        attempt.expected_evidence_count = 1
+        attempt.expected_evidence_manifest_hash = services.generic_evidence_manifest_hash([evidence])
+        attempt.terminal_event_key = f"evidence.other_ready:{attempt.id}:{checksum}"
+        attempt.terminal_state = "ready"
+        attempt.save()
+
+        evidence.extracted_text = "changed without refreshing hashes"
+        evidence.save(update_fields=("extracted_text", "updated_at"))
+        result = tasks.finalize_run_evidence.run(str(run.id))
+
+        run.refresh_from_db()
+        step.refresh_from_db()
+        self.assertEqual(result["state"], RunState.FAILED)
+        self.assertEqual(run.state, RunState.FAILED)
+        self.assertEqual(run.recovery_state, "manual_required")
+        self.assertEqual(step.error_code, "generic_evidence_manifest_invalid")
+
+    def test_finalizer_manifest_failure_closes_active_siblings_children_and_ledgers(self):
+        attempt = _generic_attempt()
+        run = attempt.run_source_item.run
+        step = RunStep.objects.create(
+            run=run,
+            name="extract",
+            attempt_no=1,
+            state="queued",
+            input_count=3,
+            fanout_completed_at=timezone.now(),
+        )
+        evidence = self._terminal_generic_evidence(attempt)
+        evidence.extracted_text = "tampered"
+        evidence.save(update_fields=("extracted_text", "updated_at"))
+
+        sibling = _generic_for_lineage(attempt.run_source_item, attempt.source_item)
+        sibling_event = uuid.uuid4()
+        sibling_token = uuid.uuid4()
+        GenericExtractionAttempt.objects.filter(pk=sibling.id).update(
+            state=ExtractionState.RUNNING,
+            source_event_id=sibling_event,
+            lease_generation=3,
+            delivery_count=3,
+            lease_owner="worker-b",
+            lease_token=sibling_token,
+            next_retry_at=timezone.now(),
+        )
+        document = DocumentExtraction.objects.create(
+            run_source_item=attempt.run_source_item,
+            source_item=attempt.source_item,
+            input_object_key="evidence/raw/sibling.pdf",
+            input_object_version="v1",
+            input_kind="pdf",
+            input_fingerprint=uuid.uuid4().hex + uuid.uuid4().hex,
+            input_mime_type="application/pdf",
+            input_checksum=SHA,
+            input_page_count=1,
+            expected_page_indices=[0],
+            state=ExtractionState.QUEUED,
+        )
+        child = _document_child(document)
+        child_event = uuid.uuid4()
+        ExtractionRun.objects.filter(pk=child.id).update(
+            state=ExtractionState.RUNNING,
+            source_event_id=child_event,
+            lease_generation=2,
+            delivery_count=2,
+            lease_owner="child-worker",
+            lease_token=uuid.uuid4(),
+            next_retry_at=timezone.now(),
+        )
+        reservation = ExtractionObjectWriteReservation.objects.create(
+            aggregate_kind="generic",
+            aggregate_id=sibling.id,
+            source_event_id=sibling_event,
+            lease_generation=3,
+            lease_identity_hash="b" * 64,
+            purpose=ExtractionObjectWritePurpose.RESULT,
+            object_key="evidence/results/sibling.json",
+            state=ExtractionObjectWriteState.UPLOADED,
+            object_version="version-1",
+            checksum="c" * 64,
+            byte_size=7,
+            content_type="application/json",
+            uploaded_at=timezone.now(),
+        )
+
+        result = tasks.finalize_run_evidence.run(str(run.id))
+
+        sibling.refresh_from_db()
+        document.refresh_from_db()
+        child.refresh_from_db()
+        reservation.refresh_from_db()
+        self.assertEqual(result["state"], RunState.FAILED)
+        for aggregate in (sibling, document, child):
+            self.assertEqual(aggregate.state, ExtractionState.FAILED)
+            self.assertIsNone(aggregate.next_retry_at)
+            self.assertEqual(aggregate.lease_owner, "")
+            self.assertIsNone(aggregate.lease_token)
+            self.assertEqual(aggregate.terminal_state, "failed")
+        self.assertEqual(reservation.state, ExtractionObjectWriteState.ORPHANED)
+
+    def test_generic_validator_rejects_deterministic_low_confidence_attempt(self):
+        attempt = _generic_attempt()
+        # The direct update deliberately bypasses model clean to reproduce a
+        # historical invalid row while respecting terminal identity immutability.
+        evidence = self._terminal_generic_evidence(
+            attempt,
+            state=ExtractionState.LOW_CONFIDENCE,
+        )
+        EvidenceAsset.objects.filter(pk=evidence.id).update(publishable=False)
+        evidence = EvidenceAsset.objects.select_related(
+            "generic_extraction_attempt"
+        ).get(pk=evidence.id)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Only calibrated generic extraction can be low-confidence",
+        ):
+            services.validate_generic_evidence_set(attempt, [evidence])
+
+    def test_terminal_generic_manifest_fields_are_database_immutable(self):
+        attempt = _generic_attempt()
+        self._terminal_generic_evidence(attempt)
+        with self.assertRaises(DatabaseError), transaction.atomic():
+            GenericExtractionAttempt.objects.filter(pk=attempt.id).update(
+                expected_evidence_count=2,
+                expected_evidence_manifest_hash="d" * 64,
+            )
+
+    def test_0006_postgresql_trigger_uses_generic_specific_function(self):
+        migration = importlib.import_module(
+            "apps.evidence.migrations.0006_generic_evidence_manifest"
+        )
+        statements = []
+        editor = SimpleNamespace(
+            connection=SimpleNamespace(vendor="postgresql"),
+            execute=statements.append,
+        )
+        migration.create_generic_manifest_terminal_trigger(None, editor)
+        sql = "\n".join(statements)
+        self.assertIn("evidence_reject_generic_terminal_change", sql)
+        self.assertIn("expected_evidence_count", sql)
+        self.assertIn("expected_evidence_manifest_hash", sql)
+        self.assertNotIn(
+            "CREATE OR REPLACE FUNCTION evidence_reject_terminal_identity_change",
+            sql,
+        )
+
+    def test_0006_reverse_restores_shared_terminal_identity_trigger(self):
+        attempt = _generic_attempt()
+        self._terminal_generic_evidence(attempt)
+        executor = MigrationExecutor(connection)
+        latest = executor.loader.graph.leaf_nodes()
+        try:
+            executor.migrate([("evidence", "0005_extraction_generation_fencing")])
+            with self.assertRaises(DatabaseError), transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE evidence_genericextractionattempt SET state = %s WHERE id = %s",
+                        ["failed", attempt.id.hex],
+                    )
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate(latest)
+
+    def test_0006_backfills_exact_single_and_fail_closes_unproven_run(self):
+        valid = _generic_attempt()
+        checksum = "a" * 64
+        evidence = EvidenceAsset.objects.create(
+            source_item=valid.source_item,
+            origin_run_source_item=valid.run_source_item,
+            derivation_type=EvidenceDerivationType.OTHER,
+            generic_extraction_attempt=valid,
+            kind=EvidenceKind.TEXT,
+            locator_type=LocatorType.HTML_DOM,
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main > p",
+                "xpath": None,
+            },
+            extraction_method=valid.engine,
+            extractor_version=valid.extractor_version,
+            extraction_config_hash=valid.config_hash,
+            validation_mode=valid.validation_mode,
+            extraction_result_checksum=checksum,
+            evidence_content_hash=services.evidence_content_hash(
+                text=None, structured_data=None, checksum=None
+            ),
+            review_subject_hash="c" * 64,
+        )
+        valid.state = ExtractionState.SUCCEEDED
+        valid.result_checksum = checksum
+        valid.evidence_asset = evidence
+        valid.terminal_event_key = f"evidence.other_ready:{valid.id}:{checksum}"
+        valid.terminal_state = "ready"
+        valid.expected_evidence_count = 1
+        valid.expected_evidence_manifest_hash = SHA
+        valid.save()
+        evidence.review_subject_hash = services.calculate_review_subject_hash(evidence)
+        evidence.save(update_fields=("review_subject_hash", "updated_at"))
+
+        invalid_locator = _generic_for_lineage(valid.run_source_item, valid.source_item)
+        invalid_checksum = "e" * 64
+        invalid_evidence = EvidenceAsset.objects.create(
+            source_item=invalid_locator.source_item,
+            origin_run_source_item=invalid_locator.run_source_item,
+            derivation_type=EvidenceDerivationType.OTHER,
+            generic_extraction_attempt=invalid_locator,
+            kind=EvidenceKind.TEXT,
+            locator_type=LocatorType.HTML_DOM,
+            locator={
+                "locator_type": LocatorType.HTML_DOM,
+                "css_selector": "main",
+                "xpath": "/html/body/main",
+            },
+            extraction_method=invalid_locator.engine,
+            extractor_version=invalid_locator.extractor_version,
+            extraction_config_hash=invalid_locator.config_hash,
+            validation_mode=invalid_locator.validation_mode,
+            extraction_result_checksum=invalid_checksum,
+            evidence_content_hash=services.evidence_content_hash(
+                text=None, structured_data=None, checksum=None
+            ),
+            review_subject_hash=SHA,
+        )
+        invalid_locator.result_checksum = invalid_checksum
+        invalid_evidence.review_subject_hash = services.calculate_review_subject_hash(
+            invalid_evidence
+        )
+        invalid_evidence.save(update_fields=("review_subject_hash", "updated_at"))
+        GenericExtractionAttempt.objects.filter(pk=invalid_locator.id).update(
+            state=ExtractionState.SUCCEEDED,
+            result_checksum=invalid_checksum,
+            evidence_asset=invalid_evidence,
+            expected_evidence_count=1,
+            expected_evidence_manifest_hash=SHA,
+            terminal_event_key=(
+                f"evidence.other_ready:{invalid_locator.id}:{invalid_checksum}"
+            ),
+            terminal_state="ready",
+        )
+
+        unproven = _generic_attempt()
+        unproven.state = ExtractionState.SUCCEEDED
+        unproven.result_checksum = "d" * 64
+        unproven.terminal_event_key = (
+            f"evidence.other_ready:{unproven.id}:{unproven.result_checksum}"
+        )
+        unproven.terminal_state = "ready"
+        unproven.expected_evidence_count = 1
+        unproven.expected_evidence_manifest_hash = SHA
+        unproven.save()
+        step = RunStep.objects.create(
+            run=unproven.run_source_item.run,
+            name="extract",
+            attempt_no=1,
+            state="queued",
+        )
+        active = _generic_for_lineage(
+            unproven.run_source_item,
+            unproven.source_item,
+        )
+        active_event = uuid.uuid4()
+        GenericExtractionAttempt.objects.filter(pk=active.id).update(
+            state=ExtractionState.RUNNING,
+            source_event_id=active_event,
+            lease_generation=4,
+            delivery_count=4,
+            lease_owner="migration-worker",
+            lease_token=uuid.uuid4(),
+            next_retry_at=timezone.now(),
+        )
+        uploaded = ExtractionObjectWriteReservation.objects.create(
+            aggregate_kind="generic",
+            aggregate_id=active.id,
+            source_event_id=active_event,
+            lease_generation=4,
+            lease_identity_hash="a" * 64,
+            purpose=ExtractionObjectWritePurpose.RESULT,
+            object_key="evidence/results/migration-uploaded.json",
+            state=ExtractionObjectWriteState.UPLOADED,
+            object_version="version-1",
+            checksum="b" * 64,
+            byte_size=3,
+            content_type="application/json",
+            uploaded_at=timezone.now(),
+        )
+        bound = ExtractionObjectWriteReservation.objects.create(
+            aggregate_kind="generic",
+            aggregate_id=active.id,
+            source_event_id=active_event,
+            lease_generation=4,
+            lease_identity_hash="a" * 64,
+            purpose=ExtractionObjectWritePurpose.REASON,
+            object_key="evidence/results/migration-bound.json",
+            state=ExtractionObjectWriteState.BOUND,
+            object_version="version-2",
+            checksum="c" * 64,
+            byte_size=4,
+            content_type="application/json",
+            uploaded_at=timezone.now(),
+            bound_at=timezone.now(),
+        )
+
+        executor = MigrationExecutor(connection)
+        latest = executor.loader.graph.leaf_nodes()
+        try:
+            executor.migrate([("evidence", "0005_extraction_generation_fencing")])
+            executor = MigrationExecutor(connection)
+            executor.migrate([("evidence", "0006_generic_evidence_manifest")])
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate(latest)
+
+        valid.refresh_from_db()
+        invalid_locator.refresh_from_db()
+        invalid_evidence.refresh_from_db()
+        unproven.refresh_from_db()
+        active.refresh_from_db()
+        uploaded.refresh_from_db()
+        bound.refresh_from_db()
+        step.refresh_from_db()
+        self.assertEqual(
+            valid.expected_evidence_count,
+            1,
+            valid.error_detail_redacted,
+        )
+        self.assertEqual(
+            valid.expected_evidence_manifest_hash,
+            services.generic_evidence_manifest_hash([evidence]),
+        )
+        self.assertEqual(unproven.expected_evidence_count, 0)
+        self.assertEqual(
+            unproven.expected_evidence_manifest_hash,
+            services.canonical_hash([]),
+        )
+        self.assertEqual(unproven.state, ExtractionState.SUCCEEDED)
+        self.assertEqual(invalid_locator.expected_evidence_count, 0)
+        self.assertTrue(invalid_evidence.manual_review_required)
+        self.assertFalse(invalid_evidence.publishable)
+        self.assertEqual(active.state, ExtractionState.FAILED)
+        self.assertIsNone(active.next_retry_at)
+        self.assertEqual(uploaded.state, ExtractionObjectWriteState.ORPHANED)
+        self.assertEqual(uploaded.object_version, "version-1")
+        self.assertEqual(bound.state, ExtractionObjectWriteState.BOUND)
+        self.assertEqual(
+            CollectionRun.objects.get(pk=unproven.run_source_item.run_id).state,
+            RunState.FAILED,
+        )
+        self.assertEqual(step.state, "failed")
+        self.assertEqual(step.recovery_state, "manual_required")

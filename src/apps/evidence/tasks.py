@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
+from django.core.exceptions import ValidationError
 from django.db import DatabaseError, transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -28,6 +29,7 @@ from adapters.extractors.base import (
 from adapters.extractors.html import HtmlExtractor
 from adapters.extractors.hwpx import HwpxExtractor
 from adapters.extractors.legacy_hwp import LegacyHwpConverter
+from adapters.extractors.media import inspect_static_image
 from adapters.extractors.native_pdf import NativePdfExtractor
 from adapters.extractors.paddleocr import PaddleOCRExtractor
 from adapters.extractors.spreadsheet import SpreadsheetExtractor
@@ -101,6 +103,8 @@ from .services import (
     extraction_fingerprint,
     generic_extraction_fingerprint,
     group_routes,
+    generic_evidence_manifest_hash,
+    validate_generic_evidence_set,
     generic_extraction_completion_fence,
     normalize_low_confidence_reasons,
     orphan_unbound_extraction_object_writes,
@@ -125,6 +129,59 @@ EXTRACTABLE_SOURCE_DISCOVERY_KINDS = (
     SourceDiscoveryKind.CORRECTED,
     SourceDiscoveryKind.RESTORED,
 )
+
+MAX_EXTERNAL_DOCUMENT_BYTES = 12 * 1024 * 1024
+MAX_DERIVED_DOCUMENT_BYTES = 64 * 1024 * 1024
+
+GENERIC_ENGINE_FACTORIES = {
+    ExtractionEngine.HTML: HtmlExtractor,
+    ExtractionEngine.STRUCTURED: StructuredDataExtractor,
+    ExtractionEngine.SPREADSHEET: SpreadsheetExtractor,
+    ExtractionEngine.HWPX: HwpxExtractor,
+    ExtractionEngine.LEGACY_HWP: LegacyHwpConverter,
+}
+
+
+def _read_frozen_object(
+    *,
+    storage: S3ObjectStorage,
+    key: str,
+    version_id: str,
+    expected_size: int | None,
+    expected_checksum: str,
+    hard_max_bytes: int,
+) -> bytes:
+    if not version_id:
+        raise ExtractorError("input_version_missing", "A frozen input object version is required")
+    if (
+        not expected_checksum
+        or len(expected_checksum) != 64
+        or any(character not in "0123456789abcdef" for character in expected_checksum)
+    ):
+        raise ExtractorError("generic_input_missing", "Input checksum provenance is incomplete")
+    if expected_size is not None and (type(expected_size) is not int or expected_size < 1):
+        raise ExtractorError("generic_input_missing", "Input byte-size provenance is invalid")
+    max_bytes = hard_max_bytes if expected_size is None else min(expected_size, hard_max_bytes)
+    try:
+        data = storage.get_bounded_bytes(
+            key=key,
+            version_id=version_id,
+            max_bytes=max_bytes,
+        )
+    except (OSError, ValueError) as exc:
+        raise ExtractorError(
+            "input_identity_mismatch",
+            "Frozen object storage input differs from bounded provenance",
+        ) from exc
+    if (
+        (expected_size is not None and len(data) != expected_size)
+        or hashlib.sha256(data).hexdigest() != expected_checksum
+    ):
+        raise ExtractorError(
+            "input_checksum_mismatch",
+            "Downloaded input differs from frozen provenance",
+        )
+    return data
 
 
 def _legacy_hwp_protocol_generation(database_lease_generation: int) -> int:
@@ -462,6 +519,7 @@ def _has_complete_legacy_hwp_pdf(
     checksum = evidence.checksum
     material_complete = (
         bool(evidence.object_key)
+        and bool(evidence.object_version)
         and isinstance(checksum, str)
         and len(checksum) == 64
         and all(character in "0123456789abcdef" for character in checksum)
@@ -611,7 +669,7 @@ def _converge_legacy_hwp_document_locked(
         source_item=attempt.source_item,
         input_asset=evidence,
         input_object_key=evidence.object_key,
-        input_object_version=evidence.object_version or evidence.checksum,
+        input_object_version=evidence.object_version,
         input_kind=DocumentInputKind.PDF,
         input_mime_type="application/pdf",
         input_checksum=evidence.checksum,
@@ -849,6 +907,39 @@ def _verify_profile(profile: ExtractionProfileSnapshot) -> None:
         raise ExtractorError("profile_material_mismatch", "Extraction profile material hash does not match")
     if profile.model_manifest is not None and canonical_hash(profile.model_manifest) != profile.model_manifest_hash:
         raise ExtractorError("model_manifest_mismatch", "Model manifest hash does not match")
+    try:
+        from .profiles import release_profile_snapshot_values
+
+        released = release_profile_snapshot_values(profile)
+    except ValidationError as exc:
+        raise ExtractorError(
+            "profile_release_mismatch",
+            "Frozen extraction profile is not executable by the active release",
+        ) from exc
+    comparable_fields = (
+        "profile_key",
+        "profile_version",
+        "engine",
+        "extractor_version",
+        "package_version",
+        "runtime_version",
+        "pipeline_name",
+        "implementation_manifest_hash",
+        "config",
+        "config_hash",
+        "validation_mode",
+        "calibration_profile_key",
+        "calibration_profile_version",
+        "calibration_profile_hash",
+        "model_manifest",
+        "model_manifest_hash",
+        "profile_material_hash",
+    )
+    if any(getattr(profile, field) != released[field] for field in comparable_fields):
+        raise ExtractorError(
+            "profile_release_mismatch",
+            "Frozen extraction profile differs from the active release material",
+        )
 
 
 def _lock_expected_fanout(run_id: Any, fence: Mapping[str, Any]) -> RunStep:
@@ -1043,6 +1134,15 @@ def _reusable_object_info(
     )
 
 
+def _required_object_version(info: ObjectInfo) -> str:
+    if not isinstance(info.version_id, str) or not info.version_id.strip():
+        raise ExtractorError(
+            "object_version_missing",
+            "Versioned object storage did not return an immutable object version",
+        )
+    return info.version_id
+
+
 def _persist_attachment(
     run_source_item,
     attachment: Mapping[str, Any],
@@ -1083,9 +1183,10 @@ def _persist_attachment(
                 "run_source_item_id": str(run_source_item.id),
             },
         )
+        object_version = _required_object_version(info)
         mark_extraction_object_uploaded(
             reservation.id,
-            object_version=info.version_id or info.etag or checksum,
+            object_version=object_version,
             object_etag=info.etag,
             checksum=info.checksum_sha256,
             byte_size=info.size,
@@ -1147,7 +1248,7 @@ def _persist_attachment(
                 },
                 "object_key": info.key,
                 "object_version": (
-                    info.version_id or info.etag or checksum
+                    _required_object_version(info)
                 ),
                 "mime_type": info.content_type,
                 "byte_size": info.size,
@@ -1411,9 +1512,10 @@ def _store_result(
             checksum_sha256=checksum,
             metadata={"aggregate_id": str(aggregate.id)},
         )
+        object_version = _required_object_version(info)
         mark_extraction_object_uploaded(
             reservation.id,
-            object_version=info.version_id or info.etag or checksum,
+            object_version=object_version,
             object_etag=info.etag,
             checksum=info.checksum_sha256,
             byte_size=info.size,
@@ -1473,9 +1575,10 @@ def _store_converted_pdf(
             expected_size=converted_size,
             metadata={"generic_attempt_id": str(attempt.id)},
         )
+        object_version = _required_object_version(info)
         mark_extraction_object_uploaded(
             reservation.id,
-            object_version=info.version_id or info.etag or converted_checksum,
+            object_version=object_version,
             object_etag=info.etag,
             checksum=info.checksum_sha256,
             byte_size=info.size,
@@ -1692,7 +1795,46 @@ def _load_or_create_document_plan(
                 preferred = "paddle-en-v1" if language == "en" else "paddle-ko-v1"
             elif engine == ExtractionEngine.NATIVE_PDF:
                 preferred = "native-pdf-v1"
-            profile = _profile(engine, preferred_key=preferred)
+            safety = (
+                document.routing_manifest.get("safety")
+                if isinstance(document.routing_manifest, dict)
+                else None
+            )
+            frozen_routing = (
+                safety.get("routing_profiles", {})
+                if isinstance(safety, dict)
+                else {}
+            )
+            frozen_profile = frozen_routing.get(engine)
+            if not isinstance(frozen_profile, dict) and isinstance(safety, dict) and safety.get("engine") == engine:
+                frozen_profile = safety
+            if isinstance(frozen_profile, dict):
+                try:
+                    profile = ExtractionProfileSnapshot.objects.get(
+                        pk=frozen_profile.get("profile_snapshot_id"),
+                        engine=engine,
+                    )
+                except ExtractionProfileSnapshot.DoesNotExist as exc:
+                    raise ExtractorError(
+                        "safety_profile_missing",
+                        "Frozen routing profile is missing",
+                    ) from exc
+                if (
+                    profile.profile_material_hash != frozen_profile.get("profile_material_hash")
+                    or profile.config_hash != frozen_profile.get("config_hash")
+                ):
+                    raise ExtractorError(
+                        "safety_profile_mismatch",
+                        "Frozen routing profile material changed",
+                    )
+                _verify_profile(profile)
+            elif safety is not None:
+                raise ExtractorError(
+                    "safety_profile_missing",
+                    "Frozen safety routing omitted a selected engine profile",
+                )
+            else:
+                profile = _profile(engine, preferred_key=preferred)
             page_set_hash, fingerprint = extraction_fingerprint(document, profile, pages)
             child, _ = ExtractionRun.objects.get_or_create(
                 document_extraction=document,
@@ -1720,8 +1862,18 @@ def _load_or_create_document_plan(
                 },
             )
             selected_by_engine[engine] = child
+        frozen_safety = (
+            {
+                key: document.routing_manifest.get(key)
+                for key in ("safety", "safety_material_hash")
+                if key in document.routing_manifest
+            }
+            if isinstance(document.routing_manifest, dict)
+            else {}
+        )
         document.routing_manifest = {
             "schema_version": "extraction-routing-v2",
+            **frozen_safety,
             "pages": [
                 {
                     "page_index": route.page_index,
@@ -1737,6 +1889,91 @@ def _load_or_create_document_plan(
         }
         document.save(update_fields=("routing_manifest", "updated_at"))
         return selected_by_engine
+
+
+def _frozen_document_safety_profile(
+    document_id: Any,
+    *,
+    engine: str,
+    expected_generation: int,
+    expected_lease_owner: str,
+    expected_lease_token: uuid.UUID,
+    preferred_key: str | None = None,
+    additional_profiles: tuple[tuple[str, str | None], ...] = (),
+) -> ExtractionProfileSnapshot:
+    with document_extraction_completion_fence(
+        document_id,
+        expected_generation=expected_generation,
+        expected_lease_owner=expected_lease_owner,
+        expected_lease_token=expected_lease_token,
+    ) as document:
+        if document is None:
+            raise EvidenceConflict("Document extraction lease was lost before safety routing")
+        manifest = dict(document.routing_manifest or {})
+        safety = manifest.get("safety")
+        if safety is not None:
+            if (
+                not isinstance(safety, dict)
+                or manifest.get("safety_material_hash") != canonical_hash(safety)
+                or safety.get("engine") != engine
+            ):
+                raise ExtractorError(
+                    "safety_profile_mismatch",
+                    "Frozen document inspection safety material is invalid",
+                )
+            try:
+                profile = ExtractionProfileSnapshot.objects.get(
+                    pk=safety.get("profile_snapshot_id"),
+                    engine=engine,
+                )
+            except ExtractionProfileSnapshot.DoesNotExist as exc:
+                raise ExtractorError(
+                    "safety_profile_missing",
+                    "Frozen document inspection profile is missing",
+                ) from exc
+            if (
+                profile.profile_material_hash != safety.get("profile_material_hash")
+                or profile.config_hash != safety.get("config_hash")
+            ):
+                raise ExtractorError(
+                    "safety_profile_mismatch",
+                    "Frozen document inspection profile differs from its routing material",
+                )
+            _verify_profile(profile)
+            return profile
+        if manifest.get("pages"):
+            raise ExtractorError(
+                "safety_profile_missing",
+                "Legacy document routing has no frozen inspection safety material",
+            )
+        profile = _profile(engine, preferred_key=preferred_key)
+        routing_profiles = {}
+        for routing_engine, routing_key in ((engine, preferred_key), *additional_profiles):
+            routed = profile if routing_engine == engine else _profile(
+                routing_engine, preferred_key=routing_key
+            )
+            routing_profiles[routing_engine] = {
+                "engine": routed.engine,
+                "profile_snapshot_id": str(routed.id),
+                "profile_material_hash": routed.profile_material_hash,
+                "config_hash": routed.config_hash,
+            }
+        safety = {
+            "engine": profile.engine,
+            "profile_snapshot_id": str(profile.id),
+            "profile_material_hash": profile.profile_material_hash,
+            "config_hash": profile.config_hash,
+            "routing_profiles": routing_profiles,
+        }
+        manifest.update({
+            "schema_version": "extraction-routing-v2",
+            "safety": safety,
+            "safety_material_hash": canonical_hash(safety),
+            "pages": [],
+        })
+        document.routing_manifest = manifest
+        document.save(update_fields=("routing_manifest", "updated_at"))
+        return profile
 
 
 def _run_document_extraction(
@@ -1769,26 +2006,60 @@ def _run_document_extraction(
     ) as current_document:
         if current_document is None:
             return DocumentExtraction.objects.get(pk=document_id)
-    data = _storage().get_bytes(key=document.input_object_key, version_id=document.input_object_version or None)
-    if hashlib.sha256(data).hexdigest() != document.input_checksum:
-        raise ExtractorError("input_checksum_mismatch", "Downloaded input checksum differs from provenance")
+    input_size = document.input_asset.byte_size if document.input_asset_id else None
+    raw_external = bool(
+        document.input_asset_id
+        and document.input_asset.derivation_type == EvidenceDerivationType.RAW
+    )
+    data = _read_frozen_object(
+        storage=_storage(),
+        key=document.input_object_key,
+        version_id=document.input_object_version,
+        expected_size=input_size,
+        expected_checksum=document.input_checksum,
+        hard_max_bytes=(
+            MAX_EXTERNAL_DOCUMENT_BYTES if raw_external else MAX_DERIVED_DOCUMENT_BYTES
+        ),
+    )
     suffix = ".pdf" if document.input_kind == DocumentInputKind.PDF else ".img"
     with tempfile.TemporaryDirectory(prefix="wisdome-evidence-") as temp_dir:
         path = Path(temp_dir) / f"input{suffix}"
         path.write_bytes(data)
-        native = NativePdfExtractor()
         if document.input_kind == DocumentInputKind.PDF:
-            inspection = native.inspect(path)
+            language = document.run_source_item.source_snapshot.config.get(
+                "ocrLanguage", "ko"
+            )
+            native_profile = _frozen_document_safety_profile(
+                document.id,
+                engine=ExtractionEngine.NATIVE_PDF,
+                preferred_key="native-pdf-v1",
+                expected_generation=expected_generation,
+                expected_lease_owner=expected_lease_owner,
+                expected_lease_token=expected_lease_token,
+                additional_profiles=((
+                    ExtractionEngine.PADDLEOCR,
+                    "paddle-en-v1" if language == "en" else "paddle-ko-v1",
+                ),),
+            )
+            inspection = NativePdfExtractor(native_profile.config).inspect(path)
             if inspection.checksum != document.input_checksum:
                 raise ExtractorError("input_checksum_mismatch", "Local PDF checksum differs from provenance")
             document.input_page_count = inspection.page_count
             document.expected_page_indices = list(range(inspection.page_count))
             routes = route_pdf_pages(signal.as_dict() for signal in inspection.page_signals)
         else:
-            from PIL import Image
-            with Image.open(path) as image:
-                if getattr(image, "n_frames", 1) != 1:
-                    raise ExtractorError("unsupported_multiframe_image", "Animated/multi-frame images are rejected")
+            language = document.run_source_item.source_snapshot.config.get(
+                "ocrLanguage", "ko"
+            )
+            paddle_profile = _frozen_document_safety_profile(
+                document.id,
+                engine=ExtractionEngine.PADDLEOCR,
+                preferred_key=("paddle-en-v1" if language == "en" else "paddle-ko-v1"),
+                expected_generation=expected_generation,
+                expected_lease_owner=expected_lease_owner,
+                expected_lease_token=expected_lease_token,
+            )
+            inspect_static_image(path, paddle_profile.config)
             document.input_page_count = 1
             document.input_frame_count = 1
             document.expected_page_indices = [0]
@@ -1903,7 +2174,7 @@ def _run_document_extraction(
                 if reason_info is not None:
                     run.low_confidence_reasons_object_key = reason_info.key
                     run.low_confidence_reasons_object_version = (
-                        reason_info.version_id or reason_info.etag
+                        _required_object_version(reason_info)
                     )
                 run.duration_ms = duration_ms
                 run.finished_at = finished_at
@@ -2016,17 +2287,49 @@ def _run_document_extraction(
 
 
 def _generic_extractor(profile: ExtractionProfileSnapshot):
-    mapping = {
-        ExtractionEngine.HTML: HtmlExtractor,
-        ExtractionEngine.STRUCTURED: StructuredDataExtractor,
-        ExtractionEngine.SPREADSHEET: SpreadsheetExtractor,
-        ExtractionEngine.HWPX: HwpxExtractor,
-        ExtractionEngine.LEGACY_HWP: LegacyHwpConverter,
-    }
     try:
-        return mapping[profile.engine](profile.config)
+        return GENERIC_ENGINE_FACTORIES[profile.engine](profile.config)
     except KeyError as exc:
         raise ExtractorError("generic_engine_unsupported", f"No local adapter for {profile.engine}") from exc
+
+
+def _validate_generic_output(
+    profile: ExtractionProfileSnapshot,
+    output: GenericExtractionOutput,
+) -> None:
+    if (
+        output.engine != profile.engine
+        or output.extractor_version != profile.extractor_version
+        or output.validation_mode != profile.validation_mode
+    ):
+        raise ExtractorError(
+            "generic_output_identity_mismatch",
+            "Generic extractor output differs from the frozen profile identity",
+        )
+    if not output.records:
+        raise ExtractorError("generic_result_empty", "Generic extractor returned no evidence records")
+    configured_limit = int(getattr(profile, "config", {}).get("max_records", 50_000))
+    if len(output.records) > min(max(configured_limit, 1), 50_000):
+        raise ExtractorError(
+            "generic_record_limit_exceeded",
+            "Generic extractor returned more records than the frozen safety limit",
+        )
+    if profile.engine == ExtractionEngine.LEGACY_HWP and len(output.records) != 1:
+        raise ExtractorError(
+            "legacy_hwp_output_invalid",
+            "Legacy HWP conversion must return exactly one verified PDF record",
+        )
+    calibrated = profile.validation_mode == GenericValidationMode.CALIBRATED
+    if calibrated and any(record.confidence is None for record in output.records):
+        raise ExtractorError(
+            "generic_confidence_missing",
+            "Calibrated generic output omitted numeric confidence",
+        )
+    if not calibrated and any(record.confidence is not None for record in output.records):
+        raise ExtractorError(
+            "generic_confidence_unapproved",
+            "Non-calibrated generic output included numeric confidence",
+        )
 
 
 def _is_quarantined_generic_attempt(
@@ -2115,6 +2418,7 @@ def _run_generic_extraction(
                 not attempt.input_asset.checksum
                 or not isinstance(attempt.input_asset.byte_size, int)
                 or attempt.input_asset.byte_size < 1
+                or not attempt.input_asset.object_version
             ):
                 raise ExtractorError(
                     "generic_input_missing",
@@ -2123,7 +2427,7 @@ def _run_generic_extraction(
             try:
                 _storage().get_file(
                     key=attempt.input_asset.object_key,
-                    version_id=attempt.input_asset.object_version or None,
+                    version_id=attempt.input_asset.object_version,
                     destination=path,
                     expected_checksum_sha256=attempt.input_asset.checksum,
                     expected_size=attempt.input_asset.byte_size,
@@ -2134,19 +2438,14 @@ def _run_generic_extraction(
                     "Downloaded legacy HWP input differs from provenance",
                 ) from exc
         else:
-            data = _storage().get_bytes(
+            data = _read_frozen_object(
+                storage=_storage(),
                 key=attempt.input_asset.object_key,
-                version_id=attempt.input_asset.object_version or None,
+                version_id=attempt.input_asset.object_version or "",
+                expected_size=attempt.input_asset.byte_size,
+                expected_checksum=attempt.input_asset.checksum or "",
+                hard_max_bytes=MAX_DERIVED_DOCUMENT_BYTES,
             )
-            if (
-                attempt.input_asset.checksum
-                and hashlib.sha256(data).hexdigest()
-                != attempt.input_asset.checksum
-            ):
-                raise ExtractorError(
-                    "input_checksum_mismatch",
-                    "Downloaded input checksum differs from provenance",
-                )
             path.write_bytes(data)
         with generic_extraction_completion_fence(
             attempt.id,
@@ -2165,6 +2464,7 @@ def _run_generic_extraction(
             )
         else:
             output = extractor.extract(path)
+        _validate_generic_output(profile, output)
         result, result_reservation_id = _store_result(
             "generic", attempt, output.as_dict()
         )
@@ -2176,14 +2476,9 @@ def _run_generic_extraction(
             )
         else:
             reason_reservation_id = None
-        records = [record.as_dict() for record in output.records]
         first = output.records[0] if output.records else None
         if first is None:
             raise ExtractorError("generic_result_empty", "Generic extractor returned no evidence records")
-        text = "\n\n".join(record.text for record in output.records if record.text)
-        structured = {"records": records, "metadata": dict(output.metadata)}
-        content_hash = evidence_content_hash(text=text or None, structured_data=structured, checksum=None)
-        kind = first.kind if first.kind in EvidenceKind.values else EvidenceKind.TEXT
         legacy_info = None
         if profile.engine == ExtractionEngine.LEGACY_HWP:
             converted_path = Path(first.object_path or "")
@@ -2231,92 +2526,104 @@ def _run_generic_extraction(
                 return attempt
             if attempt.state in (ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE):
                 return _converge_legacy_hwp_document_locked(attempt)
-            attempt.state = (
-                ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
-            )
             attempt.result_checksum = result.checksum_sha256
             attempt.low_confidence_reasons_hash = canonical_hash(reasons) if reasons else None
             if reason_info:
                 attempt.low_confidence_reasons_object_key = reason_info.key
                 attempt.low_confidence_reasons_object_version = (
-                    reason_info.version_id or reason_info.etag
+                    _required_object_version(reason_info)
                 )
+            ready_event_key = (
+                f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
+            )
+            manual = bool(reasons)
+            rights = _rights(attempt.run_source_item)
+            evidence_assets: list[EvidenceAsset] = []
+            for record_index, record in enumerate(output.records):
+                record_material = record.as_dict()
+                record_material["object_path"] = None
+                structured = {
+                    "records": [record_material],
+                    "metadata": dict(output.metadata),
+                    "record_index": record_index,
+                }
+                storage_fields = {}
+                if legacy_info and record_index == 0:
+                    info, converted_checksum, converted_size, _, _ = legacy_info
+                    storage_fields = {
+                        "object_key": info.key,
+                        "object_version": _required_object_version(info),
+                        "mime_type": "application/pdf",
+                        "byte_size": converted_size,
+                        "checksum": converted_checksum,
+                    }
+                evidence = EvidenceAsset(
+                    source_item=attempt.source_item,
+                    origin_run_source_item=attempt.run_source_item,
+                    derivation_type=EvidenceDerivationType.OTHER,
+                    generic_extraction_attempt=attempt,
+                    parent_asset=attempt.input_asset,
+                    kind=record.kind,
+                    locator_type=record.locator_type,
+                    locator=dict(record.locator),
+                    extracted_text=record.text or None,
+                    structured_data=structured,
+                    extraction_method=profile.engine,
+                    extractor_version=profile.extractor_version,
+                    extraction_config_hash=profile.config_hash,
+                    validation_mode=profile.validation_mode,
+                    extraction_result_checksum=attempt.result_checksum,
+                    calibration_profile_key=profile.calibration_profile_key,
+                    calibration_profile_version=profile.calibration_profile_version,
+                    calibration_profile_hash=profile.calibration_profile_hash,
+                    confidence=(
+                        record.confidence
+                        if profile.validation_mode == GenericValidationMode.CALIBRATED
+                        else None
+                    ),
+                    low_confidence_reasons=reasons,
+                    evidence_content_hash=evidence_content_hash(
+                        text=record.text or None,
+                        structured_data=structured,
+                        checksum=storage_fields.get("checksum"),
+                    ),
+                    review_subject_hash="0" * 64,
+                    review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
+                    manual_review_required=manual,
+                    alt_text=record.alt_text,
+                    **storage_fields,
+                    **rights,
+                )
+                evidence.save()
+                evidence.review_subject_hash = calculate_review_subject_hash(evidence)
+                evidence.publishable = calculate_publishable(evidence)
+                evidence.full_clean()
+                evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
+                evidence_assets.append(evidence)
+
+            evidence = evidence_assets[0]
+            attempt.evidence_asset = evidence
+            attempt.expected_evidence_count = len(evidence_assets)
+            attempt.expected_evidence_manifest_hash = generic_evidence_manifest_hash(
+                evidence_assets
+            )
+            attempt.state = (
+                ExtractionState.LOW_CONFIDENCE if reasons else ExtractionState.SUCCEEDED
+            )
             attempt.finished_at = timezone.now()
             attempt.next_retry_at = None
             attempt.lease_owner = ""
             attempt.lease_token = None
-            ready_event_key = (
-                f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
-            )
             attempt.terminal_event_key = ready_event_key
             attempt.terminal_state = "ready"
             attempt.full_clean()
             attempt.save()
-
-            manual = attempt.state == ExtractionState.LOW_CONFIDENCE
-            rights = _rights(attempt.run_source_item)
-            storage_fields = {}
-            if legacy_info:
-                info, converted_checksum, converted_size, _, _ = legacy_info
-                storage_fields = {
-                    "object_key": info.key,
-                    "object_version": info.version_id or info.etag or converted_checksum,
-                    "mime_type": "application/pdf",
-                    "byte_size": converted_size,
-                    "checksum": converted_checksum,
-                }
-            evidence = EvidenceAsset.objects.create(
-                source_item=attempt.source_item,
-                origin_run_source_item=attempt.run_source_item,
-                derivation_type=EvidenceDerivationType.OTHER,
-                generic_extraction_attempt=attempt,
-                parent_asset=attempt.input_asset,
-                kind=kind,
-                locator_type=first.locator_type,
-                locator=dict(first.locator),
-                extracted_text=text or None,
-                structured_data=structured,
-                extraction_method=profile.engine,
-                extractor_version=profile.extractor_version,
-                extraction_config_hash=profile.config_hash,
-                validation_mode=profile.validation_mode,
-                extraction_result_checksum=attempt.result_checksum,
-                calibration_profile_key=profile.calibration_profile_key,
-                calibration_profile_version=profile.calibration_profile_version,
-                calibration_profile_hash=profile.calibration_profile_hash,
-                confidence=(
-                    first.confidence
-                    if profile.validation_mode == GenericValidationMode.CALIBRATED
-                    else None
-                ),
-                low_confidence_reasons=reasons,
-                evidence_content_hash=content_hash,
-                review_subject_hash="0" * 64,
-                review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
-                manual_review_required=manual,
-                alt_text=first.alt_text,
-                **storage_fields,
-                **rights,
-            )
-            evidence.review_subject_hash = calculate_review_subject_hash(evidence)
-            evidence.publishable = calculate_publishable(evidence)
-            evidence.full_clean()
-            evidence.save(update_fields=("review_subject_hash", "publishable", "updated_at"))
-            attempt.evidence_asset = evidence
-            attempt.save(update_fields=("evidence_asset", "updated_at"))
             bind_extraction_object_write(result_reservation_id)
             if reason_reservation_id is not None:
                 bind_extraction_object_write(reason_reservation_id)
             if legacy_info:
                 bind_extraction_object_write(legacy_info[4])
 
-            attempt.save(
-                update_fields=(
-                    "terminal_event_key",
-                    "terminal_state",
-                    "updated_at",
-                )
-            )
             enqueue_event(
                 topic="evidence.other_ready",
                 aggregate_type="GenericExtractionAttempt",
@@ -2328,6 +2635,8 @@ def _run_generic_extraction(
                     "source_item_id": str(attempt.source_item_id),
                     "generic_extraction_attempt_id": str(attempt.id),
                     "evidence_asset_id": str(evidence.id),
+                    "evidence_count": attempt.expected_evidence_count,
+                    "evidence_manifest_hash": attempt.expected_evidence_manifest_hash,
                     "engine": attempt.engine,
                     "locator_type": evidence.locator_type,
                     "validation_mode": attempt.validation_mode,
@@ -2364,7 +2673,7 @@ def _run_generic_extraction(
                     source_item=attempt.source_item,
                     input_asset=evidence,
                     input_object_key=info.key,
-                    input_object_version=info.version_id or info.etag or converted_checksum,
+                    input_object_version=_required_object_version(info),
                     input_kind=DocumentInputKind.PDF,
                     input_mime_type="application/pdf",
                     input_checksum=converted_checksum,
@@ -2415,7 +2724,7 @@ def _process_attachment(
                 source_item=run_source_item.source_item,
                 input_asset=raw_asset,
                 input_object_key=info.key,
-                input_object_version=info.version_id or info.etag or raw_asset.checksum,
+                input_object_version=_required_object_version(info),
                 input_kind=DocumentInputKind.PDF,
                 input_mime_type=mime_type,
                 input_checksum=raw_asset.checksum,
@@ -2432,7 +2741,7 @@ def _process_attachment(
                 source_item=run_source_item.source_item,
                 input_asset=raw_asset,
                 input_object_key=info.key,
-                input_object_version=info.version_id or info.etag or raw_asset.checksum,
+                input_object_version=_required_object_version(info),
                 input_kind=DocumentInputKind.STANDALONE_IMAGE,
                 input_mime_type=mime_type,
                 input_frame_count=1,
@@ -3073,6 +3382,9 @@ def consume_other_ready(
     evidence_content_hash: str | None = None,
     review_subject_hash: str | None = None,
     locator_hash: str | None = None,
+    evidence_asset_ids: list[str] | None = None,
+    evidence_count: int | None = None,
+    evidence_manifest_hash: str | None = None,
 ):
     with transaction.atomic():
         run = CollectionRun.objects.select_for_update().get(pk=run_id)
@@ -3086,7 +3398,42 @@ def consume_other_ready(
             )
             .get(pk=generic_extraction_attempt_id)
         )
-        evidence = EvidenceAsset.objects.select_for_update().get(pk=evidence_asset_id)
+        evidence_assets = list(
+            EvidenceAsset.objects.select_for_update()
+            .filter(generic_extraction_attempt=attempt)
+            .select_related(
+                "origin_run_source_item__source_snapshot",
+                "generic_extraction_attempt__extraction_profile_snapshot",
+                "generic_extraction_attempt__input_asset__parent_asset",
+                "parent_asset",
+                "latest_review_decision",
+            )
+            .order_by("id")
+        )
+        evidence_by_id = {str(item.id): item for item in evidence_assets}
+        evidence = evidence_by_id.get(str(evidence_asset_id))
+        manifest_extension_supplied = (
+            evidence_count is not None or evidence_manifest_hash is not None
+        )
+        manifest_extension_incomplete = (
+            (evidence_count is None) != (evidence_manifest_hash is None)
+        )
+        legacy_missing_manifest = (
+            not manifest_extension_supplied
+            and evidence_asset_ids is None
+            and attempt.expected_evidence_count is None
+            and attempt.expected_evidence_manifest_hash is None
+        )
+        try:
+            observed_ids, observed_manifest_hash = validate_generic_evidence_set(
+                attempt,
+                evidence_assets,
+                allow_legacy_missing_manifest=legacy_missing_manifest,
+            )
+            evidence_set_invalid = False
+        except ValidationError:
+            observed_ids, observed_manifest_hash = [], None
+            evidence_set_invalid = True
         expected_ready_key = f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
         if (
             str(attempt.run_source_item.run_id) != str(run.id)
@@ -3094,6 +3441,7 @@ def consume_other_ready(
             or str(attempt.source_item_id) != source_item_id
             or attempt.state
             not in {ExtractionState.SUCCEEDED, ExtractionState.LOW_CONFIDENCE}
+            or evidence is None
             or attempt.evidence_asset_id != evidence.id
             or evidence.generic_extraction_attempt_id != attempt.id
             or evidence.source_item_id != attempt.source_item_id
@@ -3115,6 +3463,42 @@ def consume_other_ready(
             or attempt.extraction_fingerprint != extraction_fingerprint
             or attempt.terminal_state != "ready"
             or attempt.terminal_event_key != expected_ready_key
+            or evidence_set_invalid
+            or manifest_extension_incomplete
+            or (
+                manifest_extension_supplied
+                and (
+                    evidence_count is None
+                    or evidence_manifest_hash is None
+                    or evidence_count != len(evidence_assets)
+                    or evidence_count != attempt.expected_evidence_count
+                    or evidence_manifest_hash != observed_manifest_hash
+                    or evidence_manifest_hash
+                    != attempt.expected_evidence_manifest_hash
+                )
+            )
+            or (
+                not manifest_extension_supplied
+                and (
+                    len(evidence_assets) != 1
+                    or attempt.evidence_asset_id != evidence.id
+                )
+            )
+            or (
+                evidence_asset_ids is not None
+                and (
+                    not all(isinstance(item, str) for item in evidence_asset_ids)
+                    or evidence_asset_ids != sorted(set(evidence_asset_ids))
+                    or evidence_asset_ids != observed_ids
+                )
+            )
+            or (
+                attempt.engine == ExtractionEngine.LEGACY_HWP
+                and not _has_complete_legacy_hwp_pdf(
+                    evidence,
+                    expected_attempt=attempt,
+                )
+            )
             or (
                 input_asset_id is not None
                 and str(attempt.input_asset_id) != input_asset_id
@@ -3152,6 +3536,70 @@ def consume_other_ready(
         ):
             raise _ready_identity_mismatch("other")
         return finalize_run_evidence.run(str(run.id))
+
+
+def _fail_generic_evidence_manifest_locked(
+    run: CollectionRun,
+    step: RunStep,
+    *,
+    documents: Sequence[DocumentExtraction] | None = None,
+    attempts: Sequence[GenericExtractionAttempt] | None = None,
+    children: Sequence[ExtractionRun] | None = None,
+) -> dict[str, Any]:
+    now = timezone.now()
+    error_code = "generic_evidence_manifest_invalid"
+    _close_active_extraction_aggregates_locked(
+        run,
+        error_code=error_code,
+        error_detail_redacted=(
+            "Generic evidence material differs from its frozen manifest"
+        ),
+        finished_at=now,
+        documents=documents,
+        attempts=attempts,
+        children=children,
+        enqueue_finalizer=False,
+    )
+    orphan_unbound_extraction_object_writes(
+        aggregate_kind="fanout",
+        aggregate_id=run.id,
+        lease_generation=step.lease_generation,
+    )
+    step.state = "failed"
+    step.error_code = error_code
+    step.error_detail_redacted = "Generic evidence material differs from its frozen manifest"
+    step.finished_at = now
+    step.lease_owner = ""
+    step.lease_token = None
+    _project_domain_step_terminal(
+        step,
+        run,
+        finished_at=now,
+        final_state=step.state,
+        affected_count=1,
+        error_code=error_code,
+        recovery_state=RecoveryState.MANUAL_REQUIRED,
+    )
+    step.save()
+    run.state = RunState.FAILED
+    run.completed_at = now
+    run.error_summary = {"stage": "extract", "code": error_code}
+    project_run_terminal_observation(
+        run,
+        finished_at=now,
+        stage="extract",
+        final_state=run.state,
+        affected_count=1,
+        error_code=error_code,
+        recovery_state=RecoveryState.MANUAL_REQUIRED,
+    )
+    run.save()
+    return {
+        "runId": str(run.id),
+        "state": run.state,
+        "code": error_code,
+        "failures": 1,
+    }
 
 
 @shared_task
@@ -3198,7 +3646,11 @@ def finalize_run_evidence(run_id: str):
         attempts = list(
             GenericExtractionAttempt.objects.select_for_update()
             .filter(run_source_item__run=run)
-            .select_related("input_asset__parent_asset")
+            .select_related(
+                "input_asset__parent_asset",
+                "extraction_profile_snapshot",
+                "run_source_item__source_snapshot",
+            )
             .order_by("id")
         )
         children = list(
@@ -3206,9 +3658,16 @@ def finalize_run_evidence(run_id: str):
             .filter(document_extraction__run_source_item__run=run)
             .order_by("document_extraction_id", "id")
         )
-        list(
+        locked_evidence = list(
             EvidenceAsset.objects.select_for_update()
             .filter(origin_run_source_item__run=run)
+            .select_related(
+                "origin_run_source_item__source_snapshot",
+                "generic_extraction_attempt__extraction_profile_snapshot",
+                "generic_extraction_attempt__input_asset__parent_asset",
+                "parent_asset",
+                "latest_review_decision",
+            )
             .order_by("id")
         )
         orphan_unbound_extraction_object_writes(
@@ -3216,6 +3675,37 @@ def finalize_run_evidence(run_id: str):
             aggregate_id=run.id,
             lease_generation=step.lease_generation,
         )
+        generic_evidence_by_attempt: dict[Any, list[EvidenceAsset]] = {}
+        for evidence in locked_evidence:
+            if evidence.generic_extraction_attempt_id is not None:
+                generic_evidence_by_attempt.setdefault(
+                    evidence.generic_extraction_attempt_id, []
+                ).append(evidence)
+        try:
+            for attempt in attempts:
+                if attempt.state not in {
+                    ExtractionState.SUCCEEDED,
+                    ExtractionState.LOW_CONFIDENCE,
+                } or _is_quarantined_generic_attempt(attempt):
+                    continue
+                attempt_evidence = generic_evidence_by_attempt.get(attempt.id, [])
+                validate_generic_evidence_set(attempt, attempt_evidence)
+                if attempt.engine == ExtractionEngine.LEGACY_HWP and not (
+                    len(attempt_evidence) == 1
+                    and _has_complete_legacy_hwp_pdf(
+                        attempt_evidence[0],
+                        expected_attempt=attempt,
+                    )
+                ):
+                    raise ValidationError("Legacy HWP converted PDF material is incomplete")
+        except (ValidationError, ExtractorError):
+            return _fail_generic_evidence_manifest_locked(
+                run,
+                step,
+                documents=documents,
+                attempts=attempts,
+                children=children,
+            )
         pending_documents = any(
             document.input_fingerprint is not None
             and document.state in (ExtractionState.QUEUED, ExtractionState.RUNNING)
@@ -3763,18 +4253,22 @@ def _close_active_extraction_aggregates_locked(
     error_code: str,
     error_detail_redacted: str,
     finished_at,
+    documents: Sequence[DocumentExtraction] | None = None,
+    attempts: Sequence[GenericExtractionAttempt] | None = None,
+    children: Sequence[ExtractionRun] | None = None,
+    enqueue_finalizer: bool = True,
 ) -> None:
-    documents = list(
+    documents = list(documents) if documents is not None else list(
         DocumentExtraction.objects.select_for_update()
         .filter(run_source_item__run=run)
         .order_by("id")
     )
-    attempts = list(
+    attempts = list(attempts) if attempts is not None else list(
         GenericExtractionAttempt.objects.select_for_update()
         .filter(run_source_item__run=run)
         .order_by("id")
     )
-    children = list(
+    children = list(children) if children is not None else list(
         ExtractionRun.objects.select_for_update()
         .filter(document_extraction__run_source_item__run=run)
         .order_by("document_extraction_id", "id")
@@ -3823,7 +4317,8 @@ def _close_active_extraction_aggregates_locked(
         )
         aggregate.terminal_state = "failed"
         aggregate.save()
-        _enqueue_finalize(str(run.id), terminal_cause)
+        if enqueue_finalizer:
+            _enqueue_finalize(str(run.id), terminal_cause)
         orphan_unbound_extraction_object_writes(
             aggregate_kind=aggregate_kind,
             aggregate_id=aggregate.id,

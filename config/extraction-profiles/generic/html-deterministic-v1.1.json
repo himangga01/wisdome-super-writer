@@ -1,0 +1,7 @@
+{
+  "profile_key": "html-deterministic-v1", "profile_version": "1.1.0",
+  "engine": "html_parser", "extractor_version": "1.0.0", "package_version": "0.4.11",
+  "runtime_version": "Python-3.12.10", "pipeline_name": null, "validation_mode": "deterministic",
+  "implementation_files": ["src/adapters/extractors/base.py", "src/adapters/extractors/html.py"],
+  "config": {"python_runtime_version": "3.12.10", "max_file_bytes": 12582912, "max_records": 5000, "network_fetch": false}
+}

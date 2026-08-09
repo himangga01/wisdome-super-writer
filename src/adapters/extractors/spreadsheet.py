@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import importlib.metadata
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -73,7 +72,7 @@ class SpreadsheetExtractor:
             workbook.close()
         return GenericExtractionOutput(
             engine=self.engine,
-            extractor_version=importlib.metadata.version("openpyxl"),
+            extractor_version="1.0.0",
             validation_mode="deterministic",
             records=records,
             metadata={"sheet_count": len(workbook.sheetnames), "cells_scanned": cells_seen},
@@ -101,7 +100,7 @@ class SpreadsheetExtractor:
                 ))
         return GenericExtractionOutput(
             engine=self.engine,
-            extractor_version="csv-stdlib",
+            extractor_version="1.0.0",
             validation_mode="deterministic",
             records=records,
             metadata={"row_count": len(records), "delimiter": delimiter},
