@@ -859,47 +859,91 @@ administrator can inspect every included and excluded source before publication.
 - Modify: `src/apps/publishing/models.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/api.py`
-- Create: `src/apps/publishing/migrations/0010_intent_request_identity.py`
+- Create: `src/apps/publishing/migrations/0010_intent_dispatch_identity.py`
 - Modify: `specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml`
-- Deferred unit test: `tests/unit/test_publication_intent_idempotency.py`
+- Modify: `specs/001-automated-content-publishing/data-model.md`
+- Modify: `specs/001-automated-content-publishing/quickstart.md`
+- Unit test: `tests/unit/test_publication_intent_contract.py`
+- Unit/DB test: `tests/unit/test_publication_intent_idempotency.py`, `tests/unit/test_publication_intent_idempotency_db.py`
 
 **Interfaces:**
-- Consumes: approved `ArticleRevision`, exact target snapshot refs, commands, request key and payload hash.
-- Produces: one `PublicationIntent` replay identity and exactly one first-generation `PublicationAttempt` per target.
+- Consumes: approved frozen `ArticleRevision`, exact target snapshot/command/validation/activation refs,
+  request key, optional publication time, and canonical payload material.
+- Produces: one article-scoped `PublicationIntent` replay identity/head, one append-only
+  `PublicationDispatch` replay ledger, and exactly one first-generation `PublicationAttempt` per frozen target.
 
-- [ ] **Step 1: idempotency lookup을 mutable CAS 검사보다 먼저 이동한다.**
+- [ ] **Step 1: intent와 dispatch replay lookup을 mutable CAS 검사보다 먼저 수행한다.**
 
-  ```python
-  def find_intent_replay(*, article_revision, request_key, request_hash):
-      existing = PublicationIntent.objects.filter(
-          article_revision=article_revision,
-          request_key=request_key,
-      ).first()
-      if existing and existing.request_hash != request_hash:
-          raise Conflict("request key reused with different publication payload")
-      return existing
-  ```
+  intent는 `(article_id, request_key)`와 versioned canonical `request_hash`를 사용하고 authoritative
+  `PublicationIntentHead`를 CAS 대상으로 삼는다. 기존 `intent_hash`를 새 request hash로 간주하거나
+  backfill하지 않는다. dispatch는 별도 request identity/hash를 사용하며 exact replay는 live revision,
+  approval, target 상태를 다시 검사하기 전에 고정 결과를 반환한다. 과거 intent/dispatch의 exact
+  path·actor·body를 복원할 수 없으면 현재 v1으로 위장하지 않고 `legacy-unverifiable-v1`로 격리한다.
 
-  `PublicationIntent.request_hash`를 non-null로 추가하고 migration에서 기존 `intent_hash`로 backfill한다.
+- [ ] **Step 2: 모든 target 집합을 같은 한도와 정렬 규칙으로 canonicalize한다.**
 
-- [ ] **Step 2: target ID와 command 집합을 canonicalize한다.**
+  intent의 target snapshot/command/validation/activation refs와 dispatch의 target IDs/expected snapshots는
+  각각 최대 20개다. target ID 문자열 오름차순으로 정렬하고 같은 target을 값만 바꿔 반복한 semantic
+  duplicate, 존재하지 않는 target, 집합 불일치를 hash 계산 전에 422로 거부한다. `publishAt` 생략과
+  명시적 null은 같은 즉시 실행 material로 canonicalize한다. non-null `publishAt`은 `T/t`·초·
+  `Z/z|±HH:MM`을 가진 strict RFC 3339를 허용하고 구분자를 대문자 `T`, 동일 instant를 UTC `Z`로
+  바꾼 뒤 hash·schedule한다. date-only·공백 구분·timezone 없는 값은 422다. 유효한 UUID는 body와
+  article path 모두 대소문자를 허용하되 UUID parse 뒤 canonical lowercase로 hash·저장·응답하여
+  case-only replay를 동일하게 본다. `revisionNo`는 API와 직접 관리자·worker 경계 모두
+  1~9007199254740991만 허용한다.
+  관리자와 worker caller는 모두 nonblank·trimmed·audit-safe `reason`을 필수로 제공한다.
 
-  target ID 중복, 존재하지 않는 target, snapshot/command 집합 불일치를 payload hash 계산 전에 거부한다. target 정렬은 UUID 문자열 오름차순으로 고정한다.
+- [ ] **Step 3: intent 생성 transaction에는 attempt를 만들지 않는다.**
 
-- [ ] **Step 3: intent 생성과 attempt 생성을 한 transaction에 묶는다.**
+  새 intent는 intent/head, immutable preview, synchronous `AuditEvent`만 원자적으로 저장한다. exact replay는
+  같은 intent를 반환하고 새 preview/audit row를 만들지 않는다. 최초는 201, replay는 200, 같은 key의
+  변경 material이나 stale CAS는 409, 구조·의미 오류는 422다.
 
-  `(publication_intent, target_snapshot, attempt_no=1)` 고유 제약을 추가하고 `bulk_create(ignore_conflicts=True)`를 사용하지 않는다.
+- [ ] **Step 4: dispatch transaction에서만 ledger와 target attempt를 만든다.**
 
-- [ ] **Step 4: API replay status를 명확히 한다.**
+  새 dispatch는 append-only ledger, frozen target별 하나의 `attempt_no=1` row, outbox work, AuditEvent를
+  한 transaction에 저장하고 202를 반환한다. exact replay는 같은 ledger/attempt references를 200으로
+  반환하며 새 attempt/outbox/audit를 만들지 않는다. 같은 key의 변경 material은 409다. 조건 없는 DB
+  unique `(publication_intent, publication)`으로 target별 논리 attempt row를 하나만 유지하고 재시도는
+  그 row의 실행 counter를 전진시킨다. conflict를 무시하는 bulk insert는 쓰지 않는다.
 
-  최초 생성은 201, 동일 replay는 200과 같은 intent ID, 다른 payload는 409를 반환한다.
+- [ ] **Step 5: bounded API serializer와 exact status를 고정한다.**
 
-- [ ] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+  create service `(intent, created)`를 201/200에 연결하고 dispatch service
+  `(PublicationDispatchResult, created)`를 202/200에 연결한다. dispatch 응답은 intent/request/correlation/
+  accepted identity와 target ID로 정렬한 bounded attempt refs만 포함한다. acceptance `attemptNo`는 항상
+  1이며 논리 row의 mutable retry counter, mutable state, render, approval, attempt history는 반환하지
+  않는다. current intent 조회는 public `PublicationIntentHead` resolver projection만 사용한다. route
+  완성, cursor history, 관리자 UI, E2E는 T026이 담당한다.
 
-  ```powershell
-  git add src/apps/publishing specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml
-  git commit -m "fix: enforce publication intent request idempotency"
-  ```
+- [ ] **Step 6: 승인된 focused 계약·DB 테스트만 실행하고 작업을 고정한다.**
+
+  exact OpenAPI shape/status/bounds, strict required/unknown 거부, 모든 caller의 audit-safe trimmed reason,
+  UUID case canonical equivalence, aware RFC 3339와 동일 instant UTC `Z`, omitted/null equivalence,
+  replay-before-CAS, 부수효과 0건, target별 논리 attempt 1건과 acceptance `attemptNo=1`을 검증한다.
+  현재 승인 범위에서는 commit하지 않으며 T019와 선행
+  blocker가 남아 있으므로 구현이 존재해도 T020은 완료 표시하지 않는다.
+
+#### English / AI-readable T020 boundary
+
+T020 uses separate append-only idempotency boundaries for intent creation and dispatch. Intent replay is
+resolved before mutable CAS with an article-scoped identity, versioned request hash, and authoritative head;
+intent creation does not create attempts. Dispatch canonicalizes omitted and null `publishAt` equally and
+accepts strict RFC 3339 (`T/t`, seconds, `Z/z|+/-HH:MM`) non-null instants, canonicalizing the separator to
+uppercase `T` and equal instants to UTC `Z`; date-only, space-separated, and timezone-less values are 422.
+UUID input in both bodies and the article path is case-insensitive and canonicalized to lowercase for
+hashing, persistence, and responses. `revisionNo` is bounded to 1 through 9007199254740991 at API and
+direct admin/worker boundaries. Every admin/worker
+caller supplies a required trimmed, audit-safe reason. Dispatch atomically creates one ledger, one first
+attempt per frozen target, outbox work, and audit material. An unconditional
+`(publication_intent, publication)` unique constraint keeps one logical attempt row while retries advance
+its counters; the bounded acceptance response always projects `attemptNo=1`, never the mutable counter. Every
+target collection is bounded to 20 and semantic duplicates are invalid. Create/replay statuses are 201/200
+for intent and 202/200 for dispatch; changed material is 409 and invalid structure or semantics is 422. The
+dispatch response is bounded and excludes mutable state/history. T026 owns route completion, pagination,
+admin UI, and E2E coverage. T020 stays unchecked until T019 and predecessor blockers are complete.
+Historical intent/dispatch rows whose exact path, actor, and body cannot be reconstructed are labeled
+`legacy-unverifiable-v1` and fail closed; semantic or old audit hashes are never relabeled as current-v1 proof.
 
 ### Task 10: T021 publication attempt lease, generation과 terminal aggregation
 
@@ -942,7 +986,8 @@ administrator can inspect every included and excluded source before publication.
 
 - [ ] **Step 4: retry와 reconcile generation 한도를 단일 규칙으로 통합한다.**
 
-  retryable failure는 새 attempt number, unknown outcome은 reconcile generation을 사용한다. 최대 5회 후 `manual_required`로 종결하며 create를 다시 실행하지 않는다.
+  retryable failure는 새 row가 아니라 같은 논리 attempt row의 execution attempt number를 전진시키고,
+  unknown outcome은 reconcile generation을 사용한다. 최대 5회 후 `manual_required`로 종결하며 create를 다시 실행하지 않는다.
 
 - [ ] **Step 5: adapter remote lookup contract를 확인한다.**
 

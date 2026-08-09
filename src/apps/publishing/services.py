@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import inspect
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta, timezone as dt_timezone
@@ -13,7 +14,7 @@ from django.apps import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core import signing
-from django.db import connection, transaction
+from django.db import IntegrityError, OperationalError, connection, transaction
 from django.db.models import Max
 from django.utils.module_loading import import_string
 from django.utils import timezone
@@ -22,7 +23,11 @@ from adapters.publishers.blogger import BloggerOAuthClient, BloggerPublisher
 from adapters.publishers.wordpress import WordPressPublisher
 from apps.accounts.services import consume_reauthentication_proof
 from apps.audit.models import AuditEvent
-from apps.audit.redaction import validate_stored_metadata
+from apps.audit.redaction import (
+    AuditRedactionError,
+    sanitize_reason,
+    validate_stored_metadata,
+)
 from apps.audit.services import (
     AuditContext,
     audit_event_id,
@@ -59,9 +64,11 @@ from .models import (
     PublicationApprovalHead,
     PublicationAttempt,
     PublicationExecutionObservation,
+    PublicationDispatch,
     PublicationReconcileGeneration,
     PublicationRecoveryState,
     PublicationIntent,
+    PublicationIntentHead,
     PublicationMedia,
     PublicationTarget,
     PublicationTargetSnapshot,
@@ -94,7 +101,15 @@ ADAPTER_MANIFESTS = {
     ),
 }
 PUBLISHING_AUDIT_MATERIAL_VERSION = "publishing-state-v1"
+PUBLICATION_INTENT_REQUEST_VERSION = "publication-intent-request-v1"
+PUBLICATION_DISPATCH_REQUEST_VERSION = "publication-dispatch-request-v1"
 _TARGET_CREATE_NAMESPACE = uuid.UUID("e28b5933-26ae-4e6d-83b5-1cbe64f26ba0")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDispatchResult:
+    dispatch: PublicationDispatch
+    attempts: tuple[PublicationAttempt, ...]
 
 
 def _require_audit_actor(audit_context: AuditContext, expected: str) -> None:
@@ -290,6 +305,405 @@ def _request_hash(payload: dict[str, Any]) -> str:
     return sha256_hex(payload)
 
 
+def _request_actor_material(audit_context: AuditContext) -> dict[str, str | None]:
+    return {
+        "actorType": audit_context.actor_type,
+        "actorId": _id(audit_context.actor_id),
+        "eventKey": audit_context.event_key,
+    }
+
+
+def _canonical_uuid(value: Any, *, field_name: str) -> str:
+    raw = str(value)
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        raw,
+    ) is None:
+        raise InvalidInput(f"{field_name} must be an RFC UUID")
+    try:
+        return str(uuid.UUID(raw))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise InvalidInput(f"{field_name} must be a UUID") from exc
+
+
+def _canonical_sha256(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise InvalidInput(f"{field_name} must be a lowercase SHA-256 hash")
+    normalized = value
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise InvalidInput(f"{field_name} must be a lowercase SHA-256 hash")
+    return normalized
+
+
+_REQUEST_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/@~-]{7,199}")
+_UNSAFE_AUDIT_TEXT_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+_RFC3339_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})"
+)
+_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
+
+
+def _require_closed_object(
+    value: Any,
+    *,
+    field_name: str,
+    required: set[str],
+    optional: set[str] = frozenset(),
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InvalidInput(f"{field_name} must be an object")
+    keys = set(value)
+    missing = required - keys
+    unknown = keys - required - optional
+    if missing:
+        raise InvalidInput(f"{field_name} is missing required fields")
+    if unknown:
+        raise InvalidInput(f"{field_name} has unknown fields")
+    return dict(value)
+
+
+def _canonical_positive_integer(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InvalidInput(f"{field_name} must be a positive integer")
+    return value
+
+
+def _canonical_request_key(value: Any) -> str:
+    if not isinstance(value, str) or _REQUEST_KEY_PATTERN.fullmatch(value) is None:
+        raise InvalidInput("requestKey is invalid")
+    return value
+
+
+def _canonical_reason(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not 3 <= len(value) <= 500
+        or _UNSAFE_AUDIT_TEXT_PATTERN.search(value) is not None
+    ):
+        raise InvalidInput("reason must be a trimmed audit-safe string of 3 to 500 characters")
+    try:
+        sanitize_reason(value, required=True)
+    except AuditRedactionError as exc:
+        raise InvalidInput("reason contains forbidden audit material") from exc
+    return value
+
+
+def _canonical_nullable_uuid(value: Any, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _canonical_uuid(value, field_name=field_name)
+
+
+def _canonical_publish_at(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _RFC3339_PATTERN.fullmatch(value) is None:
+        raise InvalidInput("publishAt must be an aware RFC3339 timestamp")
+    try:
+        normalized = f"{value[:10]}T{value[11:]}"
+        if normalized[-1:] in {"Z", "z"}:
+            normalized = f"{normalized[:-1]}+00:00"
+        parsed = timezone.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise InvalidInput("publishAt must be an aware RFC3339 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidInput("publishAt must be an aware RFC3339 timestamp")
+    return parsed.astimezone(dt_timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _canonical_intent_request_body(data: dict[str, Any]) -> dict[str, Any]:
+    body = _require_closed_object(
+        data,
+        field_name="publication intent request",
+        required={
+            "revisionNo",
+            "expectedRevisionContentHash",
+            "correctionCaseId",
+            "targetSnapshots",
+            "targetCommands",
+            "approvalMode",
+            "autoPublishValidationRefs",
+            "autoPublishActivationRefs",
+            "expectedLatestIntentId",
+            "requestKey",
+            "reason",
+        },
+    )
+    body["revisionNo"] = _canonical_positive_integer(
+        body["revisionNo"], field_name="revisionNo"
+    )
+    if body["revisionNo"] > _JSON_SAFE_INTEGER_MAX:
+        raise InvalidInput("revisionNo exceeds the JSON safe integer range")
+    body["expectedRevisionContentHash"] = _canonical_sha256(
+        body["expectedRevisionContentHash"],
+        field_name="expectedRevisionContentHash",
+    )
+    body["correctionCaseId"] = _canonical_nullable_uuid(
+        body["correctionCaseId"], field_name="correctionCaseId"
+    )
+    body["expectedLatestIntentId"] = _canonical_nullable_uuid(
+        body["expectedLatestIntentId"], field_name="expectedLatestIntentId"
+    )
+    body["requestKey"] = _canonical_request_key(body["requestKey"])
+    body["reason"] = _canonical_reason(body["reason"])
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for field_name, required in (
+        ("targetSnapshots", True),
+        ("targetCommands", True),
+        ("autoPublishValidationRefs", False),
+        ("autoPublishActivationRefs", False),
+    ):
+        values = body.get(field_name, [])
+        if not isinstance(values, list):
+            raise InvalidInput(f"{field_name} must be an array")
+        if (required and not values) or len(values) > 20:
+            raise InvalidInput(f"{field_name} must contain between 1 and 20 items")
+        rows: list[dict[str, Any]] = []
+        target_ids: set[str] = set()
+        for value in values:
+            if not isinstance(value, dict):
+                raise InvalidInput(f"{field_name} entries must be objects")
+            if field_name == "targetSnapshots":
+                required_fields = {"targetId", "targetSnapshotId", "targetConfigHash"}
+                optional_fields: set[str] = set()
+            elif field_name == "targetCommands":
+                required_fields = {
+                    "targetId",
+                    "targetSnapshotId",
+                    "targetConfigHash",
+                    "resolvedAction",
+                    "canonicalDependencyTargetId",
+                }
+                optional_fields = set()
+            elif field_name == "autoPublishValidationRefs":
+                required_fields = {
+                    "targetId",
+                    "targetSnapshotId",
+                    "validationId",
+                    "materialHash",
+                }
+                optional_fields = set()
+            else:
+                required_fields = {
+                    "targetId",
+                    "targetSnapshotId",
+                    "activationId",
+                    "version",
+                    "activationHash",
+                }
+                optional_fields = set()
+            row = _require_closed_object(
+                value,
+                field_name=f"{field_name} entry",
+                required=required_fields,
+                optional=optional_fields,
+            )
+            target_id = _canonical_uuid(
+                row.get("targetId"),
+                field_name=f"{field_name}.targetId",
+            )
+            if not target_id or target_id in target_ids:
+                raise InvalidInput(f"{field_name} has duplicate or missing targetId")
+            target_ids.add(target_id)
+            row["targetId"] = target_id
+            row["targetSnapshotId"] = _canonical_uuid(
+                row.get("targetSnapshotId"),
+                field_name=f"{field_name}.targetSnapshotId",
+            )
+            if field_name in {"targetSnapshots", "targetCommands"}:
+                row["targetConfigHash"] = _canonical_sha256(
+                    row.get("targetConfigHash"),
+                    field_name=f"{field_name}.targetConfigHash",
+                )
+            if field_name == "targetCommands":
+                if row.get("resolvedAction") not in PublicationAction.values:
+                    raise InvalidInput("targetCommands.resolvedAction is invalid")
+                if row.get("canonicalDependencyTargetId") is not None:
+                    row["canonicalDependencyTargetId"] = _canonical_uuid(
+                        row["canonicalDependencyTargetId"],
+                        field_name="targetCommands.canonicalDependencyTargetId",
+                    )
+            elif field_name == "autoPublishValidationRefs":
+                row["validationId"] = _canonical_uuid(
+                    row.get("validationId"),
+                    field_name="autoPublishValidationRefs.validationId",
+                )
+                row["materialHash"] = _canonical_sha256(
+                    row.get("materialHash"),
+                    field_name="autoPublishValidationRefs.materialHash",
+                )
+            elif field_name == "autoPublishActivationRefs":
+                row["activationId"] = _canonical_uuid(
+                    row.get("activationId"),
+                    field_name="autoPublishActivationRefs.activationId",
+                )
+                row["activationHash"] = _canonical_sha256(
+                    row.get("activationHash"),
+                    field_name="autoPublishActivationRefs.activationHash",
+                )
+                row["version"] = _canonical_positive_integer(
+                    row.get("version"),
+                    field_name="autoPublishActivationRefs.version",
+                )
+            rows.append(row)
+        normalized[field_name] = sorted(rows, key=lambda row: row["targetId"])
+
+    snapshots = {row["targetId"]: row for row in normalized["targetSnapshots"]}
+    commands = {row["targetId"]: row for row in normalized["targetCommands"]}
+    if set(snapshots) != set(commands):
+        raise InvalidInput("target snapshot and command target sets must match")
+    for target_id, command in commands.items():
+        snapshot = snapshots[target_id]
+        if (
+            command.get("targetSnapshotId") != snapshot.get("targetSnapshotId")
+            or command.get("targetConfigHash") != snapshot.get("targetConfigHash")
+        ):
+            raise InvalidInput("target command and snapshot material must match")
+
+    validation_refs = {
+        row["targetId"]: row
+        for row in normalized["autoPublishValidationRefs"]
+    }
+    activation_refs = {
+        row["targetId"]: row
+        for row in normalized["autoPublishActivationRefs"]
+    }
+    if body.get("approvalMode") == ApprovalMode.MANUAL:
+        if validation_refs or activation_refs:
+            raise InvalidInput("manual intent cannot include automatic publishing refs")
+    elif body.get("approvalMode") == ApprovalMode.VALIDATED_AUTO:
+        if set(validation_refs) != set(snapshots) or set(activation_refs) != set(snapshots):
+            raise InvalidInput("automatic publishing refs must match the exact target set")
+        for target_id, snapshot in snapshots.items():
+            if (
+                validation_refs[target_id].get("targetSnapshotId")
+                != snapshot.get("targetSnapshotId")
+                or activation_refs[target_id].get("targetSnapshotId")
+                != snapshot.get("targetSnapshotId")
+            ):
+                raise InvalidInput("automatic publishing refs must match target snapshots")
+    else:
+        raise InvalidInput("approvalMode is invalid")
+
+    body.update(normalized)
+    return body
+
+
+def _publication_intent_request_hash(
+    *,
+    article_id,
+    data: dict[str, Any],
+    audit_context: AuditContext,
+) -> str:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    return canonical_request_hash(
+        operation_id="createPublicationIntent",
+        path=f"/articles/{article_id}/publication-intents",
+        payload={
+            "schemaVersion": PUBLICATION_INTENT_REQUEST_VERSION,
+            "actor": _request_actor_material(audit_context),
+            "body": _canonical_intent_request_body(data),
+        },
+    )
+
+
+def _canonical_dispatch_request_body(data: dict[str, Any]) -> dict[str, Any]:
+    body = _require_closed_object(
+        data,
+        field_name="publication dispatch request",
+        required={
+            "revisionNo",
+            "publicationIntentId",
+            "targetIds",
+            "expectedTargetSnapshots",
+            "requestKey",
+            "reason",
+        },
+        optional={"publishAt"},
+    )
+    body["revisionNo"] = _canonical_positive_integer(
+        body["revisionNo"], field_name="revisionNo"
+    )
+    if body["revisionNo"] > _JSON_SAFE_INTEGER_MAX:
+        raise InvalidInput("revisionNo exceeds the JSON safe integer range")
+    body["requestKey"] = _canonical_request_key(body["requestKey"])
+    body["reason"] = _canonical_reason(body["reason"])
+    raw_target_ids = body.get("targetIds")
+    raw_refs = body.get("expectedTargetSnapshots")
+    if not isinstance(raw_target_ids, list) or not 1 <= len(raw_target_ids) <= 20:
+        raise InvalidInput("targetIds must contain between 1 and 20 items")
+    if not isinstance(raw_refs, list) or not 1 <= len(raw_refs) <= 20:
+        raise InvalidInput("expectedTargetSnapshots must contain between 1 and 20 items")
+
+    target_ids = [
+        _canonical_uuid(value, field_name="targetIds")
+        for value in raw_target_ids
+    ]
+    if any(not value for value in target_ids) or len(target_ids) != len(set(target_ids)):
+        raise InvalidInput("targetIds has duplicate or missing targetId")
+
+    refs: list[dict[str, Any]] = []
+    ref_target_ids: set[str] = set()
+    for value in raw_refs:
+        if not isinstance(value, dict):
+            raise InvalidInput("expectedTargetSnapshots entries must be objects")
+        row = _require_closed_object(
+            value,
+            field_name="expectedTargetSnapshots entry",
+            required={"targetId", "targetSnapshotId", "targetConfigHash"},
+        )
+        target_id = _canonical_uuid(
+            row.get("targetId"),
+            field_name="expectedTargetSnapshots.targetId",
+        )
+        if not target_id or target_id in ref_target_ids:
+            raise InvalidInput("expectedTargetSnapshots has duplicate or missing targetId")
+        ref_target_ids.add(target_id)
+        row["targetId"] = target_id
+        row["targetSnapshotId"] = _canonical_uuid(
+            row.get("targetSnapshotId"),
+            field_name="expectedTargetSnapshots.targetSnapshotId",
+        )
+        row["targetConfigHash"] = _canonical_sha256(
+            row.get("targetConfigHash"),
+            field_name="expectedTargetSnapshots.targetConfigHash",
+        )
+        refs.append(row)
+
+    if set(target_ids) != ref_target_ids:
+        raise InvalidInput("targetIds and expected target snapshot sets must match")
+    body["targetIds"] = sorted(target_ids)
+    body["expectedTargetSnapshots"] = sorted(
+        refs,
+        key=lambda row: row["targetId"],
+    )
+    body["publicationIntentId"] = _canonical_uuid(
+        body.get("publicationIntentId"),
+        field_name="publicationIntentId",
+    )
+    body["publishAt"] = _canonical_publish_at(body.get("publishAt"))
+    return body
+
+
+def _publication_dispatch_request_hash(
+    *,
+    article_id,
+    data: dict[str, Any],
+    audit_context: AuditContext,
+) -> str:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    return canonical_request_hash(
+        operation_id="publishArticle",
+        path=f"/articles/{article_id}/publish",
+        payload={
+            "schemaVersion": PUBLICATION_DISPATCH_REQUEST_VERSION,
+            "actor": _request_actor_material(audit_context),
+            "body": _canonical_dispatch_request_body(data),
+        },
+    )
+
+
 def _approval_request_hash(
     *,
     article_id,
@@ -302,8 +716,8 @@ def _approval_request_hash(
         {
             "schemaVersion": "approval-request-v2",
             "path": {
-                "articleId": str(article_id),
-                "targetId": str(target_id),
+                "articleId": _canonical_uuid(article_id, field_name="articleId"),
+                "targetId": _canonical_uuid(target_id, field_name="targetId"),
             },
             "body": payload,
         }
@@ -1030,13 +1444,11 @@ def evaluate_approval_decision_readonly(
             material = _intent_material_data(intent, revision)
             refs = _target_ref_map(intent.target_snapshot_refs)
             commands = _command_map(intent.target_commands)
-            latest_intent_id = (
-                PublicationIntent.objects.using(using)
-                .filter(article_id=intent.article_id)
-                .order_by("-created_at")
-                .values_list("id", flat=True)
-                .first()
+            latest_intent = resolve_current_publication_intent(
+                intent.article_id,
+                using=using,
             )
+            latest_intent_id = latest_intent.id if latest_intent is not None else None
             content_action = command["resolvedAction"] in _CONTENT_PUBLICATION_ACTIONS
             intent_integrity = (
                 intent.revision_no == revision.revision_no
@@ -3583,6 +3995,52 @@ def _command_map(commands: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _require_publication_targets_exist(target_ids: Iterable[str]) -> None:
+    requested = {str(target_id) for target_id in target_ids}
+    existing = {
+        str(target_id)
+        for target_id in PublicationTarget.objects.filter(
+            id__in=requested
+        ).values_list("id", flat=True)
+    }
+    if existing != requested:
+        raise InvalidInput("unknown publication target ID")
+
+
+def resolve_current_publication_intent(
+    article_id,
+    *,
+    using: str = "default",
+    for_update: bool = False,
+) -> PublicationIntent | None:
+    """Resolve the authoritative per-article intent head, never timestamp order."""
+
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    heads = PublicationIntentHead.objects.using(using)
+    if for_update:
+        heads = heads.select_for_update()
+    head = heads.select_related("latest_intent").filter(article_id=article_id).first()
+    if head is None:
+        if PublicationIntent.objects.using(using).filter(article_id=article_id).exists():
+            raise Conflict(
+                "publication intent head is missing; migration or manual repair is required"
+            )
+        return None
+    latest = head.latest_intent
+    if latest is None or str(latest.article_id) != str(article_id):
+        raise Conflict("publication intent head does not match its article")
+    return latest
+
+
+def _locked_publication_intent_head(article_id) -> PublicationIntentHead | None:
+    return (
+        PublicationIntentHead.objects.select_for_update()
+        .select_related("latest_intent")
+        .filter(article_id=article_id)
+        .first()
+    )
+
+
 def _current_revision(
     article_id: str,
     revision_no: int,
@@ -3617,22 +4075,99 @@ def _current_revision(
     return article, revision
 
 
+def _is_sqlite_busy_error(exc: OperationalError) -> bool:
+    if connection.vendor != "sqlite":
+        return False
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+        )
+    )
+
+
 def create_publication_intent(
     article_id: str,
     data: dict[str, Any],
     *,
     user,
     audit_context: AuditContext,
-) -> PublicationIntent:
-    try:
-        return _create_publication_intent_atomic(
-            article_id,
-            data,
-            user=user,
-            audit_context=audit_context,
+) -> tuple[PublicationIntent, bool]:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    data = _canonical_intent_request_body(data)
+    request_hash = _publication_intent_request_hash(
+        article_id=article_id,
+        data=data,
+        audit_context=audit_context,
+    )
+    last_race: IntegrityError | OperationalError | None = None
+    for operation_attempt in range(4):
+        try:
+            existing = _find_publication_intent_replay(
+                article_id=article_id,
+                request_key=data["requestKey"],
+                request_hash=request_hash,
+                audit_context=audit_context,
+            )
+            if existing is not None:
+                return existing, False
+            _require_publication_targets_exist(
+                row["targetId"] for row in data["targetCommands"]
+            )
+            return _create_publication_intent_atomic(
+                article_id,
+                data,
+                user=user,
+                audit_context=audit_context,
+            )
+        except IntegrityError as exc:
+            last_race = exc
+        except OperationalError as exc:
+            if not _is_sqlite_busy_error(exc):
+                raise
+            last_race = exc
+        except _StaleIntentConflict as exc:
+            _raise_persisted_stale_intent(exc)
+        if operation_attempt < 3:
+            time.sleep(0.01 * (2**operation_attempt))
+    raise Conflict(
+        "publication intent creation could not settle a concurrent request"
+    ) from last_race
+
+
+def _find_publication_intent_replay(
+    *,
+    article_id,
+    request_key: str,
+    request_hash: str,
+    audit_context: AuditContext,
+) -> PublicationIntent | None:
+    existing = (
+        PublicationIntent.objects.filter(
+            article_id=article_id,
+            request_key=request_key,
         )
-    except _StaleIntentConflict as exc:
-        _raise_persisted_stale_intent(exc)
+        .select_related("article_revision")
+        .first()
+    )
+    if existing is None:
+        return None
+    if (
+        existing.request_hash_version != PUBLICATION_INTENT_REQUEST_VERSION
+        or existing.request_hash != request_hash
+    ):
+        raise Conflict("request key reused with different publication intent payload")
+    require_audit_replay(
+        context=audit_context,
+        action="publication_intent.created",
+        entity=existing,
+        identity_key=f"publication-intent:{existing.id}",
+        request_hash=request_hash,
+    )
+    return existing
 
 
 @transaction.atomic
@@ -3642,53 +4177,35 @@ def _create_publication_intent_atomic(
     *,
     user,
     audit_context: AuditContext,
-) -> PublicationIntent:
+) -> tuple[PublicationIntent, bool]:
     if audit_context.actor_type not in {"admin", "worker"}:
         raise Forbidden("admin or worker audit provenance is required")
     if audit_context.actor_type == "admin" and audit_context.actor_id != user.pk:
         raise Forbidden("intent audit actor differs from the administrator")
-    if audit_context.actor_type == "admin" and (
-        data.get("requestKey") != audit_context.request_key
-        or data.get("reason") != audit_context.reason_code
+    if data.get("reason") != audit_context.reason_code or (
+        audit_context.actor_type == "admin"
+        and data.get("requestKey") != audit_context.request_key
     ):
         raise Forbidden("intent provenance differs from the audit context")
+    data = _canonical_intent_request_body(data)
     request_key = data["requestKey"]
+    request_hash = _publication_intent_request_hash(
+        article_id=article_id,
+        data=data,
+        audit_context=audit_context,
+    )
     commands = _command_map(data["targetCommands"])
+    _require_publication_targets_exist(commands)
     _lock_article_external_write_fence(article_id)
     _lock_target_intent_fences(commands)
-    existing = (
-        PublicationIntent.objects.select_related("article_revision")
-        .filter(article_id=article_id, request_key=request_key)
-        .order_by("created_at")
-        .first()
+    existing = _find_publication_intent_replay(
+        article_id=article_id,
+        request_key=request_key,
+        request_hash=request_hash,
+        audit_context=audit_context,
     )
-    if existing:
-        existing = _require_intent_revision_publishable(existing)
-        existing_refs = _target_ref_map(data["targetSnapshots"])
-        candidate_data = {
-            **data,
-            **_revision_publication_material(existing.article_revision),
-        }
-        candidate_hash = _intent_hash(
-            candidate_data,
-            existing.article_revision,
-            existing_refs,
-            commands,
-        )
-        if (
-            existing.revision_no != int(data["revisionNo"])
-            or existing.revision_content_hash != data["expectedRevisionContentHash"]
-            or existing.intent_hash != candidate_hash
-        ):
-            raise Conflict("같은 request key가 다른 발행 의도에 사용되었습니다.")
-        require_audit_replay(
-            context=audit_context,
-            action="publication_intent.created",
-            entity=existing,
-            identity_key=f"publication-intent:{existing.id}",
-            request_hash=existing.intent_hash,
-        )
-        return existing
+    if existing is not None:
+        return existing, False
     article, revision = _current_revision(
         article_id,
         int(data["revisionNo"]),
@@ -3704,14 +4221,11 @@ def _create_publication_intent_atomic(
     target_refs = _target_ref_map(data["targetSnapshots"])
     if set(target_refs) != set(commands):
         raise InvalidInput("target snapshot과 command target 집합이 같아야 합니다.")
-    latest = (
-        PublicationIntent.objects.select_for_update()
-        .filter(article_id=article.id)
-        .order_by("-created_at")
-        .first()
-    )
+    head_before = _locked_publication_intent_head(article.id)
+    latest = head_before.latest_intent if head_before is not None else None
     if _id(latest.id if latest else None) != _id(data.get("expectedLatestIntentId")):
         raise Conflict("발행 의도가 갱신되었습니다. 다시 불러오세요.")
+    expected_head_version = (head_before.version if head_before else 0) + 1
     latest_before_material = _audit_state(latest) if latest else None
     target_rows = {
         str(row.id): row
@@ -3769,6 +4283,15 @@ def _create_publication_intent_atomic(
             raise InvalidInput("activation target 집합이 발행 target과 같아야 합니다.")
         for ref in activation_refs:
             target = target_rows[ref["targetId"]]
+            if not _validated_auto_target_material_eligible(
+                target=target,
+                supplied_validation_refs=validation_refs,
+                supplied_validation_manifest_hash=sha256_hex(validation_refs),
+                activation_ref=ref,
+            ):
+                raise Conflict(
+                    "validated-auto activation, validation, or target material is stale"
+                )
             if not target.auto_publish_enabled or str(target.latest_auto_publish_activation_id) != ref["activationId"]:
                 raise Conflict("현재 enabled activation과 발행 의도가 다릅니다.")
             activation = AutoPublishActivation.objects.get(id=ref["activationId"], target=target)
@@ -3797,12 +4320,21 @@ def _create_publication_intent_atomic(
         generation_pipeline_manifest_hash=material_data["generationPipelineManifestHash"],
         quality_gate_manifest_hash=material_data["qualityGateManifestHash"],
         quality_report_hash=material_data["qualityReportHash"],
-        supersedes_intent_id=latest.id if latest else None,
+        supersedes_intent=latest,
         intent_hash=intent_hash,
         request_key=request_key,
+        request_hash=request_hash,
+        request_hash_version=PUBLICATION_INTENT_REQUEST_VERSION,
         state=PublicationIntent.State.AWAITING_APPROVAL,
         created_by=user,
     )
+    head_after = _locked_publication_intent_head(article.id)
+    if (
+        head_after is None
+        or head_after.latest_intent_id != intent.id
+        or head_after.version != expected_head_version
+    ):
+        raise Conflict("publication intent head did not advance atomically")
     if latest and latest.state not in {PublicationIntent.State.DISPATCHED, PublicationIntent.State.CANCELLED}:
         latest.state = PublicationIntent.State.STALE
         latest.save(update_fields=["state"])
@@ -3852,12 +4384,12 @@ def _create_publication_intent_atomic(
             "revision_id": str(intent.article_revision_id),
             "revision_no": intent.revision_no,
             "intent_hash": intent.intent_hash,
-            "request_hash": intent.intent_hash,
+            "request_hash": request_hash,
             "state": intent.state,
             "count": len(target_rows),
         },
     )
-    return intent
+    return intent, True
 
 
 def _intent_hash(data, revision, target_refs, commands) -> str:
@@ -3985,6 +4517,8 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
 
 
 def get_article_preview(article_id: str, target_id: str) -> ArticleChannelRender:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    target_id = _canonical_uuid(target_id, field_name="targetId")
     try:
         return _get_article_preview_atomic(article_id, target_id)
     except _StaleIntentConflict as exc:
@@ -3996,24 +4530,14 @@ def _get_article_preview_atomic(
     article_id: str,
     target_id: str,
 ) -> ArticleChannelRender:
-    intent = (
-        PublicationIntent.objects.select_related(
-            "article_revision__generation_attempt"
-        )
-        .filter(article_id=article_id)
-        .order_by("-created_at")
-        .first()
+    intent = resolve_current_publication_intent(
+        article_id,
+        for_update=True,
     )
     if intent is None:
         raise InvalidInput("Create a publication intent before requesting a preview.")
     intent = _require_intent_revision_publishable(intent)
-    latest_id = (
-        PublicationIntent.objects.filter(article_id=article_id)
-        .order_by("-created_at")
-        .values_list("id", flat=True)
-        .first()
-    )
-    if latest_id != intent.id or intent.state == PublicationIntent.State.STALE:
+    if intent.state == PublicationIntent.State.STALE:
         raise _StaleIntentConflict(intent.id, "publication preview is stale")
     return intent.renders.get(
         target_id=target_id,
@@ -4030,6 +4554,8 @@ def decide_approval(
     audit_context: AuditContext,
     request=None,
 ) -> tuple[Approval, bool]:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    target_id = _canonical_uuid(target_id, field_name="targetId")
     try:
         return _decide_approval_atomic(
             article_id,
@@ -4208,10 +4734,9 @@ def _decide_approval_atomic(
     )
     if command is None:
         raise InvalidInput("publication intent has no command for this target")
-    latest_intent = (
-        PublicationIntent.objects.filter(article_id=article_id)
-        .order_by("-created_at")
-        .first()
+    latest_intent = resolve_current_publication_intent(
+        article_id,
+        for_update=True,
     )
     safety_transition = (
         data["decision"]
@@ -4507,15 +5032,113 @@ def dispatch_publication(
     data: dict[str, Any],
     *,
     audit_context: AuditContext,
-) -> list[PublicationAttempt]:
-    try:
-        return _dispatch_publication_atomic(
-            article_id,
-            data,
-            audit_context=audit_context,
+) -> tuple[PublicationDispatchResult, bool]:
+    article_id = _canonical_uuid(article_id, field_name="articleId")
+    data = _canonical_dispatch_request_body(data)
+    request_hash = _publication_dispatch_request_hash(
+        article_id=article_id,
+        data=data,
+        audit_context=audit_context,
+    )
+    last_race: IntegrityError | OperationalError | None = None
+    for operation_attempt in range(4):
+        try:
+            replay = _find_publication_dispatch_replay(
+                article_id=article_id,
+                intent_id=data["publicationIntentId"],
+                request_key=data["requestKey"],
+                request_hash=request_hash,
+                audit_context=audit_context,
+            )
+            if replay is not None:
+                return replay, False
+            _require_publication_targets_exist(data["targetIds"])
+            return _dispatch_publication_atomic(
+                article_id,
+                data,
+                audit_context=audit_context,
+            )
+        except IntegrityError as exc:
+            last_race = exc
+        except OperationalError as exc:
+            if not _is_sqlite_busy_error(exc):
+                raise
+            last_race = exc
+        except _StaleIntentConflict as exc:
+            _raise_persisted_stale_intent(exc)
+        if operation_attempt < 3:
+            time.sleep(0.01 * (2**operation_attempt))
+    raise Conflict(
+        "publication dispatch could not settle a concurrent request"
+    ) from last_race
+
+
+def _publication_attempt_manifest(
+    attempts: Iterable[PublicationAttempt],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "attemptId": str(row.id),
+            "publicationId": str(row.publication_id),
+            "targetId": str(row.publication.target_id),
+            # T020 freezes the initial dispatch cohort. Runtime retries mutate the
+            # execution counter but do not change this accepted dispatch identity.
+            "attemptNo": 1,
+            "resolvedAction": row.resolved_action,
+        }
+        for row in sorted(attempts, key=lambda item: str(item.id))
+    ]
+
+
+def _find_publication_dispatch_replay(
+    *,
+    article_id,
+    intent_id,
+    request_key: str,
+    request_hash: str,
+    audit_context: AuditContext,
+) -> PublicationDispatchResult | None:
+    dispatch = (
+        PublicationDispatch.objects.filter(
+            publication_intent_id=intent_id,
+            publication_intent__article_id=article_id,
         )
-    except _StaleIntentConflict as exc:
-        _raise_persisted_stale_intent(exc)
+        .select_related("publication_intent")
+        .first()
+    )
+    if dispatch is None:
+        return None
+    if (
+        dispatch.request_key != request_key
+        or dispatch.request_hash_version != PUBLICATION_DISPATCH_REQUEST_VERSION
+        or dispatch.request_hash != request_hash
+    ):
+        raise Conflict("publication dispatch request differs from the stored request")
+    attempts = tuple(
+        PublicationAttempt.objects.filter(
+            publication_intent_id=dispatch.publication_intent_id,
+        )
+        .select_related("publication__target")
+        .order_by("id")
+    )
+    manifest_hash = sha256_hex(_publication_attempt_manifest(attempts))
+    if (
+        len(attempts) != dispatch.attempt_count
+        or manifest_hash != dispatch.attempt_manifest_hash
+        or any(row.correlation_id != dispatch.correlation_id for row in attempts)
+    ):
+        raise Conflict("stored publication dispatch attempt manifest is inconsistent")
+    require_audit_replay(
+        context=audit_context,
+        action="publication.dispatched",
+        entity=dispatch.publication_intent,
+        identity_key=_publication_dispatch_audit_identity(
+            intent_id=dispatch.publication_intent_id,
+            request_key=dispatch.request_key,
+        ),
+        request_hash=dispatch.request_hash,
+    )
+    return PublicationDispatchResult(dispatch=dispatch, attempts=attempts)
 
 
 @transaction.atomic
@@ -4524,22 +5147,42 @@ def _dispatch_publication_atomic(
     data: dict[str, Any],
     *,
     audit_context: AuditContext,
-) -> list[PublicationAttempt]:
+) -> tuple[PublicationDispatchResult, bool]:
     if audit_context.actor_type not in {"admin", "worker"}:
         raise Forbidden("admin or worker audit provenance is required")
-    if audit_context.actor_type == "admin" and (
-        data.get("requestKey") != audit_context.request_key
-        or data.get("reason") != audit_context.reason_code
+    if data.get("reason") != audit_context.reason_code or (
+        audit_context.actor_type == "admin"
+        and data.get("requestKey") != audit_context.request_key
     ):
         raise Forbidden("dispatch provenance differs from the audit context")
+    data = _canonical_dispatch_request_body(data)
+    dispatch_request_hash = _publication_dispatch_request_hash(
+        article_id=article_id,
+        data=data,
+        audit_context=audit_context,
+    )
     expected = _target_ref_map(data["expectedTargetSnapshots"])
     requested_ids = [str(value) for value in data["targetIds"]]
+    _require_publication_targets_exist(requested_ids)
     if len(requested_ids) != len(set(requested_ids)):
         raise InvalidInput("target IDs에는 중복이 없어야 합니다.")
     if set(expected) != set(requested_ids):
         raise InvalidInput("target IDs와 expected target snapshot 집합이 같아야 합니다.")
     _lock_article_external_write_fence(article_id)
     _lock_target_intent_fences(requested_ids)
+    replay = _find_publication_dispatch_replay(
+        article_id=article_id,
+        intent_id=data["publicationIntentId"],
+        request_key=data["requestKey"],
+        request_hash=dispatch_request_hash,
+        audit_context=audit_context,
+    )
+    if replay is not None:
+        return replay, False
+    current_intent = resolve_current_publication_intent(
+        article_id,
+        for_update=True,
+    )
     intent_candidate = PublicationIntent.objects.select_related(
         "article_revision__generation_attempt"
     ).get(id=data["publicationIntentId"], article_id=article_id)
@@ -4567,19 +5210,8 @@ def _dispatch_publication_atomic(
         raise Conflict("발행 요청 revision과 intent가 다릅니다.")
     dispatch_material = {
         "requestKey": data["requestKey"],
-        "publishAt": data.get("publishAt"),
+        "publishAt": data["publishAt"],
     }
-    dispatch_request_hash = _request_hash(
-        {
-            "schemaVersion": "publication-dispatch-request-v1",
-            "intentId": str(intent.id),
-            "actorType": audit_context.actor_type,
-            "actorId": _id(audit_context.actor_id),
-            "provenance": audit_context.provenance_metadata(),
-            "reason": audit_context.reason_code,
-            "payload": data,
-        }
-    )
     idempotency_keys = {
         target_id: sha256_hex(
             {
@@ -4592,65 +5224,7 @@ def _dispatch_publication_atomic(
         for target_id in requested_ids
         if target_id in command_map
     }
-    replay_rows = list(
-        PublicationAttempt.objects.select_related("publication__target").filter(
-            idempotency_key__in=idempotency_keys.values()
-        )
-    )
-    if replay_rows:
-        replay_by_target = {str(row.publication.target_id): row for row in replay_rows}
-        if (
-            set(replay_by_target) != set(requested_ids)
-            or intent.state != PublicationIntent.State.DISPATCHED
-        ):
-            raise Conflict("발행 dispatch request가 부분 적용되었거나 다른 payload입니다.")
-        for target_id, row in replay_by_target.items():
-            ref = expected[target_id]
-            command = command_map.get(target_id)
-            approval = (
-                _require_current_dispatch_approval_locked(
-                    intent=intent,
-                    target=target_rows[target_id],
-                    command=command,
-                    frozen_ref=ref,
-                )
-                if command is not None
-                else None
-            )
-            if (
-                command is None
-                or row.publication_intent_id != intent.id
-                or approval is None
-                or row.approval_id != approval.id
-                or row.approval_subject_hash
-                != approval.approval_subject_hash
-                or row.resolved_action != command["resolvedAction"]
-                or str(row.target_snapshot_id) != ref["targetSnapshotId"]
-                or row.target_config_hash != ref["targetConfigHash"]
-                or row.request_fingerprint
-                != sha256_hex(
-                    {
-                        "intentHash": intent.intent_hash,
-                        "command": command,
-                        "approvalSubjectHash": row.approval_subject_hash,
-                        "dispatch": dispatch_material,
-                    }
-                )
-            ):
-                raise Conflict("같은 request key가 다른 dispatch payload에 사용되었습니다.")
-        require_audit_replay(
-            context=audit_context,
-            action="publication.dispatched",
-            entity=intent,
-            identity_key=_publication_dispatch_audit_identity(
-                intent_id=intent.id,
-                request_key=data["requestKey"],
-            ),
-            request_hash=dispatch_request_hash,
-        )
-        _mark_origin_run_publishing_locked(intent)
-        return [replay_by_target[target_id] for target_id in requested_ids]
-    latest = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
+    latest = current_intent
     content_dispatch = _commands_require_publishable_revision(
         command_map[target_id] for target_id in requested_ids
     )
@@ -4701,8 +5275,7 @@ def _dispatch_publication_atomic(
         idempotency_key = idempotency_keys[target_id]
         existing = PublicationAttempt.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
-            attempts.append(existing)
-            continue
+            raise Conflict("publication attempt exists without a matching dispatch ledger")
         activation_ref = next(
             (row for row in intent.auto_publish_activation_refs if str(row["targetId"]) == target_id), None
         )
@@ -4734,8 +5307,19 @@ def _dispatch_publication_atomic(
             ),
         )
         attempts.append(attempt)
+    attempts_manifest = _publication_attempt_manifest(attempts)
+    attempts_hash = sha256_hex(attempts_manifest)
     intent.state = PublicationIntent.State.DISPATCHED
     intent.save(update_fields=["state"])
+    dispatch = PublicationDispatch.objects.create(
+        publication_intent=intent,
+        request_key=data["requestKey"],
+        request_hash=dispatch_request_hash,
+        request_hash_version=PUBLICATION_DISPATCH_REQUEST_VERSION,
+        correlation_id=audit_context.correlation_id,
+        attempt_count=len(attempts),
+        attempt_manifest_hash=attempts_hash,
+    )
     _mark_origin_run_publishing_locked(intent)
     publish_at = data.get("publishAt")
     wordpress = [row for row in attempts if row.publication.target.channel == ChannelCode.WORDPRESS]
@@ -4743,18 +5327,6 @@ def _dispatch_publication_atomic(
     initial = wordpress or [row for row in blogger if _wordpress_dependency_ready(row)]
     for attempt in initial:
         _queue_attempt_on_commit(attempt, publish_at=publish_at)
-    attempts_manifest = [
-        {
-            "attemptId": str(row.id),
-            "publicationId": str(row.publication_id),
-            "targetId": str(row.publication.target_id),
-            "state": row.state,
-            "attemptNo": row.attempt_no,
-            "resolvedAction": row.resolved_action,
-        }
-        for row in sorted(attempts, key=lambda item: str(item.id))
-    ]
-    attempts_hash = sha256_hex(attempts_manifest)
     _record_publishing_audit(
         audit_context=audit_context,
         action="publication.dispatched",
@@ -4781,7 +5353,13 @@ def _dispatch_publication_atomic(
             "state": intent.state,
         },
     )
-    return attempts
+    return (
+        PublicationDispatchResult(
+            dispatch=dispatch,
+            attempts=tuple(attempts),
+        ),
+        True,
+    )
 
 
 def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | None = None) -> None:
@@ -4857,12 +5435,8 @@ def _validated_auto_live_eligible(
     attempt: PublicationAttempt | None = None,
     using: str = "default",
 ) -> bool:
-    if target.connection_state != PublicationTarget.ConnectionState.VERIFIED:
-        return False
     if intent.approval_mode != ApprovalMode.VALIDATED_AUTO:
-        return True
-    if not target.auto_publish_enabled:
-        return False
+        return target.connection_state == PublicationTarget.ConnectionState.VERIFIED
     activation_ref = next(
         (
             row
@@ -4874,15 +5448,52 @@ def _validated_auto_live_eligible(
     )
     if activation_ref is None:
         return False
-    activation_id = activation_ref.get("activationId")
+    return _validated_auto_target_material_eligible(
+        target=target,
+        supplied_validation_refs=intent.auto_publish_validation_refs,
+        supplied_validation_manifest_hash=intent.auto_validation_manifest_hash,
+        activation_ref=activation_ref,
+        attempt=attempt,
+        using=using,
+    )
+
+
+def _validated_auto_target_material_eligible(
+    *,
+    target: PublicationTarget,
+    supplied_validation_refs: Iterable[dict[str, Any]],
+    supplied_validation_manifest_hash: str | None,
+    activation_ref: dict[str, Any],
+    attempt: PublicationAttempt | None = None,
+    using: str = "default",
+) -> bool:
+    """Fail-closed validation shared by creation and read-only projections."""
+
+    try:
+        supplied = _normalized_validation_refs(supplied_validation_refs)
+        if supplied_validation_manifest_hash != sha256_hex(supplied):
+            return False
+        target_id = str(target.id)
+        target_supplied = [row for row in supplied if row["targetId"] == target_id]
+        activation_id = str(activation_ref["activationId"])
+        activation_version = int(activation_ref["version"])
+        activation_hash = _canonical_sha256(
+            activation_ref["activationHash"], field_name="activationHash"
+        )
+        activation_snapshot_id = str(activation_ref["targetSnapshotId"])
+    except (InvalidInput, KeyError, TypeError, ValueError):
+        return False
     if (
-        str(target.latest_auto_publish_activation_id) != str(activation_id)
+        target.connection_state != PublicationTarget.ConnectionState.VERIFIED
+        or not target.auto_publish_enabled
+        or str(target.latest_auto_publish_activation_id) != activation_id
+        or str(target.current_snapshot_id) != activation_snapshot_id
+        or getattr(target, "preflight_state", None) != ValidationState.PASSED
         or (
             attempt is not None
             and (
-                str(attempt.auto_publish_activation_id) != str(activation_id)
-                or attempt.auto_publish_activation_hash
-                != activation_ref.get("activationHash")
+                str(attempt.auto_publish_activation_id) != activation_id
+                or attempt.auto_publish_activation_hash != activation_hash
             )
         )
     ):
@@ -4896,40 +5507,63 @@ def _validated_auto_live_eligible(
         )
         .first()
     )
-    if (
-        activation is None
-        or activation.activation_hash != activation_ref.get("activationHash")
-        or activation.version != int(activation_ref.get("version", 0))
-        or str(activation.target_snapshot_id)
-        != str(activation_ref.get("targetSnapshotId"))
-        or str(target.current_snapshot_id)
-        != str(activation_ref.get("targetSnapshotId"))
-    ):
+    if activation is None:
         return False
-    validation_ids = [
-        str(row.get("validationId"))
-        for row in activation.validation_refs
-        if isinstance(row, dict) and row.get("validationId")
-    ]
-    if len(validation_ids) != len(activation.validation_refs):
-        return False
-    if (
-        AutoPublishValidation.objects.using(using)
-        .filter(
-            id__in=validation_ids,
-            status=AutoPublishValidation.State.PASSED,
+    try:
+        frozen_refs = _normalized_validation_refs(activation.validation_refs)
+        expected_activation_hash = sha256_hex(
+            {
+                "targetId": target_id,
+                "targetSnapshotId": str(activation.target_snapshot_id),
+                "operationalConfigHash": activation.target_operational_config_hash,
+                "validationRefs": frozen_refs,
+                "version": activation.version,
+                "decision": activation.decision,
+                "supersedes": _id(activation.supersedes_activation_id),
+            }
         )
-        .count()
-        != len(validation_ids)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        target_supplied != frozen_refs
+        or activation.validation_manifest_hash != sha256_hex(frozen_refs)
+        or activation.activation_hash != activation_hash
+        or activation.activation_hash != expected_activation_hash
+        or activation.version != activation_version
+        or str(activation.target_snapshot_id) != activation_snapshot_id
+        or activation.target_operational_config_hash != target.current_config_hash
     ):
         return False
-    if target.environment == TargetEnvironment.PRODUCTION:
+    validation_ids = [row["validationId"] for row in frozen_refs]
+    if not validation_ids or len(validation_ids) != len(set(validation_ids)):
+        return False
+    validations = list(
+        AutoPublishValidation.objects.using(using).filter(
+            id__in=validation_ids,
+            target_id=target.id,
+        )
+    )
+    if len(validations) != len(validation_ids):
+        return False
+    by_id = {str(row.id): row for row in validations}
+    for ref in frozen_refs:
+        row = by_id.get(ref["validationId"])
         if (
-            not target.canary_target_id
-            or target.canary_target.canary_state != ValidationState.PASSED
-            or target.pilot_state != ValidationState.PASSED
+            row is None
+            or row.status != AutoPublishValidation.State.PASSED
+            or row.material_hash != ref["materialHash"]
+            or str(row.target_id) != target_id
+            or str(row.target_snapshot_id) != activation_snapshot_id
+            or str(ref["targetSnapshotId"]) != activation_snapshot_id
+            or row.target_config_hash != target.current_config_hash
         ):
             return False
+    if target.environment == TargetEnvironment.PRODUCTION and (
+        not target.canary_target_id
+        or target.canary_target.canary_state != ValidationState.PASSED
+        or target.pilot_state != ValidationState.PASSED
+    ):
+        return False
     return True
 
 
@@ -4957,7 +5591,10 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
     if _kill_switch_enabled():
         raise Conflict("전역 kill switch가 활성화되어 외부 쓰기가 차단되었습니다.")
     intent = attempt.publication_intent
-    latest = PublicationIntent.objects.filter(article_id=intent.article_id).order_by("-created_at").first()
+    latest = resolve_current_publication_intent(
+        intent.article_id,
+        for_update=True,
+    )
     content_attempt = attempt.resolved_action in _CONTENT_PUBLICATION_ACTIONS
     intent_state_allowed = intent.state in {
         PublicationIntent.State.APPROVED,
@@ -4967,6 +5604,11 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
         content_attempt and (not latest or latest.id != intent.id)
     ):
         raise Conflict("publication attempt가 current intent에 속하지 않습니다.")
+    if (
+        not attempt.remote_lookup_key
+        or attempt.remote_lookup_key != attempt.publication.remote_lookup_key
+    ):
+        raise Conflict("publication attempt remote lookup identity is stale")
     target = attempt.publication.target
     if (
         target.current_snapshot_id != attempt.target_snapshot_id

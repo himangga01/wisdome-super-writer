@@ -90,7 +90,7 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 원격 action·상태·본문 hash가 맞을 때만 성공해야 한다.
 
 - [ ] T019 [US2] Approval을 append-only 결정으로 유지하면서 `(expectedLatestApprovalId, expectedHeadVersion)` 이중 CAS의 latest-decision projection과 approve/reject/revoke 전이를 구현한다. 결정 사유·결정 hash·material version·head version, non-null 결정 소유 관리자와 실제 admin/worker actor provenance를 불변 저장하고, revoked와 approved-unpublish에만 용도 결속 재인증을 요구하며, reject/revoke가 intent·dispatch·실행 직전 gate를 즉시 차단하게 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/automation.py`를 정비한다. 기존 approval POST의 exact request/response serializer·OpenAPI status(신규 201, 동일 replay 200, 재인증 403, stale/불법 전이/CAS 409, 본문 불일치 422)와 집중 계약 테스트는 이 작업에 포함하되 새 route, 결정 이력 pagination과 관리자 UI는 T026에 남긴다. (depends on T004, T006, T018; T018 및 선행 외부 blocker가 해소되기 전에는 완료 표시 금지)
-- [ ] T020 [US2] intent 생성과 dispatch의 idempotency lookup을 CAS보다 먼저 수행하고 request-key payload hash, 동일 replay, 다른 payload 409, target ID 중복 거부와 target별 정확히 한 attempt 생성을 `src/apps/publishing/services.py`, `src/apps/publishing/api.py`에 구현 (depends on T005, T019)
+- [ ] T020 [US2] intent 생성과 dispatch를 서로 다른 append-only 멱등 경계로 구현한다. intent는 article-scoped request identity와 versioned request hash/head projection을 사용해 mutable CAS보다 replay를 먼저 판정하고 target snapshot·command·validation·activation ref를 각각 최대 20개로 제한하며 semantic target ID 중복은 422로 거부한다. 유효한 UUID는 body와 article path 모두 case-insensitive로 받은 뒤 canonical lowercase로 hash·저장·응답하고, `revisionNo`는 API와 직접 관리자/worker 호출 모두 1~9007199254740991로 제한하며, 모든 caller가 필수 nonblank·trimmed·audit-safe `reason`을 제공한다. 최초 intent는 201, exact canonical replay는 200, 같은 key의 변경 material은 409다. dispatch는 생략/null `publishAt`을 같은 즉시 실행 요청으로 canonicalize하고 non-null은 `T/t`·초·`Z/z|±HH:MM`을 가진 strict RFC 3339를 받아 구분자를 대문자 `T`, 동일 instant를 UTC `Z`로 hash·schedule한다. ledger와 frozen target별 정확히 하나의 최초 attempt·outbox·AuditEvent를 한 transaction에 만들며 최초 202, exact replay 200, 변경 material 409, 잘못된 구조·의미는 422를 반환한다. DB는 조건 없는 `(publication_intent, publication)` unique로 논리 attempt row 하나를 유지하고 retry counter만 전진시킨다. API는 mutable state/history와 mutable retry counter 없이 bounded `PublicationDispatchResult`의 acceptance `attemptNo=1`만 반환하고 focused 계약·DB 테스트를 추가한다. route 완성·cursor history·관리자 UI·E2E는 T026 범위이며 T019와 선행 blocker가 끝나기 전에는 완료 표시하지 않는다. (depends on T005, T019)
 - [ ] T021 [US2] PublicationAttempt generation·lease·worker fencing·terminal retry aggregation과 action/content/state-aware reconcile을 구현해 중복 worker와 늦은 응답이 외부 쓰기나 최신 상태를 변경하지 못하도록 `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/wordpress/client.py`, `src/adapters/publishers/blogger/client.py`를 정비 (depends on T020)
 - [ ] T022 [US2] `VisualPlacement`, `PublishedEvidenceSnapshot`, `PublishedVisualizationSnapshot`과 immutable revision binding, channel media manifest, WordPress media·Blogger public delivery, lease generation CAS와 orphan cleanup을 `src/apps/editorial/models.py`, `src/apps/publishing/models.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`에 구현 (depends on T002, T018, T020, T021)
 - [ ] T023 [US2] Blogger OAuth connect·token persistence·refresh·scope verification·revoke와 WordPress credential disconnect의 remote reconciliation을 `src/wisdome_writer/infrastructure/secrets.py`, `src/apps/publishing/services.py`, `src/apps/publishing/tasks.py`, `src/adapters/publishers/blogger/client.py`, `src/adapters/publishers/wordpress/client.py`에 구현 (depends on T001, T003, T004)
@@ -196,6 +196,22 @@ row. `decidedBy` is the non-null approval owner; actual admin/worker actor prove
 separately and worker actor IDs are null. Revocation and approved unpublish require purpose-bound reauthentication. T026, not T019, owns
 new route registration, approval-history pagination, admin UI, and E2E coverage. T019 remains unchecked
 until T018 and its external blockers are complete.
+
+T020 separates intent creation from dispatch. Intent request replay is resolved before mutable CAS by
+an article-scoped request identity, versioned request hash, and authoritative head projection. All target
+snapshot/command/validation/activation reference sets are bounded to 20 and semantic duplicate target IDs
+are 422. Valid UUID input is case-insensitive and canonicalizes to lowercase for hashing, storage, and
+responses, including the path article UUID; `revisionNo` is bounded to 1 through 9007199254740991 at API
+and direct service boundaries. Every administrator and worker caller supplies a required trimmed,
+audit-safe `reason`. Intent
+create/replay is 201/200; changed material is 409. Dispatch canonicalizes omitted and null `publishAt`
+identically and accepts strict RFC 3339 (`T/t`, seconds, `Z/z|+/-HH:MM`) non-null instants, canonicalizing
+the separator to uppercase `T` and the instant to UTC `Z`, then atomically persists one
+append-only dispatch ledger, one first attempt per frozen target, outbox work, and audit material. An
+unconditional `(publication_intent, publication)` unique constraint preserves one logical row while retries
+advance its counters. Dispatch create/replay is 202/200 with a bounded immutable result whose acceptance
+`attemptNo` is always 1; it never returns mutable retry state or unbounded history. T026 owns route completion, cursor history,
+admin UI, and E2E coverage. T020 remains unchecked until T019 and predecessor blockers are complete.
 
 ```yaml
 schema_version: "1.0"

@@ -19,9 +19,9 @@ from .models import (
 from .services import (
     _StaleIntentConflict,
     _raise_persisted_stale_intent,
-    _require_intent_revision_publishable,
     _require_revision_for_commands,
     create_publication_intent,
+    resolve_current_publication_intent,
 )
 
 
@@ -126,6 +126,41 @@ def prepare_verified_correction(
         _raise_persisted_stale_intent(exc)
 
 
+def _frozen_correction_intent_payload(
+    intent: PublicationIntent,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "revisionNo": intent.revision_no,
+        "expectedRevisionContentHash": intent.revision_content_hash,
+        "correctionCaseId": str(intent.correction_case_id),
+        "targetSnapshots": intent.target_snapshot_refs,
+        "targetCommands": [
+            {
+                "targetId": str(row["targetId"]),
+                "targetSnapshotId": str(row["targetSnapshotId"]),
+                "targetConfigHash": row["targetConfigHash"],
+                "resolvedAction": row["resolvedAction"],
+                "canonicalDependencyTargetId": (
+                    str(row["canonicalDependencyTargetId"])
+                    if row.get("canonicalDependencyTargetId")
+                    else None
+                ),
+            }
+            for row in intent.target_commands
+        ],
+        "approvalMode": intent.approval_mode,
+        "autoPublishValidationRefs": intent.auto_publish_validation_refs,
+        "autoPublishActivationRefs": intent.auto_publish_activation_refs,
+        "expectedLatestIntentId": (
+            str(intent.supersedes_intent_id) if intent.supersedes_intent_id else None
+        ),
+        "requestKey": intent.request_key,
+        "reason": reason,
+    }
+
+
 @transaction.atomic
 def _prepare_verified_correction_atomic(
     case_id: str,
@@ -136,6 +171,33 @@ def _prepare_verified_correction_atomic(
 ) -> PublicationIntent:
     """Create an approval-ready, superseding intent for a verified correction case."""
     case = CorrectionCase.objects.select_for_update().get(id=case_id)
+    existing_intent = (
+        PublicationIntent.objects.select_related(
+            "article_revision__generation_attempt"
+        )
+        .filter(
+            article_id=case.article_id,
+            request_key=request_key,
+        )
+        .first()
+    )
+    if existing_intent is not None:
+        if str(existing_intent.correction_case_id) != str(case.id):
+            raise CorrectionWorkflowError(
+                "Correction request key is bound to different immutable material."
+            )
+        replay, created = create_publication_intent(
+            str(case.article_id),
+            _frozen_correction_intent_payload(
+                existing_intent,
+                reason=audit_context.reason_code,
+            ),
+            user=user,
+            audit_context=audit_context,
+        )
+        if created or replay.id != existing_intent.id:
+            raise CorrectionWorkflowError("Correction intent replay is not exact.")
+        return replay
     if case.state not in {
         CorrectionCase.State.VERIFIED,
         CorrectionCase.State.APPLYING,
@@ -147,21 +209,11 @@ def _prepare_verified_correction_atomic(
     revision = article_candidate.current_revision
     if revision is None:
         raise CorrectionWorkflowError("The corrected article has no current revision.")
-    existing_intent = (
-        PublicationIntent.objects.select_related(
-            "article_revision__generation_attempt"
-        )
-        .filter(article_revision=revision, request_key=request_key)
-        .first()
-    )
     if case.kind != "retraction":
-        if existing_intent is None:
-            _require_revision_for_commands(
-                revision,
-                [{"resolvedAction": PublicationAction.UPDATE}],
-            )
-        else:
-            _require_intent_revision_publishable(existing_intent)
+        _require_revision_for_commands(
+            revision,
+            [{"resolvedAction": PublicationAction.UPDATE}],
+        )
     article = (
         DraftArticle.objects.select_for_update()
         .select_related("current_revision__generation_attempt")
@@ -170,7 +222,10 @@ def _prepare_verified_correction_atomic(
     revision = article.current_revision
 
     plan = build_correction_plan(case)
-    latest = PublicationIntent.objects.filter(article_id=case.article_id).order_by("-created_at").first()
+    latest = resolve_current_publication_intent(
+        case.article_id,
+        for_update=True,
+    )
     payload = {
         "revisionNo": revision.revision_no,
         "expectedRevisionContentHash": revision.content_hash,
@@ -182,8 +237,9 @@ def _prepare_verified_correction_atomic(
         "autoPublishActivationRefs": [],
         "expectedLatestIntentId": str(latest.id) if latest else None,
         "requestKey": request_key,
+        "reason": audit_context.reason_code,
     }
-    intent = create_publication_intent(
+    intent, _intent_created = create_publication_intent(
         str(case.article_id),
         payload,
         user=user,
@@ -195,16 +251,38 @@ def _prepare_verified_correction_atomic(
     return intent
 
 
+def _locked_correction_intent_leaf(case: CorrectionCase) -> PublicationIntent | None:
+    intents = list(
+        PublicationIntent.objects.select_for_update()
+        .filter(
+            article_id=case.article_id,
+            correction_case_id=case.id,
+        )
+        .order_by("id")
+    )
+    if not intents:
+        return None
+    intent_ids = {str(row.id) for row in intents}
+    superseded_ids = {
+        str(row.supersedes_intent_id)
+        for row in intents
+        if row.supersedes_intent_id is not None
+        and str(row.supersedes_intent_id) in intent_ids
+    }
+    leaves = [row for row in intents if str(row.id) not in superseded_ids]
+    if len(leaves) != 1:
+        raise CorrectionWorkflowError(
+            "Correction intent lineage is ambiguous and requires manual recovery."
+        )
+    return leaves[0]
+
+
 @transaction.atomic
 def complete_correction_if_terminal(case_id: str) -> bool:
     """Close a case after every frozen target command reaches its terminal state."""
     case = CorrectionCase.objects.select_for_update().get(id=case_id)
-    intent = (
-        PublicationIntent.objects.filter(correction_case_id=case.id)
-        .order_by("-created_at")
-        .first()
-    )
-    if not intent:
+    intent = _locked_correction_intent_leaf(case)
+    if not intent or intent.state != PublicationIntent.State.DISPATCHED:
         return False
     terminal_by_action = {
         PublicationAction.UPDATE: {
@@ -216,7 +294,7 @@ def complete_correction_if_terminal(case_id: str) -> bool:
     }
     publications = {
         str(row.target_id): row
-        for row in Publication.objects.filter(
+        for row in Publication.objects.select_for_update().filter(
             article_id=case.article_id,
             target_id__in=[row["targetId"] for row in intent.target_commands],
         )

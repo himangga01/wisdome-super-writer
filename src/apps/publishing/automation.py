@@ -33,6 +33,7 @@ from .services import (
     create_publication_intent,
     decide_approval,
     dispatch_publication,
+    resolve_current_publication_intent,
 )
 
 
@@ -54,6 +55,61 @@ def _lock_automation_targets(
         for row in PublicationTarget.objects.select_for_update()
         .filter(id__in=requested_ids)
         .order_by("id")
+    }
+
+
+def _frozen_schedule_intent_payload(
+    intent: PublicationIntent,
+    *,
+    reason: str,
+) -> dict:
+    commands = [
+        {
+            "targetId": str(row["targetId"]),
+            "targetSnapshotId": str(row["targetSnapshotId"]),
+            "targetConfigHash": row["targetConfigHash"],
+            "resolvedAction": row["resolvedAction"],
+            "canonicalDependencyTargetId": (
+                str(row["canonicalDependencyTargetId"])
+                if row.get("canonicalDependencyTargetId")
+                else None
+            ),
+        }
+        for row in intent.target_commands
+    ]
+    return {
+        "revisionNo": intent.revision_no,
+        "expectedRevisionContentHash": intent.revision_content_hash,
+        "correctionCaseId": (
+            str(intent.correction_case_id) if intent.correction_case_id else None
+        ),
+        "targetSnapshots": intent.target_snapshot_refs,
+        "targetCommands": commands,
+        "approvalMode": intent.approval_mode,
+        "autoPublishValidationRefs": intent.auto_publish_validation_refs,
+        "autoPublishActivationRefs": intent.auto_publish_activation_refs,
+        "expectedLatestIntentId": (
+            str(intent.supersedes_intent_id) if intent.supersedes_intent_id else None
+        ),
+        "requestKey": intent.request_key,
+        "reason": reason,
+    }
+
+
+def _frozen_schedule_dispatch_payload(
+    intent: PublicationIntent,
+    *,
+    request_key: str,
+    reason: str,
+) -> dict:
+    return {
+        "revisionNo": intent.revision_no,
+        "publicationIntentId": str(intent.id),
+        "targetIds": [str(row["targetId"]) for row in intent.target_snapshot_refs],
+        "expectedTargetSnapshots": intent.target_snapshot_refs,
+        "publishAt": None,
+        "requestKey": request_key,
+        "reason": reason,
     }
 
 
@@ -98,12 +154,34 @@ def finalize_scheduled_publication_delivery_failure(
             request_key = f"schedule:{schedule_dispatch.id}:intent"
             existing = (
                 PublicationIntent.objects.using(alias)
+                .select_related("article_revision__generation_attempt")
                 .filter(article_id=article.id, request_key=request_key)
                 .first()
             )
             if existing is not None and existing.state == PublicationIntent.State.DISPATCHED:
-                attempts = list(existing.attempts.all())
-                if len(attempts) == len(existing.target_commands):
+                try:
+                    replay_intent, intent_created = create_publication_intent(
+                        str(article.id),
+                        _frozen_schedule_intent_payload(
+                            existing,
+                            reason=audit_context.reason_code,
+                        ),
+                        user=run.requested_by,
+                        audit_context=audit_context,
+                    )
+                    if intent_created or replay_intent.id != existing.id:
+                        raise Conflict("scheduled intent terminal replay is not exact")
+                    replay_result, dispatch_created = dispatch_publication(
+                        str(article.id),
+                        _frozen_schedule_dispatch_payload(
+                            replay_intent,
+                            request_key=f"schedule:{schedule_dispatch.id}:publish",
+                            reason=audit_context.reason_code,
+                        ),
+                        audit_context=audit_context,
+                    )
+                    if dispatch_created:
+                        raise Conflict("scheduled dispatch terminal replay created a ledger")
                     require_audit_replay(
                         context=audit_context,
                         action="collection_run.publication_started",
@@ -113,6 +191,10 @@ def finalize_scheduled_publication_delivery_failure(
                         ),
                     )
                     return {"runId": str(run.id), "state": run.state}
+                except (Conflict, InvalidInput):
+                    # A malformed or partial durable replay is not success. Continue
+                    # through the existing run/step terminal projection below.
+                    pass
 
         from apps.collection.services import (
             project_run_terminal_observation,
@@ -283,38 +365,65 @@ def _dispatch_validated_schedule_run_atomic(
         .filter(article_id=article.id, request_key=request_key)
         .first()
     )
-    if (
-        replay_intent is not None
-        and replay_intent.state == PublicationIntent.State.DISPATCHED
-    ):
+    if replay_intent is not None:
         if (
             str(replay_intent.origin_collection_run_id) != str(run.id)
             or replay_intent.approval_mode != ApprovalMode.VALIDATED_AUTO
         ):
             raise Conflict("stored schedule publication replay identity is invalid")
-        replay_attempts = list(replay_intent.attempts.all())
-        if len(replay_attempts) != len(replay_intent.target_commands):
-            raise Conflict("stored schedule publication replay is incomplete")
-        require_audit_replay(
-            context=audit_context,
-            action="collection_run.publication_started",
-            entity=run,
-            identity_key=(
-                f"{audit_context.event_key}:collection-run-publication"
+        replay_intent, intent_created = create_publication_intent(
+            str(article.id),
+            _frozen_schedule_intent_payload(
+                replay_intent,
+                reason=audit_context.reason_code,
             ),
+            user=run.requested_by,
+            audit_context=audit_context,
         )
-        return replay_attempts
+        if intent_created:
+            raise Conflict("stored schedule intent replay unexpectedly created a row")
+        if replay_intent.state == PublicationIntent.State.DISPATCHED:
+            replay_result, dispatch_created = dispatch_publication(
+                str(article.id),
+                _frozen_schedule_dispatch_payload(
+                    replay_intent,
+                    request_key=f"schedule:{schedule_dispatch.id}:publish",
+                    reason=audit_context.reason_code,
+                ),
+                audit_context=audit_context,
+            )
+            if dispatch_created:
+                raise Conflict("stored schedule dispatch replay unexpectedly created a ledger")
+            require_audit_replay(
+                context=audit_context,
+                action="collection_run.publication_started",
+                entity=run,
+                identity_key=(
+                    f"{audit_context.event_key}:collection-run-publication"
+                ),
+            )
+            return list(replay_result.attempts)
+    if (
+        getattr(run, "stop_requested_at", None) is not None
+        or run.state
+        in {
+            RunState.STOPPING,
+            RunState.STOPPED,
+            RunState.FAILED,
+            RunState.COMPLETED,
+        }
+    ):
+        # Exact dispatched replays above remain observable. Partial/new work never
+        # revives a stopped or terminal run; the collection terminal projection is
+        # authoritative for these states.
+        return []
+    if run.state != RunState.AWAITING_APPROVAL:
+        raise Conflict("scheduled publication requires an awaiting-approval run")
     schedule = _require_frozen_schedule(schedule_dispatch)
     revision = article.current_revision
     if revision is None or revision.quality_state != "passed":
         raise Conflict("자동발행할 current revision이 품질 gate를 통과하지 못했습니다.")
-    intent = (
-        PublicationIntent.objects.select_related(
-            "article_revision__generation_attempt"
-        )
-        .filter(article_revision=revision, request_key=request_key)
-        .first()
-    )
+    intent = replay_intent
     if intent is None:
         _require_revision_for_commands(
             revision,
@@ -359,8 +468,11 @@ def _dispatch_validated_schedule_run_atomic(
         )
 
     if intent is None:
-        latest = PublicationIntent.objects.filter(article_id=article.id).order_by("-created_at").first()
-        intent = create_publication_intent(
+        latest = resolve_current_publication_intent(
+            article.id,
+            for_update=True,
+        )
+        intent, _intent_created = create_publication_intent(
             str(article.id),
             {
                 "revisionNo": revision.revision_no,
@@ -373,6 +485,7 @@ def _dispatch_validated_schedule_run_atomic(
                 "autoPublishActivationRefs": schedule.auto_publish_activation_refs,
                 "expectedLatestIntentId": str(latest.id) if latest else None,
                 "requestKey": request_key,
+                "reason": audit_context.reason_code,
             },
             user=run.requested_by,
             audit_context=audit_context,
@@ -414,17 +527,7 @@ def _dispatch_validated_schedule_run_atomic(
             audit_context=audit_context,
         )
     intent.refresh_from_db()
-    if intent.state == PublicationIntent.State.DISPATCHED:
-        require_audit_replay(
-            context=audit_context,
-            action="collection_run.publication_started",
-            entity=run,
-            identity_key=(
-                f"{audit_context.event_key}:collection-run-publication"
-            ),
-        )
-        return list(intent.attempts.all())
-    attempts = dispatch_publication(
+    dispatch_result, _dispatch_created = dispatch_publication(
         str(article.id),
         {
             "revisionNo": intent.revision_no,
@@ -433,9 +536,21 @@ def _dispatch_validated_schedule_run_atomic(
             "expectedTargetSnapshots": intent.target_snapshot_refs,
             "publishAt": None,
             "requestKey": f"schedule:{schedule_dispatch.id}:publish",
+            "reason": audit_context.reason_code,
         },
         audit_context=audit_context,
     )
+    attempts = list(dispatch_result.attempts)
+    if not _dispatch_created:
+        require_audit_replay(
+            context=audit_context,
+            action="collection_run.publication_started",
+            entity=run,
+            identity_key=(
+                f"{audit_context.event_key}:collection-run-publication"
+            ),
+        )
+        return attempts
     run.state = RunState.PUBLISHING
     run.save(update_fields=["state"])
     record_audit_event(

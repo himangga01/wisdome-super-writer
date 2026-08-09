@@ -1587,6 +1587,8 @@ class ApprovalDecisionDatabaseTests(DjangoTestCase):
                 {str(target.id): command},
             ),
             request_key="intent-t019-service",
+            request_hash="0" * 64,
+            request_hash_version="publication-intent-request-v1",
             created_by=user,
         )
         title = revision.title

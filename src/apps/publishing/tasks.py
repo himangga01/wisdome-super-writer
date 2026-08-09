@@ -50,8 +50,10 @@ from .services import (
     run_target_preflight,
 )
 
+SCHEDULE_PUBLICATION_AUDIT_REASON = "Scheduled publication dispatch."
 
-def _worker_audit_context() -> AuditContext:
+
+def _worker_audit_context(*, reason_code: str | None = None) -> AuditContext:
     event_id = CURRENT_EVENT_ID.get()
     correlation_id = CURRENT_EVENT_CORRELATION_ID.get()
     consumer_name = CURRENT_EVENT_CONSUMER_NAME.get()
@@ -72,6 +74,7 @@ def _worker_audit_context() -> AuditContext:
             consumer_name=consumer_name,
             lease_token=lease_token,
             lease_generation=lease_generation,
+            reason_code=reason_code,
         )
     except ValueError as exc:
         raise PermanentEventError("audit_event_context_invalid") from exc
@@ -81,7 +84,9 @@ def _worker_audit_context() -> AuditContext:
 def dispatch_scheduled_run_publication(run_id: str):
     from .automation import dispatch_validated_schedule_run
 
-    audit_context = _worker_audit_context()
+    audit_context = _worker_audit_context(
+        reason_code=SCHEDULE_PUBLICATION_AUDIT_REASON,
+    )
     rows = dispatch_validated_schedule_run(
         run_id,
         audit_context=audit_context,
@@ -101,7 +106,9 @@ def finalize_scheduled_publication_delivery_failure(
     return finalize(
         run_id,
         error_code,
-        audit_context=_worker_audit_context(),
+        audit_context=_worker_audit_context(
+            reason_code=SCHEDULE_PUBLICATION_AUDIT_REASON,
+        ),
     )
 
 

@@ -47,6 +47,7 @@ from .services import (
     evaluate_approval_decision_readonly,
     get_article_preview,
     request_target_preflight,
+    resolve_current_publication_intent,
     retry_publication_attempt as retry_publication_attempt_service,
     set_auto_publish,
     start_blogger_oauth,
@@ -130,6 +131,31 @@ def _approval_audit_context(
         )
     except (AuditContextError, AuditRedactionError) as exc:
         raise InvalidInput("decisionReason or requestKey is invalid") from exc
+
+
+def _publication_audit_context(
+    request: HttpRequest,
+    data: dict[str, Any],
+) -> AuditContext:
+    reason = data.get("reason")
+    request_key = data.get("requestKey")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or reason != reason.strip()
+        or not isinstance(request_key, str)
+        or not request_key
+        or request_key != request_key.strip()
+    ):
+        raise InvalidInput("reason and requestKey must be nonblank and already trimmed")
+    try:
+        return AuditContext.for_admin(
+            request=request,
+            reason_code=reason,
+            request_key=request_key,
+        )
+    except (AuditContextError, AuditRedactionError) as exc:
+        raise InvalidInput("reason or requestKey is invalid") from exc
 
 
 def target_json(row: PublicationTarget) -> dict[str, Any]:
@@ -298,6 +324,31 @@ def approval_json(row: Approval, *, projection=None) -> dict[str, Any]:
         "isCurrent": projection.is_current,
         "dispatchEligible": projection.dispatch_eligible,
         "decidedAt": row.decided_at.isoformat(),
+    }
+
+
+def dispatch_result_json(result, *, replayed: bool) -> dict[str, Any]:
+    dispatch = result.dispatch
+    attempts = sorted(
+        result.attempts,
+        key=lambda row: str(row.publication.target_id),
+    )
+    return {
+        "publicationIntentId": str(dispatch.publication_intent_id),
+        "requestKey": dispatch.request_key,
+        "correlationId": str(dispatch.correlation_id),
+        "acceptedAt": dispatch.accepted_at.isoformat(),
+        "replayed": replayed,
+        "attempts": [
+            {
+                "attemptId": str(row.id),
+                "publicationId": str(row.publication_id),
+                "targetId": str(row.publication.target_id),
+                "resolvedAction": row.resolved_action,
+                "attemptNo": 1,
+            }
+            for row in attempts
+        ],
     }
 
 
@@ -558,20 +609,25 @@ def blogger_oauth_callback(request: HttpRequest) -> JsonResponse:
     )
 
 
-@admin_api
-@require_http_methods(["GET", "POST"])
-def publication_intents(request: HttpRequest, article_id: str) -> JsonResponse:
-    if request.method == "GET":
-        row = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
-        return JsonResponse({"item": intent_json(row) if row else None})
+@openapi_operation("createPublicationIntent")
+def _create_publication_intent(request: HttpRequest, article_id: str) -> JsonResponse:
     data = _body(request)
-    row = create_publication_intent(
+    row, created = create_publication_intent(
         article_id,
         data,
         user=request.user,
-        audit_context=_admin_audit_context(request, data),
+        audit_context=_publication_audit_context(request, data),
     )
-    return JsonResponse(intent_json(row), status=201)
+    return JsonResponse(intent_json(row), status=201 if created else 200)
+
+
+@admin_api
+@require_http_methods(["GET", "POST"])
+def publication_intents(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method == "POST":
+        return _create_publication_intent(request, article_id=article_id)
+    row = resolve_current_publication_intent(article_id)
+    return JsonResponse({"item": intent_json(row) if row else None})
 
 
 @admin_api
@@ -608,18 +664,14 @@ def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
 @require_http_methods(["POST"])
 def publish(request: HttpRequest, article_id: str) -> JsonResponse:
     data = _body(request)
-    rows = dispatch_publication(
+    result, created = dispatch_publication(
         article_id,
         data,
-        audit_context=_admin_audit_context(request, data),
+        audit_context=_publication_audit_context(request, data),
     )
     return JsonResponse(
-        {
-            "jobId": str(rows[0].id) if rows else None,
-            "state": "queued",
-            "attemptIds": [str(row.id) for row in rows],
-        },
-        status=202,
+        dispatch_result_json(result, replayed=not created),
+        status=202 if created else 200,
     )
 
 
@@ -719,7 +771,7 @@ def console_article(request: HttpRequest, article_id: str) -> HttpResponse:
     denied = _console_guard(request)
     if denied:
         return denied
-    intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
+    intent = resolve_current_publication_intent(article_id)
     publications_rows = Publication.objects.select_related("target").filter(article_id=article_id)
     return render(
         request,

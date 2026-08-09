@@ -8,6 +8,11 @@ from django.db import models
 from django.db.models import Q
 
 
+PUBLICATION_INTENT_REQUEST_VERSION = "publication-intent-request-v1"
+PUBLICATION_DISPATCH_REQUEST_VERSION = "publication-dispatch-request-v1"
+LEGACY_UNVERIFIABLE_INTENT_REQUEST_VERSION = "legacy-unverifiable-v1"
+
+
 class ChannelCode(models.TextChoices):
     WORDPRESS = "wordpress", "WordPress"
     BLOGGER = "blogger", "Google Blogger"
@@ -132,6 +137,33 @@ class PublicationTargetIntentFence(models.Model):
     )
 
 
+class PublicationTargetSnapshotQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("PublicationTargetSnapshot is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+
 class PublicationTargetSnapshot(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target = models.ForeignKey(PublicationTarget, on_delete=models.PROTECT, related_name="snapshots")
@@ -154,6 +186,7 @@ class PublicationTargetSnapshot(models.Model):
     publisher_adapter_manifest_hash = models.CharField(max_length=64)
     config_hash = models.CharField(max_length=64)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicationTargetSnapshotQuerySet)()
 
     class Meta:
         ordering = ["target_id", "-version"]
@@ -161,6 +194,14 @@ class PublicationTargetSnapshot(models.Model):
             models.UniqueConstraint(fields=["target", "version"], name="uq_target_snapshot_version"),
             models.UniqueConstraint(fields=["target", "config_hash"], name="uq_target_snapshot_material"),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("PublicationTargetSnapshot is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationTargetSnapshot is append-only")
 
 
 class TargetCanaryRun(models.Model):
@@ -288,6 +329,38 @@ class AutoPublishActivation(models.Model):
         ]
 
 
+class PublicationIntentQuerySet(models.QuerySet):
+    @staticmethod
+    def _require_state_only(fields) -> None:
+        if set(fields) - {"state"}:
+            raise TypeError("PublicationIntent frozen identity is immutable")
+
+    def update(self, **kwargs):
+        self._require_state_only(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._require_state_only(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError("PublicationIntent is append-only")
+
+    async def adelete(self):
+        raise TypeError("PublicationIntent is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("PublicationIntent is append-only")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._require_state_only(fields)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._require_state_only(fields)
+        return await super().abulk_update(objs, fields, batch_size=batch_size)
+
+
 class PublicationIntent(models.Model):
     class State(models.TextChoices):
         DRAFT = "draft", "초안"
@@ -319,18 +392,155 @@ class PublicationIntent(models.Model):
     generation_pipeline_manifest_hash = models.CharField(max_length=64, null=True, blank=True)
     quality_gate_manifest_hash = models.CharField(max_length=64)
     quality_report_hash = models.CharField(max_length=64)
-    supersedes_intent_id = models.UUIDField(null=True, blank=True)
-    intent_hash = models.CharField(max_length=64, unique=True)
+    supersedes_intent = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        db_column="supersedes_intent_id",
+        on_delete=models.PROTECT,
+        related_name="superseded_by",
+    )
+    intent_hash = models.CharField(max_length=64)
     request_key = models.CharField(max_length=200)
+    request_hash = models.CharField(max_length=64)
+    request_hash_version = models.CharField(max_length=40)
     state = models.CharField(max_length=24, choices=State.choices, default=State.AWAITING_APPROVAL)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicationIntentQuerySet)()
 
     class Meta:
         ordering = ["-created_at"]
         constraints = [
-            models.UniqueConstraint(fields=["article_revision", "request_key"], name="uq_intent_revision_request")
+            models.UniqueConstraint(
+                fields=["article_id", "request_key"],
+                name="uq_intent_article_request",
+            )
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None or set(update_fields) - {"state"}:
+                raise TypeError("PublicationIntent frozen identity is immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationIntent is append-only")
+
+
+class PublicationIntentHeadQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("PublicationIntentHead is database-managed")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+
+class PublicationIntentHead(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    article_id = models.UUIDField(unique=True)
+    latest_intent = models.ForeignKey(
+        PublicationIntent,
+        on_delete=models.PROTECT,
+        related_name="headed_by",
+    )
+    version = models.PositiveIntegerField()
+    updated_at = models.DateTimeField(auto_now=True)
+    objects = models.Manager.from_queryset(PublicationIntentHeadQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(version__gte=1),
+                name="ck_publication_intent_head_version_positive",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        raise TypeError("PublicationIntentHead is database-managed")
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationIntentHead is database-managed")
+
+
+class PublicationDispatchQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("PublicationDispatch is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+
+class PublicationDispatch(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication_intent = models.OneToOneField(
+        PublicationIntent,
+        on_delete=models.PROTECT,
+        related_name="dispatch",
+    )
+    request_key = models.CharField(max_length=200)
+    request_hash = models.CharField(max_length=64)
+    request_hash_version = models.CharField(max_length=40)
+    correlation_id = models.UUIDField(db_index=True)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+    attempt_count = models.PositiveIntegerField()
+    attempt_manifest_hash = models.CharField(max_length=64)
+    objects = models.Manager.from_queryset(PublicationDispatchQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(attempt_count__gte=1),
+                name="ck_publication_dispatch_attempt_count_positive",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("PublicationDispatch is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationDispatch is append-only")
 
 
 class ArticleChannelRenderQuerySet(models.QuerySet):
@@ -611,6 +821,49 @@ class Approval(models.Model):
         raise TypeError("Approval is append-only")
 
 
+class PublicationQuerySet(models.QuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "article_id",
+            "target",
+            "target_id",
+            "origin_target_snapshot_id",
+            "remote_lookup_key",
+            "created_at",
+        }
+    )
+    FROZEN_IDENTITY_ATTNAMES = frozenset(
+        {
+            "article_id",
+            "target_id",
+            "origin_target_snapshot_id",
+            "remote_lookup_key",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_IDENTITY_FIELDS.intersection(fields):
+            raise TypeError("Publication frozen identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return await super().abulk_update(objs, fields, batch_size=batch_size)
+
+
 class Publication(models.Model):
     class State(models.TextChoices):
         PENDING = "pending", "대기"
@@ -653,12 +906,39 @@ class Publication(models.Model):
     last_error_code = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    objects = models.Manager.from_queryset(PublicationQuerySet)()
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["article_id", "target"], name="uq_article_publication_target"),
             models.UniqueConstraint(fields=["target", "remote_lookup_key"], name="uq_target_remote_lookup"),
         ]
+
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            if (
+                not isinstance(self.remote_lookup_key, str)
+                or not self.remote_lookup_key.strip()
+                or not PublicationTargetSnapshot.objects.filter(
+                    id=self.origin_target_snapshot_id,
+                    target_id=self.target_id,
+                ).exists()
+            ):
+                raise TypeError("Publication frozen identity is invalid")
+        else:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *PublicationQuerySet.FROZEN_IDENTITY_ATTNAMES
+                ).first()
+                if frozen is None:
+                    raise TypeError("Publication frozen identity is immutable")
+                for field_name, stored in frozen.items():
+                    if getattr(self, field_name) != stored:
+                        raise TypeError("Publication frozen identity is immutable")
+            else:
+                PublicationQuerySet._reject_frozen_fields(update_fields)
+        return super().save(*args, **kwargs)
 
 
 class PublicationRecoveryState(models.TextChoices):
@@ -668,6 +948,88 @@ class PublicationRecoveryState(models.TextChoices):
     RECONCILING = "reconciling", "Reconciling"
     MANUAL_REQUIRED = "manual_required", "Manual required"
     STOPPED = "stopped", "Stopped"
+
+
+class PublicationAttemptQuerySet(models.QuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "publication",
+            "publication_id",
+            "article_revision",
+            "article_revision_id",
+            "publication_intent",
+            "publication_intent_id",
+            "target_snapshot",
+            "target_snapshot_id",
+            "target_config_hash",
+            "resolved_action",
+            "target_command_hash",
+            "publisher_contract_version",
+            "publisher_adapter_manifest_hash",
+            "approval",
+            "approval_id",
+            "approval_subject_hash",
+            "auto_publish_activation_id",
+            "auto_publish_activation_hash",
+            "idempotency_key",
+            "remote_lookup_key",
+            "request_fingerprint",
+            "correlation_id",
+            "created_at",
+        }
+    )
+    FROZEN_IDENTITY_ATTNAMES = frozenset(
+        {
+            "publication_id",
+            "article_revision_id",
+            "publication_intent_id",
+            "target_snapshot_id",
+            "target_config_hash",
+            "resolved_action",
+            "target_command_hash",
+            "publisher_contract_version",
+            "publisher_adapter_manifest_hash",
+            "approval_id",
+            "approval_subject_hash",
+            "auto_publish_activation_id",
+            "auto_publish_activation_hash",
+            "idempotency_key",
+            "remote_lookup_key",
+            "request_fingerprint",
+            "correlation_id",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_IDENTITY_FIELDS.intersection(fields):
+            raise TypeError("PublicationAttempt frozen identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError("PublicationAttempt is append-only")
+
+    async def adelete(self):
+        raise TypeError("PublicationAttempt is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("PublicationAttempt is append-only")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return await super().abulk_update(objs, fields, batch_size=batch_size)
 
 
 class PublicationAttempt(models.Model):
@@ -722,6 +1084,7 @@ class PublicationAttempt(models.Model):
     finished_at = models.DateTimeField(null=True, blank=True)
     next_retry_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicationAttemptQuerySet)()
 
     class Meta:
         ordering = ["-created_at"]
@@ -734,7 +1097,32 @@ class PublicationAttempt(models.Model):
                 condition=Q(attempt_no__gte=1, attempt_no__lte=5),
                 name="ck_publication_attempt_no_1_5",
             ),
+            models.UniqueConstraint(
+                fields=["publication_intent", "publication"],
+                name="uq_attempt_intent_publication",
+            ),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *PublicationAttemptQuerySet.FROZEN_IDENTITY_ATTNAMES
+                ).first()
+                if frozen is None:
+                    raise TypeError("PublicationAttempt is append-only")
+                for field_name, stored in frozen.items():
+                    if getattr(self, field_name) != stored:
+                        raise TypeError(
+                            "PublicationAttempt frozen identity is immutable"
+                        )
+            else:
+                PublicationAttemptQuerySet._reject_frozen_fields(update_fields)
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationAttempt is append-only")
 
 class PublicationApprovalHead(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

@@ -1076,8 +1076,12 @@ manifest가 모든 target AutoPublishValidation의 exact material과 같고 최�
 `auto_publish_activation_refs`, `auto_activation_manifest_hash`,
 `generation_attempt_id`, `input_evidence_manifest_hash`, `generation_pipeline_manifest_hash`,
 `quality_gate_manifest_hash`, `quality_report_hash`,
-`supersedes_intent_id`, `intent_hash`, `request_key`, `state`, `created_by`, `created_at`을 가진다.
+`supersedes_intent_id`, `intent_hash`, `request_key`, `request_hash`,
+`request_hash_version=publication-intent-request-v1`, `state`, `created_by`, `created_at`을 가진다.
 state는 `draft/awaiting_approval/approved/stale/dispatched/cancelled`이다.
+T020 이전 intent는 정확한 과거 path·actor·request body를 복원할 수 없으므로 semantic
+`intent_hash`를 request hash로 재사용하지 않는다. 결정적 sentinel과
+`request_hash_version=legacy-unverifiable-v1`을 저장하며 exact replay 대상으로 인정하지 않는다.
 
 `target_commands`는 target snapshot ref마다 정확히 하나인 정렬 불변 명령이며 `target_id`,
 `target_snapshot_id`, `target_config_hash`, `resolved_action: create/update/unpublish/mark_withdrawn`,
@@ -1091,17 +1095,35 @@ Blogger는 `mark_withdrawn`처럼 같은 정정 사건도 target별 action이 �
 validation snapshot 변경, 재승인 또는 CorrectionCase update는 기존 intent를 수정하지 않고
 새 target snapshot refs로 superseding intent를 만든다. current intent의 refs/hash만
 ArticleChannelRender, Approval, PublicationAttempt와 비교하며 origin CollectionRun은 감사용
-최초 의도로 남는다. `(article_revision_id, request_key)`가 멱등이고 intent hash는 exact
+최초 의도로 남는다. `(article_id, request_key)`가 멱등이다. request hash는 article path,
+admin/worker actor provenance와 검증된 전체 요청 body를 결속한다. target/ref 배열은
+`targetId` 기준으로 정렬하며 각 집합은 최대 20개다. 같은 target ID가 다른 snapshot/config로
+두 번 나와도 422다. RFC 4122 UUID 문자열은 대소문자 모두 입력할 수 있지만 UUID로 parse한 뒤
+canonical lowercase로 바꾸어 hash·저장·응답하므로 body뿐 아니라 article path UUID의 대소문자만
+다른 replay도 같은 요청이다. `revisionNo`는 직접 호출하는 관리자·worker 서비스 경계에서도
+1~9007199254740991만 허용한다.
+관리자와 worker caller 모두 nonblank·trimmed·audit-safe `reason`을 반드시 제공한다. intent hash는 exact
 revision ID/content hash, correction case, 정렬 target refs/commands, mode, validation refs와
 activation refs, generation/input/quality manifest를 모두 포함한다. unpublish도 마지막 승인
 revision과 target별 action subject를
 고정한다. current
 revision이 달라지면 409로 새 intent/렌더/승인을 요구한다.
-intent 생성은 DraftArticle/CorrectionCase subject 행을 잠그고
-`expected_latest_intent_id`를 비교해 insert, latest projection과 outbox를 한 트랜잭션으로
-갱신한다. 같은 request key·payload는 기존 intent를 반환하고 다른 payload 또는 stale CAS는
-409다. superseded/stale intent는 승인·publish·worker에서 거절한다. multi-target intent는
+intent 생성은 idempotency lookup을 mutable CAS보다 먼저 수행한다. exact replay는 외부 작업을
+만들지 않고 같은 intent를 200으로 반환한다. 신규 요청은 DraftArticle/CorrectionCase subject와
+`PublicationIntentHead`를 잠그고 `expected_latest_intent_id`를 비교해 intent, head, preview render와
+동기 `AuditEvent`를 한 트랜잭션으로 갱신한다. 신규는 201, 같은 request key·canonical payload는
+200, 같은 key의 다른 payload 또는 stale CAS는 409다. superseded/stale intent는 승인·신규
+dispatch·worker에서 거절한다. multi-target intent는
 모든 target에 current-subject latest approved Approval이 있을 때만 `approved`가 된다.
+
+### PublicationIntentHead
+
+article별 authoritative latest intent projection이다. `article_id`가 고유하고
+`latest_intent_id`, 1부터 단조 증가하는 `version`, `updated_at`을 가진다. service와 DB trigger만
+전진시키며 latest intent는 같은 article을 가리켜야 한다. append-only intent의 생성 시각 정렬로
+current를 추측하지 않는다. API와 console의 current 조회도 public
+`resolve_current_publication_intent(..., for_update=False)`만 사용한다. intent가 있는데 head가 없거나
+head가 다른 article의 intent를 가리키면 임의 fallback 없이 conflict로 실패한다.
 
 ### ArticleChannelRender
 
@@ -1379,7 +1401,9 @@ update, 공개 확인과 최신 `remote_url` 저장이 먼저 성공한 뒤 Blog
 `idempotency_key`, `remote_lookup_key`, `request_fingerprint`, `state`, `attempt_no`, `remote_request_id`,
 `http_status`, `error_code`, `error_detail_redacted`, `started_at`, `finished_at`,
 `next_retry_at`, `reconcile_attempt_no`를 가진다. `idempotency_key`가 전역 고유하고
-`reconcile_attempt_no`는 `0..5`다.
+`reconcile_attempt_no`는 `0..5`다. DB는 조건 없는 `(publication_intent_id, publication_id)` unique를
+강제해 intent와 publication마다 논리 attempt row가 정확히 하나만 존재하게 한다. 실행 재시도는 새
+row를 insert하지 않고 그 row의 `attempt_no`/retry counter를 전진시킨다.
 
 dispatch 트랜잭션은 current intent의 target command마다 PublicationAttempt를 먼저 생성하고 exact
 revision/action/snapshot/approval/activation을 고정한 뒤 attempt ID만 request outbox의 routing
@@ -1387,6 +1411,28 @@ key로 사용한다. WordPress 공개·media·reconcile과 correction 완료 신
 반환한다. worker는 payload에서 최신 intent를 추측하지 않고 attempt가 아직 current intent에
 속하는지 외부 호출·후속 target 해제 직전에 재검증한다. superseding intent 뒤 늦게 도착한
 완료 신호는 stale 처리한다.
+
+`PublicationDispatch`는 intent당 하나인 append-only acceptance ledger다.
+`publication_intent_id`, `request_key`, `request_hash`,
+`request_hash_version=publication-dispatch-request-v1`, `correlation_id`, `accepted_at`,
+`attempt_count`, `attempt_manifest_hash`를 가진다. dispatch hash는 article path, actor provenance와
+target ID·expected snapshot을 target ID 순으로 정렬한 전체 body를 결속한다. `publishAt` 생략과
+명시적 null은 같은 즉시 실행 material이다. non-null `publishAt`은 `T`/`t`, 초, `Z`/`z` 또는
+`±HH:MM` timezone을 모두 가진 strict RFC 3339를 허용하고 hash·schedule 전에 구분자는 대문자 `T`,
+같은 instant는 UTC `Z` 문자열로 canonicalize한다. date-only·공백 구분·timezone 없는 값은 422다.
+UUID와 필수 `reason`에는 intent와 같은 canonicalization·caller 규칙을 적용한다. idempotency lookup은
+live gate보다 먼저 수행한다.
+exact replay는 attempt/outbox를 다시 만들지 않고 200, 변경 replay는 409다. 신규 dispatch만 live
+revision/intent/approval/snapshot gate를 통과한 뒤 ledger, target별 정확히 하나인 최초 attempt,
+request outbox와 동기 AuditEvent를 한 transaction에 기록하고 202를 반환한다.
+T020 이전 dispatch도 old audit hash를 현재 v1 hash라고 잘못 표시하지 않는다. 검증 가능한 과거
+ledger identity와 immutable attempt manifest는 backfill하되 request version은
+`legacy-unverifiable-v1`이며 재전송은 fail-closed 409다.
+
+API `PublicationDispatchResult`는 intent/request/correlation/accepted identity와 target ID로 정렬된
+최대 20개 attempt의 ID/publication ID/target ID/action/`attemptNo=1`만 반환한다. `attemptNo`는 최초
+acceptance generation 상수이며 논리 row의 mutable 실행 재시도 counter를 직렬화하지 않는다. mutable
+state와 이력은 포함하지 않으며 T026의 cursor pagination이 소유한다.
 
 `PublicationState`: `pending → scheduled → in_progress → published`; 수정 시 `updating → published`,
 철회 시 `withdrawing → withdrawn` 또는 `marking_withdrawn → marked_withdrawn`.
@@ -2031,3 +2077,40 @@ a historical row derives `currentHead`, `isCurrent`, and `dispatchEligible` from
 head projection, never from the replayed row itself. `decidedBy` is always the non-null approval owner
 (including the activation/schedule administrator for worker auto mode). `decisionActorType` identifies
 admin versus worker execution; `decisionActorId` is the administrator UUID and is null for workers.
+
+## English / AI-readable — T020 intent and dispatch idempotency contract
+
+`PublicationIntent` stores a distinct `publication-intent-request-v1` request hash in addition to its
+semantic intent hash. The article-scoped request identity binds the path, admin/worker actor provenance,
+and the complete validated body after sorting all target/ref sets by target ID. Every target set is
+bounded to 20 and duplicate semantic target IDs are 422. `PublicationIntentHead` is the authoritative
+article-level latest projection; current intent is never inferred from creation-time ordering.
+API and console reads use only `resolve_current_publication_intent(..., for_update=False)` and fail closed
+when an extant intent lacks its head or the head points across articles. Exact
+replay is resolved before mutable CAS and returns the same intent with 200, creation is 201, and changed
+replay or stale CAS is 409. Valid RFC 4122 UUID strings are accepted case-insensitively, then UUID-parsed
+to canonical lowercase form for hashing, persistence, and responses, so case-only UUID replays are equal.
+This includes the article UUID in the request path, not only UUIDs in the body. Direct administrator and
+worker service calls also constrain `revisionNo` to 1 through 9007199254740991.
+Every administrator and worker caller supplies a required nonblank, trimmed, audit-safe `reason`.
+Pre-T020 intent rows do not reuse their semantic intent hash as request proof. They carry a deterministic
+sentinel and `legacy-unverifiable-v1`, and are never accepted as exact request replay.
+
+`PublicationDispatch` is an append-only one-per-intent acceptance ledger containing the
+`publication-dispatch-request-v1` hash, correlation ID, acceptance time, attempt count, and attempt
+manifest hash. Omitted `publishAt` and explicit null canonicalize to the same immediate value. Non-null
+`publishAt` accepts strict RFC 3339 containing `T`/`t`, seconds, and `Z`/`z` or a `+/-HH:MM` timezone.
+Lowercase separators are accepted and canonicalized to uppercase `T`; the instant is canonicalized to UTC
+`Z` before hashing and scheduling. Date-only, space-separated, and timezone-less values are 422. Exact
+replay returns 200 without creating another
+attempt, outbox event, or audit event; a new accepted
+dispatch returns 202. Only a new dispatch evaluates live gates and atomically creates the ledger,
+exactly one initial attempt per frozen target, request outbox events, and the synchronous audit event.
+`PublicationDispatchResult` is bounded and immutable: it exposes only dispatch identity plus target-sorted
+attempt/publication/target IDs, resolved action, and immutable acceptance `attemptNo=1`. The database has
+an unconditional `(publication_intent_id, publication_id)` unique constraint: retries advance counters on
+the one logical row and its mutable runtime attempt number is never serialized in the acceptance result.
+Mutable state and history remain in T026 cursor-paginated endpoints and UI.
+For a pre-T020 dispatch, migration may preserve a verifiable ledger and immutable attempt manifest from
+the historical audit record, but labels the old request hash `legacy-unverifiable-v1`; it never claims
+current-v1 replay proof and fails closed with 409.

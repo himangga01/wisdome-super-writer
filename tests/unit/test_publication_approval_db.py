@@ -384,6 +384,8 @@ class PublicationApprovalSQLiteTriggerTests(TestCase):
             quality_report_hash=revision.quality_report_hash,
             intent_hash="0" * 64,
             request_key="intent-t019-db",
+            request_hash="1" * 64,
+            request_hash_version="publication-intent-request-v1",
             created_by=user,
         )
         render = ArticleChannelRender.objects.create(
@@ -802,9 +804,17 @@ class ApprovalGuardedTransactionTestCase(TransactionTestCase):
             )
         except ModuleNotFoundError:
             publishing_0009 = None
+        try:
+            publishing_0010 = importlib.import_module(
+                "apps.publishing.migrations.0010_intent_dispatch_identity"
+            )
+        except ModuleNotFoundError:
+            publishing_0010 = None
         with connection.schema_editor() as editor:
             editorial_migration.remove_editorial_policy_guards(None, editor)
             audit_migration.remove_append_only_guards(None, editor)
+            if publishing_0010 is not None:
+                publishing_0010.remove_t020_guards(None, editor)
             if publishing_0009 is not None:
                 publishing_0009.remove_t019_guards(None, editor)
             else:
@@ -819,6 +829,8 @@ class ApprovalGuardedTransactionTestCase(TransactionTestCase):
                     publishing_0009.install_t019_guards(None, editor)
                 else:
                     publishing_0008.install_approval_guards(None, editor)
+                if publishing_0010 is not None:
+                    publishing_0010.install_t020_guards(None, editor)
 
 
 class PublicationApprovalConcurrentCASTests(
@@ -954,9 +966,6 @@ class PublicationApprovalMigrationExecutorTests(
         try:
             with self.assertRaises(IrreversibleError):
                 MigrationExecutor(connection).migrate(before)
-            self.assertTrue(Approval.objects.filter(id=approval_id).exists())
-
-            MigrationExecutor(connection).migrate(under_test)
             self.assertTrue(Approval.objects.filter(id=approval_id).exists())
         finally:
             MigrationExecutor(connection).migrate(latest)

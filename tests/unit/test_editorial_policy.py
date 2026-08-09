@@ -1903,6 +1903,7 @@ class EditorialModelContractTests(TestCase):
             "stale",
         )
         intent_ids = {}
+        prior_intent = None
         for state in states:
             intent = PublicationIntent.objects.create(
                 article_id=article.id,
@@ -1918,10 +1919,14 @@ class EditorialModelContractTests(TestCase):
                 quality_report_hash=sha,
                 intent_hash=uuid.uuid4().hex + uuid.uuid4().hex,
                 request_key=f"intent-{state}",
+                request_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                request_hash_version="publication-intent-request-v1",
+                supersedes_intent=prior_intent,
                 state=state,
                 created_by=user,
             )
             intent_ids[state] = intent.id
+            prior_intent = intent
 
         with self.assertRaisesRegex(RuntimeError, "rollback"), transaction.atomic():
             _stale_open_publication_intents_locked(

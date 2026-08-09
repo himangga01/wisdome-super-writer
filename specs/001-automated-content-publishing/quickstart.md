@@ -266,6 +266,57 @@ pagination과 관리자 UI 검증은 T026에서 수행한다. 그때까지 `Publ
 `renders`/`approvals` 배열을 포함하지 않는다. T018과 외부 blocker가 남아 있으면 T019를 완료
 표시하지 않는다.
 
+### 3.3 T020 intent 생성과 dispatch 멱등성 확인
+
+`POST /api/v1/articles/{articleId}/publication-intents`의 target snapshot/command는 각각
+1~20개다. 자동발행 validation/activation ref는 각각 최대 20개이고 `validated_auto`에서는
+각각 1개 이상, `manual`에서는 빈 배열이어야 하며 target ID 기준 집합이 정확히 같아야 한다. 같은
+target ID를 값만 바꾸어 두 번 보내도 422다. `requestKey`와 `reason`은 nonblank·trimmed·audit-safe
+필수 값이며 관리자와 worker caller 모두 생략할 수 없다. 유효한 RFC 4122 UUID는 대소문자를 모두
+받지만 UUID parse 뒤 canonical lowercase로 hash·저장·응답한다. body UUID뿐 아니라 path의
+`articleId`도 이 규칙을 적용하므로 case-only replay는 동일 요청이다. `revisionNo`는 API와 직접
+관리자·worker 호출 모두 1~9007199254740991만 허용한다. 신규 intent는 201, target/ref 배열
+순서 또는 UUID 대소문자만 다른 canonical-equivalent replay는 같은
+intent ID와 200, 같은 key의 reason·expected latest·material 변경은 409여야 한다. replay는 current
+revision/head의 mutable CAS보다 먼저 판정하며 새 render, AuditEvent 또는 외부 작업을 만들지 않는다.
+current intent GET과 console도 public `resolve_current_publication_intent`만 사용하며 생성시각 정렬로
+추측하지 않는다. intent가 있는데 head가 없거나 다른 article을 가리키면 conflict로 실패해야 한다.
+
+모든 target 승인 뒤 `POST /api/v1/articles/{articleId}/publish`를 보낸다. `targetIds`와
+`expectedTargetSnapshots`는 각각 1~20개이고 frozen intent target 전체와 정확히 같아야 한다.
+`publishAt` 생략과 null은 같은 즉시 실행 요청이다. non-null 값은 `T`/`t`, 초, `Z`/`z` 또는
+`±HH:MM` timezone을 가진 strict RFC 3339를 허용하며 소문자 구분자는 대문자 `T`, 같은 instant는
+hash·schedule 전에 UTC `Z`로 바꾼다. date-only·공백 구분·timezone 없는 값은 422이고 같은 시각의
+`2026-08-09T06:00:00Z`와 `2026-08-09T15:00:00+09:00`은 같은 replay material이다. 신규 dispatch는
+202, exact replay는 200이며
+두 응답 모두 다음 bounded shape를 사용한다.
+
+```json
+{
+  "publicationIntentId": "22222222-2222-4222-8222-222222222222",
+  "requestKey": "dispatch-request-0001",
+  "correlationId": "77777777-7777-4777-8777-777777777777",
+  "acceptedAt": "2026-08-09T06:00:00+00:00",
+  "replayed": false,
+  "attempts": [
+    {
+      "attemptId": "55555555-5555-4555-8555-555555555555",
+      "publicationId": "66666666-6666-4666-8666-666666666666",
+      "targetId": "33333333-3333-4333-8333-333333333333",
+      "resolvedAction": "create",
+      "attemptNo": 1
+    }
+  ]
+}
+```
+
+attempt는 target ID 오름차순이고 frozen target마다 정확히 하나다. 응답의 `attemptNo`는 최초 acceptance
+generation인 상수 1이며, 재시도로 증가한 논리 attempt row의 실행 counter를 노출하지 않는다. DB는
+조건 없는 `(publication_intent_id, publication_id)` unique로 논리 row 하나만 허용한다. replay에서
+attempt/outbox/audit 추가 생성은 모두 0건이어야 하며 같은 key의 변경 payload는 409다. 응답에는 mutable state나
+render/approval/attempt history가 없다. 새 route, cursor pagination, 관리자 UI와 E2E는 T026에서
+구현한다. T019와 선행 blocker가 완료되기 전에는 T020을 완료 표시하지 않는다.
+
 ## 4. 관리자·보안 검증
 
 1. 익명 사용자가 `/admin/`과 `/api/v1/*`에 접근하면 로그인 또는 401/403을 받는다.
@@ -814,6 +865,34 @@ reason. Both values must arrive nonblank, already trimmed, and audit-safe. Until
 cursor-paginated approval history, the contracted
 `PublicationIntent` response omits unbounded `renders` and `approvals` arrays. T026 owns route/history/UI
 completion.
+
+## English / AI-readable — T020 intent and dispatch procedure
+
+Intent creation accepts closed, canonical target snapshot, command, validation, and activation-reference
+sets of at most 20 entries each. Duplicate semantic target IDs are invalid with 422. A new request returns
+201, an exact canonical request replay returns the same intent with 200, and reuse of the same request key
+with changed material returns 409. Replay resolution precedes mutable head/CAS checks and creates no new
+preview or audit record. Valid RFC 4122 UUID strings are accepted case-insensitively and UUID-parsed to
+canonical lowercase for hashes, storage, and responses, so case-only UUID changes are the same replay.
+The rule includes the path `articleId`, not only body UUID fields. `revisionNo` is bounded from 1 through
+9007199254740991 at both API and direct administrator/worker service boundaries.
+Every administrator and worker caller supplies a required nonblank, trimmed, audit-safe `reason`.
+Current-intent API and console reads use only the public `resolve_current_publication_intent` resolver and
+fail closed for a missing or cross-article head instead of falling back to creation-time ordering.
+
+Non-null `publishAt` must be strict RFC 3339 containing `T`/`t`, seconds, and `Z`/`z` or a `+/-HH:MM`
+timezone. Lowercase separators are accepted, then canonicalized to uppercase `T` and the equivalent UTC
+`Z` instant before hashing or scheduling. Date-only, space-separated, and timezone-less values are 422;
+equal instants with different offsets replay.
+Dispatch treats an omitted `publishAt` and explicit null as the same immediate-publication request. A new
+dispatch returns 202; an exact replay returns 200 without another attempt, outbox message, or audit record;
+and changed request material returns 409. `PublicationDispatchResult` is bounded and immutable: it contains
+only dispatch identity and one target-ID-sorted attempt reference per frozen target. Its `attemptNo` is the
+immutable acceptance constant 1, never the mutable retry counter. An unconditional
+`(publication_intent_id, publication_id)` unique constraint keeps one logical attempt row and retries advance
+that row's counters. Mutable state, render,
+approval, and attempt history are excluded. T026 owns route completion, cursor-paginated history, admin UI,
+and E2E coverage. T020 remains unchecked until T019 and the active predecessor blockers are complete.
 
 ## English / AI-readable — Legacy HWP deployment
 
