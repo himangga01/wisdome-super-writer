@@ -10,7 +10,6 @@ from apps.audit.services import (
 from apps.collection.models import CollectionRun, RunState
 from apps.scheduling.models import ScheduleDispatch
 from wisdome_writer.domain.errors import Conflict, InvalidInput
-from wisdome_writer.domain.hashing import sha256_hex
 
 from .models import (
     Approval,
@@ -23,7 +22,12 @@ from .models import (
     PublicationTarget,
 )
 from .services import (
+    _StaleIntentConflict,
+    _latest_approval_locked,
+    _raise_persisted_stale_intent,
+    _require_intent_revision_publishable,
     _require_worker_event,
+    _require_revision_for_commands,
     create_publication_intent,
     decide_approval,
     dispatch_publication,
@@ -68,21 +72,35 @@ def _validate_automation_material(schedule, targets: dict[str, PublicationTarget
             raise Conflict("자동발행 activation이 만료되었거나 현재 target과 다릅니다.")
 
 
-@transaction.atomic
 def dispatch_validated_schedule_run(
+    run_id: str,
+    *,
+    audit_context: AuditContext,
+):
+    try:
+        return _dispatch_validated_schedule_run_atomic(
+            run_id,
+            audit_context=audit_context,
+        )
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
+@transaction.atomic
+def _dispatch_validated_schedule_run_atomic(
     run_id: str,
     *,
     audit_context: AuditContext,
 ):
     if audit_context.actor_type != "worker":
         raise Conflict("schedule publication requires worker audit provenance")
-    run = CollectionRun.objects.select_for_update().get(id=run_id)
     _require_worker_event(
         audit_context,
         topic="publication.scheduled_run_requested",
-        aggregate_id=run.id,
-        payload_identity={"run_id": str(run.id)},
+        aggregate_id=run_id,
+        payload_identity={"run_id": str(run_id)},
     )
+    run = CollectionRun.objects.select_for_update().get(id=run_id)
     if run.approval_mode != ApprovalMode.VALIDATED_AUTO:
         return []
     article = run.articles.select_for_update().select_related("current_revision").get()
@@ -101,6 +119,21 @@ def dispatch_validated_schedule_run(
         raise Conflict("자동발행할 current revision이 품질 gate를 통과하지 못했습니다.")
     schedule_dispatch = ScheduleDispatch.objects.select_related("schedule").get(collection_run=run)
     schedule = schedule_dispatch.schedule
+    request_key = f"schedule:{schedule_dispatch.id}:intent"
+    intent = (
+        PublicationIntent.objects.select_related(
+            "article_revision__generation_attempt"
+        )
+        .filter(article_revision=revision, request_key=request_key)
+        .first()
+    )
+    if intent is None:
+        _require_revision_for_commands(
+            revision,
+            [{"resolvedAction": "create"}],
+        )
+    else:
+        intent = _require_intent_revision_publishable(intent)
     requested_ids = [str(value) for value in run.requested_target_ids]
     targets = {
         str(row.id): row
@@ -142,24 +175,13 @@ def dispatch_validated_schedule_run(
             }
         )
 
-    request_key = f"schedule:{schedule_dispatch.id}:intent"
-    intent = PublicationIntent.objects.filter(
-        article_revision=revision,
-        request_key=request_key,
-    ).first()
     if intent is None:
         latest = PublicationIntent.objects.filter(article_id=article.id).order_by("-created_at").first()
         intent = create_publication_intent(
             str(article.id),
             {
                 "revisionNo": revision.revision_no,
-                "expectedRevisionContentHash": sha256_hex(
-                    {
-                        "title": revision.title,
-                        "summary": revision.summary,
-                        "bodyMarkdown": revision.body_markdown,
-                    }
-                ),
+                "expectedRevisionContentHash": revision.content_hash,
                 "correctionCaseId": None,
                 "targetSnapshots": target_refs,
                 "targetCommands": commands,
@@ -175,10 +197,9 @@ def dispatch_validated_schedule_run(
 
     for command in intent.target_commands:
         target_id = str(command["targetId"])
-        latest_approval = (
-            Approval.objects.filter(publication_intent=intent, target_id=target_id)
-            .order_by("-decided_at")
-            .first()
+        latest_approval = _latest_approval_locked(
+            intent=intent,
+            target_id=target_id,
         )
         if latest_approval and latest_approval.decision == Approval.Decision.APPROVED:
             continue
@@ -231,8 +252,6 @@ def dispatch_validated_schedule_run(
         },
         audit_context=audit_context,
     )
-    article.state = "publishing"
-    article.save(update_fields=["state", "updated_at"])
     run.state = RunState.PUBLISHING
     run.save(update_fields=["state"])
     record_audit_event(

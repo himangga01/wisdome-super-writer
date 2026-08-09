@@ -2,7 +2,102 @@ import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
+
+from wisdome_writer.domain.hashing import (
+    CANONICAL_HASH_SCHEMA_V1,
+    canonical_hash,
+)
+
+
+sha256_validator = RegexValidator(
+    regex=r"^[0-9a-f]{64}$",
+    message="Must be a lowercase SHA-256 hex digest.",
+)
+
+
+class AppendOnlyEditorialQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise TypeError(f"{self.model.__name__} is append-only")
+
+    async def aupdate(self, **kwargs):
+        raise TypeError(f"{self.model.__name__} is append-only")
+
+    def delete(self):
+        raise TypeError(f"{self.model.__name__} is append-only")
+
+    async def adelete(self):
+        raise TypeError(f"{self.model.__name__} is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError(f"{self.model.__name__} is append-only")
+
+
+class EditorialPolicySnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    topic_code = models.CharField(max_length=40)
+    policy_key = models.CharField(max_length=120)
+    policy_version = models.CharField(max_length=40)
+    document = models.JSONField()
+    release_document_hash = models.CharField(
+        max_length=64, validators=[sha256_validator]
+    )
+    config_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    implementation_manifest = models.JSONField()
+    implementation_manifest_hash = models.CharField(
+        max_length=64, validators=[sha256_validator]
+    )
+    material_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(AppendOnlyEditorialQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("topic_code", "policy_key", "policy_version"),
+                name="uq_editorial_policy_release_version",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("EditorialPolicySnapshot is append-only")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        document = self.document
+        if (
+            not isinstance(document, dict)
+            or document.get("topicCode") != self.topic_code
+            or document.get("policyKey") != self.policy_key
+            or document.get("policyVersion") != self.policy_version
+            or canonical_hash(document, schema_version=CANONICAL_HASH_SCHEMA_V1)
+            != self.config_hash
+            or canonical_hash(
+                self.implementation_manifest,
+                schema_version=CANONICAL_HASH_SCHEMA_V1,
+            )
+            != self.implementation_manifest_hash
+            or canonical_hash(
+                {
+                    "schemaVersion": "editorial-policy-release-material-v1",
+                    "releaseDocumentHash": self.release_document_hash,
+                    "configHash": self.config_hash,
+                    "implementationManifestHash": self.implementation_manifest_hash,
+                },
+                schema_version=CANONICAL_HASH_SCHEMA_V1,
+            )
+            != self.material_hash
+        ):
+            raise ValidationError(
+                "Editorial policy identity must match its canonical document."
+            )
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("EditorialPolicySnapshot is append-only")
 
 
 class DraftArticle(models.Model):
@@ -32,10 +127,32 @@ class DraftArticle(models.Model):
 class GenerationAttempt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     article = models.ForeignKey(DraftArticle, on_delete=models.CASCADE, related_name="generation_attempts")
+    origin_run = models.ForeignKey(
+        "collection.CollectionRun",
+        on_delete=models.PROTECT,
+        related_name="editorial_generation_attempts",
+    )
     generator_name = models.CharField(max_length=100, default="source_grounded_template")
     generator_version = models.CharField(max_length=40, default="v1")
     input_manifest_hash = models.CharField(max_length=64)
     generation_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    editorial_policy_snapshot = models.ForeignKey(
+        EditorialPolicySnapshot,
+        on_delete=models.PROTECT,
+        related_name="generation_attempts",
+    )
+    editorial_policy_version = models.CharField(max_length=40, blank=True, default="")
+    editorial_policy_hash = models.CharField(max_length=64, blank=True, default="")
+    verification_manifest = models.JSONField(default=list)
+    verification_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    evidence_manifest = models.JSONField(default=list)
+    evidence_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    exclusion_manifest = models.JSONField(default=list)
+    exclusion_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    visual_manifest = models.JSONField(default=list)
+    visual_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    generation_pipeline_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    output_checksum = models.CharField(max_length=64, null=True, blank=True)
     state = models.CharField(max_length=20, default="running")
     error_detail_redacted = models.CharField(max_length=500, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -45,16 +162,59 @@ class GenerationAttempt(models.Model):
 class ArticleRevision(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     article = models.ForeignKey(DraftArticle, on_delete=models.CASCADE, related_name="revisions")
+    origin_run = models.ForeignKey(
+        "collection.CollectionRun",
+        on_delete=models.PROTECT,
+        related_name="article_revisions",
+    )
     revision_no = models.PositiveIntegerField()
     generation_attempt = models.ForeignKey(GenerationAttempt, null=True, blank=True, on_delete=models.PROTECT)
+    base_revision = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseding_revisions",
+    )
+    event_verification = models.ForeignKey(
+        "EventClusterVerification",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="article_revisions",
+    )
+    editorial_policy_snapshot = models.ForeignKey(
+        EditorialPolicySnapshot,
+        on_delete=models.PROTECT,
+        related_name="article_revisions",
+    )
+    editorial_policy_version = models.CharField(max_length=40, blank=True, default="")
+    editorial_policy_hash = models.CharField(max_length=64, blank=True, default="")
+    verification_manifest = models.JSONField(default=list)
+    verification_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    evidence_manifest = models.JSONField(default=list)
+    evidence_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    exclusion_manifest = models.JSONField(default=list)
+    exclusion_manifest_hash = models.CharField(max_length=64, blank=True, default="")
+    visual_manifest = models.JSONField(default=list)
+    visual_manifest_hash = models.CharField(max_length=64, blank=True, default="")
     title = models.CharField(max_length=220)
     summary = models.TextField()
     body_markdown = models.TextField()
+    body_blocks = models.JSONField(default=list)
+    claim_bindings = models.JSONField(default=list)
+    content_hash = models.CharField(max_length=64, blank=True, default="")
     provenance_kind = models.CharField(max_length=20, default="generated")
     input_manifest_hash = models.CharField(max_length=64)
     claim_manifest_hash = models.CharField(max_length=64)
     quality_manifest_hash = models.CharField(max_length=64)
+    claim_graph_state = models.CharField(max_length=20, default="queued")
+    quality_gate_manifest_hash = models.CharField(max_length=64, null=True, blank=True)
+    quality_report_hash = models.CharField(max_length=64, null=True, blank=True)
     quality_state = models.CharField(max_length=20, default="pending")
+    revalidation_event_key = models.UUIDField(null=True, blank=True)
+    revalidation_generation = models.PositiveBigIntegerField(default=0)
+    revalidation_lease_token = models.UUIDField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -71,11 +231,15 @@ class Claim(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     revision = models.ForeignKey(ArticleRevision, on_delete=models.CASCADE, related_name="claims")
+    block_id = models.CharField(max_length=255, blank=True, default="")
     claim_type = models.CharField(max_length=24, choices=ClaimType.choices)
     text = models.TextField()
     position = models.PositiveIntegerField()
     citation_marker = models.CharField(max_length=30)
     high_impact = models.BooleanField(default=False)
+    risk_level = models.CharField(max_length=20, default="normal")
+    verification_state = models.CharField(max_length=20, default="pending")
+    subject_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["position"]
@@ -84,7 +248,13 @@ class Claim(models.Model):
 class ClaimEvidence(models.Model):
     claim = models.ForeignKey(Claim, on_delete=models.CASCADE, related_name="evidence_links")
     evidence = models.ForeignKey("evidence.EvidenceAsset", on_delete=models.PROTECT, related_name="claim_links")
-    support_kind = models.CharField(max_length=20, default="supports")
+    relation = models.CharField(max_length=20, default="supports")
+    source_span = models.TextField(null=True, blank=True)
+    source_span_hash = models.CharField(max_length=64, blank=True, default="")
+    verification_strength = models.CharField(max_length=24, default="direct")
+    checked_at = models.DateTimeField(null=True, blank=True)
+    frozen_material = models.JSONField(default=dict)
+    frozen_material_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["claim", "evidence"], name="uq_claim_evidence")]
@@ -93,8 +263,12 @@ class ClaimEvidence(models.Model):
 class QualityCheck(models.Model):
     revision = models.ForeignKey(ArticleRevision, on_delete=models.CASCADE, related_name="quality_checks")
     code = models.CharField(max_length=100)
-    state = models.CharField(max_length=20)
-    detail = models.JSONField(default=dict)
+    check_version = models.CharField(max_length=40, default="1")
+    result = models.CharField(max_length=20)
+    score = models.FloatField(null=True, blank=True)
+    blocking = models.BooleanField(default=True)
+    details = models.JSONField(default=dict)
+    details_hash = models.CharField(max_length=64, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -109,9 +283,112 @@ class VisualizationRender(models.Model):
     transform_spec = models.JSONField(default=dict)
     input_manifest_hash = models.CharField(max_length=64)
     object_key = models.CharField(max_length=1000, null=True, blank=True)
+    object_version = models.CharField(max_length=500, null=True, blank=True)
     checksum = models.CharField(max_length=64, null=True, blank=True)
     alt_text = models.CharField(max_length=500)
     state = models.CharField(max_length=20, default="queued")
+
+
+class VisualPlacement(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    revision = models.ForeignKey(
+        ArticleRevision,
+        on_delete=models.PROTECT,
+        related_name="visual_placements",
+    )
+    block_id = models.CharField(max_length=255)
+    source_evidence = models.ForeignKey(
+        "evidence.EvidenceAsset",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="editorial_visual_placements",
+    )
+    visualization = models.ForeignKey(
+        VisualizationRender,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="placements",
+    )
+    display_order = models.PositiveIntegerField()
+    locator_snapshot = models.JSONField(default=dict)
+    rights_status_snapshot = models.CharField(max_length=32)
+    rights_basis_url_snapshot = models.URLField(max_length=1000)
+    attribution_snapshot = models.TextField(null=True, blank=True)
+    alt_text_snapshot = models.TextField()
+    caption = models.TextField()
+    caption_claim_marker = models.CharField(max_length=30)
+    render_object_key_snapshot = models.CharField(
+        max_length=1000, null=True, blank=True
+    )
+    render_object_version_snapshot = models.CharField(
+        max_length=500, null=True, blank=True
+    )
+    render_checksum_snapshot = models.CharField(
+        max_length=64, null=True, blank=True,
+        validators=[sha256_validator],
+    )
+    render_input_manifest_hash_snapshot = models.CharField(
+        max_length=64, null=True, blank=True,
+        validators=[sha256_validator],
+    )
+    render_transform_hash_snapshot = models.CharField(
+        max_length=64, null=True, blank=True,
+        validators=[sha256_validator],
+    )
+    presentation_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("revision", "block_id", "display_order"),
+                name="uq_revision_visual_placement_order",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(source_evidence__isnull=False, visualization__isnull=True)
+                    | models.Q(source_evidence__isnull=True, visualization__isnull=False)
+                ),
+                name="ck_visual_placement_exactly_one_source",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if (self.source_evidence_id is None) == (self.visualization_id is None):
+            raise ValidationError(
+                "Visual placement requires exactly one evidence or visualization source."
+            )
+        if (
+            not self.block_id.strip()
+            or not self.rights_basis_url_snapshot.strip()
+            or not self.alt_text_snapshot.strip()
+            or not self.caption.strip()
+            or not self.caption_claim_marker.strip()
+            or f"[{self.caption_claim_marker}]" not in self.caption
+            or not isinstance(self.locator_snapshot, dict)
+            or not self.locator_snapshot
+        ):
+            raise ValidationError(
+                "Visual placement rights basis and provenance are incomplete."
+            )
+        render_material = (
+            self.render_object_key_snapshot,
+            self.render_object_version_snapshot,
+            self.render_checksum_snapshot,
+            self.render_input_manifest_hash_snapshot,
+            self.render_transform_hash_snapshot,
+        )
+        if self.source_evidence_id is not None and any(render_material):
+            raise ValidationError(
+                "Evidence visual placement cannot contain render provenance."
+            )
+        if self.visualization_id is not None and not all(render_material):
+            raise ValidationError(
+                "Visualization placement requires frozen render provenance."
+            )
 
 
 class EventCluster(models.Model):

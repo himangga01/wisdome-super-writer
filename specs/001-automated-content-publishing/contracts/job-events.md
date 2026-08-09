@@ -62,6 +62,7 @@
 | `article.generation_ready` | `generation_attempt_id`, `article_revision_id`, `input_evidence_manifest_hash`, `generation_pipeline_manifest_hash`, `output_checksum` | current revision provenance를 검증하고 주장 재구성 요청 |
 | `article.claims_requested` | `article_revision_id`, `revision_content_hash`, `input_evidence_manifest_hash` | 새 revision의 모든 factual text에서 Claim을 다시 추출하고 Evidence를 재연결; unsupported fact면 blocked |
 | `article.quality_requested` | `article_revision_id`, `revision_content_hash`, `quality_gate_manifest_hash` | current claim graph에 전체 차단형 품질 검사 재실행 |
+| `editorial.revalidate_requested` | `article_id`, `article_revision_id`, `editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`, `input_evidence_manifest_hash`, `excluded_material_manifest_hash` | 수동 개정의 exact bodyBlocks와 frozen policy/verification/evidence/exclusion material을 DB에서 재조회하고 current policy/evidence publish eligibility 확인 뒤 claim graph와 전체 gate 재생성 |
 | `media.upload_requested` | `remote_media_id`, `publication_attempt_id`, `publication_intent_id`, `target_snapshot_id`, `target_config_hash` | exact intent/attempt의 WordPress checksum 매핑 확인 후 업로드 또는 재사용 |
 | `media.available` | `remote_media_id`, `publication_attempt_id`, `publication_intent_id`, `target_snapshot_id`, `target_config_hash`, `remote_source_url` | 같은 current attempt의 final render 자리만 결합; stale intent면 dispatch 금지 |
 | `media.reconcile_requested` | `remote_media_id`, `publication_attempt_id`, `publication_intent_id` | media slug/marker로 exact attempt의 응답 유실 조정; 업로드 반복 금지 |
@@ -231,6 +232,7 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
 | `run.evidence_ready` | `run_id` | evidence fan-out이 성공적으로 종결된 run의 clustering 연결 |
 | `editorial.cluster_requested` | `run_id` | terminal RunSourceItem을 cluster에 결합하고 불변 검증 결정 생성 |
 | `editorial.generate_requested` | `verification_id`, `run_id`, 정렬 `verification_ids`, `generation_manifest_hash` | 최신 frozen verification set에서 canonical article identity와 초안 생성 |
+| `editorial.revalidate_requested` | `article_id`, `article_revision_id`, `editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`, `input_evidence_manifest_hash`, `excluded_material_manifest_hash` | 새 수동 revision의 current policy/evidence 재검증과 claim/quality 재생성 |
 | `run.draft_requested` | `run_id` | 기존 영속 이벤트 소비 호환용 legacy 연결; 신규 생산 금지 |
 | `publication.scheduled_run_requested` | `run_id` | validated schedule run의 publication intent/attempt 생성 |
 | `publication.preflight_requested` | `target_id`, `target_snapshot_id`, `target_config_hash` | 고정된 target fence로 preflight 시작 |
@@ -276,6 +278,37 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   끝난 마지막 worker만 검토한다. run-owned article이 정확히 1개일 때만 publication event를 만들고,
   reused digest 0개 또는 다중 article 2개 이상은 fail-closed 0건이다. 기존 dedupe event가 있으면
   새 causation으로 enqueue하지 않는다.
+
+### T018 편집 정책·수동 재검증 이벤트 불변조건
+
+- `editorial.generate_requested@1`의 첫 current 처리 transaction은 배포 release JSON에서 주제의
+  current editorial policy를 해석하고 append-only `EditorialPolicySnapshot`을 생성하거나 exact
+  material만 재사용한다. editorial policy에는 approval/head가 없다. 같은 key/version의 release,
+  config 또는 implementation bytes가 다르면 generator 입력을 읽기 전에 영구 실패한다.
+- generated/manual `ArticleRevision`은 canonical `bodyBlocks`, policy snapshot ID/material hash,
+  정렬 multi-verification snapshot, 실제 input-evidence snapshot, excluded/duplicate/conflict snapshot과
+  각각의 manifest hash를 고정한다. event hint와 DB material이 다르면 fail-closed다.
+- `editorial.revalidate_requested@1`의 exact payload는 `article_id`, `article_revision_id`,
+  `editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`,
+  `input_evidence_manifest_hash`, `excluded_material_manifest_hash`이며 추가 필드를 허용하지 않는다.
+  base-revision CAS로 pending revision을 만드는 transaction에서 같은 event를 한 번만 기록한다.
+- consumer는 current article/revision, exact policy snapshot, 세 manifest를 잠근 뒤 current release
+  policy와 사용 evidence의 current publish eligibility를 다시 계산한다. policy 교체, freshness 만료,
+  권리 철회, source lineage 변경은 과거 snapshot을 수정하지 않고 revision을 blocked/manual-required로
+  종결한다.
+- claim type은 정확히 `fact/company_claim/interpretation/outlook`이다. title, summary, bodyBlocks,
+  caption의 모든 publishable assertion을 atomic Claim으로 재구성하며 이전 revision의 Claim,
+  ClaimEvidence, QualityCheck, Approval 또는 PublicationIntent를 복사하지 않는다.
+- review-ready는 `all_publishable_claims_grounded`, `high_risk_verification_satisfied`,
+  `claim_independence_satisfied`, `source_freshness_satisfied`,
+  `evidence_publish_eligibility_current`, `quotation_limits_satisfied`,
+  `claim_types_separated_and_attributed`, `duplicate_or_conflict_resolved`,
+  `korean_readability_and_repetition`, `no_exaggeration_or_false_experience`의 exact 10개
+  content/evidence gate가 모두 passed이고 visual이 있으면 `visual_rights_and_alt_text`도 passed일
+  때만 가능하다. terminal 성공은 claim graph,
+  `quality_gate_manifest_hash`, `quality_report_hash`, article/revision state와 audit를 한 transaction에
+  기록한다. 전달 소진은 current pending revision만 failed/manual-required로 닫고 이전 revision을
+  current로 되돌리지 않는다.
 
 ### 발행·추출 재전달 규칙 보충
 
@@ -432,6 +465,7 @@ event version.
 | `run.evidence_ready@1` | `run_id` |
 | `editorial.cluster_requested@1` | `run_id` |
 | `editorial.generate_requested@1` | `verification_id`, `run_id`, sorted `verification_ids`, `generation_manifest_hash` |
+| `editorial.revalidate_requested@1` | `article_id`, `article_revision_id`, `editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`, `input_evidence_manifest_hash`, `excluded_material_manifest_hash` |
 | `run.draft_requested@1` | `run_id` |
 | `publication.scheduled_run_requested@1` | `run_id` |
 | `publication.preflight_requested@1` | `target_id`, `target_snapshot_id`, `target_config_hash` |
@@ -553,6 +587,32 @@ causally stale complete successfully at the editorial stage instead of remaining
 `validating`. If events already exist, completion requires every frozen generation event
 for the run to be superseded; a partially superseded run leaves its remaining current
 work units eligible.
+
+### T018 editorial policy binding and manual revalidation
+
+The first current handling of `editorial.generate_requested@1` resolves the topic's current policy
+from the deployed release JSON and persists or reuses an exact append-only
+`EditorialPolicySnapshot`. There is no approval record and no mutable policy head. Reusing a
+key/version with changed release, config, implementation, or material bytes is a permanent failure
+before generator input is read.
+
+Every generated or manual revision freezes canonical bodyBlocks, the policy snapshot, sorted
+multi-verification material, used publish-eligible evidence, and excluded/duplicate/conflicting
+material under separate hashes. `editorial.revalidate_requested@1` allows exactly the seven fields
+declared in the table. The pending manual revision and event are created atomically after base
+revision CAS.
+
+The consumer locks and verifies the article, revision, policy, and all three manifests, then checks
+the current release policy and current evidence publish eligibility. It rebuilds atomic claims of
+exactly `fact`, `company_claim`, `interpretation`, or `outlook`; prior claims, checks, approvals, and
+intents are never copied. Review-ready requires these ten exact gates:
+`all_publishable_claims_grounded`, `high_risk_verification_satisfied`,
+`claim_independence_satisfied`, `source_freshness_satisfied`,
+`evidence_publish_eligibility_current`, `quotation_limits_satisfied`,
+`claim_types_separated_and_attributed`, `duplicate_or_conflict_resolved`,
+`korean_readability_and_repetition`, and `no_exaggeration_or_false_experience`. Revisions containing
+visuals also require `visual_rights_and_alt_text`. Policy drift, freshness expiry, rights revocation,
+or source-lineage drift blocks the new revision without mutating the old one.
 
 ### T015 legacy-HWP sidecar event boundary
 

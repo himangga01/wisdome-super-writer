@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import re
 
-from .base import EvidenceInput, GeneratedArticle
+from .base import (
+    EvidenceInput,
+    GeneratedArticle,
+    GeneratedBlock,
+    GeneratedClaim,
+)
 
 
 def _clean(text: str, limit: int = 700) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit].rstrip()
+
+
+def _first_atomic_sentence(text: str, limit: int = 160) -> str:
+    cleaned = _clean(text, limit * 4)
+    match = re.search(r".+?[.!?。](?:\s|$)", cleaned)
+    sentence = match.group(0).strip() if match else cleaned
+    if len(sentence) > limit:
+        raise ValueError("Evidence sentence exceeds the atomic quotation limit")
+    return sentence
 
 
 class SourceGroundedTemplateGenerator:
@@ -16,46 +30,117 @@ class SourceGroundedTemplateGenerator:
     def generate(self, *, topic: str, evidence: list[EvidenceInput], article_type: str) -> GeneratedArticle:
         if not evidence:
             raise ValueError("At least one publishable evidence item is required")
-        lead = evidence[0]
-        title_prefix = "청약 공고" if topic == "housing_subscription" else "반도체 브리핑"
-        title = f"{title_prefix}: {lead.title}"[:180]
-        summary_parts = [_clean(item.text, 220) for item in evidence[:3] if item.text]
-        summary = " ".join(summary_parts)[:600] or "공식 출처의 최신 자료를 확인했습니다."
+        textual_evidence = [item for item in evidence if item.text.strip()]
+        if not textual_evidence:
+            raise ValueError("At least one evidence item with text is required")
+        lead = textual_evidence[0]
+        title = _clean(lead.title, 180)
+        if not title:
+            raise ValueError("Evidence title is required")
+        summary_sources = textual_evidence[:3]
+        summary_parts = [_first_atomic_sentence(item.text) for item in summary_sources]
+        summary = " ".join(
+            f"{statement} [S{index}]"
+            for index, statement in enumerate(summary_parts, start=1)
+        )[:600]
 
-        if topic == "housing_subscription":
-            sections = [
-                ("핵심 요약", summary),
-                ("청약 일정과 공급 정보", "아래 원문 공고의 일정·공급·자격 내용을 신청 전에 다시 확인하세요."),
-                ("확인할 점", "공고가 정정될 수 있으므로 신청 직전 공식 공고문과 청약 시스템의 최신 상태를 확인해야 합니다."),
-            ]
-        else:
-            sections = [
-                ("핵심 요약", summary),
-                ("확인된 사실", "아래 내용은 표시된 정부·기업·산업 출처에서 확인된 범위만 정리했습니다."),
-                ("산업적 의미", "기업 발표와 전망은 확정 사실과 구분해 해석해야 하며 투자 판단의 근거로 단독 사용해서는 안 됩니다."),
-            ]
-
-        claims: list[dict] = []
-        body = []
-        for heading, paragraph in sections:
-            body.extend([f"## {heading}", "", paragraph, ""])
-        body.extend(["## 근거별 내용", ""])
-        for index, item in enumerate(evidence, start=1):
-            statement = _clean(item.text)
-            if not statement:
-                continue
-            marker = f"S{index}"
-            body.extend([f"### {item.title}", "", f"{statement} [{marker}]", ""])
-            claims.append(
-                {
-                    "text": statement,
-                    "claimType": "fact",
-                    "evidenceId": item.evidence_id,
-                    "citationMarker": marker,
-                }
+        title_span = title
+        background_span = _first_atomic_sentence(lead.text)
+        lead_is_corporate = lead.authority_tier == "primary_corporate"
+        claims: list[GeneratedClaim] = [
+            GeneratedClaim(
+                block_id="title",
+                statement=title,
+                claim_type="company_claim" if lead_is_corporate else "fact",
+                evidence_ids=(lead.evidence_id,),
+                citation_marker="T1",
+                source_spans=((lead.evidence_id, title_span),),
+                semantic_key=None,
+                actor=lead.publisher if lead_is_corporate else None,
+                attribution=(f"{lead.publisher} 공식 발표" if lead_is_corporate else None),
             )
-        body.extend(["## 출처", ""])
-        for index, item in enumerate(evidence, start=1):
+        ]
+        blocks = [
+            GeneratedBlock(
+                block_id="title",
+                block_type="company_claim" if lead_is_corporate else "fact",
+                content=f"{title} [T1]",
+            ),
+            GeneratedBlock(
+                block_id="summary",
+                block_type=(
+                    "company_claim"
+                    if summary_sources
+                    and all(
+                        item.authority_tier == "primary_corporate"
+                        for item in summary_sources
+                    )
+                    else "fact"
+                ),
+                content=summary,
+            ),
+            GeneratedBlock(
+                block_id="background-1",
+                block_type="background",
+                content=f"{background_span} [B1]",
+            )
+        ]
+        for index, item in enumerate(summary_sources, start=1):
+            source_span = _first_atomic_sentence(item.text)
+            statement = source_span
+            marker = f"S{index}"
+            is_corporate = item.authority_tier == "primary_corporate"
+            claims.append(
+                GeneratedClaim(
+                    block_id="summary",
+                    statement=statement,
+                    claim_type="company_claim" if is_corporate else "fact",
+                    evidence_ids=(item.evidence_id,),
+                    citation_marker=marker,
+                    source_spans=((item.evidence_id, source_span),),
+                    semantic_key=None,
+                    actor=item.publisher if is_corporate else None,
+                    attribution=(f"{item.publisher} 공식 발표" if is_corporate else None),
+                )
+            )
+        claims.append(
+            GeneratedClaim(
+                block_id="background-1",
+                statement=background_span,
+                claim_type="company_claim" if lead_is_corporate else "fact",
+                evidence_ids=(lead.evidence_id,),
+                citation_marker="B1",
+                source_spans=((lead.evidence_id, background_span),),
+                semantic_key=None,
+                actor=lead.publisher if lead_is_corporate else None,
+                attribution=(
+                    f"{lead.publisher} 공식 발표"
+                    if lead_is_corporate
+                    else None
+                ),
+            )
+        )
+        source_lines = [
+            f"- [T1] [{lead.title}]({lead.url}) · {lead.publisher}",
+        ]
+        for index, item in enumerate(summary_sources, start=1):
             date = f" · {item.published_at}" if item.published_at else ""
-            body.append(f"- [S{index}] [{item.title}]({item.url}) · {item.publisher}{date}")
-        return GeneratedArticle(title=title, summary=summary, body_markdown="\n".join(body), claims=tuple(claims))
+            source_lines.append(
+                f"- [S{index}] [{item.title}]({item.url}) · {item.publisher}{date}"
+            )
+        source_lines.append(
+            f"- [B1] [{lead.title}]({lead.url}) · {lead.publisher}"
+        )
+        blocks.append(
+            GeneratedBlock(
+                block_id="sources",
+                block_type="sources",
+                content="\n".join(source_lines),
+            )
+        )
+        return GeneratedArticle(
+            title=title,
+            summary=summary,
+            body_blocks=tuple(blocks),
+            claims=tuple(claims),
+        )

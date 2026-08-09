@@ -121,6 +121,17 @@ class PublicationTarget(models.Model):
                 raise ValidationError({"canary_target": "동일 채널 target이어야 합니다."})
 
 
+class PublicationTargetIntentFence(models.Model):
+    """Per-target serialization row for intent creation and target mutation."""
+
+    target = models.OneToOneField(
+        PublicationTarget,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name="intent_fence",
+    )
+
+
 class PublicationTargetSnapshot(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target = models.ForeignKey(PublicationTarget, on_delete=models.PROTECT, related_name="snapshots")
@@ -365,6 +376,46 @@ class ArticleChannelRender(models.Model):
         ]
 
 
+class ApprovalQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("Approval is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    def bulk_create(
+        self,
+        objs,
+        batch_size=None,
+        ignore_conflicts=False,
+        update_conflicts=False,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        raise TypeError(
+            "Approval bulk insertion is forbidden; use decide_approval()"
+        )
+
+
 class Approval(models.Model):
     class Decision(models.TextChoices):
         APPROVED = "approved", "승인"
@@ -388,6 +439,11 @@ class Approval(models.Model):
     mode = models.CharField(max_length=20, choices=ApprovalMode.choices)
     decision = models.CharField(max_length=16, choices=Decision.choices)
     approval_subject_hash = models.CharField(max_length=64)
+    approval_material_version = models.CharField(
+        max_length=40,
+        default="approval-subject-v1",
+    )
+    head_version = models.PositiveIntegerField(default=1)
     supersedes_approval_id = models.UUIDField(null=True, blank=True)
     request_key = models.CharField(max_length=200)
     request_hash = models.CharField(max_length=64, null=True, blank=True)
@@ -398,6 +454,7 @@ class Approval(models.Model):
     source_manifest_hash = models.CharField(max_length=64)
     admin = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT)
     decided_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(ApprovalQuerySet)()
 
     class Meta:
         ordering = ["-decided_at"]
@@ -405,8 +462,20 @@ class Approval(models.Model):
             models.UniqueConstraint(
                 fields=["publication_intent", "target", "request_key"],
                 name="uq_approval_intent_target_request",
-            )
+            ),
+            models.CheckConstraint(
+                condition=Q(head_version__gte=1),
+                name="ck_approval_head_version_positive",
+            ),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("Approval is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Approval is append-only")
 
 
 class Publication(models.Model):
@@ -531,6 +600,38 @@ class PublicationAttempt(models.Model):
             models.CheckConstraint(
                 condition=Q(attempt_no__gte=1, attempt_no__lte=5),
                 name="ck_publication_attempt_no_1_5",
+            ),
+        ]
+
+class PublicationApprovalHead(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication_intent = models.ForeignKey(
+        PublicationIntent,
+        on_delete=models.CASCADE,
+        related_name="approval_heads",
+    )
+    target = models.ForeignKey(
+        PublicationTarget,
+        on_delete=models.PROTECT,
+        related_name="approval_heads",
+    )
+    latest_approval = models.ForeignKey(
+        Approval,
+        on_delete=models.PROTECT,
+        related_name="headed_by",
+    )
+    version = models.PositiveIntegerField()
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("publication_intent", "target"),
+                name="uq_publication_approval_head",
+            ),
+            models.CheckConstraint(
+                condition=Q(version__gte=1),
+                name="ck_publication_approval_head_version_positive",
             ),
         ]
 

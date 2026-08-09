@@ -287,6 +287,22 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "apps.editorial.tasks.finalize_editorial_generation_delivery_failure",
         ("run_id", "verification_id"),
     ),
+    ("editorial.revalidate_requested", 1): EventRoute(
+        "manual-article-revalidation",
+        "editorial",
+        "apps.editorial.tasks.revalidate_manual_revision",
+        (
+            "article_id",
+            "article_revision_id",
+            "editorial_policy_snapshot_id",
+            "editorial_policy_material_hash",
+            "verification_manifest_hash",
+            "input_evidence_manifest_hash",
+            "excluded_material_manifest_hash",
+        ),
+        "apps.editorial.tasks.finalize_manual_revalidation_delivery_failure",
+        ("article_id", "article_revision_id"),
+    ),
     ("publication.scheduled_run_requested", 1): EventRoute(
         "scheduled-publication",
         "publish.wordpress",
@@ -310,6 +326,8 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "publication-execute",
         "publish.wordpress",
         "apps.publishing.tasks.execute_publication_attempt",
+        ("publication_attempt_id",),
+        "apps.publishing.tasks.finalize_publication_delivery_failure",
         ("publication_attempt_id",),
     ),
     ("publication.reconcile_requested", 1): EventRoute(
@@ -643,6 +661,26 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
             "verification_id": UUID_FORMAT,
             "run_id": UUID_FORMAT,
             "generation_manifest_hash": SHA256_FORMAT,
+        },
+    ),
+    ("editorial.revalidate_requested", 1): _schema(
+        {
+            "article_id": STR,
+            "article_revision_id": STR,
+            "editorial_policy_snapshot_id": STR,
+            "editorial_policy_material_hash": STR,
+            "verification_manifest_hash": STR,
+            "input_evidence_manifest_hash": STR,
+            "excluded_material_manifest_hash": STR,
+        },
+        formats={
+            "article_id": UUID_FORMAT,
+            "article_revision_id": UUID_FORMAT,
+            "editorial_policy_snapshot_id": UUID_FORMAT,
+            "editorial_policy_material_hash": SHA256_FORMAT,
+            "verification_manifest_hash": SHA256_FORMAT,
+            "input_evidence_manifest_hash": SHA256_FORMAT,
+            "excluded_material_manifest_hash": SHA256_FORMAT,
         },
     ),
     ("publication.scheduled_run_requested", 1): _schema(

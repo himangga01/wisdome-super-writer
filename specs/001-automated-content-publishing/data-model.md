@@ -912,6 +912,31 @@ daily digest frozen verification set에는 `held` role로 포함한다. 비중�
 공급하지 않는 것은 upstream blocker다. `retracted/unavailable`은 명시 reason으로 제외하고,
 청약 공식 계보 head가 terminal이면 과거 active 자료를 다시 선택하지 않고 `rejected`한다.
 
+### EditorialPolicySnapshot
+
+편집 정책은 관리자 승인 상태나 mutable head를 갖지 않는다. 현재 정책은 배포에 포함된
+`config/editorial-policies/{topic_code}.json`의 exact release document를 서버가 직접 해석해
+결정한다.
+해석한 material은 다음 append-only snapshot으로 보존한다.
+
+| 필드 | 타입/제약 | 설명 |
+|---|---|---|
+| `id` | UUID PK | 정책 snapshot 식별자 |
+| `policy_key`, `policy_version` | string unique pair | release JSON의 안정 key/version |
+| `topic_code`, `language` | enum/BCP-47 | 적용 주제와 기본 `ko-KR` |
+| `schema_version` | string | 정책 문서 schema |
+| `release_document_hash` | SHA-256 | exact topic release JSON bytes |
+| `config`, `config_hash` | JSONB/SHA-256 | NFC+RFC 8785 JCS canonical policy와 hash |
+| `implementation_manifest`, `implementation_manifest_hash` | JSONB/SHA-256 | gate/generator/parser의 정렬 파일 경로와 exact hash |
+| `material_hash` | SHA-256 unique | 위 immutable material 전체의 canonical hash |
+| `created_at` | datetime | 최초 해석 시각; material identity에는 미포함 |
+
+`(policy_key, policy_version)`은 유일하다. 같은 key/version의 snapshot이 이미 있으면 release document,
+config, implementation과 material hash가 모두 같을 때만 재사용한다. 한 byte라도 다르면 새 행이나
+암묵적 version을 만들지 않고 영구 충돌로 거절한다. queryset/model과 PostgreSQL·SQLite trigger는
+insert 뒤 update/delete를 거부한다. event 재전달은 저장 snapshot을 사용하지만 새 generation 또는
+manual revision은 해당 시점 release JSON을 다시 resolve한다.
+
 ### DraftArticle
 
 | 필드 | 타입/제약 | 설명 |
@@ -956,11 +981,15 @@ manifest에 포함한다. 이후 한 cluster 정정은 이 join으로 영향 dig
 | `id` | UUID PK | 개정 식별자 |
 | `article_id`, `revision_no` | FK/int unique pair | 개정 번호 |
 | `title`, `summary` | text | 제목과 요약 |
-| `body_blocks` | JSONB | 사실/배경/해석/주의/출처의 구조화 블록 |
-| `canonical_markdown` | text | 관리자 검토용 정본 |
+| `body_blocks` | JSONB | 사실/기업주장/배경/해석/전망/주의/출처/정정의 구조화 정본 블록 |
+| `canonical_markdown` | text | `body_blocks`에서 결정적으로 파생한 관리자 검토용 표현 |
 | `content_hash` | SHA-256 | 개정 내용 지문 |
 | `provenance_kind` | `automated/admin_edit` | 개정 생성 경로 |
 | `generation_attempt_id` | FK GenerationAttempt nullable | automated 개정의 성공 생성 시도 |
+| `editorial_policy_snapshot_id`, `editorial_policy_material_hash` | FK/SHA-256 | release JSON에서 해석해 고정한 exact append-only policy |
+| `verification_snapshot`, `verification_manifest_hash` | JSONB/SHA-256 | 정렬 verification ID와 각 evidence/rule/result/policy/KST identity |
+| `input_evidence_snapshot` | JSONB | 실제 사용한 evidence와 source/version/locator/origin/freshness/rights/current eligibility |
+| `excluded_material_snapshot`, `excluded_material_manifest_hash` | JSONB/SHA-256 | excluded/duplicate/conflict material과 안정 reason |
 | `input_evidence_manifest_hash` | SHA-256 | 생성·재검증에 사용한 exact evidence set |
 | `generation_pipeline_manifest_hash` | SHA-256 nullable | model/prompt/schema/postprocess 묶음; admin edit는 null |
 | `claim_graph_state` | `queued/running/passed/blocked` | 현재 개정의 주장 추출·근거 재연결 상태 |
@@ -972,13 +1001,32 @@ manifest에 포함한다. 이후 한 cluster 정정은 이 join으로 영향 dig
 | `created_by_admin_id` | FK nullable | 관리자 수정인 경우 |
 | `created_at` | datetime | 생성 시각 |
 
-`body_blocks`가 정본이며 채널 HTML은 이 구조에서 파생한다. 모델 출력 원문을 바로
-발행하지 않는다.
+`body_blocks`가 정본이며 block은 stable `id`, `type`, `content`를 가진다. block type은
+`fact`, `company_claim`, `background`, `interpretation`, `outlook`, `caution`, `sources`,
+`correction`이다. canonical Markdown과 채널 HTML은 이 구조에서만 파생하며 모델 출력 원문을 바로
+발행하지 않는다. 제목·요약·caption도 Claim coverage 대상이다.
+
+ArticleDetail의 `runtime_eligibility`는 revision을 수정하는 상태가 아니라 read-time projection이다.
+평가한 policy snapshot/material, 현재 release policy snapshot/material, `policy_current`,
+`evidence_current`, `publish_eligible`, 정렬 blocking code와 `evaluated_at`을 반환한다. current policy가
+바뀌거나 사용 evidence의 freshness·rights·lineage·publishability가 달라지면 false이며 새 revision
+재검증 없이는 preview/approval/publish 대상이 될 수 없다.
+
+ArticleDetail은 revision의 verification/evidence/exclusion 값을 live SourceItem이나 현재 EvidenceAsset
+값으로 보충하지 않는다. source version, modified/retrieved 시각, rights, attribution, alt text와 제외
+사유는 revision에 고정된 값만 반환한다. 정확한 release-document/config/implementation hash가 없는
+격리 legacy policy snapshot은 해당 세 필드를 `null`로 반환하고 runtime eligibility를 false로 한다.
+API는 누락 hash를 `material_hash`로 대체하여 존재하지 않는 release identity를 만들어 내지 않는다.
+정확한 역사 evidence material을 복원할 수 없는 이관 revision은 `evidenceId`와
+`legacyQuarantine=true`만 가진 별도 최소 projection으로 반환한다. source/version/rights/freshness를
+현재 행이나 빈 문자열로 합성하지 않으며 해당 revision은 발행 불가다.
 
 ### GenerationAttempt
 
 자동 초안 생성의 append-only 실행이다. `id`, `article_id`, `origin_collection_run_id`,
-`input_evidence_manifest_hash`, `generation_manifest_hash`, `generation_pipeline_manifest_hash`, `provider`, `model_name`,
+`editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`,
+`input_evidence_manifest_hash`, `excluded_material_manifest_hash`, `generation_manifest_hash`,
+`generation_pipeline_manifest_hash`, `provider`, `model_name`,
 `model_version`, `prompt_template_hash`, `output_schema_hash`, `postprocessor_manifest_hash`,
 `request_fingerprint`, `state: queued/running/succeeded/failed`, `output_checksum`,
 `article_revision_id` nullable, `started_at`, `finished_at`, `error_code`를 가진다. 동일 fingerprint의
@@ -997,6 +1045,23 @@ Claim/ClaimEvidence/Visualization/QualityCheck/Render/Approval/Intent를 새 rev
 새 본문에서 주장 추출→근거 재연결→전체 blocking quality gate를 다시 실행한다. 미지원 fact가
 하나라도 있거나 claim graph/quality가 passed가 아니면 preview, intent, approval과 publish를
 차단한다. admin-edit revision은 generation attempt가 없으므로 manual approval만 허용한다.
+요청 transaction은 current release `EditorialPolicySnapshot`과 정렬 verification/input-evidence/
+excluded-material snapshot을 먼저 고정하고 정확한 `editorial.revalidate_requested@1`을 함께 만든다.
+event는 `article_id`, `article_revision_id`, `editorial_policy_snapshot_id`,
+`editorial_policy_material_hash`, `verification_manifest_hash`, `input_evidence_manifest_hash`,
+`excluded_material_manifest_hash` 일곱 필드만 허용한다.
+요청은 `bodyBlocks`와 exact `claimBindings`를 받는다. binding은 요청 안에서 고유한 비어 있지 않은
+`claimRef`, `blockId`, `statement`, `claimType`, 정렬 `evidenceIds`, `citationMarker`, evidence ID별
+`sourceSpans`, `semanticKey`, `actor`, `attribution`, `horizon`, `uncertaintyNote`, 정렬
+`derivedFromClaimRefs`만 허용한다. interpretation의 파생 참조는 같은 요청의
+`fact/company_claim` claimRef만 가리킨다. 서버는 이를 revision-scoped deterministic Claim UUID로
+해석해 저장·응답의 `claimId/derivedFromClaimIds`로 고정한다. 성공 응답은
+article/revision ID와 revision number, revalidation/quality state, content/evidence/policy/
+verification/exclusion hash를 반환한다. 같은 request key의 동일 material은 200, 새 revision은 201,
+다른 material replay 또는 stale base CAS는 409, 구조·의미 검증 실패는 422다.
+worker는 snapshot hash뿐 아니라 current release policy와 모든 사용 evidence의 current publish
+eligibility를 다시 검사한다. policy 교체, freshness 만료, 권리 철회, source lineage 변경이 있으면
+과거 revision을 수정하지 않고 blocked/manual-required로 남겨 새 revision 재검증을 요구한다.
 `validated_auto` intent는 revision의 succeeded GenerationAttempt와 input/generation/quality
 manifest가 모든 target AutoPublishValidation의 exact material과 같고 최신 자동 quality report가
 전부 passed인 경우에만 생성할 수 있다.
@@ -1076,14 +1141,18 @@ preview는 `canonical_link_state=pending`, `canonical_source_url=null`로 만들
 ### Claim / ClaimEvidence
 
 `Claim`은 `article_revision_id`, `block_id`, `statement`, `claim_type`, `risk_level`,
-`verification_state`, `review_note`를 가진다. `claim_type`은 `fact`, `company_claim`, `analysis`,
-`forecast`, `disclaimer`이다. `company_claim`은 주장 주체와 발표 출처를 독자에게 명시하며
-독립 검증 전 fact로 승격하거나 breaking direct-primary 근거로 사용할 수 없다.
+`verification_state`, `actor`, `attribution`, `horizon`, `uncertainty_note`,
+`derived_from_claim_ids`, `review_note`를 가진다. canonical `claim_type`은 정확히 `fact`,
+`company_claim`, `interpretation`, `outlook`이다. `company_claim`은 주장 주체와 발표 출처를
+독자에게 명시하며 독립 검증 전 fact로 승격하거나 breaking direct-primary 근거로 사용할 수 없다.
+`interpretation`은 검증된 입력 fact Claim과 추론 설명을, `outlook`은 주체·기간과 불확실성
+표현을 필수로 가진다. 한 문장에 역사 사실과 기업 전망이 섞여 있으면 atomic Claim 둘 이상으로
+분리한다.
 
 `ClaimEvidence`는 `claim_id`, 90일 purge 뒤 nullable인 `evidence_asset_id`, 발행본에서 필수인
 `published_evidence_snapshot_id`, `relation`, 90일까지만 유지하는 `source_span` nullable,
-장기 `source_span_hash`,
-`verification_strength`, `checked_at`을 가진다. `relation`은 `supports`, `contradicts`,
+장기 `source_span_hash`, `verification_strength`, `independence_group`, `origin_identity_hash`,
+`checked_at`을 가진다. `relation`은 `supports`, `contradicts`,
 `context`이다. 게시 전 `fact` 주장은 `supports` 연결이 하나 이상이어야 하고, 청약 핵심
 사실과 반도체 속보는 TopicPolicy의 강화된 검증 수를 충족해야 한다. raw purge는 source_span
 본문을 null로 만들고 PublishedEvidenceSnapshot의 hash만 남긴다.
@@ -1120,16 +1189,24 @@ review·source manifest에 포함한다. 차트/표의 출처·단위·기준일
 `article_revision_id`, `check_code`, `check_version`, `result`, `score`, `blocking`,
 `details`, `executed_at`을 가진다. revision별 정렬 check code/version/config를
 `quality_gate_manifest_hash`로, 결과/details hash를 `quality_report_hash`로 집계하며 둘은
-ArticleRevision과 PublicationIntent에 고정한다. 필수 차단 검사:
+ArticleRevision과 PublicationIntent에 고정한다. 결과는 `passed/failed/manual_required`이며 모든 행은
+append-only다. 필수 content/evidence 차단 검사는 정확히 다음 10개다.
 
-- `all_fact_claims_sourced`
-- `high_risk_verification_satisfied`
-- `visual_rights_and_alt_text`
-- `no_unsupported_quotes_or_experience`
-- `facts_analysis_forecast_separated`
-- `channel_limits_satisfied`
-- `duplicate_or_conflict_resolved`
-- `korean_readability_and_repetition`
+1. `all_publishable_claims_grounded`
+2. `high_risk_verification_satisfied`
+3. `claim_independence_satisfied`
+4. `source_freshness_satisfied`
+5. `evidence_publish_eligibility_current`
+6. `quotation_limits_satisfied`
+7. `claim_types_separated_and_attributed`
+8. `duplicate_or_conflict_resolved`
+9. `korean_readability_and_repetition`
+10. `no_exaggeration_or_false_experience`
+
+visual이 하나라도 있으면 별도 `visual_rights_and_alt_text`도 필수다. direct quote 길이는 법적
+safe-harbor 숫자가 아니라 source rights snapshot이 허용한 연속/총 Unicode 길이와 원문 비율의
+보수적 product cap이다. unknown/internal-only source의 허용 길이는 0이다. failed 또는
+manual_required인 blocking check가 하나라도 있으면 revision은 review-ready가 아니다.
 
 ### Approval
 
@@ -1500,6 +1577,8 @@ EvidenceAsset 1 ── * EvidenceReviewDecision
 EvidenceAuditSnapshot 1 ── * EvidenceReviewDecision
 SourceItem * ── * EventCluster
 EventCluster 1 ── * DraftArticle 1 ── * ArticleRevision
+EditorialPolicySnapshot 1 ── * GenerationAttempt/ArticleRevision
+ArticleRevision 1 ── * frozen EventClusterVerification/Evidence/Excluded material snapshots
 ArticleRevision 1 ── * Claim * ── * EvidenceAsset
 ArticleRevision 1 ── * VisualPlacement * ── 1 EvidenceAsset
 ArticleRevision 1 ── * PublishedEvidenceSnapshot
@@ -1834,3 +1913,53 @@ Evidence migration 0005 depends on collection 0009 and infrastructure 0002. It u
 models and the schema-editor alias, rearms only exact requested events/receipts to pending/retry,
 and preserves only provable pending-ready envelopes and full child-provenance manifests. Missing,
 multiple, or ambiguous material fails closed instead of creating synthetic ready state.
+
+## English / AI-readable — T018 editorial policy and revision contract
+
+The current editorial policy is resolved from exact deployed topic release JSON bytes. There is no policy
+approval lifecycle and no mutable policy head. `EditorialPolicySnapshot` is append-only and binds
+the exact policy key/version, release-document hash, canonical config, implementation manifest, and
+material hash. Reusing a key/version with changed bytes is a permanent conflict rather than an
+implicit new version.
+
+ArticleDetail never fills a frozen verification, evidence, or exclusion field from the live SourceItem or
+current EvidenceAsset. Source version, modified/retrieved times, rights, attribution, alt text, and exclusion
+reason come only from the revision snapshot. A quarantined legacy policy snapshot without exact release,
+config, or implementation identities exposes those three hashes as null and is runtime-ineligible; the API
+never substitutes `material_hash` for a missing identity.
+A migrated revision whose exact historical evidence material cannot be recovered exposes only the honest
+`evidenceId` plus `legacyQuarantine=true` projection. It never synthesizes source/version/rights/freshness
+from live rows or empty strings, and it is not publishable.
+
+`ArticleRevision.body_blocks` is canonical. A revision binds one policy snapshot plus three sorted,
+independently hashed materials: all contributing verifications, all used publish-eligible evidence,
+and all excluded/duplicate/conflicting inputs. Every assertion in the title, summary, body blocks,
+or captions is an atomic `fact`, `company_claim`, `interpretation`, or `outlook`. Company claims
+require actor attribution; interpretations derive from verified claims; outlooks require an actor,
+horizon, and uncertainty language.
+
+The exact mandatory content/evidence gate set is:
+`all_publishable_claims_grounded`, `high_risk_verification_satisfied`,
+`claim_independence_satisfied`, `source_freshness_satisfied`,
+`evidence_publish_eligibility_current`, `quotation_limits_satisfied`,
+`claim_types_separated_and_attributed`, `duplicate_or_conflict_resolved`,
+`korean_readability_and_repetition`, and `no_exaggeration_or_false_experience`. A revision with any
+visual also requires `visual_rights_and_alt_text`. Any blocking failed or manual-required result
+prevents review-ready state.
+
+A manual edit atomically creates a new pending revision and `editorial.revalidate_requested@1`.
+That event allows exactly `article_id`, `article_revision_id`, `editorial_policy_snapshot_id`,
+`editorial_policy_material_hash`, `verification_manifest_hash`, `input_evidence_manifest_hash`, and
+`excluded_material_manifest_hash`.
+`CreateRevisionRequest` accepts canonical bodyBlocks and exact claimBindings containing only block/statement/
+claim type, a unique non-empty request-local `claimRef`, sorted evidence IDs, citation marker, per-evidence
+source spans, semantic key, actor, attribution, horizon, uncertainty note, and sorted
+`derivedFromClaimRefs`. Interpretation references may target only fact/company_claim bindings in the same
+request. The server resolves them to revision-scoped deterministic Claim UUIDs persisted and returned as
+`claimId/derivedFromClaimIds`. The response returns the article/revision identity,
+revision number, revalidation/quality states, and content/evidence/policy/verification/exclusion hashes. An
+identical request-key replay is 200, creation is 201, changed replay or stale base is 409, and invalid material
+is 422.
+Revalidation resolves the current release policy, checks current evidence publish eligibility, and
+rebuilds every claim, relation, and quality result from the new body blocks. It never copies the
+prior revision's claims, checks, approvals, or publication intents.

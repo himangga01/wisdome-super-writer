@@ -1,17 +1,22 @@
 {
-  "version": 1,
+  "schemaVersion": "editorial-policy-v1",
+  "policyKey": "semiconductor-news-editorial",
+  "topicCode": "semiconductor_news",
+  "policyVersion": "1.0.0",
   "language": "ko-KR",
-  "requiredSections": ["핵심 요약", "확인된 사실", "배경", "산업적 의미", "주의할 해석", "출처"],
-  "breakingRequires": "one_primary_or_two_independent",
-  "breakingCategories": [
-    "regulation_export_control",
-    "factory_supply_disruption",
-    "merger_or_material_earnings",
-    "critical_technology_or_mass_production"
-  ],
-  "clusterIdentity": ["subject", "action", "official_announcement_id", "event_date_kst"],
-  "sameOriginCountsOnce": true,
-  "primaryCorporateSelfClaimCountsAsDirectPrimary": false,
-  "companyStatementsAreClaims": true,
-  "forbiddenClaims": ["주가 상승 확실", "투자 추천", "업계 관계자에 따르면"]
+  "claimTypes": ["fact", "company_claim", "interpretation", "outlook"],
+  "requiredBlockTypes": ["fact", "background", "sources"],
+  "highImpactFields": ["regulation", "export_control", "supply_disruption", "earnings", "mass_production"],
+  "checks": [
+    {"code": "quotation_limits_satisfied", "version": "1", "blocking": true, "config": {"maxCitationChars": 160}},
+    {"code": "claim_types_separated_and_attributed", "version": "1", "blocking": true, "config": {}},
+    {"code": "duplicate_or_conflict_resolved", "version": "1", "blocking": true, "config": {}},
+    {"code": "no_exaggeration_or_false_experience", "version": "1", "blocking": true, "config": {"forbiddenPhrases": ["주가 상승 확실", "투자 추천", "업계 관계자에 따르면", "직접 취재", "관계자와 인터뷰", "제가 경험"]}},
+    {"code": "source_freshness_satisfied", "version": "1", "blocking": true, "config": {"clock": "current_publication_time"}},
+    {"code": "high_risk_verification_satisfied", "version": "1", "blocking": true, "config": {"required": true}},
+    {"code": "claim_independence_satisfied", "version": "1", "blocking": true, "config": {"primaryOrIndependentCount": 2, "corporateSelfClaimCounts": false}},
+    {"code": "korean_readability_and_repetition", "version": "1", "blocking": true, "config": {"maxSentenceChars": 180, "maxParagraphChars": 800}},
+    {"code": "evidence_publish_eligibility_current", "version": "1", "blocking": true, "config": {"allowed": ["allowed", "attribution_required"]}},
+    {"code": "all_publishable_claims_grounded", "version": "1", "blocking": true, "config": {"allClaimsRequireEvidence": true}}
+  ]
 }

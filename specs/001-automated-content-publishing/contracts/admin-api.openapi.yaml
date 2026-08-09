@@ -632,13 +632,14 @@ paths:
           description: Existing revision returned for an identical request-key replay
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ArticleRevision' }
+              schema: { $ref: '#/components/schemas/CreateRevisionResult' }
         '201':
           description: New immutable drafting revision created; claim/evidence and all blocking quality checks are queued again
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ArticleRevision' }
+              schema: { $ref: '#/components/schemas/CreateRevisionResult' }
         '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
 
   /articles/{articleId}/preview:
     parameters:
@@ -3343,24 +3344,30 @@ components:
       enum: [drafting, review_ready, approved, publishing, published, blocked, correction_pending, stopped, failed]
     ArticleRevision:
       type: object
-      required: [revisionNo, title, summary, bodyBlocks, contentHash, provenanceKind, generationAttemptId, inputEvidenceManifestHash, generationPipelineManifestHash, claimGraphState, qualityGateManifestHash, qualityReportHash, createdAt]
+      required: [revisionNo, title, summary, bodyBlocks, canonicalMarkdown, contentHash, provenanceKind, generationAttemptId, editorialPolicy, verificationManifestHash, inputEvidenceManifestHash, excludedMaterialManifestHash, generationPipelineManifestHash, claimGraphState, qualityGateManifestHash, qualityReportHash, createdAt]
       properties:
         revisionNo: { type: integer, minimum: 1 }
         title: { type: string }
         summary: { type: string }
         bodyBlocks:
           type: array
+          minItems: 1
           items:
             type: object
+            additionalProperties: false
             required: [id, type, content]
             properties:
               id: { type: string }
-              type: { type: string, enum: [facts, background, analysis, forecast, caution, sources, correction] }
+              type: { type: string, enum: [fact, company_claim, background, interpretation, outlook, caution, sources, correction] }
               content: { type: string }
+        canonicalMarkdown: { type: string }
         contentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         provenanceKind: { type: string, enum: [automated, admin_edit] }
         generationAttemptId: { type: [string, 'null'], format: uuid }
+        editorialPolicy: { $ref: '#/components/schemas/EditorialPolicyRef' }
+        verificationManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         inputEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        excludedMaterialManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         generationPipelineManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
         claimGraphState: { type: string, enum: [queued, running, passed, blocked] }
         qualityGateManifestHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
@@ -3398,25 +3405,201 @@ components:
         updatedAt: { type: string, format: date-time }
     Claim:
       type: object
-      required: [id, statement, type, riskLevel, verificationState, evidenceIds]
+      required: [id, blockId, statement, type, riskLevel, verificationState, actor, attribution, horizon, uncertaintyNote, derivedFromClaimIds, evidenceIds, evidenceLinks]
       properties:
         id: { type: string, format: uuid }
+        blockId: { type: string }
         statement: { type: string }
-        type: { type: string, enum: [fact, company_claim, analysis, forecast, disclaimer] }
+        type: { type: string, enum: [fact, company_claim, interpretation, outlook] }
         riskLevel: { type: string, enum: [normal, high] }
         verificationState: { type: string, enum: [pending, verified, conflicted, rejected] }
+        actor: { type: [string, 'null'] }
+        attribution: { type: [string, 'null'] }
+        horizon: { type: [string, 'null'] }
+        uncertaintyNote: { type: [string, 'null'] }
+        derivedFromClaimIds:
+          type: array
+          items: { type: string, format: uuid }
         evidenceIds:
           type: array
           items: { type: string, format: uuid }
+        evidenceLinks:
+          type: array
+          items: { $ref: '#/components/schemas/ClaimEvidenceLink' }
+    ClaimEvidenceLink:
+      type: object
+      additionalProperties: false
+      required: [evidenceId, relation, sourceSpan, sourceSpanHash, verificationStrength, independenceGroup, originIdentityHash, checkedAt]
+      properties:
+        evidenceId: { type: string, format: uuid }
+        relation: { type: string, enum: [supports, contradicts, context] }
+        sourceSpan: { type: [string, 'null'] }
+        sourceSpanHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        verificationStrength: { type: string }
+        independenceGroup: { type: string }
+        originIdentityHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        checkedAt: { type: string, format: date-time }
     QualityCheck:
       type: object
-      required: [code, result, blocking]
+      required: [code, checkVersion, result, score, blocking, details, executedAt]
       properties:
-        code: { type: string }
+        code:
+          type: string
+          enum:
+            - all_publishable_claims_grounded
+            - high_risk_verification_satisfied
+            - claim_independence_satisfied
+            - source_freshness_satisfied
+            - evidence_publish_eligibility_current
+            - quotation_limits_satisfied
+            - claim_types_separated_and_attributed
+            - duplicate_or_conflict_resolved
+            - korean_readability_and_repetition
+            - no_exaggeration_or_false_experience
+            - visual_rights_and_alt_text
+        checkVersion: { type: string }
         result: { type: string, enum: [passed, failed, manual_required] }
         score: { type: [number, 'null'] }
         blocking: { type: boolean }
         details: { type: object, additionalProperties: true }
+        executedAt: { type: string, format: date-time }
+    EditorialPolicyRef:
+      type: object
+      additionalProperties: false
+      description: >-
+        Exact append-only release-resolved policy material. Editorial policy has no approval
+        resource and no mutable head; the server rejects changed bytes under the same key/version.
+      required: [snapshotId, policyKey, policyVersion, topic, releaseDocumentHash, configHash, implementationManifestHash, materialHash]
+      properties:
+        snapshotId: { type: string, format: uuid }
+        policyKey: { type: string, minLength: 1 }
+        policyVersion: { type: string, minLength: 1 }
+        topic:
+          oneOf:
+            - $ref: '#/components/schemas/TopicCode'
+            - type: string
+              const: legacy
+              description: Quarantined migration sentinel only; never runtime-publishable.
+        releaseDocumentHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: Null only for quarantined legacy snapshots that predate exact release-byte identity; such revisions are not publishable.
+        configHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: Null only for quarantined legacy snapshots; never synthesized from materialHash.
+        implementationManifestHash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: Null only for quarantined legacy snapshots; never synthesized from materialHash.
+        materialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+    RevisionVerificationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [verificationId, role, decision, articleType, category, policyVersion, policyHash, evidenceManifestHash, ruleManifestHash, resultManifestHash, localEventDate]
+      properties:
+        verificationId: { type: string, format: uuid }
+        role: { type: string, enum: [lead, supporting, held] }
+        decision: { type: string, enum: [verified_notice, verified_breaking, daily_digest_candidate, held] }
+        articleType: { type: string, enum: [housing_notice, housing_correction, semiconductor_daily_digest, semiconductor_breaking] }
+        category: { type: string }
+        policyVersion: { type: string }
+        policyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        evidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        ruleManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        resultManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        localEventDate: { type: string, format: date }
+    RevisionEvidenceSnapshot:
+      oneOf:
+        - $ref: '#/components/schemas/ExactRevisionEvidenceSnapshot'
+        - $ref: '#/components/schemas/LegacyRevisionEvidenceSnapshot'
+    ExactRevisionEvidenceSnapshot:
+      type: object
+      additionalProperties: false
+      required: [evidenceId, sourceItemId, runSourceItemId, sourceVersionHash, contentHash, reviewSubjectHash, locatorType, locator, authorityTier, independenceGroup, originIdentityHash, sourceTitle, sourceUrl, publisher, publishedAt, modifiedAt, retrievedAt, freshnessCutoff, rightsStatus, rightsBasisUrl, attribution, altText, evaluatedPublishEligible, eligibilityEvaluatedAt]
+      properties:
+        evidenceId: { type: string, format: uuid }
+        sourceItemId: { type: string, format: uuid }
+        runSourceItemId: { type: string, format: uuid }
+        sourceVersionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        contentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        reviewSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        locatorType: { type: string }
+        locator: { type: object, additionalProperties: true }
+        authorityTier: { type: string }
+        independenceGroup: { type: string }
+        originIdentityHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        sourceTitle: { type: [string, 'null'] }
+        sourceUrl: { type: string, format: uri }
+        publisher: { type: string }
+        publishedAt: { type: [string, 'null'], format: date-time }
+        modifiedAt: { type: [string, 'null'], format: date-time }
+        retrievedAt: { type: string, format: date-time }
+        freshnessCutoff: { type: [string, 'null'], format: date-time }
+        rightsStatus: { type: string, enum: [allowed, attribution_required] }
+        rightsBasisUrl: { type: string, format: uri }
+        attribution: { type: [string, 'null'] }
+        altText: { type: [string, 'null'] }
+        evaluatedPublishEligible: { type: boolean, const: true }
+        eligibilityEvaluatedAt: { type: string, format: date-time }
+    LegacyRevisionEvidenceSnapshot:
+      type: object
+      additionalProperties: false
+      description: >-
+        Honest minimal projection for migrated legacy revisions whose historical evidence bytes
+        cannot satisfy the exact frozen snapshot contract. It is quarantined and never publishable.
+      required: [evidenceId, legacyQuarantine]
+      properties:
+        evidenceId: { type: string, format: uuid }
+        legacyQuarantine: { type: boolean, const: true }
+    RevisionExcludedMaterial:
+      type: object
+      additionalProperties: false
+      required: [verificationId, runSourceItemId, sourceItemId, evidenceId, sourceUrl, sourceTitle, publisher, rightsStatus, classification, sourceStatus, reason]
+      properties:
+        verificationId: { type: string, format: uuid }
+        runSourceItemId: { type: [string, 'null'], format: uuid }
+        sourceItemId: { type: [string, 'null'], format: uuid }
+        evidenceId: { type: [string, 'null'], format: uuid }
+        sourceUrl: { type: [string, 'null'], format: uri }
+        sourceTitle: { type: [string, 'null'] }
+        publisher: { type: [string, 'null'] }
+        rightsStatus: { type: [string, 'null'], enum: [allowed, attribution_required, internal_analysis_only, unknown, prohibited, null] }
+        classification: { type: string, enum: [excluded, duplicate, conflicting] }
+        sourceStatus: { type: [string, 'null'] }
+        reason: { type: string, minLength: 1 }
+    EditorialRuntimeEligibility:
+      type: object
+      additionalProperties: false
+      required: [evaluatedPolicySnapshotId, evaluatedPolicyMaterialHash, currentReleasePolicySnapshotId, currentReleasePolicyMaterialHash, policyCurrent, evidenceCurrent, publishEligible, blockingCodes, evaluatedAt]
+      properties:
+        evaluatedPolicySnapshotId: { type: string, format: uuid }
+        evaluatedPolicyMaterialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        currentReleasePolicySnapshotId: { type: [string, 'null'], format: uuid }
+        currentReleasePolicyMaterialHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        policyCurrent: { type: boolean }
+        evidenceCurrent: { type: boolean }
+        publishEligible: { type: boolean }
+        blockingCodes:
+          type: array
+          items: { type: string }
+        evaluatedAt: { type: string, format: date-time }
+    EditorialVisualPlacement:
+      type: object
+      additionalProperties: false
+      required: [id, blockId, evidenceId, visualizationId, displayOrder, locator, rightsStatus, attribution, altText, caption, presentationHash]
+      properties:
+        id: { type: string, format: uuid }
+        blockId: { type: string, minLength: 1 }
+        evidenceId: { type: [string, 'null'], format: uuid }
+        visualizationId: { type: [string, 'null'], format: uuid }
+        displayOrder: { type: integer, minimum: 0 }
+        locator: { type: object, additionalProperties: true }
+        rightsStatus: { type: string, enum: [allowed, attribution_required] }
+        attribution: { type: [string, 'null'] }
+        altText: { type: string, minLength: 1 }
+        caption: { type: string }
+        presentationHash: { type: string, pattern: '^[a-f0-9]{64}$' }
     ArticleEventCluster:
       type: object
       additionalProperties: false
@@ -3455,7 +3638,7 @@ components:
             state: { $ref: '#/components/schemas/PublicationState' }
             remoteState: { $ref: '#/components/schemas/RemotePublicationState' }
             remotePostId: { type: [string, 'null'] }
-            remoteUrl: { type: [string, 'null'], format: uri }
+            remoteUrl: { type: [string, 'null'], format: uri, pattern: '^https?://' }
             canonicalSourceUrl: { type: [string, 'null'], format: uri }
             scheduledFor: { type: [string, 'null'], format: date-time }
             canonicalReadyAt: { type: [string, 'null'], format: date-time }
@@ -3466,12 +3649,21 @@ components:
       allOf:
         - $ref: '#/components/schemas/ArticleSummary'
         - type: object
-          required: [revision, clusterMemberships, claims, evidence, qualityChecks, publications]
+          required: [revision, clusterMemberships, verificationSnapshots, evidenceSnapshots, excludedMaterials, claims, evidence, qualityChecks, visualPlacements, runtimeEligibility, revalidationState, qualityState, publications]
           properties:
             revision: { $ref: '#/components/schemas/ArticleRevision' }
             clusterMemberships:
               type: array
               items: { $ref: '#/components/schemas/ArticleEventCluster' }
+            verificationSnapshots:
+              type: array
+              items: { $ref: '#/components/schemas/RevisionVerificationSnapshot' }
+            evidenceSnapshots:
+              type: array
+              items: { $ref: '#/components/schemas/RevisionEvidenceSnapshot' }
+            excludedMaterials:
+              type: array
+              items: { $ref: '#/components/schemas/RevisionExcludedMaterial' }
             claims:
               type: array
               items: { $ref: '#/components/schemas/Claim' }
@@ -3481,6 +3673,12 @@ components:
             qualityChecks:
               type: array
               items: { $ref: '#/components/schemas/QualityCheck' }
+            visualPlacements:
+              type: array
+              items: { $ref: '#/components/schemas/EditorialVisualPlacement' }
+            runtimeEligibility: { $ref: '#/components/schemas/EditorialRuntimeEligibility' }
+            revalidationState: { type: string, enum: [queued, running, passed, blocked] }
+            qualityState: { type: string, enum: [pending, passed, failed] }
             publications:
               type: array
               items: { $ref: '#/components/schemas/Publication' }
@@ -3497,16 +3695,79 @@ components:
       additionalProperties: false
       description: >-
         Creates an admin_edit revision in drafting state. Claims, evidence links, visualizations,
-        checks, renders, intents and approvals are regenerated for the new revision; preview and
-        publication remain blocked until claimGraphState and every blocking check pass.
-      required: [baseRevisionNo, requestKey, title, summary, bodyBlocks, editReason]
+        checks, renders, intents and approvals are regenerated for the new revision. The server
+        resolves the current release EditorialPolicySnapshot and freezes sorted verification,
+        eligible-evidence, and excluded/duplicate/conflict material; the client cannot choose policy
+        material. The revision and editorial.revalidate_requested@1 event are atomic. Preview and
+        publication remain blocked until claimGraphState, all ten exact content/evidence gates, the
+        conditional visual gate, and runtime policy/evidence eligibility pass. The event contains
+        exactly article_id, article_revision_id, editorial_policy_snapshot_id,
+        editorial_policy_material_hash, verification_manifest_hash,
+        input_evidence_manifest_hash, and excluded_material_manifest_hash.
+      required: [baseRevisionNo, requestKey, title, summary, bodyBlocks, claimBindings, editReason]
       properties:
         baseRevisionNo: { type: integer, minimum: 1, maximum: 9007199254740991 }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         title: { type: string, minLength: 1 }
         summary: { type: string, minLength: 1 }
         bodyBlocks: { $ref: '#/components/schemas/ArticleRevision/properties/bodyBlocks' }
+        claimBindings:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ManualClaimBinding' }
         editReason: { type: string, minLength: 3, maxLength: 500 }
+    ManualClaimBinding:
+      type: object
+      additionalProperties: false
+      required: [claimRef, blockId, statement, claimType, evidenceIds, citationMarker, sourceSpans, semanticKey, actor, attribution, horizon, uncertaintyNote, derivedFromClaimRefs]
+      properties:
+        claimRef:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Request-local unique identifier; it is not persisted as the Claim UUID.
+        blockId: { type: string, minLength: 1 }
+        statement: { type: string, minLength: 1 }
+        claimType: { type: string, enum: [fact, company_claim, interpretation, outlook] }
+        evidenceIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        citationMarker: { type: string, minLength: 1 }
+        sourceSpans:
+          type: object
+          minProperties: 1
+          propertyNames: { type: string, format: uuid }
+          additionalProperties: { type: string, minLength: 1, maxLength: 2000 }
+        semanticKey: { type: [string, 'null'] }
+        actor: { type: [string, 'null'] }
+        attribution: { type: [string, 'null'] }
+        horizon: { type: [string, 'null'] }
+        uncertaintyNote: { type: [string, 'null'] }
+        derivedFromClaimRefs:
+          type: array
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 200 }
+          description: >-
+            Request-local claimRef values. Interpretation claims may reference only fact or
+            company_claim bindings from the same request; the server resolves them to immutable
+            derivedFromClaimIds UUIDs in the persisted graph and response.
+    CreateRevisionResult:
+      type: object
+      additionalProperties: false
+      required: [articleId, revisionId, revisionNo, revalidationState, qualityState, revisionContentHash, inputEvidenceManifestHash, editorialPolicyHash, verificationManifestHash, excludedMaterialManifestHash]
+      properties:
+        articleId: { type: string, format: uuid }
+        revisionId: { type: string, format: uuid }
+        revisionNo: { type: integer, minimum: 1 }
+        revalidationState: { type: string, enum: [queued, running, passed, blocked] }
+        qualityState: { type: string, enum: [pending, passed, failed] }
+        revisionContentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        inputEvidenceManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        editorialPolicyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        verificationManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        excludedMaterialManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
     ChannelPreview:
       type: object
       required: [renderId, targetId, targetSnapshotId, targetConfigHash, channelRole, renderStage, canonicalLinkState, title, sanitizedHtml, sourceLinks, includedClaimIds, canonicalSourceUrl, violations, templateHash, renderHash, sourceManifestHash]

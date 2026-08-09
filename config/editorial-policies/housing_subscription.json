@@ -1,11 +1,22 @@
 {
-  "version": 1,
+  "schemaVersion": "editorial-policy-v1",
+  "policyKey": "housing-subscription-editorial",
+  "topicCode": "housing_subscription",
+  "policyVersion": "1.0.0",
   "language": "ko-KR",
-  "requiredSections": ["핵심 요약", "청약 일정", "공급 및 자격", "확인할 점", "출처"],
+  "claimTypes": ["fact", "company_claim", "interpretation", "outlook"],
+  "requiredBlockTypes": ["fact", "background", "sources"],
   "highImpactFields": ["price", "application_start", "application_end", "eligibility"],
-  "requirePrimarySource": true,
-  "clusterIdentity": ["authority", "notice_id"],
-  "articleIdentity": ["authority", "notice_id", "correction_id"],
-  "conflictPriority": ["latest_correction_document", "authority_detail", "structured_api", "aggregator"],
-  "forbiddenClaims": ["당첨 보장", "수익 보장", "무조건 신청"]
+  "checks": [
+    {"code": "quotation_limits_satisfied", "version": "1", "blocking": true, "config": {"maxCitationChars": 160}},
+    {"code": "claim_types_separated_and_attributed", "version": "1", "blocking": true, "config": {}},
+    {"code": "duplicate_or_conflict_resolved", "version": "1", "blocking": true, "config": {}},
+    {"code": "no_exaggeration_or_false_experience", "version": "1", "blocking": true, "config": {"forbiddenPhrases": ["당첨 보장", "수익 보장", "무조건 신청", "직접 취재", "관계자와 인터뷰", "제가 경험"]}},
+    {"code": "source_freshness_satisfied", "version": "1", "blocking": true, "config": {"clock": "current_publication_time"}},
+    {"code": "high_risk_verification_satisfied", "version": "1", "blocking": true, "config": {"required": true}},
+    {"code": "claim_independence_satisfied", "version": "1", "blocking": true, "config": {"primaryOrIndependentCount": 2}},
+    {"code": "korean_readability_and_repetition", "version": "1", "blocking": true, "config": {"maxSentenceChars": 180, "maxParagraphChars": 800}},
+    {"code": "evidence_publish_eligibility_current", "version": "1", "blocking": true, "config": {"allowed": ["allowed", "attribution_required"]}},
+    {"code": "all_publishable_claims_grounded", "version": "1", "blocking": true, "config": {"allClaimsRequireEvidence": true}}
+  ]
 }

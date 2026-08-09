@@ -7,12 +7,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta, timezone as dt_timezone
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core import signing
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Max
 from django.utils.module_loading import import_string
 from django.utils import timezone
@@ -29,6 +30,7 @@ from apps.audit.services import (
     require_audit_replay,
     require_worker_event,
 )
+from apps.editorial.services import require_revision_publishable
 from wisdome_writer.domain.concurrency import (
     canonical_request_hash,
     require_idempotent_match,
@@ -54,6 +56,7 @@ from .models import (
     ChannelRole,
     Publication,
     PublicationAction,
+    PublicationApprovalHead,
     PublicationAttempt,
     PublicationExecutionObservation,
     PublicationReconcileGeneration,
@@ -394,6 +397,795 @@ def _id(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _validated_remote_url(value: str | None) -> str | None:
+    if value in {None, ""}:
+        return value
+    try:
+        parsed = urlsplit(str(value))
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise Conflict("publisher remote URL is invalid") from exc
+    del port
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(ord(character) < 32 for character in str(value))
+    ):
+        raise Conflict("publisher remote URL must be an HTTP(S) URL")
+    return str(value)
+
+
+_CONTENT_PUBLICATION_ACTIONS = {
+    PublicationAction.CREATE,
+    PublicationAction.UPDATE,
+}
+_APPROVAL_MATERIAL_VERSION = "approval-subject-v2"
+
+_STALEABLE_INTENT_STATES = {
+    PublicationIntent.State.DRAFT,
+    PublicationIntent.State.AWAITING_APPROVAL,
+    PublicationIntent.State.APPROVED,
+}
+
+
+def _intent_state_can_be_marked_stale(state: str) -> bool:
+    return state in _STALEABLE_INTENT_STATES
+
+
+def _latest_approvals_allow_dispatch(
+    target_ids: Iterable[str],
+    decisions_by_target: dict[str, str],
+) -> bool:
+    expected = {str(target_id) for target_id in target_ids}
+    observed = {str(target_id) for target_id in decisions_by_target}
+    return expected == observed and all(
+        decisions_by_target[target_id] == Approval.Decision.APPROVED
+        for target_id in expected
+    )
+
+
+def _approval_subject_hash(
+    *,
+    intent: PublicationIntent,
+    target_id,
+    action: str,
+    command: dict[str, Any],
+    subject: dict[str, Any],
+    decision: str,
+    head_version: int,
+    supersedes_approval_id,
+) -> str:
+    return sha256_hex(
+        {
+            "schemaVersion": _APPROVAL_MATERIAL_VERSION,
+            "intentId": str(intent.id),
+            "articleRevisionId": str(intent.article_revision_id),
+            "targetId": str(target_id),
+            "targetAction": action,
+            "targetSnapshotId": str(command["targetSnapshotId"]),
+            "targetConfigHash": command["targetConfigHash"],
+            "subject": subject,
+            "qualityReportHash": intent.quality_report_hash,
+            "decision": decision,
+            "headVersion": head_version,
+            "supersedesApprovalId": _id(supersedes_approval_id),
+        }
+    )
+
+
+def _approval_matches_frozen_subject(
+    approval: Approval,
+    *,
+    intent: PublicationIntent,
+    target_id,
+    command: dict[str, Any],
+) -> bool:
+    if approval.approval_material_version == "approval-subject-v1":
+        return bool(approval.approval_subject_hash)
+    if approval.approval_material_version != _APPROVAL_MATERIAL_VERSION:
+        return False
+    expected = _approval_subject_hash(
+        intent=intent,
+        target_id=target_id,
+        action=command["resolvedAction"],
+        command=command,
+        subject=approval.action_subject,
+        decision=approval.decision,
+        head_version=approval.head_version,
+        supersedes_approval_id=approval.supersedes_approval_id,
+    )
+    return approval.approval_subject_hash == expected
+
+
+def _latest_approval_locked(
+    *,
+    intent: PublicationIntent,
+    target_id,
+) -> Approval | None:
+    head = (
+        PublicationApprovalHead.objects.select_for_update()
+        .select_related("latest_approval")
+        .filter(publication_intent=intent, target_id=target_id)
+        .first()
+    )
+    if head is not None:
+        latest = head.latest_approval
+        if (
+            latest.publication_intent_id != intent.id
+            or str(latest.target_id) != str(target_id)
+            or latest.head_version != head.version
+        ):
+            raise Conflict("approval head does not match its immutable decision")
+        return latest
+    rows = list(
+        Approval.objects.select_for_update()
+        .filter(publication_intent=intent, target_id=target_id)
+        .order_by("id")
+    )
+    if not rows:
+        return None
+    superseded_ids = {
+        row.supersedes_approval_id
+        for row in rows
+        if row.supersedes_approval_id is not None
+    }
+    leaves = [row for row in rows if row.id not in superseded_ids]
+    if len(leaves) != 1:
+        raise Conflict("approval supersession chain is ambiguous")
+    latest = leaves[0]
+    PublicationApprovalHead.objects.create(
+        publication_intent=intent,
+        target_id=target_id,
+        latest_approval=latest,
+        version=latest.head_version,
+    )
+    return latest
+
+
+def _require_exact_dispatch_targets(
+    *,
+    requested_ids: Iterable[str],
+    expected_refs: dict[str, dict[str, Any]],
+    intent_commands: dict[str, dict[str, Any]],
+    intent_refs: dict[str, dict[str, Any]],
+) -> None:
+    requested = {str(target_id) for target_id in requested_ids}
+    if not (
+        requested
+        == set(expected_refs)
+        == set(intent_commands)
+        == set(intent_refs)
+    ):
+        raise InvalidInput(
+            "dispatch targets must exactly match the frozen publication intent"
+        )
+    for target_id in requested:
+        expected = expected_refs[target_id]
+        frozen = intent_refs[target_id]
+        if (
+            str(expected.get("targetSnapshotId"))
+            != str(frozen.get("targetSnapshotId"))
+            or expected.get("targetConfigHash")
+            != frozen.get("targetConfigHash")
+        ):
+            raise Conflict(
+                "dispatch target snapshot differs from the frozen publication intent"
+            )
+
+
+def _require_current_dispatch_approval_locked(
+    *,
+    intent: PublicationIntent,
+    target: PublicationTarget,
+    command: dict[str, Any],
+    frozen_ref: dict[str, Any],
+) -> Approval:
+    if (
+        str(target.current_snapshot_id)
+        != str(frozen_ref["targetSnapshotId"])
+        or target.current_config_hash != frozen_ref["targetConfigHash"]
+        or str(command["targetSnapshotId"])
+        != str(frozen_ref["targetSnapshotId"])
+        or command["targetConfigHash"] != frozen_ref["targetConfigHash"]
+    ):
+        raise Conflict("target snapshot changed after publication approval")
+    approval = _latest_approval_locked(
+        intent=intent,
+        target_id=target.id,
+    )
+    if (
+        approval is None
+        or approval.decision != Approval.Decision.APPROVED
+        or approval.target_action != command["resolvedAction"]
+        or not _approval_matches_frozen_subject(
+            approval,
+            intent=intent,
+            target_id=target.id,
+            command=command,
+        )
+    ):
+        raise Conflict("target requires a current immutable approval")
+    return approval
+
+
+def _approval_requires_current_target_snapshot(
+    decision: str,
+    action: str,
+) -> bool:
+    del action
+    return decision not in {
+        Approval.Decision.REJECTED,
+        Approval.Decision.REVOKED,
+    }
+
+
+def _requires_article_external_write_fence(action: str) -> bool:
+    return action in {
+        PublicationAction.CREATE,
+        PublicationAction.UPDATE,
+        PublicationAction.MARK_WITHDRAWN,
+    }
+
+
+def _lock_open_intents_referencing(
+    *,
+    field_name: str,
+    reference: dict[str, str],
+) -> list[PublicationIntent]:
+    rows = list(
+        PublicationIntent.objects.select_for_update()
+        .filter(
+            state__in=_STALEABLE_INTENT_STATES,
+        )
+        .order_by("id")
+    )
+    matched = []
+    for intent in rows:
+        refs = getattr(intent, field_name, None)
+        if not isinstance(refs, list):
+            continue
+        if any(
+            isinstance(item, dict)
+            and all(item.get(key) == value for key, value in reference.items())
+            for item in refs
+        ):
+            matched.append(intent)
+    return matched
+
+
+def _lock_target_intent_fences(
+    target_ids: Iterable[str],
+) -> list[PublicationTargetIntentFence]:
+    normalized = sorted({str(target_id) for target_id in target_ids})
+    if not normalized:
+        return []
+    existing_ids = set(
+        PublicationTargetIntentFence.objects.filter(
+            target_id__in=normalized
+        ).values_list("target_id", flat=True)
+    )
+    missing = [
+        PublicationTargetIntentFence(target_id=target_id)
+        for target_id in normalized
+        if target_id not in {str(value) for value in existing_ids}
+    ]
+    if missing:
+        PublicationTargetIntentFence.objects.bulk_create(
+            missing,
+            ignore_conflicts=True,
+        )
+    rows = list(
+        PublicationTargetIntentFence.objects.select_for_update()
+        .filter(target_id__in=normalized)
+        .order_by("target_id")
+    )
+    if len(rows) != len(normalized):
+        raise Conflict("publication target intent fence is incomplete")
+    return rows
+
+
+def _lock_open_target_intents(target_id) -> list[PublicationIntent]:
+    return _lock_open_intents_referencing(
+        field_name="target_snapshot_refs",
+        reference={"targetId": str(target_id)},
+    )
+
+
+def _intent_target_ids(intent: PublicationIntent) -> list[str]:
+    return sorted(
+        {
+            str(row["targetId"])
+            for row in intent.target_commands
+            if isinstance(row, dict) and row.get("targetId")
+        }
+    )
+
+
+def _stale_locked_intents(
+    intents: Iterable[PublicationIntent],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    rows = [
+        {"id": intent.id, "state": intent.state}
+        for intent in intents
+        if _intent_state_can_be_marked_stale(intent.state)
+    ]
+    before, after = _state_transition_manifests(
+        rows,
+        state_field="state",
+        next_state=PublicationIntent.State.STALE,
+    )
+    ids = [row["id"] for row in rows]
+    if ids:
+        PublicationIntent.objects.filter(
+            id__in=ids,
+            state__in=_STALEABLE_INTENT_STATES,
+        ).update(state=PublicationIntent.State.STALE)
+    return before, after
+
+
+def _assert_target_has_no_active_external_write(target_id) -> None:
+    active = (
+        PublicationAttempt.objects.select_for_update()
+        .filter(
+            publication__target_id=target_id,
+            resolved_action__in={
+                PublicationAction.CREATE,
+                PublicationAction.UPDATE,
+                PublicationAction.MARK_WITHDRAWN,
+            },
+            state__in={
+                PublicationAttempt.State.RUNNING,
+                PublicationAttempt.State.UNKNOWN_OUTCOME,
+                PublicationAttempt.State.RECONCILING,
+            },
+        )
+        .order_by("id")
+        .exists()
+    )
+    if active:
+        raise Conflict(
+            "publication target cannot change during an active external write"
+        )
+
+
+def _lock_article_external_write_fence(article_id):
+    CollectionRun = apps.get_model("collection", "CollectionRun")
+    DraftArticle = apps.get_model("editorial", "DraftArticle")
+    try:
+        run_id = DraftArticle.objects.values_list(
+            "source_run_id", flat=True
+        ).get(id=article_id)
+    except DraftArticle.DoesNotExist as exc:
+        raise NotFound("publication article does not exist") from exc
+    CollectionRun.objects.select_for_update().get(id=run_id)
+    return DraftArticle.objects.select_for_update().get(id=article_id)
+
+
+def _set_article_external_write_fence_locked(
+    attempt: PublicationAttempt,
+) -> None:
+    if not _requires_article_external_write_fence(attempt.resolved_action):
+        return
+    article = _lock_article_external_write_fence(
+        attempt.publication_intent.article_id
+    )
+    if article.current_revision_id != attempt.article_revision_id:
+        raise Conflict("publication attempt revision is no longer current")
+    if article.state != "publishing":
+        article.state = "publishing"
+        article.save(update_fields=("state", "updated_at"))
+
+
+def _lock_publication_attempt_domain(
+    preliminary: PublicationAttempt,
+) -> PublicationAttempt:
+    PublicationIntent.objects.select_for_update().get(
+        id=preliminary.publication_intent_id
+    )
+    PublicationTarget.objects.select_for_update().get(
+        id=preliminary.publication.target_id
+    )
+    Approval.objects.select_for_update().get(id=preliminary.approval_id)
+    Publication.objects.select_for_update().get(
+        id=preliminary.publication_id
+    )
+    return (
+        PublicationAttempt.objects.select_for_update()
+        .select_related(
+            "publication__target",
+            "publication_intent",
+            "approval__article_channel_render",
+        )
+        .get(id=preliminary.id)
+    )
+
+
+def _publication_run_terminal_state(
+    attempt_states: Iterable[str],
+) -> tuple[str, str, str | None] | None:
+    states = list(attempt_states)
+    terminal = {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }
+    if not states or any(state not in terminal for state in states):
+        return None
+    if all(state == PublicationAttempt.State.SUCCEEDED for state in states):
+        return "completed", "not_required", None
+    return "failed", "manual_required", "publication_terminal_failure"
+
+
+def _mark_origin_run_publishing_locked(intent: PublicationIntent) -> None:
+    run_id = intent.origin_collection_run_id
+    if run_id is None:
+        return
+    CollectionRun = apps.get_model("collection", "CollectionRun")
+    run = CollectionRun.objects.select_for_update().get(id=run_id)
+    if run.state == "awaiting_approval":
+        run.state = "publishing"
+        run.save(update_fields=("state",))
+
+
+def _terminalize_unreachable_dependents_locked(
+    attempt: PublicationAttempt,
+) -> None:
+    if (
+        attempt.publication.target.channel != ChannelCode.WORDPRESS
+        or attempt.state
+        not in {
+            PublicationAttempt.State.PERMANENT_FAILED,
+            PublicationAttempt.State.MANUAL_REQUIRED,
+            PublicationAttempt.State.STALE,
+        }
+    ):
+        return
+    dependent_target_ids = {
+        str(command["targetId"])
+        for command in attempt.publication_intent.target_commands
+        if (
+            isinstance(command, dict)
+            and str(command.get("canonicalDependencyTargetId"))
+            == str(attempt.publication.target_id)
+        )
+    }
+    if not dependent_target_ids:
+        return
+    dependent_publications = list(
+        Publication.objects.select_for_update()
+        .filter(
+            article_id=attempt.publication.article_id,
+            target_id__in=dependent_target_ids,
+        )
+        .order_by("target_id", "id")
+    )
+    publications_by_id = {
+        row.id: row for row in dependent_publications
+    }
+    dependents = list(
+        PublicationAttempt.objects.select_for_update()
+        .filter(
+            publication_intent=attempt.publication_intent,
+            publication_id__in=publications_by_id,
+            state=PublicationAttempt.State.QUEUED,
+        )
+        .order_by("id")
+    )
+    now = timezone.now()
+    for dependent in dependents:
+        dependent.state = PublicationAttempt.State.MANUAL_REQUIRED
+        dependent.finished_at = now
+        dependent.error_code = "canonical_dependency_failed"
+        dependent.recovery_state = PublicationRecoveryState.MANUAL_REQUIRED
+        dependent.next_recovery_at = None
+        dependent.terminal_impact = _publication_terminal_impact(
+            stage="canonical_dependency",
+            final_state=dependent.state,
+            error_code=dependent.error_code,
+        )
+        dependent.save(
+            update_fields=(
+                "state",
+                "finished_at",
+                "error_code",
+                "recovery_state",
+                "next_recovery_at",
+                "terminal_impact",
+            )
+        )
+        publication = publications_by_id[dependent.publication_id]
+        publication.state = Publication.State.MANUAL_REQUIRED
+        publication.last_error_code = dependent.error_code
+        publication.save(
+            update_fields=("state", "last_error_code", "updated_at")
+        )
+
+
+def _project_origin_run_terminal_locked(
+    attempt: PublicationAttempt,
+) -> None:
+    run_id = attempt.publication_intent.origin_collection_run_id
+    if run_id is None:
+        return
+    CollectionRun = apps.get_model("collection", "CollectionRun")
+    run = CollectionRun.objects.select_for_update().get(id=run_id)
+    if run.state != "publishing":
+        return
+    _terminalize_unreachable_dependents_locked(attempt)
+    attempts = list(
+        PublicationAttempt.objects.select_for_update()
+        .filter(publication_intent=attempt.publication_intent)
+        .order_by("id")
+    )
+    expected_count = len(attempt.publication_intent.target_commands)
+    if len(attempts) != expected_count:
+        return
+    projection = _publication_run_terminal_state(
+        row.state for row in attempts
+    )
+    if projection is None:
+        return
+    final_state, recovery_state, error_code = projection
+    from apps.collection.services import project_run_terminal_observation
+
+    now = timezone.now()
+    run.state = final_state
+    run.error_summary = (
+        None
+        if error_code is None
+        else {
+            "code": error_code,
+            "failedAttemptIds": [
+                str(row.id)
+                for row in attempts
+                if row.state != PublicationAttempt.State.SUCCEEDED
+            ],
+        }
+    )
+    project_run_terminal_observation(
+        run,
+        finished_at=now,
+        stage="publishing",
+        final_state=final_state,
+        affected_count=len(attempts),
+        error_code=error_code,
+        recovery_state=recovery_state,
+    )
+    run.save(
+        update_fields=(
+            "state",
+            "error_summary",
+            "completed_at",
+            "duration_ms",
+            "terminal_impact",
+            "recovery_state",
+            "next_recovery_at",
+        )
+    )
+
+
+def _release_article_external_write_fence_locked(
+    attempt: PublicationAttempt,
+) -> None:
+    if _requires_article_external_write_fence(attempt.resolved_action):
+        article = _lock_article_external_write_fence(
+            attempt.publication_intent.article_id
+        )
+        active_external_write = PublicationAttempt.objects.filter(
+            publication_intent__article_id=article.id,
+            resolved_action__in={
+                PublicationAction.CREATE,
+                PublicationAction.UPDATE,
+                PublicationAction.MARK_WITHDRAWN,
+            },
+            state__in={
+                PublicationAttempt.State.RUNNING,
+                PublicationAttempt.State.UNKNOWN_OUTCOME,
+                PublicationAttempt.State.RECONCILING,
+            },
+        ).exists()
+        next_state = "publishing" if active_external_write else (
+            "published"
+            if Publication.objects.filter(
+                article_id=article.id,
+                remote_post_id__isnull=False,
+            ).exists()
+            else "review_ready"
+        )
+        if article.state != next_state:
+            article.state = next_state
+            article.save(update_fields=("state", "updated_at"))
+    _project_origin_run_terminal_locked(attempt)
+
+
+def _require_manual_revalidation_provenance(revision) -> None:
+    if getattr(revision, "provenance_kind", "generated") != "admin_edit":
+        return
+    from wisdome_writer.infrastructure.models import (
+        OutboxConsumerReceipt,
+        OutboxMessage,
+    )
+    from wisdome_writer.infrastructure.outbox import compute_material_hash
+
+    if (
+        revision.revalidation_event_key is None
+        or revision.revalidation_generation <= 0
+        or revision.revalidation_lease_token is None
+    ):
+        raise Conflict("manual revision revalidation provenance is incomplete")
+    expected_payload = {
+        "article_id": str(revision.article_id),
+        "article_revision_id": str(revision.id),
+        "editorial_policy_snapshot_id": str(
+            revision.editorial_policy_snapshot_id
+        ),
+        "editorial_policy_material_hash": revision.editorial_policy_hash,
+        "verification_manifest_hash": revision.verification_manifest_hash,
+        "input_evidence_manifest_hash": revision.evidence_manifest_hash,
+        "excluded_material_manifest_hash": revision.exclusion_manifest_hash,
+    }
+    expected_policy_versions = {
+        "editorialPolicyVersion": revision.editorial_policy_version,
+        "editorialPolicyHash": revision.editorial_policy_hash,
+    }
+    alias = revision._state.db or "default"
+    event = OutboxMessage.objects.using(alias).filter(
+        id=revision.revalidation_event_key,
+        topic="editorial.revalidate_requested",
+        event_version=1,
+        aggregate_type="article_revision",
+        aggregate_id=revision.id,
+        job_id=revision.article.source_run_id,
+        message_key=f"editorial.revalidate_requested:{revision.id}",
+        status=OutboxMessage.Status.PUBLISHED,
+    ).first()
+    if (
+        event is None
+        or event.payload != expected_payload
+        or event.policy_versions != expected_policy_versions
+        or event.immutable_material_hash != compute_material_hash(event)
+    ):
+        raise Conflict("manual revision revalidation event provenance is invalid")
+    receipt = OutboxConsumerReceipt.objects.using(alias).filter(
+        event=event,
+        consumer_name="manual-article-revalidation",
+    ).first()
+    if (
+        receipt is None
+        or receipt.state != OutboxConsumerReceipt.State.SUCCEEDED
+        or receipt.lease_generation < revision.revalidation_generation
+    ):
+        raise Conflict("manual revision revalidation receipt is not complete")
+
+
+class _StaleIntentConflict(Conflict):
+    def __init__(self, intent_id, detail: str):
+        super().__init__(detail)
+        self.intent_id = intent_id
+
+
+def _revision_publication_material(revision) -> dict[str, Any]:
+    generation_attempt = getattr(revision, "generation_attempt", None)
+    return {
+        "revisionContentHash": revision.content_hash,
+        "generationAttemptId": _id(revision.generation_attempt_id),
+        "inputEvidenceManifestHash": revision.evidence_manifest_hash,
+        "generationPipelineManifestHash": (
+            generation_attempt.generation_pipeline_manifest_hash
+            if generation_attempt is not None
+            else None
+        ),
+        "qualityGateManifestHash": revision.quality_gate_manifest_hash,
+        "qualityReportHash": revision.quality_report_hash,
+        "editorialPolicyHash": revision.editorial_policy_hash,
+        "verificationManifestHash": revision.verification_manifest_hash,
+        "exclusionManifestHash": revision.exclusion_manifest_hash,
+        "claimManifestHash": revision.claim_manifest_hash,
+        "revalidationGeneration": revision.revalidation_generation,
+    }
+
+
+def _commands_require_publishable_revision(commands: Iterable[dict[str, Any]]) -> bool:
+    return any(
+        command.get("resolvedAction") in _CONTENT_PUBLICATION_ACTIONS
+        for command in commands
+    )
+
+
+def _require_revision_for_commands(
+    revision,
+    commands: Iterable[dict[str, Any]],
+    *,
+    approval_decision: str | None = None,
+) -> None:
+    if approval_decision in {
+        Approval.Decision.REJECTED,
+        Approval.Decision.REVOKED,
+    }:
+        return
+    if not _commands_require_publishable_revision(commands):
+        return
+    _require_manual_revalidation_provenance(revision)
+    try:
+        require_revision_publishable(revision)
+    except ValueError as exc:
+        raise Conflict(str(exc)) from exc
+
+
+def _intent_material_data(intent: PublicationIntent, revision) -> dict[str, Any]:
+    return {
+        "approvalMode": intent.approval_mode,
+        "autoPublishValidationRefs": intent.auto_publish_validation_refs,
+        "autoPublishActivationRefs": intent.auto_publish_activation_refs,
+        "correctionCaseId": _id(intent.correction_case_id),
+        **_revision_publication_material(revision),
+    }
+
+
+def _require_intent_revision_publishable(
+    intent: PublicationIntent,
+    *,
+    approval_decision: str | None = None,
+) -> PublicationIntent:
+    if approval_decision in {
+        Approval.Decision.REJECTED,
+        Approval.Decision.REVOKED,
+    } or not _commands_require_publishable_revision(intent.target_commands):
+        return intent
+    try:
+        _require_revision_for_commands(
+            intent.article_revision,
+            intent.target_commands,
+            approval_decision=approval_decision,
+        )
+        locked_intent = (
+            PublicationIntent.objects.select_for_update()
+            .select_related("article_revision__generation_attempt")
+            .get(id=intent.id)
+        )
+        revision = locked_intent.article_revision
+        material = _intent_material_data(locked_intent, revision)
+        refs = _target_ref_map(locked_intent.target_snapshot_refs)
+        commands = _command_map(locked_intent.target_commands)
+        if (
+            locked_intent.revision_no != revision.revision_no
+            or locked_intent.revision_content_hash != material["revisionContentHash"]
+            or _id(locked_intent.generation_attempt_id)
+            != material["generationAttemptId"]
+            or locked_intent.input_evidence_manifest_hash
+            != material["inputEvidenceManifestHash"]
+            or locked_intent.generation_pipeline_manifest_hash
+            != material["generationPipelineManifestHash"]
+            or locked_intent.quality_gate_manifest_hash
+            != material["qualityGateManifestHash"]
+            or locked_intent.quality_report_hash != material["qualityReportHash"]
+            or locked_intent.intent_hash
+            != _intent_hash(material, revision, refs, commands)
+        ):
+            raise Conflict("publication intent editorial material is stale")
+        return locked_intent
+    except Conflict as exc:
+        raise _StaleIntentConflict(intent.id, str(exc)) from exc
+
+
+def _persist_stale_intent(intent_id) -> None:
+    with transaction.atomic():
+        intent = PublicationIntent.objects.select_for_update().get(id=intent_id)
+        if _intent_state_can_be_marked_stale(intent.state):
+            intent.state = PublicationIntent.State.STALE
+            intent.save(update_fields=["state"])
+
+
+def _raise_persisted_stale_intent(exc: _StaleIntentConflict):
+    if connection.in_atomic_block:
+        raise exc
+    _persist_stale_intent(exc.intent_id)
+    raise Conflict(str(exc)) from exc
+
+
 def _secret_resolver():
     from wisdome_writer.infrastructure.secrets import SecretResolver
 
@@ -620,6 +1412,10 @@ def complete_blogger_oauth(
     if not credential_ref:
         raise InvalidInput("OAuth token store가 credential reference를 반환하지 않았습니다.")
     with transaction.atomic(using=audit_context.database_alias):
+        _lock_target_intent_fences((state_data["targetId"],))
+        locked_intents = _lock_open_target_intents(
+            state_data["targetId"]
+        )
         target = PublicationTarget.objects.using(
             audit_context.database_alias
         ).select_for_update().get(
@@ -638,6 +1434,7 @@ def complete_blogger_oauth(
         target.auto_publish_enabled = False
         target.save()
         _snapshot_locked(target)
+        _stale_locked_intents(locked_intents)
         _record_publishing_audit(
             audit_context=audit_context,
             action="publication_target.oauth_connected",
@@ -800,6 +1597,7 @@ def create_target(
     )
     target.full_clean()
     target.save()
+    PublicationTargetIntentFence.objects.create(target=target)
     _snapshot_locked(target)
     _record_publishing_audit(
         audit_context=audit_context,
@@ -826,6 +1624,18 @@ def update_target(
     audit_context: AuditContext,
 ) -> PublicationTarget:
     _require_audit_actor(audit_context, "admin")
+    _lock_target_intent_fences((target_id,))
+    changed_connection = bool(
+        {"canaryTargetId", "usernameRef", "credentialRef"}.intersection(data)
+    )
+    locked_intents = (
+        _lock_open_intents_referencing(
+            field_name="target_snapshot_refs",
+            reference={"targetId": str(target_id)},
+        )
+        if changed_connection
+        else []
+    )
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _admin_request_hash(
         audit_context=audit_context,
@@ -845,6 +1655,8 @@ def update_target(
             request_hash=request_hash,
         )
         return target
+    if changed_connection:
+        _assert_target_has_no_active_external_write(target.id)
     immutable = {"channel", "channelRole", "role", "environment", "baseUrl", "remoteBlogId"}
     if immutable.intersection(data):
         raise InvalidInput("채널, 역할, 환경, base URL과 remote blog ID는 변경할 수 없습니다.")
@@ -855,12 +1667,9 @@ def update_target(
         "usernameRef": "username_ref",
         "credentialRef": "credential_ref",
     }
-    changed_connection = False
     for external_name, field_name in field_map.items():
         if external_name in data:
             setattr(target, field_name, data[external_name])
-            if external_name != "displayName":
-                changed_connection = True
     empty_before, empty_after = _state_transition_manifests(
         [],
         state_field="state",
@@ -899,27 +1708,7 @@ def update_target(
             invalidated_at=timezone.now(),
             invalidation_reason="target_configuration_changed",
         )
-        intent_query = (
-            PublicationIntent.objects.select_for_update()
-            .filter(
-                target_snapshot_refs__contains=[
-                    {"targetId": str(target.id)}
-                ],
-                state__in=[
-                    PublicationIntent.State.DRAFT,
-                    PublicationIntent.State.AWAITING_APPROVAL,
-                    PublicationIntent.State.APPROVED,
-                ],
-            )
-            .order_by("id")
-        )
-        intent_rows = list(intent_query.values("id", "state"))
-        intent_before, intent_after = _state_transition_manifests(
-            intent_rows,
-            state_field="state",
-            next_state=PublicationIntent.State.STALE,
-        )
-        intent_query.update(state=PublicationIntent.State.STALE)
+        intent_before, intent_after = _stale_locked_intents(locked_intents)
         transition_before = {
             "validations": validation_before,
             "intents": intent_before,
@@ -1043,17 +1832,17 @@ def begin_target_preflight(
     audit_context: AuditContext,
 ) -> tuple[PublicationTarget, TargetPreflightFence] | None:
     _require_audit_actor(audit_context, "worker")
-    target = PublicationTarget.objects.select_for_update().get(id=target_id)
     _require_worker_event(
         audit_context,
         topic="publication.preflight_requested",
-        aggregate_id=target.id,
+        aggregate_id=target_id,
         payload_identity={
-            "target_id": str(target.id),
+            "target_id": str(target_id),
             "target_snapshot_id": expected_snapshot_id,
             "target_config_hash": expected_config_hash,
         },
     )
+    target = PublicationTarget.objects.select_for_update().get(id=target_id)
     if _worker_audit_replay(
         audit_context,
         entity=target,
@@ -1122,17 +1911,23 @@ def persist_target_preflight_result(
     audit_context: AuditContext,
 ) -> tuple[PublicationTarget, bool]:
     _require_audit_actor(audit_context, "worker")
-    target = PublicationTarget.objects.select_for_update().get(id=fence.target_id)
     _require_worker_event(
         audit_context,
         topic="publication.preflight_requested",
-        aggregate_id=target.id,
+        aggregate_id=fence.target_id,
         payload_identity={
-            "target_id": str(target.id),
+            "target_id": str(fence.target_id),
             "target_snapshot_id": str(fence.target_snapshot_id),
             "target_config_hash": fence.target_config_hash,
         },
     )
+    _lock_target_intent_fences((fence.target_id,))
+    locked_intents = _lock_open_intents_referencing(
+        field_name="target_snapshot_refs",
+        reference={"targetId": str(fence.target_id)},
+    )
+    target = PublicationTarget.objects.select_for_update().get(id=fence.target_id)
+    _assert_target_has_no_active_external_write(target.id)
     if (
         target.current_snapshot_id != fence.target_snapshot_id
         or target.current_config_hash != fence.target_config_hash
@@ -1205,6 +2000,7 @@ def persist_target_preflight_result(
     target.last_preflight_at = timezone.now()
     target.save()
     _snapshot_locked(target)
+    intent_before, intent_after = _stale_locked_intents(locked_intents)
     result_hash = sha256_hex(
         {
             "passed": result.passed,
@@ -1223,11 +2019,13 @@ def persist_target_preflight_result(
         before_material={
             **before_material,
             "staleValidations": validation_before,
+            "staleIntents": intent_before,
         },
         after_material={
             **_audit_state(target),
             "resultHash": result_hash,
             "staleValidations": validation_after,
+            "staleIntents": intent_after,
         },
         metadata={
             "target_id": str(target.id),
@@ -1443,19 +2241,22 @@ def begin_canary_run(
     audit_context: AuditContext,
 ) -> tuple[TargetCanaryRun, TargetCanaryFence | None]:
     _require_audit_actor(audit_context, "worker")
+    target_id = TargetCanaryRun.objects.values_list(
+        "target_id", flat=True
+    ).get(id=run_id)
+    _require_worker_event(
+        audit_context,
+        topic="publishing.target_canary.requested",
+        aggregate_id=target_id,
+        payload_identity={
+            "canary_run_id": str(run_id),
+            "target_id": str(target_id),
+        },
+    )
     run = (
         TargetCanaryRun.objects.select_for_update()
         .select_related("target", "target_snapshot")
         .get(id=run_id)
-    )
-    _require_worker_event(
-        audit_context,
-        topic="publishing.target_canary.requested",
-        aggregate_id=run.target_id,
-        payload_identity={
-            "canary_run_id": str(run.id),
-            "target_id": str(run.target_id),
-        },
     )
     if _worker_audit_replay(
         audit_context,
@@ -1604,19 +2405,21 @@ def persist_canary_run_result(
     audit_context: AuditContext,
 ) -> TargetCanaryRun:
     _require_audit_actor(audit_context, "worker")
-    run = (
-        TargetCanaryRun.objects.select_for_update()
-        .select_related("target")
-        .get(id=fence.run_id)
-    )
+    _lock_target_intent_fences((fence.target_id,))
+    locked_intents = _lock_open_target_intents(fence.target_id)
     _require_worker_event(
         audit_context,
         topic="publishing.target_canary.requested",
         aggregate_id=fence.target_id,
         payload_identity={
-            "canary_run_id": str(run.id),
+            "canary_run_id": str(fence.run_id),
             "target_id": str(fence.target_id),
         },
+    )
+    run = (
+        TargetCanaryRun.objects.select_for_update()
+        .select_related("target")
+        .get(id=fence.run_id)
     )
     input_result_hash = sha256_hex(
         {
@@ -1638,6 +2441,7 @@ def persist_canary_run_result(
         return run
     before_material = _audit_state(run)
     target = PublicationTarget.objects.select_for_update().get(id=fence.target_id)
+    _assert_target_has_no_active_external_write(target.id)
     target_before_material = _audit_state(target)
     fenced = (
         run.target_snapshot_id == fence.target_snapshot_id
@@ -1676,6 +2480,7 @@ def persist_canary_run_result(
         target.last_canary_at = timezone.now()
         target.save()
         _snapshot_locked(target)
+        _stale_locked_intents(locked_intents)
     _record_publishing_audit(
         audit_context=audit_context,
         action="publication_target.canary_completed",
@@ -1818,6 +2623,7 @@ def decide_auto_publish_validation(
     audit_context: AuditContext,
 ) -> tuple[AutoPublishValidationDecision, bool]:
     _require_audit_actor(audit_context, "admin")
+    _lock_target_intent_fences((target_id,))
     user = request.user
     if audit_context.actor_id != user.pk:
         raise Forbidden("validation audit actor differs from the administrator")
@@ -1828,6 +2634,15 @@ def decide_auto_publish_validation(
         raise Forbidden(
             "validation decision provenance differs from the audit context"
         )
+    locked_intents = (
+        _lock_open_intents_referencing(
+            field_name="auto_publish_validation_refs",
+            reference={"validationId": str(validation_id)},
+        )
+        if data.get("decision")
+        == AutoPublishValidationDecision.Decision.REVOKED
+        else []
+    )
     target = PublicationTarget.objects.select_for_update().get(
         id=target_id
     )
@@ -1903,26 +2718,7 @@ def decide_auto_publish_validation(
     if decision.decision == AutoPublishValidationDecision.Decision.REVOKED:
         target.auto_publish_enabled = False
         target.save(update_fields=["auto_publish_enabled", "updated_at"])
-        intent_query = (
-            PublicationIntent.objects.select_for_update()
-            .filter(
-                auto_publish_validation_refs__contains=[
-                    {"validationId": str(validation.id)}
-                ],
-                state__in=[
-                    PublicationIntent.State.APPROVED,
-                    PublicationIntent.State.AWAITING_APPROVAL,
-                ],
-            )
-            .order_by("id")
-        )
-        intent_rows = list(intent_query.values("id", "state"))
-        intent_before, intent_after = _state_transition_manifests(
-            intent_rows,
-            state_field="state",
-            next_state=PublicationIntent.State.STALE,
-        )
-        intent_query.update(state=PublicationIntent.State.STALE)
+        intent_before, intent_after = _stale_locked_intents(locked_intents)
     _record_publishing_audit(
         audit_context=audit_context,
         action="auto_publish_validation.decided",
@@ -1977,6 +2773,7 @@ def set_auto_publish(
     audit_context: AuditContext,
 ) -> tuple[AutoPublishActivation, bool]:
     _require_audit_actor(audit_context, "admin")
+    _lock_target_intent_fences((target_id,))
     user = request.user
     if audit_context.actor_id != user.pk:
         raise Forbidden("activation audit actor differs from the administrator")
@@ -1987,6 +2784,19 @@ def set_auto_publish(
         raise Forbidden(
             "activation provenance differs from the audit context"
         )
+    disabling_activation_id = (
+        data.get("expectedLatestActivationId")
+        if not bool(data.get("enabled"))
+        else None
+    )
+    locked_intents = (
+        _lock_open_intents_referencing(
+            field_name="auto_publish_activation_refs",
+            reference={"activationId": str(disabling_activation_id)},
+        )
+        if disabling_activation_id is not None
+        else []
+    )
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _request_hash(data)
     existing = target.activations.filter(request_key=data["requestKey"]).first()
@@ -2089,30 +2899,7 @@ def set_auto_publish(
         ]
     )
     if not enabled:
-        intent_query = (
-            PublicationIntent.objects.select_for_update()
-            .filter(
-                auto_publish_activation_refs__contains=[
-                    {
-                        "activationId": str(
-                            activation.supersedes_activation_id
-                        )
-                    }
-                ],
-                state__in=[
-                    PublicationIntent.State.APPROVED,
-                    PublicationIntent.State.AWAITING_APPROVAL,
-                ],
-            )
-            .order_by("id")
-        )
-        intent_rows = list(intent_query.values("id", "state"))
-        intent_before, intent_after = _state_transition_manifests(
-            intent_rows,
-            state_field="state",
-            next_state=PublicationIntent.State.STALE,
-        )
-        intent_query.update(state=PublicationIntent.State.STALE)
+        intent_before, intent_after = _stale_locked_intents(locked_intents)
     _record_publishing_audit(
         audit_context=audit_context,
         action="auto_publish_activation.decided",
@@ -2172,25 +2959,60 @@ def _command_map(commands: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _current_revision(article_id: str, revision_no: int):
+def _current_revision(
+    article_id: str,
+    revision_no: int,
+    *,
+    commands: Iterable[dict[str, Any]],
+):
     DraftArticle = apps.get_model("editorial", "DraftArticle")
     ArticleRevision = apps.get_model("editorial", "ArticleRevision")
     try:
-        article = DraftArticle.objects.select_for_update().get(id=article_id)
+        current_revision_id = DraftArticle.objects.values_list(
+            "current_revision_id", flat=True
+        ).get(id=article_id)
     except DraftArticle.DoesNotExist as exc:
         raise NotFound("글을 찾을 수 없습니다.") from exc
-    if not article.current_revision_id:
+    if not current_revision_id:
         raise Conflict("현재 개정이 없습니다.")
-    revision = ArticleRevision.objects.get(id=article.current_revision_id)
+    revision = ArticleRevision.objects.select_related("generation_attempt").get(
+        id=current_revision_id
+    )
+    _require_revision_for_commands(revision, commands)
+    article = DraftArticle.objects.select_for_update().get(id=article_id)
+    revision = ArticleRevision.objects.select_related("generation_attempt").get(
+        id=article.current_revision_id
+    )
     if revision.revision_no != revision_no:
         raise Conflict("현재 개정 번호가 바뀌었습니다.")
-    if revision.quality_state != "passed":
+    if (
+        _commands_require_publishable_revision(commands)
+        and revision.quality_state != "passed"
+    ):
         raise Conflict("차단 품질 검사를 모두 통과해야 발행할 수 있습니다.")
     return article, revision
 
 
-@transaction.atomic
 def create_publication_intent(
+    article_id: str,
+    data: dict[str, Any],
+    *,
+    user,
+    audit_context: AuditContext,
+) -> PublicationIntent:
+    try:
+        return _create_publication_intent_atomic(
+            article_id,
+            data,
+            user=user,
+            audit_context=audit_context,
+        )
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
+@transaction.atomic
+def _create_publication_intent_atomic(
     article_id: str,
     data: dict[str, Any],
     *,
@@ -2207,6 +3029,9 @@ def create_publication_intent(
     ):
         raise Forbidden("intent provenance differs from the audit context")
     request_key = data["requestKey"]
+    commands = _command_map(data["targetCommands"])
+    _lock_article_external_write_fence(article_id)
+    _lock_target_intent_fences(commands)
     existing = (
         PublicationIntent.objects.select_related("article_revision")
         .filter(article_id=article_id, request_key=request_key)
@@ -2214,22 +3039,17 @@ def create_publication_intent(
         .first()
     )
     if existing:
+        existing = _require_intent_revision_publishable(existing)
         existing_refs = _target_ref_map(data["targetSnapshots"])
-        existing_commands = _command_map(data["targetCommands"])
         candidate_data = {
             **data,
-            "revisionContentHash": existing.revision_content_hash,
-            "generationAttemptId": _id(existing.generation_attempt_id),
-            "inputEvidenceManifestHash": existing.input_evidence_manifest_hash,
-            "generationPipelineManifestHash": existing.generation_pipeline_manifest_hash,
-            "qualityGateManifestHash": existing.quality_gate_manifest_hash,
-            "qualityReportHash": existing.quality_report_hash,
+            **_revision_publication_material(existing.article_revision),
         }
         candidate_hash = _intent_hash(
             candidate_data,
             existing.article_revision,
             existing_refs,
-            existing_commands,
+            commands,
         )
         if (
             existing.revision_no != int(data["revisionNo"])
@@ -2245,35 +3065,27 @@ def create_publication_intent(
             request_hash=existing.intent_hash,
         )
         return existing
-    article, revision = _current_revision(article_id, int(data["revisionNo"]))
-    revision_content_hash = sha256_hex(
-        {"title": revision.title, "summary": revision.summary, "bodyMarkdown": revision.body_markdown}
+    article, revision = _current_revision(
+        article_id,
+        int(data["revisionNo"]),
+        commands=commands.values(),
     )
+    revision_content_hash = revision.content_hash
     if revision_content_hash != data["expectedRevisionContentHash"]:
         raise Conflict("현재 개정 본문 hash가 요청 시점과 다릅니다.")
-    generation_pipeline_manifest_hash = sha256_hex(
-        {
-            "generator": getattr(revision.generation_attempt, "generator_name", "admin_edit"),
-            "version": getattr(revision.generation_attempt, "generator_version", "v1"),
-        }
-    )
-    quality_rows = list(
-        revision.quality_checks.order_by("code").values("code", "state", "detail")
-    )
     material_data = {
         **data,
-        "revisionContentHash": revision_content_hash,
-        "generationAttemptId": _id(revision.generation_attempt_id),
-        "inputEvidenceManifestHash": revision.input_manifest_hash,
-        "generationPipelineManifestHash": generation_pipeline_manifest_hash,
-        "qualityGateManifestHash": revision.quality_manifest_hash,
-        "qualityReportHash": sha256_hex(quality_rows),
+        **_revision_publication_material(revision),
     }
     target_refs = _target_ref_map(data["targetSnapshots"])
-    commands = _command_map(data["targetCommands"])
     if set(target_refs) != set(commands):
         raise InvalidInput("target snapshot과 command target 집합이 같아야 합니다.")
-    latest = PublicationIntent.objects.filter(article_id=article.id).order_by("-created_at").first()
+    latest = (
+        PublicationIntent.objects.select_for_update()
+        .filter(article_id=article.id)
+        .order_by("-created_at")
+        .first()
+    )
     if _id(latest.id if latest else None) != _id(data.get("expectedLatestIntentId")):
         raise Conflict("발행 의도가 갱신되었습니다. 다시 불러오세요.")
     latest_before_material = _audit_state(latest) if latest else None
@@ -2370,7 +3182,8 @@ def create_publication_intent(
         latest.state = PublicationIntent.State.STALE
         latest.save(update_fields=["state"])
     for target_id in sorted(target_rows):
-        _create_preview_render(intent, revision, target_rows[target_id])
+        if commands[target_id]["resolvedAction"] != PublicationAction.UNPUBLISH:
+            _create_preview_render(intent, revision, target_rows[target_id])
     render_manifest = list(
         intent.renders.order_by("target_id", "id").values(
             "id",
@@ -2437,6 +3250,11 @@ def _intent_hash(data, revision, target_refs, commands) -> str:
             "generationPipelineManifestHash": data.get("generationPipelineManifestHash"),
             "qualityGateManifestHash": data["qualityGateManifestHash"],
             "qualityReportHash": data["qualityReportHash"],
+            "editorialPolicyHash": data["editorialPolicyHash"],
+            "verificationManifestHash": data["verificationManifestHash"],
+            "exclusionManifestHash": data["exclusionManifestHash"],
+            "claimManifestHash": data["claimManifestHash"],
+            "revalidationGeneration": data["revalidationGeneration"],
             "correctionCaseId": data.get("correctionCaseId"),
         }
     )
@@ -2541,8 +3359,67 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
     )
 
 
+def get_article_preview(article_id: str, target_id: str) -> ArticleChannelRender:
+    try:
+        return _get_article_preview_atomic(article_id, target_id)
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
 @transaction.atomic
+def _get_article_preview_atomic(
+    article_id: str,
+    target_id: str,
+) -> ArticleChannelRender:
+    intent = (
+        PublicationIntent.objects.select_related(
+            "article_revision__generation_attempt"
+        )
+        .filter(article_id=article_id)
+        .order_by("-created_at")
+        .first()
+    )
+    if intent is None:
+        raise InvalidInput("Create a publication intent before requesting a preview.")
+    intent = _require_intent_revision_publishable(intent)
+    latest_id = (
+        PublicationIntent.objects.filter(article_id=article_id)
+        .order_by("-created_at")
+        .values_list("id", flat=True)
+        .first()
+    )
+    if latest_id != intent.id or intent.state == PublicationIntent.State.STALE:
+        raise _StaleIntentConflict(intent.id, "publication preview is stale")
+    return intent.renders.get(
+        target_id=target_id,
+        render_stage=ArticleChannelRender.Stage.PREVIEW,
+    )
+
+
 def decide_approval(
+    article_id: str,
+    target_id: str,
+    data: dict[str, Any],
+    *,
+    user,
+    audit_context: AuditContext,
+    request=None,
+) -> tuple[Approval, bool]:
+    try:
+        return _decide_approval_atomic(
+            article_id,
+            target_id,
+            data,
+            user=user,
+            audit_context=audit_context,
+            request=request,
+        )
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
+@transaction.atomic
+def _decide_approval_atomic(
     article_id: str,
     target_id: str,
     data: dict[str, Any],
@@ -2560,14 +3437,29 @@ def decide_approval(
         or data.get("reason") != audit_context.reason_code
     ):
         raise Forbidden("approval provenance differs from the audit context")
-    target = PublicationTarget.objects.select_for_update().get(
-        id=target_id
+    intent_candidate = PublicationIntent.objects.select_related(
+        "article_revision__generation_attempt"
+    ).get(id=data["publicationIntentId"], article_id=article_id)
+    command = next(
+        (
+            row
+            for row in intent_candidate.target_commands
+            if str(row["targetId"]) == str(target_id)
+        ),
+        None,
+    )
+    if not command:
+        raise InvalidInput("publication intent has no command for this target")
+    _require_intent_revision_publishable(
+        intent_candidate,
+        approval_decision=data["decision"],
     )
     intent = PublicationIntent.objects.select_for_update().get(
         id=data["publicationIntentId"], article_id=article_id
     )
+    target = PublicationTarget.objects.select_for_update().get(id=target_id)
     request_hash = _request_hash(data)
-    existing = Approval.objects.filter(
+    existing = Approval.objects.select_for_update().filter(
         publication_intent=intent,
         target_id=target_id,
         request_key=data["requestKey"],
@@ -2587,7 +3479,23 @@ def decide_approval(
         )
         return existing, False
     latest_intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
-    if not latest_intent or latest_intent.id != intent.id or intent.state == PublicationIntent.State.STALE:
+    safety_transition = (
+        data["decision"]
+        in {
+            Approval.Decision.REJECTED,
+            Approval.Decision.REVOKED,
+        }
+        or command["resolvedAction"]
+        in {
+            PublicationAction.UNPUBLISH,
+            PublicationAction.MARK_WITHDRAWN,
+        }
+    )
+    if not safety_transition and (
+        not latest_intent
+        or latest_intent.id != intent.id
+        or intent.state == PublicationIntent.State.STALE
+    ):
         raise Conflict("current 발행 의도만 승인할 수 있습니다.")
     intent_before_material = _audit_state(intent)
     command = next(
@@ -2595,9 +3503,18 @@ def decide_approval(
     )
     if not command:
         raise InvalidInput("발행 의도에 해당 target command가 없습니다.")
-    if str(target.current_snapshot_id) != str(command["targetSnapshotId"]):
+    if (
+        _approval_requires_current_target_snapshot(
+            data["decision"], command["resolvedAction"]
+        )
+        and str(target.current_snapshot_id)
+        != str(command["targetSnapshotId"])
+    ):
         raise Conflict("target snapshot이 변경되어 새 미리보기가 필요합니다.")
-    latest = Approval.objects.filter(publication_intent=intent, target=target).order_by("-decided_at").first()
+    latest = _latest_approval_locked(
+        intent=intent,
+        target_id=target.id,
+    )
     if _id(latest.id if latest else None) != _id(data.get("expectedLatestApprovalId")):
         raise Conflict("승인 상태가 갱신되었습니다. 다시 불러오세요.")
     subject = data["actionSubject"]
@@ -2637,17 +3554,16 @@ def decide_approval(
             raise Conflict("미리보기 source manifest가 다릅니다.")
         render_template_hash = render.template_hash
         source_manifest_hash = render.source_manifest_hash
-    approval_subject_hash = sha256_hex(
-        {
-            "intentId": str(intent.id),
-            "articleRevisionId": str(intent.article_revision_id),
-            "targetId": str(target.id),
-            "targetAction": action,
-            "targetSnapshotId": str(target.current_snapshot_id),
-            "targetConfigHash": target.current_config_hash,
-            "subject": subject,
-            "qualityReportHash": intent.quality_report_hash,
-        }
+    head_version = (latest.head_version if latest else 0) + 1
+    approval_subject_hash = _approval_subject_hash(
+        intent=intent,
+        target_id=target.id,
+        action=action,
+        command=command,
+        subject=subject,
+        decision=data["decision"],
+        head_version=head_version,
+        supersedes_approval_id=latest.id if latest else None,
     )
     approval = Approval.objects.create(
         article_revision_id=intent.article_revision_id,
@@ -2657,11 +3573,13 @@ def decide_approval(
         target_action=action,
         article_channel_render=render,
         action_subject=subject,
-        target_snapshot_id=target.current_snapshot_id,
-        target_config_hash=target.current_config_hash,
+        target_snapshot_id=command["targetSnapshotId"],
+        target_config_hash=command["targetConfigHash"],
         mode=intent.approval_mode,
         decision=data["decision"],
         approval_subject_hash=approval_subject_hash,
+        approval_material_version=_APPROVAL_MATERIAL_VERSION,
+        head_version=head_version,
         supersedes_approval_id=latest.id if latest else None,
         request_key=data["requestKey"],
         request_hash=request_hash,
@@ -2672,16 +3590,38 @@ def decide_approval(
         source_manifest_hash=source_manifest_hash,
         admin=user,
     )
+    head = (
+        PublicationApprovalHead.objects.select_for_update()
+        .filter(publication_intent=intent, target=target)
+        .first()
+    )
+    if head is None:
+        PublicationApprovalHead.objects.create(
+            publication_intent=intent,
+            target=target,
+            latest_approval=approval,
+            version=head_version,
+        )
+    else:
+        if latest is None or head.latest_approval_id != latest.id:
+            raise Conflict("approval head changed during decision")
+        head.latest_approval = approval
+        head.version = head_version
+        head.save(update_fields=("latest_approval", "version", "updated_at"))
     target_ids = {str(row["targetId"]) for row in intent.target_commands}
-    approved_ids = set()
+    decisions_by_target: dict[str, str] = {}
     for command_row in intent.target_commands:
-        current = Approval.objects.filter(
-            publication_intent=intent, target_id=command_row["targetId"]
-        ).order_by("-decided_at").first()
-        if current and current.decision == Approval.Decision.APPROVED:
-            approved_ids.add(str(current.target_id))
-    if target_ids.issubset(approved_ids):
+        current = _latest_approval_locked(
+            intent=intent,
+            target_id=command_row["targetId"],
+        )
+        if current:
+            decisions_by_target[str(current.target_id)] = current.decision
+    if _latest_approvals_allow_dispatch(target_ids, decisions_by_target):
         intent.state = PublicationIntent.State.APPROVED
+        intent.save(update_fields=["state"])
+    elif intent.state == PublicationIntent.State.APPROVED:
+        intent.state = PublicationIntent.State.AWAITING_APPROVAL
         intent.save(update_fields=["state"])
     _record_publishing_audit(
         audit_context=audit_context,
@@ -2713,7 +3653,11 @@ def decide_approval(
 
 
 def _publication_for(article_id: str, target: PublicationTarget) -> Publication:
-    publication = Publication.objects.filter(article_id=article_id, target=target).first()
+    publication = (
+        Publication.objects.select_for_update()
+        .filter(article_id=article_id, target=target)
+        .first()
+    )
     if publication:
         return publication
     publication = Publication(
@@ -2727,8 +3671,24 @@ def _publication_for(article_id: str, target: PublicationTarget) -> Publication:
     return publication
 
 
-@transaction.atomic
 def dispatch_publication(
+    article_id: str,
+    data: dict[str, Any],
+    *,
+    audit_context: AuditContext,
+) -> list[PublicationAttempt]:
+    try:
+        return _dispatch_publication_atomic(
+            article_id,
+            data,
+            audit_context=audit_context,
+        )
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
+@transaction.atomic
+def _dispatch_publication_atomic(
     article_id: str,
     data: dict[str, Any],
     *,
@@ -2747,6 +3707,23 @@ def dispatch_publication(
         raise InvalidInput("target IDs에는 중복이 없어야 합니다.")
     if set(expected) != set(requested_ids):
         raise InvalidInput("target IDs와 expected target snapshot 집합이 같아야 합니다.")
+    _lock_article_external_write_fence(article_id)
+    _lock_target_intent_fences(requested_ids)
+    intent_candidate = PublicationIntent.objects.select_related(
+        "article_revision__generation_attempt"
+    ).get(id=data["publicationIntentId"], article_id=article_id)
+    _require_intent_revision_publishable(intent_candidate)
+    intent = PublicationIntent.objects.select_for_update().get(
+        id=data["publicationIntentId"], article_id=article_id
+    )
+    command_map = _command_map(intent.target_commands)
+    intent_ref_map = _target_ref_map(intent.target_snapshot_refs)
+    _require_exact_dispatch_targets(
+        requested_ids=requested_ids,
+        expected_refs=expected,
+        intent_commands=command_map,
+        intent_refs=intent_ref_map,
+    )
     target_rows = {
         str(row.id): row
         for row in PublicationTarget.objects.select_for_update()
@@ -2755,14 +3732,8 @@ def dispatch_publication(
     }
     if set(target_rows) != set(requested_ids):
         raise InvalidInput("알 수 없는 발행 target이 포함되었습니다.")
-    intent = PublicationIntent.objects.select_for_update().get(
-        id=data["publicationIntentId"], article_id=article_id
-    )
     if intent.revision_no != int(data["revisionNo"]):
         raise Conflict("발행 요청 revision과 intent가 다릅니다.")
-    command_map = {str(row["targetId"]): row for row in intent.target_commands}
-    if any(target_id not in command_map for target_id in requested_ids):
-        raise InvalidInput("publication intent does not contain every requested target")
     dispatch_material = {
         "requestKey": data["requestKey"],
         "publishAt": data.get("publishAt"),
@@ -2805,9 +3776,23 @@ def dispatch_publication(
         for target_id, row in replay_by_target.items():
             ref = expected[target_id]
             command = command_map.get(target_id)
+            approval = (
+                _require_current_dispatch_approval_locked(
+                    intent=intent,
+                    target=target_rows[target_id],
+                    command=command,
+                    frozen_ref=ref,
+                )
+                if command is not None
+                else None
+            )
             if (
                 command is None
                 or row.publication_intent_id != intent.id
+                or approval is None
+                or row.approval_id != approval.id
+                or row.approval_subject_hash
+                != approval.approval_subject_hash
                 or row.resolved_action != command["resolvedAction"]
                 or str(row.target_snapshot_id) != ref["targetSnapshotId"]
                 or row.target_config_hash != ref["targetConfigHash"]
@@ -2832,10 +3817,23 @@ def dispatch_publication(
             ),
             request_hash=dispatch_request_hash,
         )
+        _mark_origin_run_publishing_locked(intent)
         return [replay_by_target[target_id] for target_id in requested_ids]
     latest = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
-    if not latest or latest.id != intent.id or intent.state != PublicationIntent.State.APPROVED:
+    content_dispatch = _commands_require_publishable_revision(
+        command_map[target_id] for target_id in requested_ids
+    )
+    if content_dispatch and (
+        not latest
+        or latest.id != intent.id
+        or intent.state != PublicationIntent.State.APPROVED
+    ):
         raise Conflict("current approved 발행 의도만 전송할 수 있습니다.")
+    if not content_dispatch and intent.state not in {
+        PublicationIntent.State.APPROVED,
+        PublicationIntent.State.STALE,
+    }:
+        raise Conflict("withdrawal intent must be approved before dispatch")
     before_material = _audit_state(intent)
     attempts: list[PublicationAttempt] = []
     for target_id in requested_ids:
@@ -2844,18 +3842,27 @@ def dispatch_publication(
         if not target or not command:
             raise InvalidInput("발행 의도에 없는 target입니다.")
         ref = expected[target_id]
+        _require_current_dispatch_approval_locked(
+            intent=intent,
+            target=target,
+            command=command,
+            frozen_ref=ref,
+        )
         if (
             str(target.current_snapshot_id) != ref["targetSnapshotId"]
             or target.current_config_hash != ref["targetConfigHash"]
             or str(command["targetSnapshotId"]) != ref["targetSnapshotId"]
         ):
             raise Conflict("target snapshot이 변경되어 재승인이 필요합니다.")
-        approval = Approval.objects.filter(
-            publication_intent=intent,
-            target=target,
-            decision=Approval.Decision.APPROVED,
-        ).order_by("-decided_at").first()
-        if not approval or approval.approval_subject_hash == "":
+        approval = _latest_approval_locked(
+            intent=intent,
+            target_id=target.id,
+        )
+        if (
+            not approval
+            or approval.decision != Approval.Decision.APPROVED
+            or approval.approval_subject_hash == ""
+        ):
             raise Conflict("target별 current action 승인이 필요합니다.")
         if approval.target_action != command["resolvedAction"]:
             raise Conflict("승인 action과 target command가 다릅니다.")
@@ -2898,6 +3905,7 @@ def dispatch_publication(
         attempts.append(attempt)
     intent.state = PublicationIntent.State.DISPATCHED
     intent.save(update_fields=["state"])
+    _mark_origin_run_publishing_locked(intent)
     publish_at = data.get("publishAt")
     wordpress = [row for row in attempts if row.publication.target.channel == ChannelCode.WORDPRESS]
     blogger = [row for row in attempts if row.publication.target.channel == ChannelCode.BLOGGER]
@@ -2993,10 +4001,14 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
         raise Conflict("전역 kill switch가 활성화되어 외부 쓰기가 차단되었습니다.")
     intent = attempt.publication_intent
     latest = PublicationIntent.objects.filter(article_id=intent.article_id).order_by("-created_at").first()
-    if not latest or latest.id != intent.id or intent.state not in {
+    content_attempt = attempt.resolved_action in _CONTENT_PUBLICATION_ACTIONS
+    intent_state_allowed = intent.state in {
         PublicationIntent.State.APPROVED,
         PublicationIntent.State.DISPATCHED,
-    }:
+    }
+    if not intent_state_allowed or (
+        content_attempt and (not latest or latest.id != intent.id)
+    ):
         raise Conflict("publication attempt가 current intent에 속하지 않습니다.")
     target = attempt.publication.target
     if (
@@ -3007,10 +4019,31 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
     ):
         raise Conflict("target 또는 publisher adapter snapshot이 변경되었습니다.")
     approval = attempt.approval
+    command = next(
+        (
+            row
+            for row in intent.target_commands
+            if str(row.get("targetId")) == str(target.id)
+        ),
+        None,
+    )
+    latest_approval = _latest_approval_locked(
+        intent=intent,
+        target_id=target.id,
+    )
     if (
-        approval.decision != Approval.Decision.APPROVED
+        latest_approval is None
+        or latest_approval.id != approval.id
+        or approval.decision != Approval.Decision.APPROVED
         or approval.approval_subject_hash != attempt.approval_subject_hash
         or approval.target_action != attempt.resolved_action
+        or command is None
+        or not _approval_matches_frozen_subject(
+            approval,
+            intent=intent,
+            target_id=target.id,
+            command=command,
+        )
     ):
         raise Conflict("현재 action-specific 승인과 attempt가 다릅니다.")
     if intent.approval_mode == ApprovalMode.VALIDATED_AUTO:
@@ -3375,6 +4408,7 @@ def _manualize_reconcile_attempt_locked(
             "updated_at",
         )
     )
+    _release_article_external_write_fence_locked(attempt)
     return attempt.state
 
 
@@ -3544,6 +4578,110 @@ def _enqueue_reconcile_locked(
 
 @transaction.atomic
 def begin_attempt(
+    attempt_id: str,
+    *,
+    audit_context: AuditContext,
+) -> tuple[PublicationAttempt, PublishCommand | None]:
+    _require_audit_actor(audit_context, "worker")
+    preliminary = PublicationAttempt.objects.select_related(
+        "publication__target",
+        "publication_intent__article_revision__generation_attempt",
+        "approval",
+    ).get(id=attempt_id)
+    _require_worker_event(
+        audit_context,
+        topic="publication.requested",
+        aggregate_id=preliminary.id,
+        payload_identity={"publication_attempt_id": str(preliminary.id)},
+    )
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    if preliminary.state in {
+        PublicationAttempt.State.QUEUED,
+        PublicationAttempt.State.RETRYABLE_FAILED,
+    }:
+        try:
+            intent = _require_intent_revision_publishable(
+                preliminary.publication_intent
+            )
+        except _StaleIntentConflict:
+            intent = PublicationIntent.objects.select_for_update().get(
+                id=preliminary.publication_intent_id
+            )
+            if _intent_state_can_be_marked_stale(intent.state):
+                intent.state = PublicationIntent.State.STALE
+                intent.save(update_fields=["state"])
+            PublicationTarget.objects.select_for_update().get(
+                id=preliminary.publication.target_id
+            )
+            Approval.objects.select_for_update().get(id=preliminary.approval_id)
+            Publication.objects.select_for_update().get(
+                id=preliminary.publication_id
+            )
+            attempt = PublicationAttempt.objects.select_for_update().get(
+                id=preliminary.id
+            )
+            if attempt.state in {
+                PublicationAttempt.State.QUEUED,
+                PublicationAttempt.State.RETRYABLE_FAILED,
+            }:
+                before_material = _audit_state(attempt)
+                attempt.state = PublicationAttempt.State.STALE
+                attempt.finished_at = timezone.now()
+                attempt.error_code = "editorial_eligibility_stale"
+                attempt.terminal_impact = _publication_terminal_impact(
+                    stage="execution_gate",
+                    final_state=attempt.state,
+                    error_code=attempt.error_code,
+                )
+                attempt.recovery_state = PublicationRecoveryState.STOPPED
+                attempt.next_recovery_at = None
+                attempt.save(
+                    update_fields=[
+                        "state",
+                        "finished_at",
+                        "error_code",
+                        "terminal_impact",
+                        "recovery_state",
+                        "next_recovery_at",
+                    ]
+                )
+                _release_article_external_write_fence_locked(attempt)
+                _record_publishing_audit(
+                    audit_context=audit_context,
+                    action="publication_attempt.finished",
+                    entity=attempt,
+                    identity_key=(
+                        f"{audit_context.event_key}:attempt-result:"
+                        f"{attempt.attempt_no}"
+                    ),
+                    before_material=before_material,
+                    after_material=_audit_state(attempt),
+                    metadata={
+                        "publication_attempt_id": str(attempt.id),
+                        "attempt": attempt.attempt_no,
+                        "result": "stale",
+                        "error_code": attempt.error_code,
+                        "state": attempt.state,
+                    },
+                )
+            return attempt, None
+        intent = PublicationIntent.objects.select_for_update().get(id=intent.id)
+        PublicationTarget.objects.select_for_update().get(
+            id=preliminary.publication.target_id
+        )
+        Approval.objects.select_for_update().get(id=preliminary.approval_id)
+        Publication.objects.select_for_update().get(id=preliminary.publication_id)
+        PublicationAttempt.objects.select_for_update().get(id=preliminary.id)
+    return _begin_attempt_locked(attempt_id, audit_context=audit_context)
+
+
+@transaction.atomic
+def _begin_attempt_locked(
     attempt_id: str,
     *,
     audit_context: AuditContext,
@@ -3734,6 +4872,7 @@ def begin_attempt(
                 "next_recovery_at",
             ]
         )
+        _release_article_external_write_fence_locked(attempt)
         _record_publishing_audit(
             audit_context=audit_context,
             action="publication_attempt.finished",
@@ -3758,6 +4897,7 @@ def begin_attempt(
         "attempt": _audit_state(attempt),
         "publication": _audit_state(publication),
     }
+    _set_article_external_write_fence_locked(attempt)
     attempt.state = PublicationAttempt.State.RUNNING
     attempt.started_at = timezone.now()
     attempt.finished_at = None
@@ -3864,17 +5004,6 @@ def persist_publish_result(
     retry_after_seconds: int | None = None,
 ) -> PublicationAttempt:
     _require_audit_actor(audit_context, "worker")
-    attempt = PublicationAttempt.objects.select_for_update().select_related(
-        "publication__target", "publication_intent"
-    ).get(id=attempt_id)
-    publication = attempt.publication
-    target = publication.target
-    before_material = {
-        "attempt": _audit_state(attempt),
-        "publication": _audit_state(publication),
-        "target": _audit_state(target),
-        "media": _publication_media_state_manifest(publication.id),
-    }
     if (
         expected_reconcile_generation is None
     ) != (
@@ -3886,8 +5015,8 @@ def persist_publish_result(
         _require_worker_event(
             audit_context,
             topic="publication.requested",
-            aggregate_id=attempt.id,
-            payload_identity={"publication_attempt_id": str(attempt.id)},
+            aggregate_id=attempt_id,
+            payload_identity={"publication_attempt_id": str(attempt_id)},
         )
     else:
         try:
@@ -3900,17 +5029,47 @@ def persist_publish_result(
             raise Conflict(
                 "reconcile result event fence differs from audit provenance"
             )
-        _require_worker_event(
+        source_event = _require_worker_event(
             audit_context,
             topic="publication.reconcile_requested",
-            aggregate_id=attempt.id,
+            aggregate_id=attempt_id,
             payload_identity={
-                "publication_attempt_id": str(attempt.id),
-                "reconcile_attempt_no": str(
-                    expected_reconcile_generation
-                ),
+                "publication_attempt_id": str(attempt_id),
             },
         )
+        source_payload = (
+            source_event.payload
+            if isinstance(source_event.payload, dict)
+            else {}
+        )
+        if source_event.event_version == 2:
+            if (
+                source_payload.get("reconcile_attempt_no")
+                != expected_reconcile_generation
+            ):
+                raise Conflict(
+                    "reconcile result generation differs from the worker event"
+                )
+        elif source_event.event_version != 1:
+            raise Conflict("unsupported reconcile event version")
+    preliminary = PublicationAttempt.objects.select_related(
+        "publication_intent"
+    ).get(id=attempt_id)
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    attempt = _lock_publication_attempt_domain(preliminary)
+    publication = attempt.publication
+    target = publication.target
+    before_material = {
+        "attempt": _audit_state(attempt),
+        "publication": _audit_state(publication),
+        "target": _audit_state(target),
+        "media": _publication_media_state_manifest(publication.id),
+    }
     result_identity = _publish_result_identity(result)
     execution_attempt_no = attempt.attempt_no
     replay_attempt_no = (
@@ -3983,6 +5142,11 @@ def persist_publish_result(
         raise Conflict(
             "publication result can only finalize the active worker attempt"
         )
+    validated_remote_url = (
+        _validated_remote_url(result.remote_url)
+        if result.status == "succeeded"
+        else None
+    )
     now = timezone.now()
     attempt.http_status = result.http_status
     attempt.remote_request_id = result.request_id or ""
@@ -3992,7 +5156,7 @@ def persist_publish_result(
     if result.status == "succeeded":
         attempt.state = PublicationAttempt.State.SUCCEEDED
         publication.remote_post_id = result.remote_post_id or publication.remote_post_id
-        publication.remote_url = result.remote_url or publication.remote_url
+        publication.remote_url = validated_remote_url or publication.remote_url
         publication.remote_state = result.remote_state
         publication.published_revision_no = attempt.publication_intent.revision_no
         publication.last_success_at = now
@@ -4168,6 +5332,7 @@ def persist_publish_result(
             "next_recovery_at",
         )
     )
+    _release_article_external_write_fence_locked(attempt)
     audit_action = (
         "publication_attempt.reconciled"
         if reconcile_generation is not None
@@ -4249,6 +5414,174 @@ def persist_publish_result(
     return attempt
 
 
+@transaction.atomic
+def finalize_publication_delivery_failure(
+    attempt_id: str,
+    *,
+    error_code: str,
+    audit_context: AuditContext,
+) -> PublicationAttempt | None:
+    _require_audit_actor(audit_context, "worker")
+    _require_worker_event(
+        audit_context,
+        topic="publication.requested",
+        aggregate_id=attempt_id,
+        payload_identity={"publication_attempt_id": str(attempt_id)},
+    )
+    preliminary = (
+        PublicationAttempt.objects.select_related("publication_intent")
+        .filter(id=attempt_id)
+        .first()
+    )
+    if preliminary is None:
+        return None
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    attempt = _lock_publication_attempt_domain(preliminary)
+    audit_identity = (
+        f"{audit_context.event_key}:delivery-failure:"
+        f"{attempt.attempt_no}"
+    )
+    replay = _worker_audit_replay(
+        audit_context,
+        entity=attempt,
+        candidates=(
+            (
+                "publication_attempt.finished",
+                audit_identity,
+                {"attempt": attempt.attempt_no},
+            ),
+            (
+                "publication_attempt.reconcile_started",
+                audit_identity,
+                {"attempt": attempt.attempt_no},
+            ),
+        ),
+    )
+    if replay is not None:
+        return attempt
+    if attempt.state in {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }:
+        raise Conflict(
+            "terminal publication attempt has no delivery-failure audit"
+        )
+    before_material = {
+        "attempt": _audit_state(attempt),
+        "publication": _audit_state(attempt.publication),
+    }
+    now = timezone.now()
+    effective_error_code = (
+        error_code or "publication_delivery_exhausted"
+    )[:100]
+    if attempt.state in {
+        PublicationAttempt.State.RUNNING,
+        PublicationAttempt.State.UNKNOWN_OUTCOME,
+        PublicationAttempt.State.RECONCILING,
+    }:
+        if attempt.state == PublicationAttempt.State.RUNNING:
+            attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
+            attempt.finished_at = now
+            attempt.error_code = effective_error_code
+            attempt.recovery_state = PublicationRecoveryState.RECONCILING
+            attempt.next_recovery_at = None
+            attempt.save(
+                update_fields=(
+                    "state",
+                    "finished_at",
+                    "error_code",
+                    "recovery_state",
+                    "next_recovery_at",
+                )
+            )
+            _complete_execution_observation_locked(
+                attempt,
+                execution_attempt_no=attempt.attempt_no,
+                finished_at=now,
+                result_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+                error_code=attempt.error_code,
+                recovery_state=PublicationRecoveryState.RECONCILING,
+                terminal_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+            )
+            attempt.save(
+                update_fields=(
+                    "duration_ms",
+                    "retry_count",
+                    "terminal_impact",
+                )
+            )
+        attempt.publication.state = Publication.State.RECONCILING
+        attempt.publication.remote_state = Publication.RemoteState.UNKNOWN
+        attempt.publication.last_error_code = effective_error_code
+        attempt.publication.save(
+            update_fields=(
+                "state",
+                "remote_state",
+                "last_error_code",
+                "updated_at",
+            )
+        )
+        _enqueue_reconcile_locked(attempt)
+        action = "publication_attempt.reconcile_started"
+        result = "unknown_outcome"
+    else:
+        attempt.state = PublicationAttempt.State.MANUAL_REQUIRED
+        attempt.finished_at = now
+        attempt.error_code = effective_error_code
+        attempt.recovery_state = PublicationRecoveryState.MANUAL_REQUIRED
+        attempt.next_recovery_at = None
+        attempt.terminal_impact = _publication_terminal_impact(
+            scope="publication_delivery",
+            stage="delivery",
+            final_state=attempt.state,
+            error_code=attempt.error_code,
+        )
+        attempt.save(
+            update_fields=(
+                "state",
+                "finished_at",
+                "error_code",
+                "recovery_state",
+                "next_recovery_at",
+                "terminal_impact",
+            )
+        )
+        attempt.publication.state = Publication.State.MANUAL_REQUIRED
+        attempt.publication.last_error_code = effective_error_code
+        attempt.publication.save(
+            update_fields=("state", "last_error_code", "updated_at")
+        )
+        _release_article_external_write_fence_locked(attempt)
+        action = "publication_attempt.finished"
+        result = "manual_required"
+    _record_publishing_audit(
+        audit_context=audit_context,
+        action=action,
+        entity=attempt,
+        identity_key=audit_identity,
+        before_material=before_material,
+        after_material={
+            "attempt": _audit_state(attempt),
+            "publication": _audit_state(attempt.publication),
+        },
+        metadata={
+            "publication_attempt_id": str(attempt.id),
+            "attempt": attempt.attempt_no,
+            "result": result,
+            "error_code": effective_error_code,
+            "state": attempt.state,
+        },
+    )
+    return attempt
+
+
 def _complete_correction(case_id: str) -> None:
     from .corrections import complete_correction_if_terminal
 
@@ -4277,10 +5610,20 @@ def publisher_error_result(error: PublisherError):
 def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
     if attempt.publication.target.channel != ChannelCode.WORDPRESS:
         return
+    dependent_target_ids = {
+        str(command["targetId"])
+        for command in attempt.publication_intent.target_commands
+        if (
+            isinstance(command, dict)
+            and str(command.get("canonicalDependencyTargetId"))
+            == str(attempt.publication.target_id)
+        )
+    }
     dependent = list(
         PublicationAttempt.objects.filter(
             publication_intent=attempt.publication_intent,
             publication__target__channel=ChannelCode.BLOGGER,
+            publication__target_id__in=dependent_target_ids,
             state=PublicationAttempt.State.QUEUED,
         ).values_list("id", "correlation_id")
     )
@@ -4310,8 +5653,6 @@ def begin_reconcile(
     PublicationReconcileGeneration | None,
     PublishCommand | None,
 ]:
-    from wisdome_writer.infrastructure.models import OutboxMessage
-
     _require_audit_actor(audit_context, "worker")
     try:
         source_event_uuid = uuid.UUID(str(source_event_id))
@@ -4319,27 +5660,27 @@ def begin_reconcile(
         raise Conflict("reconcile source event context is invalid") from exc
     if str(source_event_uuid) != audit_context.event_key:
         raise Conflict("reconcile source event differs from audit provenance")
-    attempt = PublicationAttempt.objects.select_for_update().select_related(
-        "publication__target", "publication_intent", "approval__article_channel_render"
-    ).get(id=attempt_id)
-    expected_payload = {"publication_attempt_id": str(attempt.id)}
+    expected_payload = {"publication_attempt_id": str(attempt_id)}
     if expected_reconcile_attempt_no is not None:
         expected_payload["reconcile_attempt_no"] = str(
             expected_reconcile_attempt_no
         )
-    _require_worker_event(
+    source_event = _require_worker_event(
         audit_context,
         topic="publication.reconcile_requested",
-        aggregate_id=attempt.id,
+        aggregate_id=attempt_id,
         payload_identity=expected_payload,
     )
-    source_event = OutboxMessage.objects.select_for_update().filter(
-        id=source_event_uuid,
-        topic="publication.reconcile_requested",
-        aggregate_id=attempt.id,
-    ).first()
-    if source_event is None:
-        raise Conflict("reconcile source event does not match the attempt")
+    preliminary = PublicationAttempt.objects.select_related(
+        "publication_intent"
+    ).get(id=attempt_id)
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    attempt = _lock_publication_attempt_domain(preliminary)
     payload = source_event.payload if isinstance(source_event.payload, dict) else {}
     if payload.get("publication_attempt_id") != str(attempt.id):
         raise Conflict("reconcile source event payload does not match the attempt")
@@ -4505,8 +5846,6 @@ def finalize_reconcile_delivery_failure(
     error_code: str,
     audit_context: AuditContext,
 ) -> PublicationAttempt | None:
-    from wisdome_writer.infrastructure.models import OutboxMessage
-
     _require_audit_actor(audit_context, "worker")
     try:
         source_event_uuid = uuid.UUID(str(source_event_id))
@@ -4514,20 +5853,24 @@ def finalize_reconcile_delivery_failure(
         return None
     if str(source_event_uuid) != audit_context.event_key:
         raise Conflict("reconcile source event differs from audit provenance")
-    attempt = (
-        PublicationAttempt.objects.select_for_update()
-        .select_related("publication")
-        .filter(id=attempt_id)
-        .first()
-    )
-    if attempt is None:
-        return None
-    _require_worker_event(
+    source_event = _require_worker_event(
         audit_context,
         topic="publication.reconcile_requested",
-        aggregate_id=attempt.id,
-        payload_identity={"publication_attempt_id": str(attempt.id)},
+        aggregate_id=attempt_id,
+        payload_identity={"publication_attempt_id": str(attempt_id)},
     )
+    preliminary = PublicationAttempt.objects.select_related(
+        "publication_intent"
+    ).filter(id=attempt_id).first()
+    if preliminary is None:
+        return None
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    attempt = _lock_publication_attempt_domain(preliminary)
     if _worker_audit_replay(
         audit_context,
         entity=attempt,
@@ -4574,22 +5917,6 @@ def finalize_reconcile_delivery_failure(
                 "state": attempt.state,
             },
         )
-    source_event = (
-        OutboxMessage.objects.select_for_update()
-        .filter(
-            id=source_event_uuid,
-            topic="publication.reconcile_requested",
-            aggregate_id=attempt.id,
-        )
-        .first()
-    )
-    if source_event is None:
-        _manualize_reconcile_attempt_locked(
-            attempt,
-            error_code="reconcile_source_event_missing",
-        )
-        audit_failure()
-        return attempt
     payload = source_event.payload if isinstance(source_event.payload, dict) else {}
     if payload.get("publication_attempt_id") != str(attempt.id):
         _manualize_reconcile_attempt_locked(
@@ -4695,6 +6022,16 @@ def begin_remote_media_reconcile(
     audit_context: AuditContext,
 ) -> tuple[RemoteMedia, RemoteMediaReconcileFence | None]:
     _require_audit_actor(audit_context, "worker")
+    _require_worker_event(
+        audit_context,
+        topic="media.reconcile_requested",
+        aggregate_id=remote_media_id,
+        payload_identity={
+            "remote_media_id": str(remote_media_id),
+            "publication_attempt_id": str(publication_attempt_id),
+            "publication_intent_id": str(publication_intent_id),
+        },
+    )
     attempt = PublicationAttempt.objects.select_for_update().get(
         id=publication_attempt_id,
         publication_intent_id=publication_intent_id,
@@ -4713,16 +6050,6 @@ def begin_remote_media_reconcile(
         raise Conflict(
             "media reconcile identity does not match the publication attempt"
         )
-    _require_worker_event(
-        audit_context,
-        topic="media.reconcile_requested",
-        aggregate_id=remote.id,
-        payload_identity={
-            "remote_media_id": str(remote.id),
-            "publication_attempt_id": str(attempt.id),
-            "publication_intent_id": str(attempt.publication_intent_id),
-        },
-    )
     result_identity = (
         f"{audit_context.event_key}:remote-media-result:"
         f"{remote.lease_generation}"
@@ -4804,6 +6131,16 @@ def persist_remote_media_reconcile_result(
     audit_context: AuditContext,
 ) -> RemoteMedia:
     _require_audit_actor(audit_context, "worker")
+    _require_worker_event(
+        audit_context,
+        topic="media.reconcile_requested",
+        aggregate_id=fence.remote_media_id,
+        payload_identity={
+            "remote_media_id": str(fence.remote_media_id),
+            "publication_attempt_id": str(fence.publication_attempt_id),
+            "publication_intent_id": str(fence.publication_intent_id),
+        },
+    )
     attempt = PublicationAttempt.objects.select_for_update().filter(
         id=fence.publication_attempt_id,
         publication_intent_id=fence.publication_intent_id,
@@ -4828,16 +6165,6 @@ def persist_remote_media_reconcile_result(
         raise Conflict(
             "media reconcile result no longer matches the publication attempt"
         )
-    _require_worker_event(
-        audit_context,
-        topic="media.reconcile_requested",
-        aggregate_id=remote.id,
-        payload_identity={
-            "remote_media_id": str(remote.id),
-            "publication_attempt_id": str(attempt.id),
-            "publication_intent_id": str(attempt.publication_intent_id),
-        },
-    )
     result_hash = _remote_media_result_hash(result)
     result_identity = (
         f"{audit_context.event_key}:remote-media-result:"
@@ -5202,6 +6529,7 @@ def begin_target_credential_revoke(
 ) -> tuple[
     TargetDisconnectDecision,
     PublicationTarget,
+    PublicationTargetIntentFence,
     TargetCredentialRevokeFence,
 ] | None:
     _require_audit_actor(audit_context, "worker")
@@ -5209,19 +6537,19 @@ def begin_target_credential_revoke(
         "target_id",
         flat=True,
     ).get(id=decision_id)
+    _require_worker_event(
+        audit_context,
+        topic="publishing.target_disconnect.requested",
+        aggregate_id=target_id,
+        payload_identity={
+            "decision_id": str(decision_id),
+            "target_id": str(target_id),
+        },
+    )
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
     decision = TargetDisconnectDecision.objects.select_for_update().get(
         id=decision_id,
         target_id=target.id,
-    )
-    _require_worker_event(
-        audit_context,
-        topic="publishing.target_disconnect.requested",
-        aggregate_id=target.id,
-        payload_identity={
-            "decision_id": str(decision.id),
-            "target_id": str(target.id),
-        },
     )
     terminal_recorded = _worker_audit_replay(
         audit_context,
@@ -5339,19 +6667,21 @@ def persist_target_credential_revoke_result(
     audit_context: AuditContext,
 ) -> TargetDisconnectDecision:
     _require_audit_actor(audit_context, "worker")
+    _require_worker_event(
+        audit_context,
+        topic="publishing.target_disconnect.requested",
+        aggregate_id=fence.target_id,
+        payload_identity={
+            "decision_id": str(fence.decision_id),
+            "target_id": str(fence.target_id),
+        },
+    )
+    _lock_target_intent_fences((fence.target_id,))
+    locked_intents = _lock_open_target_intents(fence.target_id)
     target = PublicationTarget.objects.select_for_update().get(id=fence.target_id)
     decision = TargetDisconnectDecision.objects.select_for_update().get(
         id=fence.decision_id,
         target_id=target.id,
-    )
-    _require_worker_event(
-        audit_context,
-        topic="publishing.target_disconnect.requested",
-        aggregate_id=target.id,
-        payload_identity={
-            "decision_id": str(decision.id),
-            "target_id": str(target.id),
-        },
     )
     fenced = (
         target.current_snapshot_id == fence.target_snapshot_id
@@ -5411,6 +6741,7 @@ def persist_target_credential_revoke_result(
             update_fields=("credential_ref", "username_ref", "updated_at")
         )
         _snapshot_locked(target)
+        _stale_locked_intents(locked_intents)
         decision.state = TargetDisconnectDecision.State.COMPLETED
     else:
         decision.state = (
@@ -5462,6 +6793,8 @@ def disconnect_target(
     audit_context: AuditContext,
 ) -> TargetDisconnectDecision:
     _require_audit_actor(audit_context, "admin")
+    _lock_target_intent_fences((target_id,))
+    locked_intents = _lock_open_target_intents(target_id)
     user = request.user
     if audit_context.actor_id != user.pk:
         raise Forbidden("disconnect audit actor differs from the administrator")
@@ -5486,6 +6819,7 @@ def disconnect_target(
             request_hash=request_hash,
         )
         return existing
+    _assert_target_has_no_active_external_write(target.id)
     if (
         str(target.current_snapshot_id) != str(data["expectedTargetSnapshotId"])
         or target.current_config_hash != data["expectedTargetConfigHash"]
@@ -5513,6 +6847,7 @@ def disconnect_target(
     target.connection_state = PublicationTarget.ConnectionState.REVOKED
     target.save()
     _snapshot_locked(target)
+    _stale_locked_intents(locked_intents)
     _record_publishing_audit(
         audit_context=audit_context,
         action="publication_target.disconnected",

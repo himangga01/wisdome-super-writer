@@ -7,8 +7,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.audit.services import AuditContext
-from apps.editorial.models import CorrectionCase
-from wisdome_writer.domain.hashing import sha256_hex
+from apps.editorial.models import CorrectionCase, DraftArticle
 
 from .models import (
     ApprovalMode,
@@ -17,7 +16,13 @@ from .models import (
     PublicationAction,
     PublicationIntent,
 )
-from .services import create_publication_intent
+from .services import (
+    _StaleIntentConflict,
+    _raise_persisted_stale_intent,
+    _require_intent_revision_publishable,
+    _require_revision_for_commands,
+    create_publication_intent,
+)
 
 
 class CorrectionWorkflowError(ValueError):
@@ -103,7 +108,6 @@ def build_correction_plan(case: CorrectionCase) -> CorrectionPlan:
     return CorrectionPlan(target_snapshots=refs, target_commands=commands)
 
 
-@transaction.atomic
 def prepare_verified_correction(
     case_id: str,
     *,
@@ -111,32 +115,65 @@ def prepare_verified_correction(
     request_key: str,
     audit_context: AuditContext,
 ) -> PublicationIntent:
+    try:
+        return _prepare_verified_correction_atomic(
+            case_id,
+            user=user,
+            request_key=request_key,
+            audit_context=audit_context,
+        )
+    except _StaleIntentConflict as exc:
+        _raise_persisted_stale_intent(exc)
+
+
+@transaction.atomic
+def _prepare_verified_correction_atomic(
+    case_id: str,
+    *,
+    user,
+    request_key: str,
+    audit_context: AuditContext,
+) -> PublicationIntent:
     """Create an approval-ready, superseding intent for a verified correction case."""
-    case = (
-        CorrectionCase.objects.select_for_update()
-        .select_related("article__current_revision")
-        .get(id=case_id)
-    )
+    case = CorrectionCase.objects.select_for_update().get(id=case_id)
     if case.state not in {
         CorrectionCase.State.VERIFIED,
         CorrectionCase.State.APPLYING,
     }:
         raise CorrectionWorkflowError("Only a verified correction can be prepared for publishing.")
-    revision = case.article.current_revision
-    if revision is None or revision.quality_state != "passed":
-        raise CorrectionWorkflowError("The corrected article revision has not passed quality gates.")
+    article_candidate = DraftArticle.objects.select_related(
+        "current_revision__generation_attempt"
+    ).get(id=case.article_id)
+    revision = article_candidate.current_revision
+    if revision is None:
+        raise CorrectionWorkflowError("The corrected article has no current revision.")
+    existing_intent = (
+        PublicationIntent.objects.select_related(
+            "article_revision__generation_attempt"
+        )
+        .filter(article_revision=revision, request_key=request_key)
+        .first()
+    )
+    if case.kind != "retraction":
+        if existing_intent is None:
+            _require_revision_for_commands(
+                revision,
+                [{"resolvedAction": PublicationAction.UPDATE}],
+            )
+        else:
+            _require_intent_revision_publishable(existing_intent)
+    article = (
+        DraftArticle.objects.select_for_update()
+        .select_related("current_revision__generation_attempt")
+        .get(id=case.article_id)
+    )
+    revision = article.current_revision
 
     plan = build_correction_plan(case)
     latest = PublicationIntent.objects.filter(article_id=case.article_id).order_by("-created_at").first()
     payload = {
         "revisionNo": revision.revision_no,
-        "expectedRevisionContentHash": sha256_hex(
-            {
-                "title": revision.title,
-                "summary": revision.summary,
-                "bodyMarkdown": revision.body_markdown,
-            }
-        ),
+        "expectedRevisionContentHash": revision.content_hash,
         "correctionCaseId": str(case.id),
         "targetSnapshots": plan.target_snapshots,
         "targetCommands": plan.target_commands,

@@ -624,51 +624,108 @@
 - Deferred unit test: `tests/unit/test_editorial_policy.py`
 
 **Interfaces:**
-- Consumes: latest `EventClusterVerification`, publishable `EvidenceAsset`, locator/rights/freshness/authority material.
-- Produces: `ArticleRevision` with frozen editorial policy version/hash, typed `Claim`, `ClaimEvidence`, `QualityCheck`, `VisualizationRender`/placement material.
+- Consumes: revision에 고정한 정렬 `EventClusterVerification` 전체, current publish-eligible
+  `EvidenceAsset`, locator/rights/freshness/authority/origin material, 배포 release JSON에서 해석한
+  exact editorial policy.
+- Produces: `body_blocks` 정본 `ArticleRevision`, append-only `EditorialPolicySnapshot`, typed
+  `Claim`/`ClaimEvidence`, verification/evidence/exclusion snapshot과 manifest hash, exact quality
+  gate/report, `VisualizationRender`/placement material.
 
-- [ ] **Step 1: generation과 revision에 policy material을 고정한다.**
+- [ ] **Step 1: release JSON을 해석한 append-only policy snapshot을 고정한다.**
 
   ```python
-  editorial_policy_version = models.CharField(max_length=40)
-  editorial_policy_hash = models.CharField(max_length=64)
-  event_verification = models.ForeignKey(EventClusterVerification, on_delete=models.PROTECT)
-  evidence_manifest_hash = models.CharField(max_length=64)
+  class EditorialPolicySnapshot(models.Model):
+      policy_key = models.CharField(max_length=120)
+      policy_version = models.CharField(max_length=40)
+      topic_code = models.CharField(max_length=40)
+      release_document_hash = models.CharField(max_length=64)
+      config = models.JSONField()
+      config_hash = models.CharField(max_length=64)
+      implementation_manifest = models.JSONField()
+      implementation_manifest_hash = models.CharField(max_length=64)
+      material_hash = models.CharField(max_length=64, unique=True)
   ```
 
-- [ ] **Step 2: policy loader를 RFC 8785 canonical hash로 구현한다.**
+  Editorial policy에는 approval/head projection을 만들지 않는다. 현재 정책은
+  `config/editorial-policies/{topic_code}.json`의 exact release document를 서버가 직접 해석해
+  결정한다.
+  `(policy_key, policy_version)`은 유일하며 같은 version으로 다른 canonical config,
+  implementation manifest 또는 release bytes가 들어오면 영구 실패한다. snapshot/queryset과
+  PostgreSQL·SQLite trigger는 insert 뒤 update/delete를 거부한다.
+
+- [ ] **Step 2: policy resolver와 revision snapshot을 결속한다.**
 
   ```python
   @dataclass(frozen=True)
   class EditorialPolicy:
+      snapshot_id: UUID
       document: Mapping[str, Any]
       material_hash: str
 
-  def load_editorial_policy(topic_code: str) -> EditorialPolicy:
-      path = Path(settings.EDITORIAL_POLICY_ROOT) / f"{topic_code}.json"
-      document = json.loads(path.read_text("utf-8"))
-      return EditorialPolicy(document=document, material_hash=canonical_hash(document))
+  def resolve_release_editorial_policy(topic_code: str) -> EditorialPolicy:
+      # Resolve the exact topic release JSON bytes and implementation files.
+      # Reuse only an identical snapshot; reject same-version changed material.
+      ...
   ```
 
-- [ ] **Step 3: generator output을 typed claim으로 바꾼다.**
+  `ArticleRevision`은 `editorial_policy_snapshot_id/material_hash`, 정렬 verification snapshot과
+  hash, publish 입력 evidence snapshot과 hash, excluded/duplicate/conflict snapshot과 hash를
+  저장한다. 각 evidence snapshot은 content/review hash뿐 아니라 source version, locator,
+  authority/origin group, published/modified/retrieved 시각, rights/attribution/alt와 gate 시점의
+  publish eligibility를 고정한다. 현재 release policy 또는 current evidence eligibility가 달라진
+  revision은 과거 행을 수정하지 않고 새 재검증 revision이 필요하다.
 
-  generator 계약은 `fact`, `company_claim`, `interpretation`, `outlook` 중 하나와 evidence IDs를 필수로 반환한다. 회사 발표만 근거인 문장을 fact로 승격하지 않는다.
+- [ ] **Step 3: bodyBlocks 정본과 atomic typed claim graph를 생성한다.**
 
-- [ ] **Step 4: 차단형 품질 검사를 구현한다.**
+  generator 계약은 stable block ID와 `fact`, `company_claim`, `interpretation`, `outlook` 중
+  하나인 atomic claim, evidence relation/locator를 필수 반환한다. `body_blocks`가 정본이고
+  canonical Markdown은 여기서만 파생한다. 제목·요약·caption의 사실도 claim coverage에 포함한다.
+  기업 주장은 actor와 attribution이 필수이며 독립 검증 전 fact로 승격하지 않는다. interpretation은
+  입력 fact IDs, outlook은 주체·기간·불확실성을 요구한다. source 원문을 700자씩 본문에 복사하는
+  기존 template 경로는 제거한다.
 
-  최소 code 집합은 `source_coverage`, `claim_type_separation`, `high_impact_locator`, `independence`, `freshness`, `rights`, `citation_length`, `duplicate_conflict`, `readability`, `exaggeration`이다. 하나라도 failed면 `quality_state=failed`다.
+- [ ] **Step 4: exact 10개 content/evidence gate와 별도 visual gate를 구현한다.**
+
+  exact blocking code 집합은 다음 10개다.
+
+  1. `all_publishable_claims_grounded`
+  2. `high_risk_verification_satisfied`
+  3. `claim_independence_satisfied`
+  4. `source_freshness_satisfied`
+  5. `evidence_publish_eligibility_current`
+  6. `quotation_limits_satisfied`
+  7. `claim_types_separated_and_attributed`
+  8. `duplicate_or_conflict_resolved`
+  9. `korean_readability_and_repetition`
+  10. `no_exaggeration_or_false_experience`
+
+  visual을 포함한 revision은 별도 blocking `visual_rights_and_alt_text`도 반드시 통과한다.
+  `QualityCheck`는 code/version/result/score/blocking/details/executed_at의 append-only 결과다.
+  정렬된 code/version/config 정의는 `quality_gate_manifest_hash`, 결과/details는
+  `quality_report_hash`로 고정한다. failed/manual_required가 하나라도 있으면 review-ready가 아니다.
 
 - [ ] **Step 5: visual placement와 provenance를 revision에 연결한다.**
 
-  각 visual은 block ID, 본문 위치, source evidence, rights status, alt text, caption, presentation hash를 가진다. 게시 가능한 rights와 locator가 없으면 quality gate가 실패한다.
+  각 visual은 block ID, 본문 위치, source evidence, rights status/basis/attribution snapshot,
+  alt text, caption, presentation hash를 가진다. 게시 가능한 current rights와 locator가 없으면
+  `visual_rights_and_alt_text`가 실패한다. T022의 PublishedEvidenceSnapshot 전까지도 visual
+  provenance와 차단 결과는 revision에 불변으로 남긴다.
 
 - [ ] **Step 6: 수동 개정 재검증 task/API를 연결한다.**
 
-  `create_manual_revision()`은 pending revision만 만들고 `editorial.revalidate_requested` Outbox를 생성한다. 재검증 성공 전 preview/approval/publish가 revision을 선택하지 못하게 한다.
+  `CreateRevisionRequest`는 Markdown 대신 canonical `bodyBlocks`를 받는다. base revision CAS 뒤
+  current release policy를 resolve하고 multi-verification/evidence/exclusion snapshot을 고정한 pending
+  revision과 exact `editorial.revalidate_requested@1` Outbox를 한 transaction에서 만든다. worker는
+  current policy와 evidence publish eligibility를 다시 검사하고 새 본문에서 Claim/ClaimEvidence와
+  모든 gate를 재생성한다. 이전 claim/check/approval/intent는 복사하지 않으며 재검증 성공 전
+  preview/approval/publish가 revision을 선택하지 못한다.
 
 - [ ] **Step 7: 관리자 화면에 claim·evidence·제외 사유를 표시한다.**
 
-  article detail에서 claim type, linked evidence locator, source URL, rights/freshness, excluded item reason과 blocking quality result를 조회한다.
+  ArticleDetail은 revision policy ref와 runtime eligibility, verification/evidence/exclusion snapshots,
+  claim type/risk/state, linked evidence relation/locator/source URL, rights/freshness/independence,
+  excluded/duplicate/conflict reason과 blocking check result를 반환한다. UI는 이 관계를 claim별로
+  펼쳐 보고 source-derived text를 escape/sanitize한다.
 
 - [ ] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
@@ -676,6 +733,25 @@
   git add src/apps/editorial src/adapters/generators config/editorial-policies src/templates/admin_console src/static/admin_console
   git commit -m "feat: enforce immutable editorial quality policy"
   ```
+
+#### English / AI-readable T018 decision
+
+T018 resolves the current topic policy from the exact topic release JSON. There is no editorial-policy
+approval table and no mutable head projection. `EditorialPolicySnapshot` is append-only; an exact
+key/version may be reused only when release bytes, canonical config, implementation manifest, and
+material hash are identical. Same-version changed material fails permanently.
+
+`ArticleRevision.body_blocks` is canonical. Every title, summary, body, and caption assertion maps to
+an atomic `fact`, `company_claim`, `interpretation`, or `outlook` claim. A revision freezes sorted
+verification snapshots, eligible evidence snapshots, and excluded/duplicate/conflict snapshots with
+separate canonical hashes. Review-ready requires the ten exact gates listed above and, when visuals
+exist, `visual_rights_and_alt_text`. Both the current release policy and current evidence publish
+eligibility are rechecked before a pending revision may pass.
+
+Manual edits create a new immutable pending revision and `editorial.revalidate_requested@1` in one
+transaction. Revalidation rebuilds claims, links, and checks from the new body blocks; it never copies
+prior claims or approvals. ArticleDetail exposes the frozen snapshots plus runtime eligibility so an
+administrator can inspect every included and excluded source before publication.
 
 ---
 

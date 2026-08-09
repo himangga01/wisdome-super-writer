@@ -23,6 +23,7 @@
     {% block content %}{% endblock %}
   </main>
   <script>window.csrfToken = '{{ csrf_token }}';</script>
+  <script src="{% static 'admin_console/url_safety.js' %}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

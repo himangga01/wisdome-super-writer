@@ -33,8 +33,17 @@ from .clustering import (
     generation_manifest_for_verifications,
     verify_event_cluster,
 )
-from .models import DraftArticle, EventCluster, EventClusterVerification
-from .services import build_source_grounded_draft
+from .models import (
+    ArticleRevision,
+    DraftArticle,
+    EventCluster,
+    EventClusterVerification,
+)
+from .services import (
+    build_source_grounded_draft,
+    revalidate_manual_revision_locked,
+    terminalize_manual_revision_locked,
+)
 
 
 def _worker_audit_context(reason_code: str) -> AuditContext:
@@ -336,6 +345,8 @@ def _maybe_enqueue_auto_publication(run, audit_context):
     if not (
         run.trigger == "schedule"
         and run.approval_mode == "validated_auto"
+        and run.state == RunState.AWAITING_APPROVAL
+        and run.stop_requested_at is None
     ):
         return False
     alias = audit_context.database_alias
@@ -452,6 +463,149 @@ def generate_verification_draft(
         "articleId": str(article.id),
         "state": article.state,
     }
+
+
+@shared_task(name="apps.editorial.tasks.revalidate_manual_revision")
+def revalidate_manual_revision(
+    article_id: str,
+    article_revision_id: str,
+    editorial_policy_snapshot_id: str,
+    editorial_policy_material_hash: str,
+    verification_manifest_hash: str,
+    input_evidence_manifest_hash: str,
+    excluded_material_manifest_hash: str,
+):
+    audit_context = _worker_audit_context("manual article revalidation")
+    alias = audit_context.database_alias
+    run_id = (
+        ArticleRevision.objects.using(alias)
+        .filter(pk=article_revision_id, article_id=article_id)
+        .values_list("origin_run_id", flat=True)
+        .first()
+    )
+    if run_id is None:
+        raise ValueError("manual revalidation article does not exist")
+    with transaction.atomic(using=alias):
+        require_worker_event(
+            context=audit_context,
+            topic="editorial.revalidate_requested",
+            aggregate_id=article_revision_id,
+            payload_identity={
+                "article_id": article_id,
+                "article_revision_id": article_revision_id,
+                "editorial_policy_snapshot_id": editorial_policy_snapshot_id,
+                "editorial_policy_material_hash": editorial_policy_material_hash,
+                "verification_manifest_hash": verification_manifest_hash,
+                "input_evidence_manifest_hash": input_evidence_manifest_hash,
+                "excluded_material_manifest_hash": excluded_material_manifest_hash,
+            },
+        )
+        run = CollectionRun.objects.using(alias).select_for_update().get(
+            pk=run_id
+        )
+        article = (
+            DraftArticle.objects.using(alias)
+            .select_for_update()
+            .get(pk=article_id)
+        )
+        revision = (
+            ArticleRevision.objects.using(alias)
+            .select_for_update()
+            .select_related(
+                "editorial_policy_snapshot",
+                "origin_run",
+                "event_verification",
+            )
+            .get(pk=article_revision_id, article=article)
+        )
+        if (
+            str(revision.editorial_policy_snapshot_id)
+            != editorial_policy_snapshot_id
+            or revision.editorial_policy_hash
+            != editorial_policy_material_hash
+            or revision.verification_manifest_hash
+            != verification_manifest_hash
+            or revision.evidence_manifest_hash
+            != input_evidence_manifest_hash
+            or revision.exclusion_manifest_hash
+            != excluded_material_manifest_hash
+        ):
+            raise ValueError("manual revalidation payload no longer matches")
+        revision = revalidate_manual_revision_locked(
+            article=article,
+            revision=revision,
+            source_event_id=audit_context.event_key,
+            lease_generation=audit_context.worker_lease_generation,
+            lease_token=audit_context.worker_lease_token,
+            using=alias,
+        )
+        return {
+            "articleId": str(article.id),
+            "articleRevisionId": str(revision.id),
+            "claimGraphState": revision.claim_graph_state,
+            "qualityState": revision.quality_state,
+        }
+
+
+@shared_task(
+    name="apps.editorial.tasks.finalize_manual_revalidation_delivery_failure"
+)
+def finalize_manual_revalidation_delivery_failure(
+    article_id: str,
+    article_revision_id: str,
+    error_code: str,
+):
+    audit_context = _worker_audit_context(
+        "manual article revalidation delivery exhausted"
+    )
+    alias = audit_context.database_alias
+    run_id = (
+        ArticleRevision.objects.using(alias)
+        .filter(pk=article_revision_id, article_id=article_id)
+        .values_list("origin_run_id", flat=True)
+        .first()
+    )
+    if run_id is None:
+        return {"articleId": article_id, "state": "missing"}
+    with transaction.atomic(using=alias):
+        require_worker_event(
+            context=audit_context,
+            topic="editorial.revalidate_requested",
+            aggregate_id=article_revision_id,
+            payload_identity={
+                "article_id": article_id,
+                "article_revision_id": article_revision_id,
+            },
+        )
+        run = CollectionRun.objects.using(alias).select_for_update().get(
+            pk=run_id
+        )
+        article = (
+            DraftArticle.objects.using(alias)
+            .select_for_update()
+            .get(pk=article_id)
+        )
+        revision = (
+            ArticleRevision.objects.using(alias)
+            .select_for_update()
+            .select_related(
+                "editorial_policy_snapshot",
+                "origin_run",
+                "event_verification",
+            )
+            .get(pk=article_revision_id, article=article)
+        )
+        terminalize_manual_revision_locked(
+            article=article,
+            revision=revision,
+            error_code=error_code,
+            using=alias,
+        )
+        return {
+            "articleId": str(article.id),
+            "articleRevisionId": str(revision.id),
+            "state": revision.claim_graph_state,
+        }
 
 
 @shared_task

@@ -73,7 +73,7 @@ run 결과가 생성되고, 사용·제외·충돌 근거와 주장별 citation�
 - [ ] T015 [US1] 승인된 converter manifest를 실제 Python/rhwp/qpdf/library/font/fontconfig/LICENSE/Cargo.lock/build/Compose bytes와 대조하고, exact CHOWN/KILL/SETUID/SETGID만 가진 root supervisor·zero-cap child 65533·validator 65531, subreaper descendant cleanup, split input/output, streaming snapshot, exact UDS EOF/report/object/page 결속, absolute deadline, concurrency 1·전용 OCR profile-admin·volume bootstrap을 갖는 no-network legacy HWP sandbox를 `src/adapters/extractors/legacy_hwp.py`, `src/apps/evidence/profiles.py`, `src/apps/evidence/tasks.py`, `config/extraction-profiles/generic/legacy-hwp-v1.json`, `deploy/containers/`, `compose.yaml`에 구현한다. 1.1.0은 immutable golden=false draft로 유지하고 profile-before-attempt 영구 실패도 raw quarantine, typed counter/failure count와 manual recovery로 보존한다. (depends on T001, T003, T014)
 - [ ] T016 [US1] DocumentExtraction·ExtractionRun·GenericExtractionAttempt의 uniqueness, row lock, generation fencing, retry/finalizer 순서, 예상 밖 예외 terminal 처리, stop hook와 outbox 전이를 `src/apps/evidence/models.py`, `src/apps/evidence/services.py`, `src/apps/evidence/tasks.py`에 구현. receipt lease generation, atomic DLQ terminal callback, exact child provenance, stop/stale 분리, evidence-native object-write ledger, historical event/receipt rearm을 collection 0009/evidence 0005에 포함 (depends on T005, T014, T015; T015 외부 승인 blocker가 해소되기 전에는 완료 표시 금지)
 - [ ] T017 [US1] browser/media/manual profile을 실제 routing에 연결하거나 계약에서 제거하고 XML parser fail-closed, PDF/image dimension·decompression·S3 read 제한, locator·confidence 필수 보존을 `src/apps/evidence/tasks.py`, `src/adapters/extractors/`, `src/adapters/storage/s3.py`에 구현 (depends on T001, T014, T015, T016)
-- [ ] T018 [US1] immutable editorial policy를 적용해 사실·기업주장·해석·전망을 분리하고 고위험 값·독립성·출처 freshness·권리·인용 길이·가독성·중복·과장 gate와 수동 개정 재검증, 주장·근거·제외 자료 관리자 화면을 `src/apps/editorial/`, `src/adapters/generators/`, `config/editorial-policies/`, `src/templates/admin_console/`, `src/static/admin_console/`에 구현 (depends on T002, T013, T016, T017)
+- [ ] T018 [US1] release JSON으로 현재 정책을 해석하되 approval/head 없이 append-only `EditorialPolicySnapshot`을 만들고 같은 key/version의 변경 bytes를 거부한다. `bodyBlocks`를 revision 정본으로 삼아 사실·기업주장·해석·전망 atomic claim을 분리하고, 정렬 multi-verification/input-evidence/excluded·duplicate·conflict snapshot을 고정한다. `all_publishable_claims_grounded`, `high_risk_verification_satisfied`, `claim_independence_satisfied`, `source_freshness_satisfied`, `evidence_publish_eligibility_current`, `quotation_limits_satisfied`, `claim_types_separated_and_attributed`, `duplicate_or_conflict_resolved`, `korean_readability_and_repetition`, `no_exaggeration_or_false_experience`의 exact 10개 gate와 visual 사용 시 `visual_rights_and_alt_text`를 적용한다. current policy/evidence publish eligibility 재확인, `editorial.revalidate_requested` 수동 개정 재검증, 주장·근거·제외 자료·runtime eligibility 관리자 화면을 `src/apps/editorial/`, `src/adapters/generators/`, `config/editorial-policies/`, `src/templates/admin_console/`, `src/static/admin_console/`에 구현한다. (depends on T002, T013, T016, T017; T015~T017 외부 blocker가 해소되기 전에는 완료 표시 금지)
 
 **Checkpoint**: US1만으로도 외부 채널에 쓰지 않고, 검증 가능한 근거와 안전한 초안을
 독립적으로 생성·검토할 수 있다.
@@ -180,6 +180,14 @@ T032 owns immutable artifact/signature validation, hermetic signed release mater
 of golden profile 1.2.0. It must replace the deliberately hard-false gate only with exact
 versioned artifact-byte and external-trust-root signature verification. Version 1.1.0 remains an
 immutable superseded draft and is not retired.
+
+T018 resolves the active topic policy from release JSON and persists an append-only snapshot without
+an approval workflow or mutable head. Same key/version with changed release or implementation bytes
+is a permanent conflict. Canonical revisions use bodyBlocks and freeze sorted verification, eligible
+evidence, and excluded/duplicate/conflict snapshots. They distinguish only `fact`, `company_claim`,
+`interpretation`, and `outlook`, pass the ten exact editorial gates plus the conditional visual gate,
+and recheck current policy/evidence eligibility. Manual edits remain pending behind
+`editorial.revalidate_requested` until the entire claim graph and gate report are rebuilt.
 
 ```yaml
 schema_version: "1.0"

@@ -528,17 +528,66 @@ engine↔locator contract test를 통과하기 전 HWP profile을 승인해서�
 
 ## 9. 편집·권리 게이트
 
-모든 review-ready 개정에서 다음을 확인한다.
+1. `config/editorial-policies/{topic_code}.json`이 주제별 current key/version, exact config와
+   implementation manifest hash를 포함하는지 확인한다. 처음 해석은 append-only
+   `EditorialPolicySnapshot`을 만들고 같은 release material의 재실행은 같은 snapshot을 반환해야
+   한다. 같은 key/version의 policy·implementation·release bytes 중 하나를 바꾼 fixture는 새
+   snapshot을 만들지 않고 영구 충돌해야 한다. editorial policy에는 approval/head가 없다.
+2. 모든 revision의 정본이 stable ID/type/content를 가진 `bodyBlocks`인지 확인한다. 제목·요약·본문·
+   caption의 각 주장은 `fact`, `company_claim`, `interpretation`, `outlook` 중 정확히 하나이며
+   회사 주장에는 actor/attribution, interpretation에는 입력 fact, outlook에는 주체·기간·불확실성
+   표현이 있어야 한다.
+3. revision에서 정렬 verification snapshot, 실제 입력 evidence snapshot, excluded/duplicate/conflict
+   snapshot과 각각의 canonical manifest hash를 확인한다. evidence snapshot에는 source version,
+   locator, authority/origin group, 시각, rights/attribution/alt와 평가 시 publish eligibility가
+   포함되어야 한다.
+4. 모든 review-ready revision은 다음 exact 10개 blocking check를 모두 `passed`로 가진다.
 
-- `fact` Claim마다 supports Evidence가 하나 이상이다.
-- 청약 고위험 수치와 반도체 속보는 강화된 검증 규칙을 통과한다.
-- 원문 URL은 모델 출력이 아니라 SourceItem에서 가져온다.
-- 존재하지 않는 인터뷰, 경험, 전문 자격, 인간 저자 또는 직접 인용이 없다.
-- 정정/철회 이력은 독자에게 보이는 본문 블록으로 포함된다.
-- 기업 이미지나 PDF 캡처의 권리가 불명확하면 내부 미리보기에는 보이더라도 게시 렌더에서
-  제외된다.
-- 자체 차트는 원자료, 단위, 기준일, 변환식, alt text와 출처를 가진다.
-- 관리자가 본문을 편집해 새 revision을 만들면 이전 승인이 무효가 된다.
+   - `all_publishable_claims_grounded`
+   - `high_risk_verification_satisfied`
+   - `claim_independence_satisfied`
+   - `source_freshness_satisfied`
+   - `evidence_publish_eligibility_current`
+   - `quotation_limits_satisfied`
+   - `claim_types_separated_and_attributed`
+   - `duplicate_or_conflict_resolved`
+   - `korean_readability_and_repetition`
+   - `no_exaggeration_or_false_experience`
+
+   visual이 하나라도 있으면 `visual_rights_and_alt_text`도 `passed`여야 한다. 정렬된
+   code/version/config의 `quality_gate_manifest_hash`와 result/details의 `quality_report_hash`를
+   별도로 다시 계산해 revision 값과 비교한다.
+5. 청약 가격·날짜·자격 충돌, 같은 보도자료를 전재한 두 URL, TTL을 지난 뉴스, 권리 철회,
+   source 전문 장문 복사, 반복·과장·허위 경험과 기업 전망의 fact 승격 fixture를 각각 넣는다.
+   해당 code는 `failed` 또는 `manual_required`이고 revision/runtime publish eligibility는 false여야
+   한다. 출처 링크만 붙인 장문 복사는 quotation gate를 통과한 것으로 간주하지 않는다.
+6. 원문 URL은 모델 출력이 아니라 SourceItem snapshot에서 가져온다. 기업 이미지나 PDF 캡처의
+   권리가 불명확하면 내부 분석에는 남아도 visual placement와 게시 렌더에는 들어가지 않는다.
+   자체 차트는 원자료, 단위, 기준일, 변환식, alt text와 출처를 가진다.
+7. 관리자가 `bodyBlocks`를 편집하면 base revision CAS와 current release policy resolve 뒤 새 pending
+   revision과 `editorial.revalidate_requested@1`이 한 transaction에 만들어져야 한다. 이전 Claim,
+   QualityCheck, 승인과 intent는 복사하지 않는다. worker가 current policy와 current evidence publish
+   eligibility를 재확인하고 전체 claim graph/gate report를 다시 만들기 전에는 preview·승인·발행이
+   모두 차단되어야 한다.
+8. ArticleDetail 화면에서 claim별 type/risk/state, supports/contradicts/context evidence, locator,
+   원문 URL, freshness, independence, rights와 excluded/duplicate/conflict reason, exact blocking check,
+   runtime eligibility를 확인한다. source-derived text는 실행 가능한 HTML로 해석되지 않아야 한다.
+9. ArticleDetail의 frozen evidence에서 source version, modified/retrieved 시각, rights, attribution,
+   alt text를 바꾼 뒤 live SourceItem/EvidenceAsset만 수정해도 응답이 바뀌지 않는지 확인한다. exact
+   release/config/implementation hash가 없는 legacy policy는 세 값을 null로 보이고 발행 링크를
+   숨겨야 하며, API가 material hash를 복제해 채우면 실패다. exact 역사 evidence를 복원할 수 없는
+   이관 revision은 `evidenceId`와 `legacyQuarantine=true`만 반환해야 한다. live provenance나 빈
+   source/version/rights/freshness를 합성하면 실패다.
+10. CreateRevisionRequest의 각 binding에 요청-local 고유 `claimRef`와
+    `derivedFromClaimRefs`를 보내면 201이어야 한다. interpretation 참조는 같은 요청의
+    fact/company_claim ref만 허용하고, 저장·응답은 서버가 만든 UUID `claimId/derivedFromClaimIds`를
+    사용한다. 같은 request key와 같은 material은
+    200이어야 한다. 추가 member, 누락 semantic field, stale base, 같은 key의 변경 claim binding을
+    각각 422, 422, 409, 409로 확인하고 응답의 revalidation/quality state와 다섯 manifest/content hash를
+    OpenAPI schema로 검증한다. outbox의 `editorial.revalidate_requested@1`은 `article_id`,
+    `article_revision_id`, `editorial_policy_snapshot_id`, `editorial_policy_material_hash`,
+    `verification_manifest_hash`, `input_evidence_manifest_hash`, `excluded_material_manifest_hash`만
+    가져야 한다.
 
 ## 10. WordPress 샌드박스 발행
 
@@ -658,6 +707,38 @@ new-producer catalog entries. Old v1.0 in-flight snapshots fail closed under the
 Legacy HWP uses its sidecar protocol/converter trust chain and is not subject to the host-Python gate.
 HWPX performs EOCD/central/local-header preflight before `ZipFile`, accepts official OPF package
 manifests, and incrementally parses only canonical spine section XML.
+
+## English / AI-readable — T018 editorial release and quality contract
+
+Resolve the current topic policy from exact `config/editorial-policies/{topic_code}.json` bytes.
+Persist or reuse an
+append-only `EditorialPolicySnapshot`; there is no approval workflow and no mutable policy head.
+Reusing a key/version is legal only when the release document bytes, canonical policy,
+implementation manifest, and material hashes are identical. Changed bytes under the same version
+fail permanently.
+
+`ArticleRevision.bodyBlocks` is canonical. Every assertion in title, summary, blocks, and captions is
+an atomic `fact`, `company_claim`, `interpretation`, or `outlook`. The revision freezes sorted
+verification, eligible-evidence, and excluded/duplicate/conflict snapshots with independent hashes.
+Review-ready requires all ten exact gates from the Korean procedure above and, when any visual is
+present, `visual_rights_and_alt_text`. Runtime eligibility also requires the frozen policy to remain
+the current release policy and every used evidence item to remain publish-eligible.
+
+A manual edit creates a new pending revision and `editorial.revalidate_requested@1` atomically.
+Revalidation rebuilds all claims, evidence relations, and checks from the new body blocks; it never
+copies prior claims, checks, approvals, or intents. ArticleDetail must expose frozen snapshots,
+current runtime eligibility, and all exclusion reasons before publication can be considered. Mutating live
+source/evidence rows must not rewrite the frozen ArticleDetail projection. Missing legacy release/config/
+implementation hashes remain null and block publication; they are never synthesized from materialHash.
+Migrated evidence without recoverable exact historical material exposes only `evidenceId` and
+`legacyQuarantine=true`; it never fabricates live or empty provenance fields. Manual claim bindings use a
+unique non-empty request-local `claimRef` and `derivedFromClaimRefs`; interpretation refs may target only
+fact/company_claim bindings in the same request. Persisted and response graphs use server-generated
+`claimId/derivedFromClaimIds` UUIDs. The revalidation event has exactly `article_id`, `article_revision_id`,
+`editorial_policy_snapshot_id`, `editorial_policy_material_hash`, `verification_manifest_hash`,
+`input_evidence_manifest_hash`, and `excluded_material_manifest_hash`.
+Validate exact claimBindings and CreateRevisionResult against OpenAPI: create/replay is 201/200, stale or
+changed-key material is 409, and structural or semantic input errors are 422.
 
 ## English / AI-readable — Legacy HWP deployment
 

@@ -395,6 +395,12 @@ CELERY_TASK_ROUTES = {
 }
 
 OBJECT_STORAGE_PRESIGN_TTL_SECONDS = int(os.getenv("OBJECT_STORAGE_PRESIGN_TTL_SECONDS", "300"))
+EDITORIAL_POLICY_ROOT = Path(
+    os.getenv(
+        "EDITORIAL_POLICY_ROOT",
+        str(REPOSITORY_ROOT / "config" / "editorial-policies"),
+    )
+).resolve()
 
 REAUTH_PROOF_TTL_SECONDS = min(int(os.getenv("REAUTH_PROOF_TTL_SECONDS", "300")), 300)
 REAUTH_FAILURE_LIMIT = min(

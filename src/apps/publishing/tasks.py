@@ -31,6 +31,9 @@ from .models import (
     TargetDisconnectDecision,
 )
 from .services import (
+    finalize_publication_delivery_failure as _finalize_publication_delivery_failure,
+)
+from .services import (
     _kill_switch_enabled,
     begin_attempt,
     begin_canary_run,
@@ -210,6 +213,23 @@ def execute_publication_attempt(attempt_id: str):
     if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
         raise error or RuntimeError(persisted.error_code)
     return {"attemptId": attempt_id, "state": persisted.state, "remotePostId": persisted.publication.remote_post_id}
+
+
+@shared_task(
+    name="apps.publishing.tasks.finalize_publication_delivery_failure"
+)
+def finalize_publication_delivery_failure(
+    attempt_id: str,
+    error_code: str,
+):
+    attempt = _finalize_publication_delivery_failure(
+        attempt_id,
+        error_code=error_code,
+        audit_context=_worker_audit_context(),
+    )
+    if attempt is None:
+        return {"attemptId": attempt_id, "state": "missing"}
+    return {"attemptId": str(attempt.id), "state": attempt.state}
 
 
 @shared_task(

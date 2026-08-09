@@ -42,6 +42,7 @@ from .services import (
     decide_auto_publish_validation,
     disconnect_target,
     dispatch_publication,
+    get_article_preview,
     request_target_preflight,
     retry_publication_attempt as retry_publication_attempt_service,
     set_auto_publish,
@@ -531,10 +532,7 @@ def article_preview(request: HttpRequest, article_id: str) -> JsonResponse:
     target_id = request.GET.get("targetId")
     if not target_id:
         raise InvalidInput("targetId query가 필요합니다.")
-    intent = PublicationIntent.objects.filter(article_id=article_id).order_by("-created_at").first()
-    if not intent:
-        raise InvalidInput("먼저 publication intent를 만드세요.")
-    row = intent.renders.get(target_id=target_id, render_stage=ArticleChannelRender.Stage.PREVIEW)
+    row = get_article_preview(article_id, target_id)
     return JsonResponse(render_json(row))
 
 
