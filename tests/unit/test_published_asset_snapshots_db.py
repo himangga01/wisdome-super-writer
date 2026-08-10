@@ -54,8 +54,8 @@ class PublishedAssetSnapshotSQLiteGuardTests(DjangoTestCase):
             item_count=0,
             manifest=[],
             manifest_hash=(
-                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e7c2a7f"
-                "15ab5a670f7a8e73"
+                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba87"
+                "3c2f11161202b945"
             ),
         )
 

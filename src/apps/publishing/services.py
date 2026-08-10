@@ -73,6 +73,10 @@ from .models import (
     PublicationIntent,
     PublicationIntentHead,
     PublicationMedia,
+    PublishedAssetCohort,
+    PublishedEvidenceSnapshot,
+    PublishedVisualizationInput,
+    PublishedVisualizationSnapshot,
     PublicationTarget,
     PublicationTargetIntentFence,
     PublicationTargetSnapshot,
@@ -111,6 +115,18 @@ PUBLISHING_AUDIT_MATERIAL_VERSION = "publishing-state-v1"
 PUBLICATION_INTENT_REQUEST_VERSION = "publication-intent-request-v1"
 PUBLICATION_DISPATCH_REQUEST_VERSION = "publication-dispatch-request-v1"
 _TARGET_CREATE_NAMESPACE = uuid.UUID("e28b5933-26ae-4e6d-83b5-1cbe64f26ba0")
+_PUBLISHED_ASSET_COHORT_NAMESPACE = uuid.UUID(
+    "8c94074e-7b22-4f8f-a8cf-bcad55bd1a8f"
+)
+_PUBLISHED_EVIDENCE_SNAPSHOT_NAMESPACE = uuid.UUID(
+    "f147431b-78b8-4596-8832-bc4ab16c0b88"
+)
+_PUBLISHED_VISUALIZATION_SNAPSHOT_NAMESPACE = uuid.UUID(
+    "8d916109-79ed-4dfb-a7f0-a22fb69df563"
+)
+_PUBLISHED_VISUALIZATION_INPUT_NAMESPACE = uuid.UUID(
+    "446371d4-d982-4ba7-8daf-9f11f88a519f"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -5144,7 +5160,510 @@ def _revision_source_links(revision) -> list[str]:
     return sorted({str(value) for value in values if value})
 
 
+@transaction.atomic
+def freeze_revision_asset_cohort(
+    *,
+    revision,
+    using: str = "default",
+) -> PublishedAssetCohort:
+    """Freeze or replay the exact visual material for one article revision."""
+
+    revision_model = type(revision)
+    locked_revision = revision_model.objects.using(using).select_for_update().get(
+        pk=revision.pk
+    )
+    placements = list(
+        locked_revision.visual_placements.using(using)
+        .select_for_update()
+        .select_related("source_evidence", "source_evidence__source_item", "visualization")
+        .order_by("block_id", "display_order", "id")
+    )
+    if not placements:
+        if locked_revision.visual_manifest:
+            raise Conflict("revision visual placement set is incomplete")
+        manifest: list[dict[str, Any]] = []
+        evidence_snapshots: list[dict[str, Any]] = []
+        visualization_snapshots: list[dict[str, Any]] = []
+        visualization_inputs: list[dict[str, Any]] = []
+    else:
+        if (
+            locked_revision.visual_manifest_hash
+            != sha256_hex(locked_revision.visual_manifest)
+            or locked_revision.evidence_manifest_hash
+            != sha256_hex(locked_revision.evidence_manifest)
+        ):
+            raise Conflict("revision asset manifest hash is stale")
+        frozen_evidence = {
+            str(row.get("evidenceId")): row
+            for row in locked_revision.evidence_manifest
+            if isinstance(row, dict) and row.get("evidenceId")
+        }
+        if len(frozen_evidence) != len(locked_revision.evidence_manifest):
+            raise Conflict("revision evidence manifest is not canonical")
+        manifest = []
+        evidence_snapshots = []
+        visualization_snapshots = []
+        visualization_inputs = []
+        pending_visualizations = []
+        observed_visual_manifest = []
+        for placement in placements:
+            placement.full_clean()
+            visual = {
+                "blockId": placement.block_id,
+                "evidenceId": (
+                    str(placement.source_evidence_id)
+                    if placement.source_evidence_id
+                    else None
+                ),
+                "visualizationId": (
+                    str(placement.visualization_id)
+                    if placement.visualization_id
+                    else None
+                ),
+                "rightsStatus": placement.rights_status_snapshot,
+                "rightsBasisUrl": placement.rights_basis_url_snapshot,
+                "attributionText": placement.attribution_snapshot,
+                "altText": placement.alt_text_snapshot,
+                "caption": placement.caption,
+                "captionClaimMarker": placement.caption_claim_marker,
+                "locator": placement.locator_snapshot,
+                "renderProvenance": (
+                    {
+                        "objectKey": placement.render_object_key_snapshot,
+                        "objectVersion": placement.render_object_version_snapshot,
+                        "checksum": placement.render_checksum_snapshot,
+                        "inputManifestHash": (
+                            placement.render_input_manifest_hash_snapshot
+                        ),
+                        "transformHash": placement.render_transform_hash_snapshot,
+                    }
+                    if placement.visualization_id
+                    else None
+                ),
+            }
+            presentation_material = {
+                "schemaVersion": "editorial-visual-placement-v1",
+                **visual,
+                "displayOrder": placement.display_order,
+            }
+            if placement.presentation_hash != sha256_hex(presentation_material):
+                raise Conflict("visual placement presentation hash is stale")
+            observed_visual_manifest.append(
+                {
+                    "placementId": str(placement.id),
+                    **presentation_material,
+                    "presentationHash": placement.presentation_hash,
+                }
+            )
+            if placement.source_evidence_id is None:
+                pending_visualizations.append(placement)
+                continue
+            evidence = placement.source_evidence
+            source_item = evidence.source_item if evidence is not None else None
+            frozen = frozen_evidence.get(str(placement.source_evidence_id))
+            if frozen is None or evidence is None or source_item is None:
+                raise Conflict("visual evidence is outside the frozen revision")
+            if (
+                evidence.publishable is not True
+                or evidence.review_state != "passed"
+                or evidence.rights_status not in {"allowed", "attribution_required"}
+                or source_item.status != "active"
+                or not evidence.object_key
+                or not evidence.object_version
+                or not evidence.checksum
+                or not evidence.mime_type
+                or evidence.byte_size is None
+                or evidence.byte_size <= 0
+                or not evidence.rights_basis_url
+                or not evidence.alt_text
+                or (
+                    evidence.rights_status == "attribution_required"
+                    and not evidence.attribution_text
+                )
+            ):
+                raise Conflict("visual evidence is not currently publishable")
+            exact_frozen_material = {
+                "evidenceId": str(evidence.id),
+                "sourceItemId": str(source_item.id),
+                "contentHash": evidence.evidence_content_hash,
+                "checksum": evidence.checksum,
+                "reviewSubjectHash": evidence.review_subject_hash,
+                "publishable": evidence.publishable,
+                "derivationType": evidence.derivation_type,
+                "kind": evidence.kind,
+                "locatorType": evidence.locator_type,
+                "locator": evidence.locator,
+                "rightsStatus": evidence.rights_status,
+                "rightsBasisUrl": evidence.rights_basis_url,
+                "attributionText": evidence.attribution_text,
+                "altText": evidence.alt_text,
+                "sourceTitle": source_item.title,
+                "sourceUrl": source_item.canonical_url,
+                "publisher": source_item.publisher,
+                "sourceStatus": source_item.status,
+                "sourceVersionHash": source_item.source_version_hash,
+                "sourceContentHash": source_item.content_hash,
+                "publishedAt": (
+                    source_item.published_at.isoformat()
+                    if source_item.published_at
+                    else None
+                ),
+                "modifiedAt": (
+                    source_item.modified_at.isoformat()
+                    if source_item.modified_at
+                    else None
+                ),
+                "retrievedAt": source_item.first_collected_at.isoformat(),
+            }
+            if any(
+                frozen.get(key) != value
+                for key, value in exact_frozen_material.items()
+            ):
+                raise Conflict("visual evidence no longer matches revision material")
+            if (
+                placement.rights_status_snapshot != evidence.rights_status
+                or placement.rights_basis_url_snapshot != evidence.rights_basis_url
+                or placement.attribution_snapshot != evidence.attribution_text
+                or placement.alt_text_snapshot != evidence.alt_text
+                or placement.locator_snapshot != evidence.locator
+            ):
+                raise Conflict("visual placement rights or locator is stale")
+            snapshot_id = uuid.uuid5(
+                _PUBLISHED_EVIDENCE_SNAPSHOT_NAMESPACE,
+                str(placement.id),
+            )
+            rights_material_hash = sha256_hex(
+                {
+                    "rightsStatus": placement.rights_status_snapshot,
+                    "rightsBasisUrl": placement.rights_basis_url_snapshot,
+                    "attributionText": placement.attribution_snapshot,
+                    "altText": placement.alt_text_snapshot,
+                    "caption": placement.caption,
+                }
+            )
+            manifest.append(
+                {
+                    "schemaVersion": "published-asset-item-v1",
+                    "placementId": str(placement.id),
+                    "snapshotKind": "evidence",
+                    "snapshotId": str(snapshot_id),
+                    "blockId": placement.block_id,
+                    "displayOrder": placement.display_order,
+                    "usage": "inline",
+                    "assetChecksum": evidence.checksum,
+                    "presentationHash": placement.presentation_hash,
+                    "mimeType": evidence.mime_type,
+                    "byteSize": evidence.byte_size,
+                    "rightsMaterialHash": rights_material_hash,
+                }
+            )
+            evidence_snapshots.append(
+                {
+                    "id": snapshot_id,
+                    "visual_placement": placement,
+                    "evidence": evidence,
+                    "source_item_id": source_item.id,
+                    "source_version_hash": source_item.source_version_hash,
+                    "source_url_snapshot": source_item.canonical_url,
+                    "source_title_snapshot": source_item.title,
+                    "source_publisher_snapshot": source_item.publisher,
+                    "source_published_at_snapshot": source_item.published_at,
+                    "source_modified_at_snapshot": source_item.modified_at,
+                    "source_collected_at_snapshot": source_item.first_collected_at,
+                    "evidence_content_hash": evidence.evidence_content_hash,
+                    "asset_checksum": evidence.checksum,
+                    "object_key": evidence.object_key,
+                    "object_version": evidence.object_version,
+                    "mime_type": evidence.mime_type,
+                    "byte_size": evidence.byte_size,
+                    "locator_snapshot": evidence.locator,
+                    "rights_status_snapshot": placement.rights_status_snapshot,
+                    "rights_basis_url_snapshot": placement.rights_basis_url_snapshot,
+                    "attribution_snapshot": placement.attribution_snapshot or "",
+                    "alt_text_snapshot": placement.alt_text_snapshot,
+                    "caption_snapshot": placement.caption,
+                    "presentation_hash": placement.presentation_hash,
+                }
+            )
+        evidence_snapshot_by_evidence_id = {}
+        for material in evidence_snapshots:
+            evidence_id = str(material["evidence"].id)
+            if evidence_id in evidence_snapshot_by_evidence_id:
+                raise Conflict("visual evidence placement is ambiguous")
+            evidence_snapshot_by_evidence_id[evidence_id] = material
+        for placement in pending_visualizations:
+            render = placement.visualization
+            transform = render.transform_spec if render is not None else None
+            if (
+                render is None
+                or render.state != "succeeded"
+                or not render.object_key
+                or not render.object_version
+                or not render.checksum
+                or not isinstance(transform, dict)
+                or render.object_key != placement.render_object_key_snapshot
+                or render.object_version
+                != placement.render_object_version_snapshot
+                or render.checksum != placement.render_checksum_snapshot
+                or render.input_manifest_hash
+                != placement.render_input_manifest_hash_snapshot
+                or sha256_hex(transform)
+                != placement.render_transform_hash_snapshot
+            ):
+                raise Conflict("visualization output is incomplete or stale")
+            input_evidence_ids = transform.get("inputEvidenceIds")
+            mime_type = transform.get("outputMimeType")
+            byte_size = transform.get("outputByteSize")
+            renderer_manifest_hash = transform.get("rendererManifestHash")
+            if (
+                not isinstance(input_evidence_ids, list)
+                or not input_evidence_ids
+                or any(not isinstance(value, str) for value in input_evidence_ids)
+                or len(input_evidence_ids) != len(set(input_evidence_ids))
+                or sha256_hex(input_evidence_ids) != render.input_manifest_hash
+                or not isinstance(mime_type, str)
+                or not mime_type.strip()
+                or not isinstance(byte_size, int)
+                or isinstance(byte_size, bool)
+                or byte_size <= 0
+                or not isinstance(renderer_manifest_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", renderer_manifest_hash)
+                or placement.rights_status_snapshot
+                not in {"allowed", "attribution_required"}
+                or not placement.rights_basis_url_snapshot
+                or not placement.alt_text_snapshot
+                or (
+                    placement.rights_status_snapshot == "attribution_required"
+                    and not placement.attribution_snapshot
+                )
+            ):
+                raise Conflict("visualization material is not publishable")
+            input_materials = []
+            for input_order, evidence_id in enumerate(input_evidence_ids):
+                evidence_material = evidence_snapshot_by_evidence_id.get(evidence_id)
+                frozen = frozen_evidence.get(evidence_id)
+                if evidence_material is None or frozen is None:
+                    raise Conflict(
+                        "visualization input is outside published evidence snapshots"
+                    )
+                input_materials.append(
+                    {
+                        "display_order": input_order,
+                        "evidence_snapshot_id": evidence_material["id"],
+                        "input_material_hash": sha256_hex(
+                            {
+                                "evidenceId": evidence_id,
+                                "evidenceSnapshotId": str(evidence_material["id"]),
+                                "contentHash": frozen.get("contentHash"),
+                                "sourceVersionHash": frozen.get(
+                                    "sourceVersionHash"
+                                ),
+                                "displayOrder": input_order,
+                            }
+                        ),
+                    }
+                )
+            snapshot_id = uuid.uuid5(
+                _PUBLISHED_VISUALIZATION_SNAPSHOT_NAMESPACE,
+                str(placement.id),
+            )
+            rights_material_hash = sha256_hex(
+                {
+                    "rightsStatus": placement.rights_status_snapshot,
+                    "rightsBasisUrl": placement.rights_basis_url_snapshot,
+                    "attributionText": placement.attribution_snapshot,
+                    "altText": placement.alt_text_snapshot,
+                    "caption": placement.caption,
+                }
+            )
+            manifest.append(
+                {
+                    "schemaVersion": "published-asset-item-v1",
+                    "placementId": str(placement.id),
+                    "snapshotKind": "visualization",
+                    "snapshotId": str(snapshot_id),
+                    "blockId": placement.block_id,
+                    "displayOrder": placement.display_order,
+                    "usage": "inline",
+                    "assetChecksum": render.checksum,
+                    "presentationHash": placement.presentation_hash,
+                    "mimeType": mime_type,
+                    "byteSize": byte_size,
+                    "rightsMaterialHash": rights_material_hash,
+                }
+            )
+            visualization_snapshots.append(
+                {
+                    "id": snapshot_id,
+                    "visual_placement": placement,
+                    "visualization": render,
+                    "output_checksum": render.checksum,
+                    "object_key": render.object_key,
+                    "object_version": render.object_version,
+                    "input_manifest_hash": render.input_manifest_hash,
+                    "transform_hash": placement.render_transform_hash_snapshot,
+                    "renderer_manifest_hash": renderer_manifest_hash,
+                    "mime_type": mime_type,
+                    "byte_size": byte_size,
+                    "rights_status_snapshot": placement.rights_status_snapshot,
+                    "rights_basis_url_snapshot": placement.rights_basis_url_snapshot,
+                    "attribution_snapshot": placement.attribution_snapshot or "",
+                    "alt_text_snapshot": placement.alt_text_snapshot,
+                    "caption_snapshot": placement.caption,
+                    "presentation_hash": placement.presentation_hash,
+                }
+            )
+            for input_material in input_materials:
+                visualization_inputs.append(
+                    {
+                        "id": uuid.uuid5(
+                            _PUBLISHED_VISUALIZATION_INPUT_NAMESPACE,
+                            f"{snapshot_id}:{input_material['display_order']}",
+                        ),
+                        "visualization_snapshot_id": snapshot_id,
+                        **input_material,
+                    }
+                )
+        manifest.sort(
+            key=lambda row: (
+                row["blockId"],
+                row["displayOrder"],
+                row["placementId"],
+            )
+        )
+        if observed_visual_manifest != locked_revision.visual_manifest:
+            raise Conflict("revision visual placement set is stale")
+
+    cohort_id = uuid.uuid5(
+        _PUBLISHED_ASSET_COHORT_NAMESPACE,
+        str(locked_revision.id),
+    )
+    manifest_hash = sha256_hex(manifest)
+    existing = (
+        PublishedAssetCohort.objects.using(using)
+        .filter(revision_id=locked_revision.id)
+        .first()
+    )
+    if existing is not None:
+        if (
+            existing.schema_version != "published-assets-v1"
+            or existing.material_state != PublishedAssetCohort.MaterialState.CURRENT
+            or existing.id != cohort_id
+            or existing.item_count != len(manifest)
+            or existing.manifest != manifest
+            or existing.manifest_hash != manifest_hash
+        ):
+            raise Conflict("publication asset cohort replay does not match")
+        if (
+            existing.evidence_snapshots.count() != len(evidence_snapshots)
+            or existing.visualization_snapshots.count()
+            != len(visualization_snapshots)
+        ):
+            raise Conflict("publication asset cohort snapshot set is incomplete")
+        for material in evidence_snapshots:
+            snapshot = existing.evidence_snapshots.filter(pk=material["id"]).first()
+            if snapshot is None or any(
+                getattr(snapshot, field) != value.pk
+                if field in {"visual_placement", "evidence"}
+                else getattr(snapshot, field) != value
+                for field, value in material.items()
+                if field != "id"
+            ):
+                raise Conflict("published evidence snapshot replay does not match")
+        for material in visualization_snapshots:
+            snapshot = existing.visualization_snapshots.filter(
+                pk=material["id"]
+            ).first()
+            if snapshot is None or any(
+                getattr(snapshot, field) != value.pk
+                if field in {"visual_placement", "visualization"}
+                else getattr(snapshot, field) != value
+                for field, value in material.items()
+                if field != "id"
+            ):
+                raise Conflict(
+                    "published visualization snapshot replay does not match"
+                )
+        expected_inputs = {
+            material["id"]: material for material in visualization_inputs
+        }
+        persisted_inputs = {
+            row.id: row
+            for row in PublishedVisualizationInput.objects.using(using).filter(
+                visualization_snapshot__cohort=existing
+            )
+        }
+        if set(persisted_inputs) != set(expected_inputs):
+            raise Conflict("published visualization input replay does not match")
+        for input_id, material in expected_inputs.items():
+            row = persisted_inputs[input_id]
+            if any(
+                getattr(row, field) != value
+                for field, value in material.items()
+                if field not in {"id", "visualization_snapshot_id", "evidence_snapshot_id"}
+            ) or (
+                row.visualization_snapshot_id
+                != material["visualization_snapshot_id"]
+                or row.evidence_snapshot_id != material["evidence_snapshot_id"]
+            ):
+                raise Conflict("published visualization input replay does not match")
+        return existing
+    cohort = PublishedAssetCohort.objects.using(using).create(
+        id=cohort_id,
+        revision=locked_revision,
+        schema_version="published-assets-v1",
+        material_state=PublishedAssetCohort.MaterialState.CURRENT,
+        item_count=len(manifest),
+        manifest=manifest,
+        manifest_hash=manifest_hash,
+    )
+    for material in evidence_snapshots:
+        PublishedEvidenceSnapshot.objects.using(using).create(
+            cohort=cohort,
+            **material,
+        )
+    for material in visualization_snapshots:
+        PublishedVisualizationSnapshot.objects.using(using).create(
+            cohort=cohort,
+            **material,
+        )
+    for material in visualization_inputs:
+        PublishedVisualizationInput.objects.using(using).create(**material)
+    return cohort
+
+
+def build_channel_media_manifest(
+    *,
+    cohort: PublishedAssetCohort,
+    channel: str,
+) -> list[dict[str, Any]]:
+    if channel not in {ChannelCode.WORDPRESS, ChannelCode.BLOGGER}:
+        raise InvalidInput("unsupported publication media channel")
+    if (
+        cohort.schema_version != "published-assets-v1"
+        or cohort.material_state != PublishedAssetCohort.MaterialState.CURRENT
+        or cohort.item_count != len(cohort.manifest)
+        or cohort.manifest_hash != sha256_hex(cohort.manifest)
+    ):
+        raise Conflict("publication asset cohort is not current")
+    return [
+        {
+            **item,
+            "cohortId": str(cohort.id),
+            "cohortManifestHash": cohort.manifest_hash,
+            "channel": str(channel),
+        }
+        for item in cohort.manifest
+    ]
+
+
+@transaction.atomic
 def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
+    asset_cohort = freeze_revision_asset_cohort(revision=revision)
+    media_manifest = build_channel_media_manifest(
+        cohort=asset_cohort,
+        channel=target.channel,
+    )
     body = _markdown_to_html(revision.body_markdown)
     source_links = _revision_source_links(revision)
     if revision.claims.exists() and not source_links:
@@ -5180,6 +5699,7 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
         template_hash=template_hash,
         content_hash=sha256_hex({"title": revision.title, "body": body}),
         source_manifest_hash=source_manifest_hash,
+        media_manifest=media_manifest,
     )
 
 
