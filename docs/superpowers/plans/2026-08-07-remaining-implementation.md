@@ -1077,59 +1077,55 @@ their SHA-256 is audited. T026
 owns OpenAPI operational history/retry routes, cursor pagination, admin UI and E2E; T028 owns global
 run/step/channel stop and terminal aggregation.
 
-### Task 11: T022 visual placement와 published evidence snapshot
+### Task 11: T022 불변 발행 자산 cohort와 채널 미디어 전달
+
+상세 RED→GREEN 구현 순서와 exact interface는
+`docs/superpowers/plans/2026-08-10-t022-published-visual-assets.md`를 정본으로 사용한다.
 
 **Files:**
-- Modify: `src/apps/editorial/models.py`
-- Create: `src/apps/editorial/migrations/0004_visual_placement.py`
 - Modify: `src/apps/publishing/models.py`
 - Create: `src/apps/publishing/migrations/0012_published_asset_snapshots.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/tasks.py`
+- Modify: `src/wisdome_writer/infrastructure/event_routes.py`
 - Modify: `src/adapters/storage/s3.py`
 - Modify: `src/adapters/publishers/wordpress/client.py`
-- Deferred integration test: `tests/integration/test_published_asset_snapshots.py`
+- Create: `tests/unit/test_published_asset_snapshots.py`
+- Create: `tests/unit/test_published_asset_snapshots_db.py`
+- Create: `tests/unit/test_publication_media_bindings.py`
+- Create: `tests/unit/test_media_delivery_operations.py`
+- Create: `tests/unit/test_media_delivery_operations_db.py`
+- Create: `tests/unit/test_wordpress_media_delivery.py`
+- Create: `tests/unit/test_public_delivery_assets.py`
+- Create: `tests/unit/test_publication_media_cleanup.py`
 
 **Interfaces:**
-- Consumes: approved revision visual placement, `EvidenceAsset`, `VisualizationRender`, rights/alt/caption material.
-- Produces: immutable `PublishedEvidenceSnapshot`, `PublishedVisualizationSnapshot`, channel delivery binding and media manifest.
+- Consumes: existing T018 `VisualPlacement`, `EvidenceAsset`, `VisualizationRender`, approved media manifest, T021 execution fence.
+- Produces: immutable `PublishedAssetCohort`, evidence/visualization snapshots, exact `PublicationMedia` binding, append-only media operation generations and safe cleanup.
 
-- [ ] **Step 1: revision visual placement 모델을 추가한다.**
+- [ ] **Step 1: publishing 0012에 revision별 asset cohort와 evidence/visualization/input snapshot을 추가한다.**
 
-  ```python
-  class VisualPlacement(models.Model):
-      revision = models.ForeignKey(ArticleRevision, on_delete=models.PROTECT, related_name="visual_placements")
-      block_id = models.CharField(max_length=255)
-      source_evidence = models.ForeignKey("evidence.EvidenceAsset", null=True, on_delete=models.PROTECT)
-      visualization = models.ForeignKey(VisualizationRender, null=True, on_delete=models.PROTECT)
-      usage = models.CharField(max_length=16)
-      display_order = models.PositiveIntegerField()
-      presentation_hash = models.CharField(max_length=64)
-  ```
+  기존 editorial `VisualPlacement`를 그대로 사용하고 publishing FK를 editorial에 역방향 추가하지 않는다. snapshot/cohort는 append-only이며 legacy non-empty material은 exact reconstruction이 불가능하면 quarantine한다.
 
-  evidence/visualization XOR와 `(revision, block_id)` 고유 제약을 둔다.
+- [ ] **Step 2: 첫 preview transaction에서 stable-order cohort와 bounded media manifest를 동결한다.**
 
-- [ ] **Step 2: 발행 snapshot 모델을 추가한다.**
+  동일 revision/material은 같은 cohort를 반환하고 live rights, evidence version, visualization input 또는 placement material이 달라지면 새 revision 없이 거부한다.
 
-  `PublishedEvidenceSnapshot`은 evidence content hash, locator, source URL, rights, alt/caption/attribution, object key/version을 저장한다. `PublishedVisualizationSnapshot`은 render checksum, transform/input manifest, rights/alt/caption과 object version을 저장한다.
+- [ ] **Step 3: dispatch가 exact mapping/binding/event cohort를 원자적으로 만들고 T021 pre-I/O gate가 current·available exact set을 요구하게 한다.**
 
-- [ ] **Step 3: intent 생성 시 revision의 media manifest를 동결한다.**
+- [ ] **Step 4: prepare/reconcile/delete를 append-only `MediaDeliveryOperation`과 v2 event/receipt capability에 결속한다.**
 
-  `_create_preview_render()`가 mutable EvidenceAsset을 직접 읽지 않고 snapshot IDs와 presentation hash를 `media_manifest`에 기록한다.
+  WordPress는 exact slug/marker/alt/caption/source proof, Blogger는 exact object version/checksum/size/MIME 및 anonymous HTTPS proof를 요구한다. ambiguous write는 repeat하지 않고 reconcile한다.
 
-- [ ] **Step 4: WordPress media와 Blogger public delivery를 각각 준비한다.**
+- [ ] **Step 5: 30일 유예와 locked zero-reference recount 뒤 exact media/object version만 삭제한다.**
 
-  WordPress는 `(target, asset_checksum, presentation_hash)` RemoteMedia를 사용한다. Blogger는 immutable PublicDeliveryAsset URL을 사용하고 active reference count를 publication binding과 같은 transaction에서 관리한다.
+  active/prepared/in-flight/remote-body/correction/rights/retention hold 중 하나라도 있으면 삭제를 거부하고 재참조는 이전 delete generation을 fence한다.
 
-- [ ] **Step 5: lease generation CAS와 orphan cleanup을 연결한다.**
-
-  media upload/deletion callback이 expected lease generation과 일치할 때만 상태를 변경한다. 활성 `PublicationMedia`가 0인 자산만 grace period 이후 삭제한다.
-
-- [ ] **Step 6: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [ ] **Step 6: focused RED→GREEN, SQLite 실제 migration/trigger와 PG SQL parity, 승인된 check를 검증하고 커밋한다.**
 
   ```powershell
-  git add src/apps/editorial src/apps/publishing src/adapters/storage/s3.py src/adapters/publishers/wordpress/client.py
-  git commit -m "feat: freeze published evidence and visual assets"
+  git add src/apps/publishing src/wisdome_writer/infrastructure/event_routes.py src/adapters tests/unit specs/001-automated-content-publishing docs/superpowers/plans
+  git commit -m "feat: complete immutable publication media flow"
   ```
 
 ### Task 12: T023 Blogger OAuth refresh와 credential disconnect
