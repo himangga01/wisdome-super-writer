@@ -1031,6 +1031,8 @@ class PublicationDispatchCreateTests(SimpleTestCase):
             attempt_no=1,
             resolved_action="create",
             correlation_id=context.correlation_id,
+            depends_on_attempt_id=None,
+            dependency_subject_hash="",
         )
         dispatch = SimpleNamespace(
             id="00000000-0000-0000-0000-000000000841",

@@ -204,6 +204,14 @@ AuditEvent에 남긴다.
    Blogger `revert/delete`를 실행한다. 이 분기에는 공개 URL 200이나
    `canonical_source_url`이 필요하지 않으며 이전 URL은 감사용으로만 보존한다.
 
+각 Blogger command와 논리 attempt는 같은 intent·revision·article·environment의 정확한
+`primary_canonical` WordPress command/attempt를 `depends_on_attempt_id`와
+`publication-dependency-v1` subject hash로 결속한다. dispatch는 WordPress attempt를 먼저 만들고
+Blogger attempt는 그 ID를 참조한 채 대기한다. release, execution gate, final render와 reconcile은
+target ID나 생성 시각으로 WordPress Publication을 다시 검색하지 않고 이 FK만 따른다. dependency
+subject는 immutable lineage를, Blogger final render의 `canonical_source_url`·본문·content hash는
+실제 검증 URL을 동결한다. test와 production dependency를 섞거나 legacy material을 추측하지 않는다.
+
 create의 내부 preflight는 bounded read가 정상 완료되고 응답 schema, target/blog,
 pagination이 정확하며 lookup/marker match가 0건임을 증명할 때만 POST를 허용한다. timeout,
 408/429/5xx, JSON/schema 오류, 불완전 pagination, target/blog 불일치와 복수 match는
@@ -304,6 +312,18 @@ target/blog·remote ID·기대 state·title·marker를 제거한 canonical body�
 - base URL/remote blog ID 변경 PATCH 거절; 새 target의 기존 remote post ID 재사용 0건
 - WordPress Application Password와 Blogger OAuth token 폐기 후 target이 각각
   `revoked` 또는 `expired`로 전환되고 쓰기가 거부된다.
+
+## English / AI-readable — T024 canonical publication dependency
+
+Every Blogger command, including unpublish, names the single `primary_canonical` WordPress target in the
+same intent and environment. Dispatch creates the WordPress logical attempt first and freezes its exact ID
+on the Blogger attempt through `depends_on_attempt_id`. `publication-dependency-v1` hashes both immutable
+attempt lineages, while the Blogger final render separately freezes the verified WordPress URL in
+`canonical_source_url`, body HTML, and the content hash. Release, execution, final rendering, and
+reconciliation follow only that FK; they never select another WordPress Publication by timestamp, target
+channel, or article. Create/update require a public dependency and verified URL, mark-withdrawn preserves
+the last verified URL, and unpublish waits for the WordPress withdrawal terminal result without requiring
+a public URL. Cross-environment and unverifiable legacy dependencies fail closed.
 
 ## English / AI-readable — T021 execution and reconciliation contract
 

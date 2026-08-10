@@ -1245,50 +1245,20 @@ class AttemptOriginRunGateTests(TestCase):
 
 
 class CanonicalDependencyTests(TestCase):
-    def _attempt(self):
-        dependency_id = uuid.uuid4()
-        blogger_id = uuid.uuid4()
-        intent = SimpleNamespace(
-            id=uuid.uuid4(),
-            target_commands=[
-                {
-                    "targetId": str(blogger_id),
-                    "canonicalDependencyTargetId": str(dependency_id),
-                    "resolvedAction": PublicationAction.CREATE,
-                }
-            ],
-        )
-        target = SimpleNamespace(id=blogger_id, channel="blogger")
-        return (
-            SimpleNamespace(
-                resolved_action=PublicationAction.CREATE,
-                publication_intent=intent,
-                publication=SimpleNamespace(
-                    article_id=uuid.uuid4(),
-                    target=target,
-                ),
-            ),
-            dependency_id,
-        )
-
-    def test_readiness_queries_the_exact_frozen_wordpress_dependency(self):
-        attempt, dependency_id = self._attempt()
-        query = MagicMock()
-        query.exists.return_value = True
+    def test_readiness_uses_only_the_explicit_dependency_verifier(self):
+        attempt = SimpleNamespace()
+        dependency = SimpleNamespace()
 
         with patch.object(
-            services.Publication.objects,
-            "filter",
-            return_value=query,
-        ) as publication_filter:
+            services,
+            "_require_wordpress_dependency",
+            return_value=dependency,
+        ) as require_dependency:
             self.assertTrue(services._wordpress_dependency_ready(attempt))
 
-        publication_filter.assert_called_once_with(
-            article_id=attempt.publication.article_id,
-            target_id=dependency_id,
-            target__channel="wordpress",
-            state="published",
-            canonical_ready_at__isnull=False,
+        require_dependency.assert_called_once_with(
+            attempt,
+            require_ready=True,
         )
 
 

@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
+from types import SimpleNamespace
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
@@ -2174,12 +2175,46 @@ def _lock_publication_attempt_domain(
     PublicationIntent.objects.select_for_update().get(
         id=preliminary.publication_intent_id
     )
-    PublicationTarget.objects.select_for_update().get(
-        id=preliminary.publication.target_id
+    dependency = None
+    if preliminary.depends_on_attempt_id is not None:
+        dependency = (
+            PublicationAttempt.objects.select_related("publication")
+            .only(
+                "id",
+                "publication_id",
+                "publication__target_id",
+                "approval_id",
+            )
+            .get(id=preliminary.depends_on_attempt_id)
+        )
+    target_ids = {preliminary.publication.target_id}
+    approval_ids = {preliminary.approval_id}
+    publication_ids = {preliminary.publication_id}
+    attempt_ids = {preliminary.id}
+    if dependency is not None:
+        target_ids.add(dependency.publication.target_id)
+        approval_ids.add(dependency.approval_id)
+        publication_ids.add(dependency.publication_id)
+        attempt_ids.add(dependency.id)
+    list(
+        PublicationTarget.objects.select_for_update()
+        .filter(id__in=target_ids)
+        .order_by("id")
     )
-    Approval.objects.select_for_update().get(id=preliminary.approval_id)
-    Publication.objects.select_for_update().get(
-        id=preliminary.publication_id
+    list(
+        Approval.objects.select_for_update()
+        .filter(id__in=approval_ids)
+        .order_by("id")
+    )
+    list(
+        Publication.objects.select_for_update()
+        .filter(id__in=publication_ids)
+        .order_by("id")
+    )
+    list(
+        PublicationAttempt.objects.select_for_update()
+        .filter(id__in=attempt_ids)
+        .order_by("id")
     )
     return (
         PublicationAttempt.objects.select_for_update()
@@ -2187,6 +2222,8 @@ def _lock_publication_attempt_domain(
             "publication__target",
             "publication_intent",
             "approval__article_channel_render",
+            "depends_on_attempt__publication__target",
+            "depends_on_attempt__publication_intent",
         )
         .get(id=preliminary.id)
     )
@@ -2304,37 +2341,21 @@ def _terminalize_unreachable_dependents_locked(
         }
     ):
         return
-    dependent_target_ids = {
-        str(command["targetId"])
-        for command in attempt.publication_intent.target_commands
-        if (
-            isinstance(command, dict)
-            and str(command.get("canonicalDependencyTargetId"))
-            == str(attempt.publication.target_id)
-        )
-    }
-    if not dependent_target_ids:
-        return
-    dependent_publications = list(
-        Publication.objects.select_for_update()
-        .filter(
-            article_id=attempt.publication.article_id,
-            target_id__in=dependent_target_ids,
-        )
-        .order_by("target_id", "id")
-    )
-    publications_by_id = {
-        row.id: row for row in dependent_publications
-    }
     dependents = list(
         PublicationAttempt.objects.select_for_update()
         .filter(
-            publication_intent=attempt.publication_intent,
-            publication_id__in=publications_by_id,
+            depends_on_attempt=attempt,
             state=PublicationAttempt.State.QUEUED,
         )
+        .select_related("publication")
         .order_by("id")
     )
+    dependent_publications = list(
+        Publication.objects.select_for_update()
+        .filter(id__in=[row.publication_id for row in dependents])
+        .order_by("target_id", "id")
+    )
+    publications_by_id = {row.id: row for row in dependent_publications}
     now = timezone.now()
     for dependent in dependents:
         requested = _requested_event_for_terminal_locked(dependent)
@@ -5154,7 +5175,6 @@ def _create_publication_intent_atomic(
     }
     if set(target_rows) != set(target_refs):
         raise InvalidInput("알 수 없는 발행 target이 포함되었습니다.")
-    wordpress_ids = [key for key, row in target_rows.items() if row.channel == ChannelCode.WORDPRESS]
     for target_id, target in target_rows.items():
         ref = target_refs[target_id]
         command = commands[target_id]
@@ -5166,18 +5186,10 @@ def _create_publication_intent_atomic(
             raise InvalidInput("target command와 snapshot ref가 다릅니다.")
         if command["resolvedAction"] not in target.capabilities or not target.capabilities[command["resolvedAction"]]:
             raise InvalidInput(f"{target.display_name}은 요청한 동작을 지원하지 않습니다.")
-        if target.channel == ChannelCode.BLOGGER and command["resolvedAction"] != PublicationAction.UNPUBLISH:
-            dependency = command["canonicalDependencyTargetId"]
-            if dependency not in wordpress_ids:
-                prior_wordpress = Publication.objects.filter(
-                    article_id=article.id,
-                    target_id=dependency,
-                    target__channel=ChannelCode.WORDPRESS,
-                    state=Publication.State.PUBLISHED,
-                    canonical_ready_at__isnull=False,
-                ).exists()
-                if not prior_wordpress:
-                    raise InvalidInput("Blogger 발행에는 대표 WordPress target이 필요합니다.")
+    _validate_canonical_dependency_commands(
+        target_rows=target_rows,
+        commands=commands,
+    )
     mode = data["approvalMode"]
     validation_refs = _normalized_validation_refs(data.get("autoPublishValidationRefs", []))
     activation_refs = sorted(
@@ -7700,9 +7712,28 @@ def _publication_attempt_manifest(
             # execution counter but do not change this accepted dispatch identity.
             "attemptNo": 1,
             "resolvedAction": row.resolved_action,
+            "dependsOnAttemptId": _id(getattr(row, "depends_on_attempt_id", None)),
+            "dependencySubjectHash": getattr(row, "dependency_subject_hash", ""),
         }
         for row in sorted(attempts, key=lambda item: str(item.id))
     ]
+
+
+def _dispatch_attempt_dependency(
+    *,
+    target: PublicationTarget,
+    command: dict[str, Any],
+    attempts_by_target: dict[str, PublicationAttempt],
+) -> PublicationAttempt | None:
+    if target.channel != ChannelCode.BLOGGER:
+        return None
+    dependency_id = str(command.get("canonicalDependencyTargetId"))
+    dependency = attempts_by_target.get(dependency_id)
+    if dependency is None:
+        raise Conflict(
+            "Blogger attempt dependency was not created in the exact dispatch cohort"
+        )
+    return dependency
 
 
 def _find_publication_dispatch_replay(
@@ -7856,8 +7887,16 @@ def _dispatch_publication_atomic(
         raise Conflict("withdrawal intent must be approved before dispatch")
     before_material = _audit_state(intent)
     attempts: list[PublicationAttempt] = []
+    attempts_by_target: dict[str, PublicationAttempt] = {}
     media_pending_attempt_ids: set[uuid.UUID] = set()
-    for target_id in requested_ids:
+    ordered_target_ids = sorted(
+        requested_ids,
+        key=lambda target_id: (
+            target_rows[target_id].channel == ChannelCode.BLOGGER,
+            target_id,
+        ),
+    )
+    for target_id in ordered_target_ids:
         target = target_rows.get(target_id)
         command = command_map.get(target_id)
         if not target or not command:
@@ -7895,7 +7934,40 @@ def _dispatch_publication_atomic(
         activation_ref = next(
             (row for row in intent.auto_publish_activation_refs if str(row["targetId"]) == target_id), None
         )
+        dependency = _dispatch_attempt_dependency(
+            target=target,
+            command=command,
+            attempts_by_target=attempts_by_target,
+        )
+        attempt_id = uuid.uuid4()
+        attempt_material = SimpleNamespace(
+            id=attempt_id,
+            publication=publication,
+            publication_id=publication.id,
+            article_revision_id=intent.article_revision_id,
+            publication_intent_id=intent.id,
+            target_snapshot_id=target.current_snapshot_id,
+            target_config_hash=target.current_config_hash,
+            resolved_action=command["resolvedAction"],
+        )
+        dependency_subject_hash = ""
+        if dependency is not None:
+            dependency_subject_hash = _publication_dependency_subject_hash(
+                dependent_attempt=attempt_material,
+                dependency_attempt=dependency,
+            )
+        request_fingerprint = sha256_hex(
+            {
+                "intentHash": intent.intent_hash,
+                "command": command,
+                "approvalSubjectHash": approval.approval_subject_hash,
+                "dispatch": dispatch_material,
+                "dependsOnAttemptId": _id(dependency.id if dependency else None),
+                "dependencySubjectHash": dependency_subject_hash,
+            }
+        )
         attempt = PublicationAttempt.objects.create(
+            id=attempt_id,
             publication=publication,
             article_revision_id=intent.article_revision_id,
             publication_intent=intent,
@@ -7913,14 +7985,9 @@ def _dispatch_publication_atomic(
             remote_lookup_key=publication.remote_lookup_key,
             correlation_id=audit_context.correlation_id,
             recovery_state=PublicationRecoveryState.IN_PROGRESS,
-            request_fingerprint=sha256_hex(
-                {
-                    "intentHash": intent.intent_hash,
-                    "command": command,
-                    "approvalSubjectHash": approval.approval_subject_hash,
-                    "dispatch": dispatch_material,
-                }
-            ),
+            depends_on_attempt=dependency,
+            dependency_subject_hash=dependency_subject_hash,
+            request_fingerprint=request_fingerprint,
         )
         media_operations = ensure_publication_media_delivery_operations_locked(
             attempt=attempt
@@ -7928,6 +7995,7 @@ def _dispatch_publication_atomic(
         if media_operations:
             media_pending_attempt_ids.add(attempt.id)
         attempts.append(attempt)
+        attempts_by_target[target_id] = attempt
     attempts_manifest = _publication_attempt_manifest(attempts)
     attempts_hash = sha256_hex(attempts_manifest)
     intent.state = PublicationIntent.State.DISPATCHED
@@ -7943,14 +8011,10 @@ def _dispatch_publication_atomic(
     )
     _mark_origin_run_publishing_locked(intent)
     publish_at = data.get("publishAt")
-    wordpress = [row for row in attempts if row.publication.target.channel == ChannelCode.WORDPRESS]
-    blogger = [row for row in attempts if row.publication.target.channel == ChannelCode.BLOGGER]
     initial = [
         row
-        for row in (
-            wordpress
-            or [row for row in blogger if _wordpress_dependency_ready(row)]
-        )
+        for row in attempts
+        if row.depends_on_attempt_id is None
         if row.id not in media_pending_attempt_ids
     ]
     for attempt in initial:
@@ -8015,41 +8079,172 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
     )
 
 
-def _canonical_dependency_target_id(attempt: PublicationAttempt) -> uuid.UUID:
+def _attempt_command(attempt: PublicationAttempt) -> dict[str, Any]:
     command = next(
         (
             row
             for row in attempt.publication_intent.target_commands
             if isinstance(row, dict)
-            and str(row.get("targetId"))
-            == str(attempt.publication.target.id)
+            and str(row.get("targetId")) == str(attempt.publication.target.id)
         ),
         None,
     )
-    try:
-        dependency_id = uuid.UUID(
-            str((command or {}).get("canonicalDependencyTargetId"))
-        )
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise Conflict(
-            "Blogger publication has no exact WordPress dependency target"
-        ) from exc
-    return dependency_id
+    if command is None:
+        raise Conflict("publication attempt has no exact frozen target command")
+    return command
 
 
-def _wordpress_dependency_queryset(attempt: PublicationAttempt):
-    dependency_id = _canonical_dependency_target_id(attempt)
-    return Publication.objects.filter(
-        article_id=attempt.publication.article_id,
-        target_id=dependency_id,
-        target__channel=ChannelCode.WORDPRESS,
-        state=Publication.State.PUBLISHED,
-        canonical_ready_at__isnull=False,
+def _publication_dependency_subject_hash(
+    *,
+    dependent_attempt: PublicationAttempt,
+    dependency_attempt: PublicationAttempt,
+) -> str:
+    return sha256_hex(
+        {
+            "version": "publication-dependency-v1",
+            "publicationIntentId": str(dependent_attempt.publication_intent_id),
+            "articleRevisionId": str(dependent_attempt.article_revision_id),
+            "dependentTargetId": str(dependent_attempt.publication.target_id),
+            "dependentTargetSnapshotId": str(dependent_attempt.target_snapshot_id),
+            "dependentTargetConfigHash": dependent_attempt.target_config_hash,
+            "dependentAction": dependent_attempt.resolved_action,
+            "dependencyAttemptId": str(dependency_attempt.id),
+            "dependencyPublicationId": str(dependency_attempt.publication_id),
+            "dependencyTargetId": str(dependency_attempt.publication.target_id),
+            "dependencyTargetSnapshotId": str(dependency_attempt.target_snapshot_id),
+            "dependencyTargetConfigHash": dependency_attempt.target_config_hash,
+            "dependencyAction": dependency_attempt.resolved_action,
+            "dependencyApprovalSubjectHash": dependency_attempt.approval_subject_hash,
+            "dependencyRequestFingerprint": dependency_attempt.request_fingerprint,
+            "environment": dependency_attempt.publication.target.environment,
+        }
     )
 
 
+def _valid_public_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    parts = urlsplit(value)
+    return parts.scheme.lower() in {"http", "https"} and bool(parts.netloc)
+
+
+def _require_wordpress_dependency(
+    attempt: PublicationAttempt,
+    *,
+    require_ready: bool,
+) -> PublicationAttempt:
+    target = attempt.publication.target
+    if target.channel != ChannelCode.BLOGGER:
+        raise Conflict("only Blogger attempts may have a WordPress dependency")
+    dependency = getattr(attempt, "depends_on_attempt", None)
+    if dependency is None or not getattr(attempt, "depends_on_attempt_id", None):
+        raise Conflict("Blogger publication has no explicit WordPress attempt dependency")
+    if str(dependency.id) == str(attempt.id):
+        raise Conflict("publication dependency cannot reference itself")
+    dependency_target = dependency.publication.target
+    if (
+        dependency_target.channel != ChannelCode.WORDPRESS
+        or dependency_target.role != ChannelRole.PRIMARY
+    ):
+        raise Conflict("dependency is not the primary WordPress target")
+    if dependency_target.environment != target.environment:
+        raise Conflict("WordPress dependency environment differs from Blogger")
+    if (
+        str(dependency.publication_intent_id)
+        != str(attempt.publication_intent_id)
+        or str(dependency.article_revision_id) != str(attempt.article_revision_id)
+        or str(dependency.publication.article_id)
+        != str(attempt.publication.article_id)
+    ):
+        raise Conflict("WordPress dependency lineage differs from Blogger")
+    command = _attempt_command(attempt)
+    if str(command.get("canonicalDependencyTargetId")) != str(
+        dependency.publication.target_id
+    ):
+        raise Conflict("frozen canonical dependency target differs from attempt")
+    dependency_command = _attempt_command(dependency)
+    if (
+        str(dependency_command.get("targetSnapshotId"))
+        != str(dependency.target_snapshot_id)
+        or dependency_command.get("targetConfigHash")
+        != dependency.target_config_hash
+        or dependency_command.get("resolvedAction") != dependency.resolved_action
+    ):
+        raise Conflict("WordPress dependency command differs from attempt")
+    expected_subject_hash = _publication_dependency_subject_hash(
+        dependent_attempt=attempt,
+        dependency_attempt=dependency,
+    )
+    if attempt.dependency_subject_hash != expected_subject_hash:
+        raise Conflict("WordPress dependency subject hash differs from attempt")
+    if not require_ready:
+        return dependency
+    if dependency.state != PublicationAttempt.State.SUCCEEDED:
+        raise Conflict("WordPress dependency attempt is not terminal-successful")
+    publication = dependency.publication
+    if attempt.resolved_action == PublicationAction.UNPUBLISH:
+        if publication.state not in {
+            Publication.State.WITHDRAWN,
+            Publication.State.MARKED_WITHDRAWN,
+        }:
+            raise Conflict("WordPress withdrawal dependency is not terminal")
+        return dependency
+    if not _valid_public_url(publication.remote_url) or publication.canonical_ready_at is None:
+        raise Conflict("WordPress dependency has no verified canonical URL")
+    if attempt.resolved_action in {
+        PublicationAction.CREATE,
+        PublicationAction.UPDATE,
+    } and (
+        publication.state != Publication.State.PUBLISHED
+        or publication.remote_state != Publication.RemoteState.PUBLISHED
+    ):
+        raise Conflict("WordPress dependency is not publicly published")
+    return dependency
+
+
+def _canonical_wordpress_url(attempt: PublicationAttempt) -> str:
+    dependency = _require_wordpress_dependency(attempt, require_ready=True)
+    remote_url = dependency.publication.remote_url
+    if not _valid_public_url(remote_url):
+        raise Conflict("WordPress dependency canonical URL is invalid")
+    return remote_url
+
+
 def _wordpress_dependency_ready(attempt: PublicationAttempt) -> bool:
-    return _wordpress_dependency_queryset(attempt).exists()
+    try:
+        _require_wordpress_dependency(attempt, require_ready=True)
+    except Conflict:
+        return False
+    return True
+
+
+def _validate_canonical_dependency_commands(
+    *,
+    target_rows: dict[str, PublicationTarget],
+    commands: dict[str, dict[str, Any]],
+) -> None:
+    for target_id, target in target_rows.items():
+        command = commands[target_id]
+        dependency_id = command.get("canonicalDependencyTargetId")
+        if target.channel != ChannelCode.BLOGGER:
+            if dependency_id is not None:
+                raise InvalidInput(
+                    "WordPress target command cannot declare a canonical dependency"
+                )
+            continue
+        dependency = target_rows.get(str(dependency_id))
+        if dependency is None:
+            raise InvalidInput(
+                "Blogger command requires an exact WordPress target in the intent"
+            )
+        if (
+            dependency.channel != ChannelCode.WORDPRESS
+            or dependency.role != ChannelRole.PRIMARY
+            or dependency.environment != target.environment
+        ):
+            raise InvalidInput(
+                "Blogger dependency must be the same-environment primary WordPress target"
+            )
 
 
 def _kill_switch_enabled() -> bool:
@@ -8316,9 +8511,9 @@ def validate_attempt_gate(
             or target.pilot_state != ValidationState.PASSED
         ):
             raise Conflict("현재 test canary와 운영 파일럿 게이트가 유효하지 않습니다.")
-    if target.channel == ChannelCode.BLOGGER and attempt.resolved_action != PublicationAction.UNPUBLISH:
+    if target.channel == ChannelCode.BLOGGER:
         if not _wordpress_dependency_ready(attempt):
-            raise Conflict("WordPress 대표 원문의 공개 확인을 기다리고 있습니다.")
+            raise Conflict("정확한 WordPress 선행 attempt의 terminal 결과를 기다리고 있습니다.")
 
     if require_media:
         require_publication_media_ready_locked(attempt=attempt)
@@ -8338,10 +8533,7 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
     canonical_url = None
     canonical_state = ArticleChannelRender.CanonicalState.NOT_APPLICABLE
     if target.channel == ChannelCode.BLOGGER:
-        wordpress = _wordpress_dependency_queryset(attempt).first()
-        if not wordpress or not wordpress.remote_url:
-            raise Conflict("검증된 WordPress 대표 URL이 없습니다.")
-        canonical_url = wordpress.remote_url
+        canonical_url = _canonical_wordpress_url(attempt)
         canonical_state = ArticleChannelRender.CanonicalState.RESOLVED
         body = body.replace(
             "{{CANONICAL_WORDPRESS_URL}}",
@@ -9061,6 +9253,7 @@ def begin_attempt(
         "publication__target",
         "publication_intent__article_revision__generation_attempt",
         "approval",
+        "depends_on_attempt__publication__target",
     ).get(id=attempt_id)
     source_event = _require_worker_event(
         audit_context,
@@ -9151,13 +9344,7 @@ def begin_attempt(
                     },
                 )
             return attempt, None, None
-        intent = PublicationIntent.objects.select_for_update().get(id=intent.id)
-        PublicationTarget.objects.select_for_update().get(
-            id=preliminary.publication.target_id
-        )
-        Approval.objects.select_for_update().get(id=preliminary.approval_id)
-        Publication.objects.select_for_update().get(id=preliminary.publication_id)
-        PublicationAttempt.objects.select_for_update().get(id=preliminary.id)
+        _lock_publication_attempt_domain(preliminary)
     else:
         _lock_publication_attempt_domain(preliminary)
     return _begin_attempt_locked(
@@ -9180,7 +9367,11 @@ def _begin_attempt_locked(
 ]:
     _require_audit_actor(audit_context, "worker")
     attempt = PublicationAttempt.objects.select_for_update().select_related(
-        "publication__target", "publication_intent", "approval__article_channel_render"
+        "publication__target",
+        "publication_intent",
+        "approval__article_channel_render",
+        "depends_on_attempt__publication__target",
+        "depends_on_attempt__publication_intent",
     ).get(id=attempt_id)
     publication = attempt.publication
     source_event = _require_worker_event(
@@ -10161,12 +10352,8 @@ def persist_publish_result(
         if publication.target.channel == ChannelCode.WORDPRESS and publication.state == Publication.State.PUBLISHED:
             publication.canonical_ready_at = now
         if publication.target.channel == ChannelCode.BLOGGER:
-            wordpress = Publication.objects.filter(
-                article_id=publication.article_id,
-                target__channel=ChannelCode.WORDPRESS,
-                state=Publication.State.PUBLISHED,
-            ).first()
-            publication.canonical_source_url = wordpress.remote_url if wordpress else None
+            if attempt.resolved_action != PublicationAction.UNPUBLISH:
+                publication.canonical_source_url = _canonical_wordpress_url(attempt)
         PublicationMedia.objects.filter(
             publication=publication,
             article_revision_id=attempt.article_revision_id,
@@ -10769,20 +10956,9 @@ def publisher_error_result(error: PublisherError):
 def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
     if attempt.publication.target.channel != ChannelCode.WORDPRESS:
         return
-    dependent_target_ids = {
-        str(command["targetId"])
-        for command in attempt.publication_intent.target_commands
-        if (
-            isinstance(command, dict)
-            and str(command.get("canonicalDependencyTargetId"))
-            == str(attempt.publication.target_id)
-        )
-    }
     dependent = list(
         PublicationAttempt.objects.filter(
-            publication_intent=attempt.publication_intent,
-            publication__target__channel=ChannelCode.BLOGGER,
-            publication__target_id__in=dependent_target_ids,
+            depends_on_attempt=attempt,
             state=PublicationAttempt.State.QUEUED,
         ).values_list("id", "correlation_id")
     )

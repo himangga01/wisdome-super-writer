@@ -823,6 +823,21 @@ engine↔locator contract test를 통과하기 전 HWP profile을 승인해서�
 7. 안전한 단계만 재개하고 run/step/publication의 correlation ID가 이어지는지 확인한다.
 8. 예정 시각 ±5분 기준과 WordPress 공개 지연을 포함한 지연 사유 보고를 측정한다.
 
+### 12.1 T024 대표 원문 dependency 확인
+
+1. 같은 production intent에 `primary_canonical` WordPress와 Blogger target을 함께 넣고 dispatch한다.
+2. WordPress/Blogger 논리 attempt가 각각 하나이고 Blogger의 `depends_on_attempt_id`가 그 dispatch의
+   WordPress attempt ID와 같은지 확인한다. dispatch manifest에도 ID와 dependency subject hash가 있어야 한다.
+3. WordPress 공개 확인 전에는 Blogger `publication.requested@2`가 생성되지 않는지 확인한다.
+4. WordPress 성공 뒤 Blogger final render의 `canonical_source_url`, 본문 원문 링크와 content hash가
+   그 dependency Publication의 검증 URL을 동결하는지 확인한다.
+5. 같은 article의 다른 WordPress publication, test target URL, 다른 environment 또는 subject hash
+   변조를 주입하면 Blogger 외부 호출이 0건인지 확인한다.
+6. correction update/mark-withdrawn은 WordPress terminal 결과와 최신 검증 URL 뒤에만 Blogger를
+   release하고, 완전 unpublish는 WordPress withdrawal terminal 뒤 공개 URL 없이 release하는지 확인한다.
+7. dependency가 없거나 둘 이상인 legacy Blogger attempt를 migration fixture에 넣으면 임의 선택 없이
+   fail-closed하는지 확인한다.
+
 ## 13. 자동 검증 모음
 
 ```powershell
@@ -1071,3 +1086,13 @@ refresh token and treats only 200 or explicit `invalid_token` as success. WordPr
 the exact introspected Application Password UUID and verifies 404/410 absence. Only proven remote
 success clears the local reference/version and snapshots the target; ambiguous results remain in
 reconciliation. No raw token or credential reference may appear in API, problem, audit, or log output.
+
+## English / AI-readable — T024 canonical dependency checks
+
+Dispatch WordPress and Blogger in one intent and assert that the Blogger logical attempt freezes the exact
+same-cohort WordPress attempt ID and dependency subject hash. No Blogger execution event may be released
+before that attempt reaches the required terminal state. Its final render must freeze only the linked
+Publication URL in canonical URL, body, and content hash. Cross-environment/test URLs, another WordPress
+Publication, subject tampering, and ambiguous legacy backfill must produce zero Blogger writes. Correction
+update/mark-withdrawn retains the linked verified URL; full unpublish waits for WordPress withdrawal and
+does not require a public URL.

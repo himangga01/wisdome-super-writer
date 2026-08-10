@@ -988,6 +988,9 @@ class PublicationAttemptQuerySet(models.QuerySet):
             "remote_lookup_key",
             "request_fingerprint",
             "execution_identity_version",
+            "depends_on_attempt",
+            "depends_on_attempt_id",
+            "dependency_subject_hash",
             "correlation_id",
             "created_at",
         }
@@ -1011,6 +1014,8 @@ class PublicationAttemptQuerySet(models.QuerySet):
             "remote_lookup_key",
             "request_fingerprint",
             "execution_identity_version",
+            "depends_on_attempt_id",
+            "dependency_subject_hash",
             "correlation_id",
             "created_at",
         }
@@ -1088,6 +1093,14 @@ class PublicationAttempt(models.Model):
         max_length=40,
         default=PUBLICATION_EXECUTION_IDENTITY_VERSION,
     )
+    depends_on_attempt = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="dependent_attempts",
+    )
+    dependency_subject_hash = models.CharField(max_length=64, blank=True)
     execution_generation = models.PositiveBigIntegerField(default=0)
     active_source_event = models.ForeignKey(
         "infrastructure.OutboxMessage",

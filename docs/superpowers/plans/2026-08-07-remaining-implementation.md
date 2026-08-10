@@ -1235,14 +1235,14 @@ raw credentials or credential references into API/problem/audit/log output.
 - Modify: `src/apps/publishing/automation.py`
 - Modify: `src/apps/publishing/corrections.py`
 - Modify: `src/apps/publishing/tasks.py`
-- Create: `src/apps/publishing/migrations/0013_publication_dependency.py`
+- Create: `src/apps/publishing/migrations/0014_publication_dependency.py`
 - Deferred contract test: `tests/contract/test_publishers.py`
 
 **Interfaces:**
 - Consumes: target refs frozen on `PublicationIntent`, WordPress `Publication.remote_url` and public verification timestamp.
 - Produces: explicit Blogger attempt dependency and final render with the exact WordPress URL.
 
-- [ ] **Step 1: attempt dependency를 모델에 명시한다.**
+- [x] **Step 1: attempt dependency를 모델에 명시한다.**
 
   ```python
   depends_on_attempt = models.ForeignKey(
@@ -1251,19 +1251,29 @@ raw credentials or credential references into API/problem/audit/log output.
   dependency_subject_hash = models.CharField(max_length=64, blank=True)
   ```
 
-- [ ] **Step 2: WordPress attempt가 성공·공개 확인된 뒤 Blogger를 release한다.**
+- [x] **Step 2: WordPress attempt가 성공·공개 확인된 뒤 Blogger를 release한다.**
 
-  `_wordpress_dependency_ready()`는 `remote_state=published`, `canonical_ready_at`, intent의 exact primary target snapshot과 public URL hash를 확인한다.
+  `_wordpress_dependency_ready()`는 explicit `depends_on_attempt`, 같은 intent/revision/article/environment,
+  exact primary target snapshot과 action-specific terminal/public URL 상태를 확인한다.
 
-- [ ] **Step 3: Blogger final render를 frozen URL로 생성한다.**
+- [x] **Step 3: Blogger final render를 frozen URL로 생성한다.**
 
-  mutable target 또는 다른 WordPress publication을 검색하지 않고 dependency attempt의 publication ID와 URL만 사용한다. test target URL은 production intent에 결합하지 않는다.
+  mutable target 또는 다른 WordPress publication을 검색하지 않고 dependency attempt의 publication ID와 URL만 사용한다. dependency subject는 lineage를, final render content hash는 URL을 동결하며 test target URL은 production intent에 결합하지 않는다.
 
-- [ ] **Step 4: correction dependency도 같은 순서를 사용한다.**
+- [x] **Step 4: correction dependency도 같은 순서를 사용한다.**
 
   update/mark-withdrawn/unpublish 모두 WordPress terminal result 후 Blogger command를 release한다.
 
-- [ ] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+#### English / AI-readable T024 decision
+
+`PublicationAttempt.depends_on_attempt` is a protected, immutable self-reference. Every Blogger action
+must reference the single same-intent, same-revision, same-article, same-environment primary WordPress
+attempt. The v1 dependency subject freezes lineage, and the Blogger final render separately freezes the
+verified URL in canonical URL/body/content material. Dispatch and correction create WordPress first;
+release, execution, final render, and reconcile follow only the FK. Unverifiable legacy cohorts abort the
+0014 migration rather than selecting an arbitrary publication.
+
+- [x] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
   git add src/apps/publishing

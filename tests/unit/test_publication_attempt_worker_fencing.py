@@ -673,9 +673,7 @@ class PublicationExecutionWorkerContractTests(SimpleTestCase):
         dispatch = SimpleNamespace(
             publication_intent_id=intent_id,
             attempt_count=1,
-            attempt_manifest_hash=(
-                "7b3e374055554f7d04213536eb73b4971829e0f18bb2e0bd65041e8f46847b02"
-            ),
+            attempt_manifest_hash="",
             correlation_id=correlation_id,
         )
         attempt = SimpleNamespace(
@@ -689,6 +687,11 @@ class PublicationExecutionWorkerContractTests(SimpleTestCase):
             publication=SimpleNamespace(target_id=uuid.UUID(int=3)),
             correlation_id=correlation_id,
             resolved_action="create",
+            depends_on_attempt_id=None,
+            dependency_subject_hash="",
+        )
+        dispatch.attempt_manifest_hash = services.sha256_hex(
+            services._publication_attempt_manifest([attempt])
         )
 
         observed = services._validated_dispatch_attempt_cohort(

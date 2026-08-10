@@ -1087,8 +1087,9 @@ T020 이전 intent는 정확한 과거 path·actor·request body를 복원할 �
 `target_snapshot_id`, `target_config_hash`, `resolved_action: create/update/unpublish/mark_withdrawn`,
 `canonical_dependency_target_id` nullable를 가진다. capability에 따라 WordPress는 `unpublish`,
 Blogger는 `mark_withdrawn`처럼 같은 정정 사건도 target별 action이 다를 수 있으므로 전역 action을
-두지 않는다. Blogger create/update/mark command는 primary WordPress target을 canonical dependency로
-고정하고, unpublish에는 dependency가 없다.
+두지 않는다. Blogger의 create/update/mark-withdrawn/unpublish command는 모두 같은 intent와
+같은 environment에 포함된 단 하나의 `primary_canonical` WordPress target을 canonical dependency로
+고정한다. 완전 unpublish는 공개 URL을 요구하지 않지만 WordPress terminal attempt가 먼저 성공해야 한다.
 
 초기 자동 경로는 CollectionRun snapshot을 복사해 intent를 만들지만 target 없는 초안도
 나중에 관리자가 target을 골라 manual intent를 만들 수 있다. target credential/capability/
@@ -1419,12 +1420,25 @@ update, 공개 확인과 최신 `remote_url` 저장이 먼저 성공한 뒤 Blog
 `next_retry_at`, `reconcile_attempt_no`, `execution_identity_version`, `execution_generation`,
 `active_source_event`, `active_consumer_name`, `active_consumer_lease_generation`,
 `active_consumer_lease_token`, `active_lease_token_hash`, `active_lease_expires_at`, `active_write_marker`,
-`active_write_started_at`, `terminal_event_key`, `terminal_generation`, `terminal_state`를 가진다.
+`active_write_started_at`, `terminal_event_key`, `terminal_generation`, `terminal_state`,
+`depends_on_attempt_id` nullable self-FK, `dependency_subject_hash`를 가진다.
 현재 실행 identity version은 `publication-execution-v1`이고 검증할 수 없는 legacy terminal
 material만 `legacy-unverifiable-v1`이다. `idempotency_key`가 전역 고유하고
 `reconcile_attempt_no`는 `0..5`다. DB는 조건 없는 `(publication_intent_id, publication_id)` unique를
 강제해 intent와 publication마다 논리 attempt row가 정확히 하나만 존재하게 한다. 실행 재시도는 새
 row를 insert하지 않고 그 row의 `attempt_no`/retry counter를 전진시킨다.
+
+Blogger attempt의 `depends_on_attempt_id`는 같은 dispatch cohort·intent·revision·article에서
+같은 environment의 `primary_canonical` WordPress attempt를 정확히 하나 가리킨다. WordPress와
+그 밖의 attempt에는 dependency가 없어야 한다. `publication-dependency-v1` subject hash는 양쪽
+attempt ID, publication/target/snapshot/config/action, approval subject, request fingerprint와
+environment를 결속하며 FK와 hash는 생성 뒤 불변이다. dispatch manifest도 dependency attempt ID와
+subject hash를 포함한다. WordPress 성공 뒤 Blogger final render가 그 dependency Publication의
+검증된 URL을 `canonical_source_url`, 본문과 content hash에 동결하므로 이후 다른 WordPress target,
+다른 environment 또는 같은 글의 다른 Publication을 다시 검색하지 않는다. create/update는 실제
+public state·`canonical_ready_at`·HTTP(S) URL이 필요하고, mark-withdrawn은 직전 검증 URL을 유지하며,
+unpublish는 WordPress terminal withdrawal만 요구하고 공개 URL은 요구하지 않는다. 검증할 수 없는
+legacy Blogger dependency나 불완전 dispatch cohort는 migration에서 추측하지 않고 fail-closed한다.
 
 T020 응답 `attemptNo=1`은 immutable acceptance 값이다. 모델의 `attempt_no`는 1~5 business
 write 번호이며 API/문서에서는 `executionAttemptNo`로 부른다. `execution_generation`은 같은
@@ -1801,6 +1815,7 @@ CorrectionCase 0..1 ── * PublicationIntent
 ArticleRevision 1 ── * QualityCheck
 ArticleRevision 1 ── * Approval * ── 1 PublicationTarget
 DraftArticle 1 ── * Publication 1 ── * PublicationAttempt
+PublicationAttempt(Blogger) * ── 1 PublicationAttempt(WordPress dependency)
 PublicationAttempt 1 ── * PublicationExecutionObservation 0..1 ── * PublicationLateExecutionResult
 PublicationAttempt 1 ── 0..5 PublicationReconcileGeneration 1 ── * PublicationReconcileDeliveryObservation
 PublicationReconcileDeliveryObservation 0..1 ── * PublicationLateExecutionResult
@@ -2379,3 +2394,20 @@ success clears the local reference and version together and creates a new immuta
 Timeouts, server failures, or a still-present WordPress password keep the decision in reconciliation and
 do not erase the local credential projection. Tokens and credential references never enter response,
 problem, audit, or log material.
+
+## English / AI-readable — T024 canonical publication dependency
+
+Every Blogger logical attempt freezes a protected `depends_on_attempt` self-reference to the exact
+same-dispatch, same-intent, same-revision, same-article, same-environment `primary_canonical` WordPress
+attempt. `publication-dependency-v1` binds both immutable attempt identities and their publication,
+target, snapshot, config, action, approval subject, request fingerprint, and environment. The Dispatch
+manifest also includes the dependency ID and subject hash. WordPress and all non-Blogger attempts must
+have no dependency. The relationship and hash are immutable after insert.
+
+The lineage hash intentionally precedes the remote write. Once the linked WordPress attempt succeeds,
+the Blogger final render separately freezes its verified URL in `canonical_source_url`, body HTML, and
+the render content hash. Release, execution, final rendering, and reconciliation follow only this FK and
+never search by article/channel/timestamp. Create/update require a public WordPress projection and
+verified HTTP(S) URL; mark-withdrawn preserves the last verified URL; unpublish waits for the WordPress
+withdrawal terminal result without requiring a public URL. Cross-environment, ambiguous, or incomplete
+legacy cohorts fail closed during migration.

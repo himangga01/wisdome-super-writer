@@ -35,6 +35,24 @@ class CorrectionPlan:
     target_commands: list[dict[str, Any]]
 
 
+def _canonical_wordpress_target_id(
+    blogger_publication: Publication,
+    publications: list[Publication],
+) -> str:
+    matches = [
+        str(row.target.id)
+        for row in publications
+        if row.target.channel == ChannelCode.WORDPRESS
+        and row.target.role == "primary_canonical"
+        and row.target.environment == blogger_publication.target.environment
+    ]
+    if len(matches) != 1:
+        raise CorrectionWorkflowError(
+            "Blogger corrections require one same-environment primary WordPress target."
+        )
+    return matches[0]
+
+
 def _resolved_action(case: CorrectionCase, publication: Publication) -> str:
     capabilities = publication.target.capabilities or {}
     if case.kind == "retraction":
@@ -65,14 +83,6 @@ def build_correction_plan(case: CorrectionCase) -> CorrectionPlan:
     if not publications:
         raise CorrectionWorkflowError("No existing remote publication is available to correct.")
 
-    wordpress_target_id = next(
-        (
-            str(row.target_id)
-            for row in publications
-            if row.target.channel == ChannelCode.WORDPRESS
-        ),
-        None,
-    )
     refs: list[dict[str, Any]] = []
     commands: list[dict[str, Any]] = []
     for publication in publications:
@@ -83,12 +93,11 @@ def build_correction_plan(case: CorrectionCase) -> CorrectionPlan:
             )
         action = _resolved_action(case, publication)
         dependency = None
-        if target.channel == ChannelCode.BLOGGER and action != PublicationAction.UNPUBLISH:
-            if not wordpress_target_id:
-                raise CorrectionWorkflowError(
-                    "Blogger corrections require the canonical WordPress target."
-                )
-            dependency = wordpress_target_id
+        if target.channel == ChannelCode.BLOGGER:
+            dependency = _canonical_wordpress_target_id(
+                publication,
+                publications,
+            )
         refs.append(
             {
                 "targetId": str(target.id),

@@ -58,6 +58,24 @@ def _lock_automation_targets(
     }
 
 
+def _canonical_wordpress_target_id(
+    blogger_target: PublicationTarget,
+    targets: dict[str, PublicationTarget],
+) -> str:
+    matches = [
+        str(row.id)
+        for row in targets.values()
+        if row.channel == ChannelCode.WORDPRESS
+        and row.role == "primary_canonical"
+        and row.environment == blogger_target.environment
+    ]
+    if len(matches) != 1:
+        raise InvalidInput(
+            "Blogger 자동발행에는 동일 환경의 대표 WordPress target 하나가 필요합니다."
+        )
+    return matches[0]
+
+
 def _frozen_schedule_intent_payload(
     intent: PublicationIntent,
     *,
@@ -436,10 +454,6 @@ def _dispatch_validated_schedule_run_atomic(
     if not requested_ids or set(targets) != set(requested_ids):
         raise InvalidInput("일정에 존재하지 않는 발행 target이 포함되어 있습니다.")
     _validate_automation_material(schedule, targets)
-    wordpress_ids = [key for key, row in targets.items() if row.channel == ChannelCode.WORDPRESS]
-    if any(row.channel == ChannelCode.BLOGGER for row in targets.values()) and not wordpress_ids:
-        raise InvalidInput("Blogger 자동발행 일정에는 대표 WordPress target이 필요합니다.")
-
     target_refs = []
     commands = []
     for target_id in sorted(targets):
@@ -462,7 +476,9 @@ def _dispatch_validated_schedule_run_atomic(
                 "targetConfigHash": target.current_config_hash,
                 "resolvedAction": action,
                 "canonicalDependencyTargetId": (
-                    wordpress_ids[0] if target.channel == ChannelCode.BLOGGER else None
+                    _canonical_wordpress_target_id(target, targets)
+                    if target.channel == ChannelCode.BLOGGER
+                    else None
                 ),
             }
         )
