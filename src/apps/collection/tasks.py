@@ -23,6 +23,7 @@ from .services import (
     finalize_source_attempt_delivery_failure as finalize_source_attempt_failure_service,
     project_run_terminal_observation,
     project_step_terminal_observation,
+    schedule_queue_one_release,
 )
 
 
@@ -307,6 +308,7 @@ def _finalize_collection_run_delivery_failure(
                 "next_recovery_at",
             )
         )
+        schedule_queue_one_release(run)
         return {
             "runId": str(run.id),
             "state": run.state,

@@ -52,6 +52,7 @@ from apps.collection.services import (
     begin_step_observation,
     project_run_terminal_observation,
     project_step_terminal_observation,
+    schedule_queue_one_release,
 )
 from wisdome_writer.infrastructure.http_safety import redact_url
 from wisdome_writer.infrastructure.outbox import (
@@ -616,6 +617,7 @@ def _fail_incomplete_legacy_hwp_locked(
             "next_recovery_at",
         )
     )
+    schedule_queue_one_release(run)
     return attempt
 
 
@@ -2123,6 +2125,12 @@ def _run_document_extraction(
             ) as current_child:
                 if current_child is None:
                     return DocumentExtraction.objects.get(pk=document_id)
+            if not CollectionRun.objects.filter(
+                pk=document.run_source_item.run_id,
+                state=RunState.EXTRACTING,
+                stop_requested_at__isnull=True,
+            ).exists():
+                return DocumentExtraction.objects.get(pk=document_id)
             if engine == ExtractionEngine.NATIVE_PDF:
                 output = NativePdfExtractor(profile.config).extract(path, pages)
             else:
@@ -2455,6 +2463,12 @@ def _run_generic_extraction(
         ) as current_attempt:
             if current_attempt is None:
                 return GenericExtractionAttempt.objects.get(pk=attempt.id)
+        if not CollectionRun.objects.filter(
+            pk=attempt.run_source_item.run_id,
+            state=RunState.EXTRACTING,
+            stop_requested_at__isnull=True,
+        ).exists():
+            return GenericExtractionAttempt.objects.get(pk=attempt.id)
         extractor = _generic_extractor(profile)
         if profile.engine == ExtractionEngine.LEGACY_HWP:
             output: GenericExtractionOutput = extractor.extract(
@@ -3594,6 +3608,7 @@ def _fail_generic_evidence_manifest_locked(
         recovery_state=RecoveryState.MANUAL_REQUIRED,
     )
     run.save()
+    schedule_queue_one_release(run)
     return {
         "runId": str(run.id),
         "state": run.state,
@@ -3904,6 +3919,7 @@ def finalize_run_evidence(run_id: str):
                     "next_recovery_at",
                 )
             )
+            schedule_queue_one_release(run)
             return {
                 "runId": str(run.id),
                 "state": run.state,
@@ -3983,6 +3999,7 @@ def finalize_run_evidence(run_id: str):
                     "next_recovery_at",
                 )
             )
+            schedule_queue_one_release(run)
             return {
                 "runId": str(run.id),
                 "state": run.state,
@@ -4157,6 +4174,7 @@ def finalize_run_evidence_fanout_failure(run_id: str, error_code: str):
                 "next_recovery_at",
             )
         )
+        schedule_queue_one_release(run)
         return {
             "runId": str(run.id),
             "state": run.state,
@@ -4244,6 +4262,7 @@ def _stop_run_evidence_locked(
             "next_recovery_at",
         )
     )
+    schedule_queue_one_release(run)
     return {"runId": str(run.id), "state": run.state}
 
 
@@ -4498,6 +4517,7 @@ def _finalize_run_evidence_wake_failure_locked(
             "next_recovery_at",
         )
     )
+    schedule_queue_one_release(run)
     return {
         "runId": str(run.id),
         "state": run.state,

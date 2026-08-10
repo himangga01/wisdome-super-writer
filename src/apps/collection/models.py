@@ -288,6 +288,60 @@ class CollectionRun(models.Model):
             raise ValidationError(errors)
 
 
+class RunControlDecisionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise TypeError("RunControlDecision is append-only")
+
+    def delete(self):
+        raise TypeError("RunControlDecision is append-only")
+
+    async def aupdate(self, **kwargs):
+        raise TypeError("RunControlDecision is append-only")
+
+    async def adelete(self):
+        raise TypeError("RunControlDecision is append-only")
+
+
+class RunControlDecision(models.Model):
+    class Action(models.TextChoices):
+        STOP = "stop", "Stop"
+        RETRY = "retry", "Retry"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(
+        CollectionRun,
+        on_delete=models.PROTECT,
+        related_name="control_decisions",
+    )
+    action = models.CharField(max_length=24, choices=Action.choices)
+    scope = models.JSONField(default=dict, blank=True)
+    request_key = models.CharField(max_length=200)
+    request_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    reauth_proof_id = models.UUIDField(null=True, blank=True)
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    decided_at = models.DateTimeField(auto_now_add=True)
+
+    objects = RunControlDecisionQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("run", "request_key"),
+                name="uq_run_control_decision_request",
+            ),
+        ]
+        ordering = ("decided_at", "id")
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("RunControlDecision is append-only")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("RunControlDecision is append-only")
+
+
 class SourceCollectionAttempt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     run = models.ForeignKey(CollectionRun, on_delete=models.CASCADE, related_name="collection_attempts")

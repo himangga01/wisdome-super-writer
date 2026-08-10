@@ -14,8 +14,10 @@ from apps.collection.models import (
     RunStep,
 )
 from apps.collection.services import (
+    mark_run_stage_stopped_locked,
     project_run_terminal_observation,
     project_step_terminal_observation,
+    schedule_queue_one_release,
 )
 from wisdome_writer.infrastructure.outbox import (
     CURRENT_EVENT_CONSUMER_LEASE_GENERATION,
@@ -125,6 +127,7 @@ def _complete_run_without_generation(run, *, alias: str) -> bool:
         ),
         using=alias,
     )
+    schedule_queue_one_release(run)
     return True
 
 
@@ -144,6 +147,8 @@ def request_run_clustering(run_id: str):
             aggregate_id=run.id,
             payload_identity={"run_id": str(run.id)},
         )
+        if mark_run_stage_stopped_locked(run, stage="editorial"):
+            return {"runId": str(run.id), "state": run.state}
         if run.state not in {
             RunState.VALIDATING,
             RunState.DRAFTING,
@@ -178,6 +183,8 @@ def cluster_and_verify_run(run_id: str):
             aggregate_id=run.id,
             payload_identity={"run_id": str(run.id)},
         )
+        if mark_run_stage_stopped_locked(run, stage="editorial"):
+            return {"runId": str(run.id), "state": run.state}
         clusters = cluster_run_items(run.id, using=alias)
         verifications = [
             verify_event_cluster(cluster.id, run_id=run.id, using=alias)
@@ -426,6 +433,12 @@ def generate_verification_draft(
                 "generation_manifest_hash": generation_manifest_hash,
             },
         )
+        if mark_run_stage_stopped_locked(run, stage="editorial"):
+            return {
+                "runId": str(run.id),
+                "verificationId": str(verification.id),
+                "state": run.state,
+            }
         list(
             EventCluster.objects.using(alias)
             .select_for_update()
@@ -624,6 +637,8 @@ def generate_run_draft(run_id: str):
             aggregate_id=run.id,
             payload_identity={"run_id": str(run.id)},
         )
+        if mark_run_stage_stopped_locked(run, stage="editorial"):
+            return {"runId": str(run.id), "state": run.state}
         verifications = list(
             EventClusterVerification.objects.using(alias)
             .filter(origin_run=run)
@@ -805,6 +820,7 @@ def _finalize_editorial_delivery_failure(
             ),
             using=alias,
         )
+        schedule_queue_one_release(run)
         record_audit_event(
             context=audit_context,
             action="collection_run.editorial_failed",

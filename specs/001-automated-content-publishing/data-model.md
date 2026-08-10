@@ -2524,3 +2524,40 @@ refs, a union window, manifest hash, and monotonic version. Release freezes one
 the original registry/policy/owner/targets/approval mode. Publishing consumes only this frozen material and
 separately rechecks current safety gates. `legacy-unverifiable-v1` rows are fail-closed for new or queued
 execution.
+
+## T028 실행 중지·선택 재시도·종결 정본 (한국어)
+
+`RunControlDecision`은 run 제어 요청의 append-only 정본이다. `(run, request_key)`는 유일하며
+`action`, 정규화한 단일 `scope`, 관리자, 재인증 proof ID와 요청 전체의 RFC 8785 SHA-256
+`request_hash`를 보존한다. 같은 key와 같은 material은 기존 결정을 replay하고, action·scope·사유·
+관리자·proof 중 하나라도 다르면 영구 충돌이다. `stop`은 빈 scope만 허용하고 `retry`는
+`sourceAttemptId`, `documentExtractionId`, `publicationAttemptId`, `targetId` 중 정확히 하나만 허용한다.
+결정 행은 ORM과 SQLite/PostgreSQL trigger에서 UPDATE/DELETE할 수 없다.
+
+중지 요청은 같은 transaction에서 `stop_requested_at`을 단조 설정하고 아직 임대되지 않은 run-owned
+Outbox를 `run_stop_requested` terminal 상태로 만든다. queued source는 `skipped`, queued publication은
+정확한 requested event에 결속한 `stale`, queued step은 `stopped`가 된다. 이미 실행 중인 worker의
+결과는 지우지 않되 collection/evidence/editorial/publishing 각 경계가 새 외부 HTTP·CPU 작업과 다음
+fan-out 직전에 stop을 다시 읽는다. 모든 child가 terminal이면 stop이 최종 run 상태에서 우선한다.
+
+공용 run projection은 step의 `succeeded|completed|failed|stopped`, source의
+`succeeded|failed|skipped`, publication의 `succeeded|permanent_failed|manual_required|stale`만
+terminal로 인정한다. 하나라도 열려 있으면 run을 바꾸지 않는다. stop이 없을 때 source가 모두
+실패했거나 required step/publication이 실패하면 `failed`, 그 외에는 `completed`다. error summary와
+failed count는 step/source/publication scope별로 계산한다. 최초 terminal commit만 queue-one release를
+예약하며 WordPress 성공 뒤 Blogger가 아직 대기 중이면 terminal로 보지 않는다.
+
+## T028 Run Stop, Selective Retry, and Terminal Authority (English/AI-readable)
+
+`RunControlDecision` is the append-only authority for run control. `(run, request_key)` is unique and
+the canonical request hash binds action, normalized single scope, reason, actor, and optional reauth
+proof. Exact material replays; any changed field conflicts. Stop accepts an empty scope. Retry accepts
+exactly one of `sourceAttemptId`, `documentExtractionId`, `publicationAttemptId`, or `targetId`.
+ORM and SQLite/PostgreSQL guards reject update and delete.
+
+Stop atomically sets the monotonic run stop timestamp and terminalizes unleased run-owned work. Queued
+source, publication, and step projections become skipped, stale with exact event provenance, and stopped.
+In-flight factual results remain durable, but every worker boundary rechecks stop before new HTTP/CPU work
+or downstream fan-out. The shared terminal projection waits for all step/source/publication children,
+preserves all-source failure, gives stop precedence, and derives one scoped error summary/impact document.
+Only the first terminal commit schedules queue-one release; an unresolved Blogger dependency is nonterminal.

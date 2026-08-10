@@ -866,6 +866,29 @@ historical replay or terminal outcome and never authorizes a new external write.
 - Migration rearms an in-flight requested event/receipt to pending/retry only when one exact
   immutable identity exists. Historical pending-ready keeps the v1 selected-manifest hash and must
   remain acceptable after aggregate recomputation.
+
+## 한국어 — T028 중지·재시도 이벤트 경계
+
+- 공개 worker event payload에는 관리자 사유, reauth proof, `RunControlDecision.request_hash`를 넣지
+  않는다. 이 값은 DB의 append-only 결정과 AuditEvent에서만 읽는다.
+- 중지는 새 fan-out event를 만들지 않는다. 아직 dispatcher가 임대하지 않은 run-owned message는
+  `run_stop_requested` terminal로 닫고, 이미 publish/claim된 event는 기존 payload와 receipt identity를
+  유지한 채 consumer가 run stop을 재조회해 정상 no-op 또는 factual-result settlement로 끝낸다.
+- 선택 재시도는 결정 scope가 정확히 한 terminal unit과 run lineage에 일치한 뒤에만 기존 domain의
+  versioned retry/reconcile event를 사용한다. 성공한 sibling의 event나 logical attempt를 다시 만들지
+  않는다. public payload에 다중 scope 또는 임의 target 집합을 추가하지 않는다.
+- terminal worker는 mutable run state를 추측하지 않고 step/source/publication terminal 집합을 다시
+  잠가 공용 projection을 적용한다. 최초 terminal commit만 queue-one release를 예약한다.
+
+## English / AI-readable — T028 stop and retry event boundary
+
+Administrator reason, reauth proof, and control request hash remain in the append-only database decision
+and audit ledger; they are not public worker payload fields. Stop emits no new fan-out. Unleased run-owned
+messages are terminalized, while already published/claimed deliveries retain their original event and
+receipt identity and converge through a stop-aware no-op or factual settlement. Selective retry may reuse
+only the existing versioned retry/reconcile event for one decision-scoped terminal unit and never recreates
+successful siblings. Terminal consumers lock and recompute the shared step/source/publication projection;
+only the first terminal commit releases a queue-one schedule.
 ## T025 자동발행 material 변경 이벤트 (한국어)
 
 - `evidence.profile_decided@1`의 기존 exact 4필드 payload는 이제 단순 ACK가 아니라 모든

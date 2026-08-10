@@ -1189,3 +1189,36 @@ Schedule and prove the existing run remains bound to the frozen owner, registry/
 mode, and execution hash. For queue-one, coalesce multiple ticks into one bounded sorted root and union
 window, release once after the active run terminates, and require exact replay. Frozen-field mutation and
 legacy queued execution must fail closed.
+
+## T028 중지·선택 재시도·종결 확인 절차 (한국어)
+
+1. 같은 run에 같은 `requestKey`로 stop을 두 번 요청한다. `RunControlDecision`은 한 행이고 두 번째
+   응답은 replay여야 한다. 같은 key로 사유나 action을 바꾸면 충돌해야 한다.
+2. source/editorial/publication event가 아직 pending인 run을 중지한다. message는
+   `run_stop_requested`로 terminal이고 queued step/source/publication은 각각
+   `stopped`/`skipped`/`stale`여야 하며 외부 adapter 호출은 0회여야 한다.
+3. worker가 이미 실행 중인 run을 중지한다. 이미 관측한 결과는 보존하되 다음 fan-out이 없어야 하고,
+   다음 HTTP/CPU 경계는 stop을 다시 읽어야 한다.
+4. source 전부 실패, 일부 source 성공, required step 실패, publication manual-required, stop 요청을
+   각각 만들고 공용 projection을 확인한다. all-source failure는 `failed`, stop은 모든 child terminal
+   뒤 `stopped`, 성공 집합만 `completed`여야 한다.
+5. retry scope에 두 ID를 보내면 거부한다. 정확히 한 failed source/document/publication/target만
+   선택하면 결정은 한 행이며 이미 성공한 sibling의 row/outbox 수는 변하지 않아야 한다.
+6. queue-one 대기 tick이 있는 run을 terminal로 만든다. commit 뒤 queued root가 정확히 한 번 release되고,
+   Blogger dependency가 아직 대기 중인 경우에는 release되지 않는지 확인한다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_run_control tests.unit.test_publication_attempt_worker_fencing tests.unit.test_schedule_dispatch_material -v 2
+```
+
+## T028 Run Control Verification (English/AI-readable)
+
+Replay one stop request and reject changed material under the same key. Stop a run with pending work and
+require terminal outbox plus stopped/skipped/stale child projections and zero new adapter calls. For an
+in-flight worker, preserve factual results but block all new fan-out and recheck stop at the next I/O/CPU
+boundary. Exercise all-source failure, required-step failure, publication failure, stop precedence, and
+successful completion through the shared projection. Retry accepts one supported failed unit only and
+does not recreate successful siblings. A terminal commit releases one queue-one root exactly once, while
+an unresolved channel dependency remains nonterminal.

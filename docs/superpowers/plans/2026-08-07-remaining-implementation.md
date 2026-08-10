@@ -1435,7 +1435,7 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/tasks.py`
 - Modify: `src/apps/scheduling/services.py`
-- Create: `src/apps/collection/migrations/0009_run_control_decision.py`
+- Create: `src/apps/collection/migrations/0010_run_control_decision.py`
 - Modify: `specs/001-automated-content-publishing/contracts/job-events.md`
 - Deferred integration test: `tests/integration/test_scheduling_operations.py`
 
@@ -1443,7 +1443,7 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Consumes: run state, kill switch version, terminal steps/attempts/channels, retry request key.
 - Produces: append-only `RunControlDecision`, cancelled/stopped projections, selective retry Outbox and final run state.
 
-- [ ] **Step 1: run 제어 결정을 append-only로 추가한다.**
+- [x] **Step 1: run 제어 결정을 append-only로 추가한다.**
 
   ```python
   class RunControlDecision(models.Model):
@@ -1458,15 +1458,15 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 
   `(run, request_key)` 고유 제약으로 stop/retry replay를 멱등 처리한다.
 
-- [ ] **Step 2: 모든 worker가 외부 작업 전에 stop을 다시 확인한다.**
+- [x] **Step 2: 모든 worker가 외부 작업 전에 stop을 다시 확인한다.**
 
   collection, evidence, editorial, publishing의 task entry와 외부 HTTP/CPU 작업 직전에 `stop_requested_at`과 global kill switch를 확인한다.
 
-- [ ] **Step 3: queued Outbox와 attempt를 안전하게 취소한다.**
+- [x] **Step 3: queued Outbox와 attempt를 안전하게 취소한다.**
 
   아직 lease되지 않은 메시지는 cancelled terminal observation을 남기고, 실행 중 worker는 결과를 보존하되 다음 fanout을 만들지 않는다.
 
-- [ ] **Step 4: run/step/channel terminal 집계를 하나의 service로 통합한다.**
+- [x] **Step 4: run/step/channel terminal 집계를 하나의 service로 통합한다.**
 
   ```python
   @dataclass(frozen=True)
@@ -1565,11 +1565,11 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 
   `calculate_run_terminal_projection()`은 required step/source/document/publication 상태를 모두 읽고 all-source failure를 `failed`로 유지한다.
 
-- [ ] **Step 5: selective retry 범위를 검증한다.**
+- [x] **Step 5: selective retry 범위를 검증한다.**
 
   `sourceAttemptId`, `documentExtractionId`, `publicationAttemptId`, `targetId` 중 정확히 하나의 승인된 terminal 단위만 재시도한다. 이미 성공한 다른 단위를 새로 만들지 않는다.
 
-- [ ] **Step 6: 모든 terminal 경로에서 queue-one을 해제한다.**
+- [x] **Step 6: 모든 terminal 경로에서 queue-one을 해제한다.**
 
   `release_waiting_for_topic()`을 transaction commit 이후 정확히 한 번 호출하고, WordPress 성공 후 Blogger 대기 상태는 terminal로 보지 않는다.
 

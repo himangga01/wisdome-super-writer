@@ -2459,6 +2459,77 @@ def _terminalize_unreachable_dependents_locked(
         )
 
 
+def stop_queued_publication_attempts_for_run_locked(
+    run_id: uuid.UUID | str,
+    *,
+    stopped_at=None,
+) -> int:
+    now = stopped_at or timezone.now()
+    attempts = list(
+        PublicationAttempt.objects.select_for_update()
+        .select_related("publication")
+        .filter(
+            publication_intent__origin_collection_run_id=run_id,
+            state__in={
+                PublicationAttempt.State.QUEUED,
+                PublicationAttempt.State.RETRYABLE_FAILED,
+            },
+        )
+        .order_by("id")
+    )
+    publication_ids: set[uuid.UUID] = set()
+    for attempt in attempts:
+        requested = _requested_event_for_terminal_locked(attempt)
+        attempt.state = PublicationAttempt.State.STALE
+        attempt.finished_at = now
+        attempt.error_code = "run_stop_requested"
+        attempt.recovery_state = PublicationRecoveryState.STOPPED
+        attempt.next_recovery_at = None
+        attempt.next_retry_at = None
+        attempt.terminal_impact = _publication_terminal_impact(
+            stage="run_stop",
+            final_state=attempt.state,
+            error_code=attempt.error_code,
+        )
+        attempt.terminal_event_key = requested.message_key
+        attempt.terminal_generation = attempt.execution_generation
+        attempt.terminal_state = attempt.state
+        attempt.save(
+            update_fields=(
+                "state",
+                "finished_at",
+                "error_code",
+                "recovery_state",
+                "next_recovery_at",
+                "next_retry_at",
+                "terminal_impact",
+                "terminal_event_key",
+                "terminal_generation",
+                "terminal_state",
+            )
+        )
+        publication_ids.add(attempt.publication_id)
+    for publication in Publication.objects.select_for_update().filter(
+        id__in=publication_ids
+    ):
+        publication.state = (
+            Publication.State.PUBLISHED
+            if publication.remote_post_id
+            else Publication.State.PENDING
+        )
+        publication.scheduled_for = None
+        publication.last_error_code = "run_stop_requested"
+        publication.save(
+            update_fields=(
+                "state",
+                "scheduled_for",
+                "last_error_code",
+                "updated_at",
+            )
+        )
+    return len(attempts)
+
+
 def _project_origin_run_terminal_locked(
     attempt: PublicationAttempt,
 ) -> None:
@@ -2582,6 +2653,9 @@ def _project_origin_run_terminal_locked(
             "next_recovery_at",
         )
     )
+    from apps.collection.services import schedule_queue_one_release
+
+    schedule_queue_one_release(run)
 
 
 def _converge_revoked_attempt_redelivery_locked(
