@@ -2411,3 +2411,39 @@ never search by article/channel/timestamp. Create/update require a public WordPr
 verified HTTP(S) URL; mark-withdrawn preserves the last verified URL; unpublish waits for the WordPress
 withdrawal terminal result without requiring a public URL. Cross-environment, ambiguous, or incomplete
 legacy cohorts fail closed during migration.
+## T025 서버 유도형 자동발행 검증 정본 (한국어)
+
+`AutoPublishValidation`의 정본은 클라이언트가 제출한 해시 묶음이 아니라 서버가 만든
+`auto-publish-validation-material-v2` 문서다. 관리자는 `topic`, `requestKey`, `reason`만
+제출한다. 서버는 현재 target snapshot과 credential version, 승인된 source registry와
+source-adapter 구현 manifest, 승인된 extraction profile과 검증 보고서, 현재 topic policy,
+exact editorial policy release, generation/quality/render/publisher contract를 조회해 RFC 8785
+SHA-256으로 `materialHash`를 계산한다. 같은 요청 키의 동일 요청은 기존 행을 반환하고,
+다른 요청 키는 material이 같아도 별도의 감사 가능한 append-only validation 행을 만든다.
+
+test target 검증은 서버 고정 `auto-publish-canary-v1`으로 실행한
+create→update→media(채널상 불필요하면 명시적 통과)→public verify→withdraw→cleanup 결과를
+사용한다. 원격 post/media ID와 최종 `deleted` 상태를 `remoteCleanupRefs`에 보존하고, canary
+실행 snapshot과 완료 뒤 target snapshot을 모두 결속한다. production target은 동일 채널의
+현재 test canary와 관리자 승인·공개 URL이 확인된 manual pilot attempt를 함께 결속한다.
+
+registry/profile 결정 또는 target snapshot 변경은 draft/passed validation을 `stale`로
+투영하고 target 자동발행을 끈다. 파일 기반 editorial policy를 포함해 비동기 투영 전에
+변경될 수 있는 모든 material은 activation, intent 생성, attempt gate, 외부 쓰기 직전 gate가
+현재 서버 material을 다시 계산해 exact 불일치 시 fail-closed한다. migration 이전
+`legacy-client-material-v1`은 조회만 가능하며 activation 근거가 될 수 없다.
+
+## T025 Server-Derived Auto-Publish Validation Canonical Model (English/AI-readable)
+
+`AutoPublishValidation.material_document` is canonical only when
+`material_version=auto-publish-validation-material-v2`. The request body contains exactly
+`topic`, `requestKey`, and `reason`; every registry/profile/policy/generator/publisher/credential
+hash and implementation version is server-resolved. `material_hash` is RFC 8785 SHA-256, is not
+globally unique, and each distinct request identity retains its own append-only row.
+
+Test evidence freezes the destructive canary execution snapshot, result target snapshot, passed
+stage report, and deleted remote object identities. Production evidence freezes the current
+same-channel test canary plus an approved manual pilot attempt and verified public URL. Upstream
+registry/profile decisions and target snapshot changes project validations to `stale` and disable
+the target; every validated-auto boundary independently rebuilds the current material. Historical
+`legacy-client-material-v1` rows are permanently ineligible.

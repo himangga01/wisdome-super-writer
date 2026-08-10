@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import html
 import hashlib
+import importlib.metadata
+import platform
 import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
@@ -36,7 +39,13 @@ from apps.audit.services import (
     require_audit_replay,
     require_worker_event,
 )
+from apps.editorial.policies import resolve_editorial_policy_snapshot
 from apps.editorial.services import require_revision_publishable
+from apps.evidence.profiles import approved_profile_refs
+from apps.topics.services import (
+    approved_registry_material,
+    approved_topic_policy_material,
+)
 from wisdome_writer.domain.concurrency import (
     canonical_request_hash,
     require_idempotent_match,
@@ -48,7 +57,11 @@ from wisdome_writer.domain.errors import (
     NotFound,
     RequestKeyConflict,
 )
-from wisdome_writer.domain.hashing import sha256_hex
+from wisdome_writer.domain.hashing import (
+    CANONICAL_HASH_SCHEMA_V1,
+    canonical_hash,
+    sha256_hex,
+)
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle, RenderedMedia
 from .models import (
@@ -94,6 +107,18 @@ from .models import (
 
 
 PUBLISHER_CONTRACT_VERSION = "publisher-v1"
+AUTO_PUBLISH_VALIDATION_MATERIAL_VERSION = "auto-publish-validation-material-v2"
+AUTO_PUBLISH_CANARY_POLICY_VERSION = "auto-publish-canary-v1"
+AUTO_PUBLISH_RENDER_CONTRACT_VERSION = "article-channel-render-v1"
+REQUIRED_CANARY_STAGE_CODES = frozenset(
+    {"create", "update", "media", "public_verify", "withdraw", "cleanup"}
+)
+
+
+def _auto_publish_material_hash(value: Any) -> str:
+    return canonical_hash(value, schema_version=CANONICAL_HASH_SCHEMA_V1)
+
+
 ADAPTER_MANIFESTS = {
     ChannelCode.WORDPRESS: sha256_hex(
         {
@@ -112,6 +137,47 @@ ADAPTER_MANIFESTS = {
         }
     ),
 }
+
+_PUBLISHER_IMPLEMENTATION_FILES = {
+    ChannelCode.WORDPRESS: (
+        "src/adapters/publishers/wordpress/__init__.py",
+        "src/adapters/publishers/wordpress/client.py",
+    ),
+    ChannelCode.BLOGGER: (
+        "src/adapters/publishers/blogger/__init__.py",
+        "src/adapters/publishers/blogger/client.py",
+        "src/adapters/publishers/blogger/oauth.py",
+    ),
+}
+
+
+def _publisher_implementation_manifest(channel: str) -> dict[str, Any]:
+    repository_root = Path(settings.REPOSITORY_ROOT)
+    paths = (
+        "src/apps/publishing/contracts.py",
+        "src/wisdome_writer/domain/hashing.py",
+        *_PUBLISHER_IMPLEMENTATION_FILES[channel],
+    )
+    return {
+        "schemaVersion": "publisher-implementation-manifest-v1",
+        "channel": channel,
+        "contractVersion": PUBLISHER_CONTRACT_VERSION,
+        "runtime": {
+            "pythonVersion": platform.python_version(),
+            "httpxVersion": importlib.metadata.version("httpx"),
+        },
+        "implementationFiles": [
+            {
+                "path": relative,
+                "sha256": hashlib.sha256(
+                    (repository_root / relative).read_bytes()
+                ).hexdigest(),
+            }
+            for relative in sorted(paths)
+        ],
+    }
+
+
 PUBLISHING_AUDIT_MATERIAL_VERSION = "publishing-state-v1"
 PUBLICATION_INTENT_REQUEST_VERSION = "publication-intent-request-v1"
 PUBLICATION_DISPATCH_REQUEST_VERSION = "publication-dispatch-request-v1"
@@ -3437,7 +3503,32 @@ def _target_material(target: PublicationTarget) -> dict[str, Any]:
     }
 
 
+def _stale_target_validations_after_snapshot_change(
+    target: PublicationTarget,
+    *,
+    prior_snapshot_id: uuid.UUID | None,
+) -> None:
+    if prior_snapshot_id is None or prior_snapshot_id == target.current_snapshot_id:
+        return
+    AutoPublishValidation.objects.filter(
+        target=target,
+        target_snapshot_id=prior_snapshot_id,
+        status__in=(
+            AutoPublishValidation.State.DRAFT,
+            AutoPublishValidation.State.PASSED,
+        ),
+    ).update(
+        status=AutoPublishValidation.State.STALE,
+        invalidated_at=timezone.now(),
+        invalidation_reason="publication_target_snapshot_changed",
+    )
+    if target.auto_publish_enabled:
+        target.auto_publish_enabled = False
+        target.save(update_fields=("auto_publish_enabled", "updated_at"))
+
+
 def _snapshot_locked(target: PublicationTarget) -> PublicationTargetSnapshot:
+    prior_snapshot_id = target.current_snapshot_id
     material = _target_material(target)
     config_hash = sha256_hex(material)
     existing = PublicationTargetSnapshot.objects.filter(target=target, config_hash=config_hash).first()
@@ -3456,6 +3547,10 @@ def _snapshot_locked(target: PublicationTarget) -> PublicationTargetSnapshot:
                 "publisher_adapter_manifest_hash",
                 "updated_at",
             ]
+        )
+        _stale_target_validations_after_snapshot_change(
+            target,
+            prior_snapshot_id=prior_snapshot_id,
         )
         return existing
     version = (
@@ -3497,6 +3592,10 @@ def _snapshot_locked(target: PublicationTarget) -> PublicationTargetSnapshot:
             "publisher_adapter_manifest_hash",
             "updated_at",
         ]
+    )
+    _stale_target_validations_after_snapshot_change(
+        target,
+        prior_snapshot_id=prior_snapshot_id,
     )
     return snapshot
 
@@ -4064,7 +4163,6 @@ def run_target_preflight(
 def create_canary_run(
     target_id: str,
     *,
-    policy_version: str,
     reason: str,
     request_key: str,
     user,
@@ -4078,6 +4176,7 @@ def create_canary_run(
     if audit_context.reason_code != reason:
         raise Forbidden("reason differs from audit provenance")
 
+    policy_version = AUTO_PUBLISH_CANARY_POLICY_VERSION
     normalized_target_id = str(uuid.UUID(str(target_id)))
     request_hash = _canary_request_hash(
         target_id=normalized_target_id,
@@ -4378,6 +4477,7 @@ def persist_canary_run_result(
     *,
     stages: list[dict[str, object]],
     passed: bool,
+    remote_cleanup_refs: list[dict[str, str]] | None = None,
     audit_context: AuditContext,
 ) -> TargetCanaryRun:
     _require_audit_actor(audit_context, "worker")
@@ -4401,6 +4501,7 @@ def persist_canary_run_result(
         {
             "stages": stages,
             "passed": passed,
+            "remoteCleanupRefs": remote_cleanup_refs or [],
         }
     )
     if _worker_audit_replay(
@@ -4429,6 +4530,7 @@ def persist_canary_run_result(
         passed = False
     report_hash = sha256_hex(stages)
     run.stage_results = stages
+    run.remote_cleanup_refs = remote_cleanup_refs or []
     run.report_hash = report_hash
     run.state = (
         TargetCanaryRun.State.PASSED
@@ -4441,6 +4543,7 @@ def persist_canary_run_result(
     run.save(
         update_fields=(
             "stage_results",
+            "remote_cleanup_refs",
             "report_hash",
             "state",
             "finished_at",
@@ -4455,7 +4558,9 @@ def persist_canary_run_result(
             target.connection_state = PublicationTarget.ConnectionState.VERIFIED
         target.last_canary_at = timezone.now()
         target.save()
-        _snapshot_locked(target)
+        result_snapshot = _snapshot_locked(target)
+        run.result_target_snapshot = result_snapshot
+        run.save(update_fields=("result_target_snapshot",))
         _stale_locked_intents(locked_intents)
     _record_publishing_audit(
         audit_context=audit_context,
@@ -4482,27 +4587,325 @@ def persist_canary_run_result(
     return run
 
 
-def _validation_material(data: dict[str, Any], target_id: str) -> dict[str, Any]:
-    return {
-        "targetId": target_id,
-        "topic": data["topic"],
-        "targetSnapshotId": data["targetSnapshotId"],
-        "targetConfigHash": data["targetConfigHash"],
-        "sourceRegistrySnapshotId": data["sourceRegistrySnapshotId"],
-        "registryManifestHash": data["registryManifestHash"],
-        "sourceAdapterManifestHash": data["sourceAdapterManifestHash"],
-        "extractionProfileManifestHash": data["extractionProfileManifestHash"],
-        "generationPipelineManifestHash": data["generationPipelineManifestHash"],
-        "topicPolicyVersion": data["topicPolicyVersion"],
-        "editorialPolicyHash": data["editorialPolicyHash"],
-        "qualityGateManifestHash": data["qualityGateManifestHash"],
-        "renderContractVersion": data["renderContractVersion"],
-        "channelContractVersion": data["channelContractVersion"],
-        "publisherAdapterManifestHash": data["publisherAdapterManifestHash"],
-        "testReportObjectKey": data["testReportObjectKey"],
-        "testReportObjectVersion": data["testReportObjectVersion"],
-        "testReportHash": data["testReportHash"],
+def _normalize_auto_publish_validation_request(data: dict[str, Any]) -> dict[str, str]:
+    allowed = {"topic", "requestKey", "reason"}
+    if not isinstance(data, dict) or set(data) != allowed:
+        raise InvalidInput(
+            "auto-publish validation accepts only topic, requestKey, and reason"
+        )
+    topic = data.get("topic")
+    request_key = data.get("requestKey")
+    reason = data.get("reason")
+    if topic not in {"housing_subscription", "semiconductor_news"}:
+        raise InvalidInput("unknown auto-publish validation topic")
+    if (
+        not isinstance(request_key, str)
+        or request_key != request_key.strip()
+        or not 8 <= len(request_key) <= 200
+    ):
+        raise InvalidInput("requestKey is invalid")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 3 <= len(reason) <= 500
+    ):
+        raise InvalidInput("reason is invalid")
+    return {"topic": topic, "requestKey": request_key, "reason": reason}
+
+
+def _canary_run_material(run: TargetCanaryRun) -> dict[str, Any]:
+    if (
+        run.state != TargetCanaryRun.State.PASSED
+        or run.policy_version != AUTO_PUBLISH_CANARY_POLICY_VERSION
+        or not isinstance(run.stage_results, list)
+        or not run.report_hash
+        or not run.result_target_snapshot_id
+        or sha256_hex(run.stage_results) != run.report_hash
+    ):
+        raise InvalidInput("current canary result is not a verified passed run")
+    stages = {
+        str(row.get("code")): bool(row.get("passed"))
+        for row in run.stage_results
+        if isinstance(row, dict)
     }
+    if any(not stages.get(code) for code in REQUIRED_CANARY_STAGE_CODES):
+        raise InvalidInput("canary result does not contain every required stage")
+    refs = run.remote_cleanup_refs
+    if (
+        not isinstance(refs, list)
+        or not refs
+        or any(
+            not isinstance(ref, dict)
+            or ref.get("kind") not in {"post", "media"}
+            or not isinstance(ref.get("remoteId"), str)
+            or not ref["remoteId"]
+            or ref.get("state") != "deleted"
+            for ref in refs
+        )
+        or not any(ref["kind"] == "post" for ref in refs)
+    ):
+        raise InvalidInput("canary cleanup identity is incomplete")
+    return {
+        "kind": "test_canary",
+        "runId": str(run.id),
+        "targetSnapshotId": str(run.target_snapshot_id),
+        "resultTargetSnapshotId": str(run.result_target_snapshot_id),
+        "policyVersion": run.policy_version,
+        "reportHash": run.report_hash,
+        "stageResults": [dict(row) for row in run.stage_results],
+        "cleanupRefs": sorted(
+            [dict(ref) for ref in refs],
+            key=lambda ref: (str(ref["kind"]), str(ref["remoteId"])),
+        ),
+    }
+
+
+def _passed_canary_for_target(target: PublicationTarget) -> dict[str, Any]:
+    run = (
+        TargetCanaryRun.objects.filter(
+            target=target,
+            result_target_snapshot_id=target.current_snapshot_id,
+            policy_version=AUTO_PUBLISH_CANARY_POLICY_VERSION,
+            state=TargetCanaryRun.State.PASSED,
+        )
+        .order_by("-finished_at", "-created_at", "-id")
+        .first()
+    )
+    if run is None:
+        raise Conflict("current target snapshot has no passed destructive canary")
+    return _canary_run_material(run)
+
+
+def _production_pilot_material(target: PublicationTarget) -> dict[str, Any]:
+    attempt = (
+        PublicationAttempt.objects.select_related(
+            "publication",
+            "publication_intent",
+            "approval",
+        )
+        .filter(
+            publication__target=target,
+            publication_intent__approval_mode=ApprovalMode.MANUAL,
+            state=PublicationAttempt.State.SUCCEEDED,
+            resolved_action__in=(
+                PublicationAction.CREATE,
+                PublicationAction.UPDATE,
+                PublicationAction.MARK_WITHDRAWN,
+            ),
+            approval__decision=Approval.Decision.APPROVED,
+        )
+        .order_by("-finished_at", "-created_at", "-id")
+        .first()
+    )
+    if (
+        attempt is None
+        or target.pilot_state != ValidationState.PASSED
+        or target.last_pilot_at is None
+        or attempt.finished_at is None
+        or attempt.finished_at > target.last_pilot_at
+        or attempt.publication.state
+        not in {Publication.State.PUBLISHED, Publication.State.MARKED_WITHDRAWN}
+        or not attempt.publication.remote_url
+    ):
+        raise Conflict("production target has no approved public pilot evidence")
+    remote_url = _validated_remote_url(attempt.publication.remote_url)
+    return {
+        "kind": "production_pilot",
+        "attemptId": str(attempt.id),
+        "publicationId": str(attempt.publication_id),
+        "approvalId": str(attempt.approval_id),
+        "targetSnapshotId": str(attempt.target_snapshot_id),
+        "revisionNo": attempt.publication_intent.revision_no,
+        "remoteUrl": remote_url,
+        "remoteUrlHash": sha256_hex(remote_url),
+        "verifiedAt": attempt.finished_at.isoformat(),
+    }
+
+
+def _auto_publish_validation_evidence(target: PublicationTarget) -> dict[str, Any]:
+    if target.environment == TargetEnvironment.TEST:
+        return _passed_canary_for_target(target)
+    if (
+        target.canary_target_id is None
+        or target.canary_target.environment != TargetEnvironment.TEST
+        or target.canary_target.channel != target.channel
+    ):
+        raise Conflict("production target has no same-channel isolated canary target")
+    return {
+        "kind": "production_release_evidence",
+        "canary": _passed_canary_for_target(target.canary_target),
+        "pilot": _production_pilot_material(target),
+    }
+
+
+def build_auto_publish_validation_material(
+    target: PublicationTarget,
+    topic_code: str,
+    *,
+    using: str = "default",
+) -> dict[str, Any]:
+    """Build the immutable auto-publish proof exclusively from server state."""
+
+    if (
+        target.current_snapshot_id is None
+        or target.connection_state != PublicationTarget.ConnectionState.VERIFIED
+        or target.preflight_state != ValidationState.PASSED
+        or target.publisher_adapter_manifest_hash != ADAPTER_MANIFESTS[target.channel]
+    ):
+        raise Conflict("publication target is not eligible for validation")
+    lock_material = transaction.get_connection(using).in_atomic_block
+    registry = approved_registry_material(
+        topic_code,
+        using=using,
+        for_update=lock_material,
+    )
+    profiles = approved_profile_refs(
+        using=using,
+        for_update=lock_material,
+    )
+    topic_policy = approved_topic_policy_material(
+        topic_code,
+        using=using,
+        for_update=lock_material,
+    )
+    editorial = resolve_editorial_policy_snapshot(topic_code, using=using)
+    generation = {
+        "schemaVersion": "source-grounded-template-pipeline-v2",
+        "generator": "source_grounded_template",
+        "generatorVersion": "v3",
+        "claimContract": "generated-claim-v2",
+        "policyMaterialHash": editorial.material_hash,
+        "implementationManifestHash": editorial.implementation_manifest_hash,
+    }
+    quality_checks = [dict(row) for row in editorial.document["checks"]]
+    publisher_implementation = _publisher_implementation_manifest(target.channel)
+    publisher = {
+        "contractVersion": PUBLISHER_CONTRACT_VERSION,
+        "adapterManifestHash": ADAPTER_MANIFESTS[target.channel],
+        "implementationManifest": publisher_implementation,
+        "implementationManifestHash": _auto_publish_material_hash(
+            publisher_implementation
+        ),
+        "renderContractVersion": AUTO_PUBLISH_RENDER_CONTRACT_VERSION,
+        "channelContractVersion": f"{target.channel}-publisher-v1",
+    }
+    quality = {
+        "checks": quality_checks,
+        "conditionalVisualGate": {
+            "code": "visual_rights_and_alt_text",
+            "version": "1",
+            "blocking": True,
+            "config": {"captionClaimRequired": True},
+        },
+    }
+    quality["gateManifestHash"] = _auto_publish_material_hash(quality)
+    return {
+        "schemaVersion": AUTO_PUBLISH_VALIDATION_MATERIAL_VERSION,
+        "topic": topic_code,
+        "target": {
+            "id": str(target.id),
+            "snapshotId": str(target.current_snapshot_id),
+            "snapshotVersion": target.current_snapshot_version,
+            "configHash": target.current_config_hash,
+            "channel": target.channel,
+            "role": target.role,
+            "environment": target.environment,
+            "credentialVersion": target.credential_version,
+        },
+        "registry": registry,
+        "profiles": profiles["refs"],
+        "profileManifestHash": profiles["manifestHash"],
+        "topicPolicy": topic_policy,
+        "editorialPolicy": {
+            "snapshotId": str(editorial.id),
+            "policyKey": editorial.policy_key,
+            "policyVersion": editorial.policy_version,
+            "materialHash": editorial.material_hash,
+            "releaseDocumentHash": editorial.release_document_hash,
+            "configHash": editorial.config_hash,
+            "implementationManifestHash": editorial.implementation_manifest_hash,
+        },
+        "generation": {
+            **generation,
+            "manifestHash": _auto_publish_material_hash(generation),
+        },
+        "quality": quality,
+        "publisher": publisher,
+        "validationEvidence": _auto_publish_validation_evidence(target),
+    }
+
+
+def _auto_publish_validation_is_current(
+    validation: AutoPublishValidation,
+    *,
+    using: str = "default",
+) -> bool:
+    try:
+        if validation.material_version != AUTO_PUBLISH_VALIDATION_MATERIAL_VERSION:
+            return False
+        current = build_auto_publish_validation_material(
+            validation.target,
+            validation.topic_code,
+            using=using,
+        )
+        return (
+            validation.material_document == current
+            and validation.material_hash == _auto_publish_material_hash(current)
+        )
+    except Exception:
+        return False
+
+
+@transaction.atomic
+def invalidate_auto_publish_server_material(
+    *,
+    topic_code: str | None,
+    reason: str,
+) -> int:
+    """Project an audited upstream material change into fail-closed publishing state."""
+
+    queryset = AutoPublishValidation.objects.filter(
+        status__in=(
+            AutoPublishValidation.State.DRAFT,
+            AutoPublishValidation.State.PASSED,
+        )
+    )
+    if topic_code is not None:
+        queryset = queryset.filter(topic_code=topic_code)
+    target_ids = sorted(
+        {str(value) for value in queryset.values_list("target_id", flat=True)}
+    )
+    if not target_ids:
+        return 0
+    _lock_target_intent_fences(target_ids)
+    targets = {
+        str(row.id): row
+        for row in PublicationTarget.objects.select_for_update()
+        .filter(id__in=target_ids)
+        .order_by("id")
+    }
+    validations = list(
+        queryset.select_for_update().order_by("target_id", "id")
+    )
+    now = timezone.now()
+    for validation in validations:
+        validation.status = AutoPublishValidation.State.STALE
+        validation.invalidated_at = now
+        validation.invalidation_reason = reason[:500]
+        validation.save(
+            update_fields=(
+                "status",
+                "invalidated_at",
+                "invalidation_reason",
+            )
+        )
+    for target_id, target in targets.items():
+        intents = _lock_open_target_intents(target_id)
+        _stale_locked_intents(intents)
+        if target.auto_publish_enabled:
+            target.auto_publish_enabled = False
+            target.save(update_fields=("auto_publish_enabled", "updated_at"))
+    return len(validations)
 
 
 @transaction.atomic
@@ -4511,20 +4914,24 @@ def create_auto_publish_validation(
     data: dict[str, Any],
     *,
     audit_context: AuditContext,
-) -> AutoPublishValidation:
+) -> tuple[AutoPublishValidation, bool]:
     _require_audit_actor(audit_context, "admin")
+    normalized = _normalize_auto_publish_validation_request(data)
     if (
-        data.get("requestKey") != audit_context.request_key
-        or data.get("reason") != audit_context.reason_code
+        normalized["requestKey"] != audit_context.request_key
+        or normalized["reason"] != audit_context.reason_code
     ):
         raise Forbidden(
             "validation request provenance differs from the audit context"
         )
-    target = PublicationTarget.objects.select_for_update().get(id=target_id)
-    request_key = data["requestKey"]
-    material = _validation_material(data, str(target.id))
-    request_hash = _request_hash({"requestKey": request_key, **material})
-    existing = AutoPublishValidation.objects.filter(target=target, request_key=request_key).first()
+    request_key = normalized["requestKey"]
+    request_hash = _request_hash(
+        {"path": {"targetId": str(target_id)}, "body": normalized}
+    )
+    existing = AutoPublishValidation.objects.filter(
+        target_id=target_id,
+        request_key=request_key,
+    ).first()
     if existing:
         if existing.request_hash != request_hash:
             raise Conflict("같은 request key가 다른 validation payload에 사용되었습니다.")
@@ -4535,38 +4942,57 @@ def create_auto_publish_validation(
             identity_key=f"validation-created:{existing.id}",
             request_hash=request_hash,
         )
-        return existing
-    if str(target.current_snapshot_id) != str(data["targetSnapshotId"]):
+        return existing, False
+    target = (
+        PublicationTarget.objects.select_for_update()
+        .select_related("canary_target")
+        .get(id=target_id)
+    )
+    material = build_auto_publish_validation_material(
+        target,
+        normalized["topic"],
+        using=audit_context.database_alias,
+    )
+    if str(target.current_snapshot_id) != str(material["target"]["snapshotId"]):
         raise Conflict("현재 target snapshot과 validation 대상이 다릅니다.")
-    if target.current_config_hash != data["targetConfigHash"]:
+    if target.current_config_hash != material["target"]["configHash"]:
         raise Conflict("현재 target config hash와 validation 대상이 다릅니다.")
-    if ADAPTER_MANIFESTS[target.channel] != data["publisherAdapterManifestHash"]:
+    if ADAPTER_MANIFESTS[target.channel] != material["publisher"]["adapterManifestHash"]:
         raise Conflict("현재 배포된 publisher adapter material과 다릅니다.")
-    material_hash = sha256_hex(material)
-    same_material = AutoPublishValidation.objects.filter(
-        target=target, material_hash=material_hash
-    ).first()
-    if same_material:
-        return same_material
+    material_hash = _auto_publish_material_hash(material)
+    registry = material["registry"]
+    publisher = material["publisher"]
+    evidence = material["validationEvidence"]
+    report_evidence = (
+        evidence["pilot"]
+        if evidence.get("kind") == "production_release_evidence"
+        else evidence
+    )
+    report_identity = report_evidence.get("runId") or report_evidence.get("attemptId")
+    report_hash = report_evidence.get("reportHash") or _auto_publish_material_hash(
+        report_evidence
+    )
     validation = AutoPublishValidation.objects.create(
         target=target,
-        topic_code=data["topic"],
-        target_snapshot_id=data["targetSnapshotId"],
-        target_config_hash=data["targetConfigHash"],
-        source_registry_snapshot_id=data["sourceRegistrySnapshotId"],
-        registry_manifest_hash=data["registryManifestHash"],
-        source_adapter_manifest_hash=data["sourceAdapterManifestHash"],
-        extraction_profile_manifest_hash=data["extractionProfileManifestHash"],
-        generation_pipeline_manifest_hash=data["generationPipelineManifestHash"],
-        topic_policy_version=data["topicPolicyVersion"],
-        editorial_policy_hash=data["editorialPolicyHash"],
-        quality_gate_manifest_hash=data["qualityGateManifestHash"],
-        render_contract_version=data["renderContractVersion"],
-        channel_contract_version=data["channelContractVersion"],
-        publisher_adapter_manifest_hash=data["publisherAdapterManifestHash"],
-        test_report_object_key=data["testReportObjectKey"],
-        test_report_object_version=data["testReportObjectVersion"],
-        test_report_hash=data["testReportHash"],
+        topic_code=normalized["topic"],
+        target_snapshot_id=material["target"]["snapshotId"],
+        target_config_hash=material["target"]["configHash"],
+        source_registry_snapshot_id=registry["snapshotId"],
+        registry_manifest_hash=registry["manifestHash"],
+        source_adapter_manifest_hash=registry["sourceAdapterManifestHash"],
+        extraction_profile_manifest_hash=material["profileManifestHash"],
+        generation_pipeline_manifest_hash=material["generation"]["manifestHash"],
+        topic_policy_version=material["topicPolicy"]["version"],
+        editorial_policy_hash=material["editorialPolicy"]["materialHash"],
+        quality_gate_manifest_hash=material["quality"]["gateManifestHash"],
+        render_contract_version=publisher["renderContractVersion"],
+        channel_contract_version=publisher["channelContractVersion"],
+        publisher_adapter_manifest_hash=publisher["adapterManifestHash"],
+        test_report_object_key=f"db://publishing/server-validation-evidence/{report_identity}",
+        test_report_object_version=AUTO_PUBLISH_VALIDATION_MATERIAL_VERSION,
+        test_report_hash=report_hash,
+        material_version=AUTO_PUBLISH_VALIDATION_MATERIAL_VERSION,
+        material_document=material,
         material_hash=material_hash,
         request_key=request_key,
         request_hash=request_hash,
@@ -4586,7 +5012,7 @@ def create_auto_publish_validation(
             "state": validation.status,
         },
     )
-    return validation
+    return validation, True
 
 
 @transaction.atomic
@@ -4660,6 +5086,14 @@ def decide_auto_publish_validation(
         raise Conflict("validation target snapshot이 이미 만료되었습니다.")
     if validation.target.current_config_hash != validation.target_config_hash:
         raise Conflict("validation target config가 이미 만료되었습니다.")
+    if (
+        data["decision"] == AutoPublishValidationDecision.Decision.PASSED
+        and not _auto_publish_validation_is_current(
+            validation,
+            using=audit_context.database_alias,
+        )
+    ):
+        raise Conflict("validation server material is no longer current")
     version = validation.decision_version + 1
     decision_hash = sha256_hex(
         {
@@ -4827,6 +5261,11 @@ def set_auto_publish(
                 raise Conflict("passed 상태가 아닌 validation은 활성화할 수 없습니다.")
             if validation.material_hash != ref["materialHash"]:
                 raise Conflict("validation material hash가 다릅니다.")
+            if not _auto_publish_validation_is_current(
+                validation,
+                using=audit_context.database_alias,
+            ):
+                raise Conflict("validation server material is stale")
             if validation.target_snapshot_id != target.current_snapshot_id:
                 raise Conflict("validation target snapshot이 현재 값과 다릅니다.")
             if ref["targetSnapshotId"] != str(target.current_snapshot_id):
@@ -8381,6 +8820,7 @@ def _validated_auto_target_material_eligible(
             or str(row.target_snapshot_id) != activation_snapshot_id
             or str(ref["targetSnapshotId"]) != activation_snapshot_id
             or row.target_config_hash != target.current_config_hash
+            or not _auto_publish_validation_is_current(row, using=using)
         ):
             return False
     if target.environment == TargetEnvironment.PRODUCTION and (

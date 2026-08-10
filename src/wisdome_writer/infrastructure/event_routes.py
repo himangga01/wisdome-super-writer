@@ -241,10 +241,27 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         ("generic_extraction_attempt_id",),
     ),
     ("evidence.profile_decided", 1): EventRoute(
-        "profile-decision-ack",
-        "maintenance",
-        "wisdome_writer.infrastructure.tasks.acknowledge_domain_event",
-        (),
+        "auto-publish-profile-invalidation",
+        "publishing",
+        "apps.publishing.tasks.invalidate_auto_publish_for_profile",
+        (
+            "profile_snapshot_id",
+            "decision_id",
+            "decision",
+            "profile_material_hash",
+        ),
+    ),
+    ("topics.registry_decided", 1): EventRoute(
+        "auto-publish-registry-invalidation",
+        "publishing",
+        "apps.publishing.tasks.invalidate_auto_publish_for_registry",
+        (
+            "topic_code",
+            "registry_id",
+            "decision_id",
+            "decision",
+            "manifest_hash",
+        ),
     ),
     ("evidence.review_decided", 1): EventRoute(
         "evidence-review-ack",
@@ -719,6 +736,24 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
             "profile_material_hash": SHA256_FORMAT,
         },
         choices={"decision": {"approved", "retired"}},
+    ),
+    ("topics.registry_decided", 1): _schema(
+        {
+            "topic_code": STR,
+            "registry_id": STR,
+            "decision_id": STR,
+            "decision": STR,
+            "manifest_hash": STR,
+        },
+        formats={
+            "registry_id": UUID_FORMAT,
+            "decision_id": UUID_FORMAT,
+            "manifest_hash": SHA256_FORMAT,
+        },
+        choices={
+            "topic_code": {"housing_subscription", "semiconductor_news"},
+            "decision": {"approved", "retired"},
+        },
     ),
     ("evidence.review_decided", 1): _schema(
         {

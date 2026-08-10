@@ -2874,6 +2874,22 @@ def decide_source_registry(
                 ),
             },
         )
+        from wisdome_writer.infrastructure.outbox import enqueue_event
+
+        enqueue_event(
+            topic="topics.registry_decided",
+            aggregate_type="SourceRegistrySnapshot",
+            aggregate_id=registry.id,
+            message_key=f"topics.registry_decided:{registry.id}:{decision.id}",
+            correlation_id=audit_context.correlation_id,
+            payload={
+                "topic_code": registry.topic_code,
+                "registry_id": str(registry.id),
+                "decision_id": str(decision.id),
+                "decision": decision_value,
+                "manifest_hash": registry.manifest_hash,
+            },
+        )
         return decision, True
 
 
@@ -3546,6 +3562,7 @@ def current_registry(
     topic_code: str,
     *,
     for_update: bool = False,
+    using: str = "default",
 ) -> SourceRegistrySnapshot:
     if (
         for_update
@@ -3554,7 +3571,7 @@ def current_registry(
         raise RuntimeError(
             "A locked registry lookup requires an active transaction."
         )
-    head_queryset = TopicRegistryHead.objects
+    head_queryset = TopicRegistryHead.objects.using(using)
     if for_update:
         head_queryset = head_queryset.select_for_update()
     try:
@@ -3567,7 +3584,7 @@ def current_registry(
         raise StateConflict(
             "No consistent approved source registry exists for this topic."
         )
-    registry_queryset = SourceRegistrySnapshot.objects
+    registry_queryset = SourceRegistrySnapshot.objects.using(using)
     if for_update:
         registry_queryset = registry_queryset.select_for_update()
     registry = registry_queryset.get(
@@ -3598,10 +3615,83 @@ def current_registry(
                 "An approved source registry contains an unverifiable snapshot."
             )
     return (
-        SourceRegistrySnapshot.objects.prefetch_related(
+        SourceRegistrySnapshot.objects.using(using).prefetch_related(
             "memberships__source_definition",
             "memberships__source_snapshot",
         )
         .select_related("latest_decision", "base_approved_registry")
         .get(pk=registry.pk)
     )
+
+
+def approved_topic_policy_material(
+    topic_code: str,
+    *,
+    using: str = "default",
+    for_update: bool = False,
+) -> dict[str, Any]:
+    """Return the current server-owned topic-policy identity."""
+
+    queryset = TopicPolicy.objects.using(using)
+    if for_update:
+        if not transaction.get_connection(using).in_atomic_block:
+            raise RuntimeError("A locked topic-policy lookup requires a transaction.")
+        queryset = queryset.select_for_update()
+    policy = (
+        queryset.filter(code=topic_code, active=True)
+        .order_by("-version", "-created_at")
+        .first()
+    )
+    if policy is None or _hash(policy.policy) != policy.policy_hash:
+        raise StateConflict("No verifiable active topic policy exists for this topic.")
+    return {
+        "id": str(policy.id),
+        "version": policy.version,
+        "policyHash": policy.policy_hash,
+    }
+
+
+def approved_registry_material(
+    topic_code: str,
+    *,
+    using: str = "default",
+    for_update: bool = False,
+) -> dict[str, Any]:
+    """Resolve the approved registry and exact source-adapter release set."""
+
+    registry = current_registry(
+        topic_code,
+        for_update=for_update,
+        using=using,
+    )
+    members = []
+    for membership in registry.memberships.all():
+        if not membership.enabled:
+            continue
+        snapshot = membership.source_snapshot
+        if not _is_verifiable_source_snapshot(snapshot):
+            raise Conflict("Approved registry source material is not verifiable.")
+        frozen = snapshot.frozen_config
+        members.append(
+            {
+                "sourceId": str(membership.source_definition_id),
+                "sourceSnapshotId": str(snapshot.id),
+                "sourceSnapshotVersion": snapshot.version,
+                "configHash": snapshot.frozen_config_hash,
+                "adapterKey": str(frozen["adapterKey"]),
+                "adapterVersion": str(frozen["adapterVersion"]),
+                "adapterImplementationManifestHash": str(
+                    frozen["adapterImplementationManifestHash"]
+                ),
+            }
+        )
+    members.sort(key=lambda row: (row["sourceId"], row["sourceSnapshotId"]))
+    if not members:
+        raise StateConflict("Approved registry has no enabled source material.")
+    return {
+        "snapshotId": str(registry.id),
+        "version": registry.version,
+        "manifestHash": registry.manifest_hash,
+        "sourceAdapters": members,
+        "sourceAdapterManifestHash": _hash(members),
+    }

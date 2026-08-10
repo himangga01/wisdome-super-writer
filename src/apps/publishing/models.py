@@ -228,6 +228,13 @@ class TargetCanaryRun(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target = models.ForeignKey(PublicationTarget, on_delete=models.PROTECT, related_name="canary_runs")
     target_snapshot = models.ForeignKey(PublicationTargetSnapshot, on_delete=models.PROTECT)
+    result_target_snapshot = models.ForeignKey(
+        PublicationTargetSnapshot,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="completed_canary_runs",
+    )
     policy_version = models.CharField(max_length=100)
     request_key = models.CharField(max_length=200)
     state = models.CharField(max_length=24, choices=State.choices, default=State.QUEUED)
@@ -271,7 +278,12 @@ class AutoPublishValidation(models.Model):
     test_report_object_key = models.CharField(max_length=1000)
     test_report_object_version = models.CharField(max_length=255)
     test_report_hash = models.CharField(max_length=64)
-    material_hash = models.CharField(max_length=64, unique=True)
+    material_version = models.CharField(
+        max_length=100,
+        default="auto-publish-validation-material-v2",
+    )
+    material_document = models.JSONField(default=dict)
+    material_hash = models.CharField(max_length=64, db_index=True)
     status = models.CharField(max_length=16, choices=State.choices, default=State.DRAFT)
     latest_decision_id = models.UUIDField(null=True, blank=True)
     decision_version = models.PositiveIntegerField(default=0)
@@ -286,6 +298,46 @@ class AutoPublishValidation(models.Model):
             models.UniqueConstraint(fields=["target", "request_key"], name="uq_auto_validation_request")
         ]
         ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            alias = kwargs.get("using") or self._state.db or "default"
+            original = type(self).objects.using(alias).get(pk=self.pk)
+            frozen_fields = (
+                "target_id",
+                "topic_code",
+                "target_snapshot_id",
+                "target_config_hash",
+                "source_registry_snapshot_id",
+                "registry_manifest_hash",
+                "source_adapter_manifest_hash",
+                "extraction_profile_manifest_hash",
+                "generation_pipeline_manifest_hash",
+                "topic_policy_version",
+                "editorial_policy_hash",
+                "quality_gate_manifest_hash",
+                "render_contract_version",
+                "channel_contract_version",
+                "publisher_adapter_manifest_hash",
+                "test_report_object_key",
+                "test_report_object_version",
+                "test_report_hash",
+                "material_version",
+                "material_document",
+                "material_hash",
+                "request_key",
+                "request_hash",
+                "created_at",
+            )
+            if any(
+                getattr(self, field) != getattr(original, field)
+                for field in frozen_fields
+            ):
+                raise TypeError("AutoPublishValidation material is immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("AutoPublishValidation is append-only")
 
 
 class AutoPublishValidationDecision(models.Model):
@@ -1173,6 +1225,7 @@ class PublicationAttempt(models.Model):
 
     def delete(self, *args, **kwargs):
         raise TypeError("PublicationAttempt is append-only")
+
 
 class PublicationApprovalHead(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

@@ -4336,10 +4336,9 @@ components:
     CanaryRequest:
       type: object
       additionalProperties: false
-      required: [confirmIsolatedTestTarget, policyVersion, requestKey, reason]
+      required: [confirmIsolatedTestTarget, requestKey, reason]
       properties:
         confirmIsolatedTestTarget: { type: boolean, const: true }
-        policyVersion: { type: string, minLength: 1 }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         reason: { type: string, minLength: 3, maxLength: 500 }
     AutoPublishValidationMaterial:
@@ -4364,14 +4363,16 @@ components:
         testReportObjectVersion: { type: string, minLength: 1 }
         testReportHash: { type: string, pattern: '^[a-f0-9]{64}$' }
     AutoPublishValidationRequest:
-      allOf:
-        - $ref: '#/components/schemas/AutoPublishValidationMaterial'
-        - type: object
-          required: [requestKey, reason]
-          properties:
-            requestKey: { type: string, minLength: 8, maxLength: 200 }
-            reason: { type: string, minLength: 3, maxLength: 500 }
-      unevaluatedProperties: false
+      type: object
+      additionalProperties: false
+      description: >-
+        The client selects only the topic and request identity. Registry, profile, policy,
+        generator, publisher, credential, canary and pilot material are resolved by the server.
+      required: [topic, requestKey, reason]
+      properties:
+        topic: { $ref: '#/components/schemas/TopicCode' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
     AutoPublishValidationCreateRequest:
       allOf:
         - $ref: '#/components/schemas/AutoPublishValidationRequest'
@@ -4380,10 +4381,20 @@ components:
       allOf:
         - $ref: '#/components/schemas/AutoPublishValidationMaterial'
         - type: object
-          required: [id, requestKey, materialHash, status, latestDecisionId, decisionVersion, createdAt]
+          required: [id, requestKey, materialVersion, materialDocument, materialHash, status, latestDecisionId, decisionVersion, createdAt]
           properties:
             id: { type: string, format: uuid }
             requestKey: { type: string, minLength: 8, maxLength: 200 }
+            materialVersion:
+              type: string
+              enum: [auto-publish-validation-material-v2, legacy-client-material-v1]
+            materialDocument:
+              type: object
+              description: >-
+                Immutable server-resolved target, approved registry/profile/policy, generator,
+                publisher, credential and canary/pilot evidence document. Legacy material is
+                quarantined and cannot satisfy a current activation gate.
+              additionalProperties: true
             materialHash: { type: string, pattern: '^[a-f0-9]{64}$' }
             status: { type: string, enum: [draft, passed, revoked, stale] }
             latestDecisionId: { type: [string, 'null'], format: uuid }

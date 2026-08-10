@@ -47,6 +47,8 @@ from .services import (
     begin_target_credential_revoke,
     finalize_reconcile_delivery_failure,
     finalize_media_delivery_operation_failure as _finalize_media_delivery_operation_failure,
+    invalidate_auto_publish_server_material,
+    _require_worker_event,
     persist_canary_run_result,
     persist_media_delivery_operation_result,
     persist_publish_result,
@@ -59,6 +61,60 @@ from .services import (
 )
 
 SCHEDULE_PUBLICATION_AUDIT_REASON = "Scheduled publication dispatch."
+
+
+@shared_task(name="apps.publishing.tasks.invalidate_auto_publish_for_profile")
+def invalidate_auto_publish_for_profile(
+    profile_snapshot_id: str,
+    decision_id: str,
+    decision: str,
+    profile_material_hash: str,
+):
+    audit_context = _worker_audit_context()
+    _require_worker_event(
+        audit_context,
+        topic="evidence.profile_decided",
+        aggregate_id=profile_snapshot_id,
+        payload_identity={
+            "profile_snapshot_id": profile_snapshot_id,
+            "decision_id": decision_id,
+            "decision": decision,
+            "profile_material_hash": profile_material_hash,
+        },
+    )
+    count = invalidate_auto_publish_server_material(
+        topic_code=None,
+        reason=f"extraction_profile_{decision}",
+    )
+    return {"invalidatedValidationCount": count}
+
+
+@shared_task(name="apps.publishing.tasks.invalidate_auto_publish_for_registry")
+def invalidate_auto_publish_for_registry(
+    topic_code: str,
+    registry_id: str,
+    decision_id: str,
+    decision: str,
+    manifest_hash: str,
+):
+    audit_context = _worker_audit_context()
+    _require_worker_event(
+        audit_context,
+        topic="topics.registry_decided",
+        aggregate_id=registry_id,
+        payload_identity={
+            "topic_code": topic_code,
+            "registry_id": registry_id,
+            "decision_id": decision_id,
+            "decision": decision,
+            "manifest_hash": manifest_hash,
+        },
+    )
+    count = invalidate_auto_publish_server_material(
+        topic_code=topic_code,
+        reason=f"source_registry_{decision}",
+    )
+    return {"invalidatedValidationCount": count}
 
 
 @shared_task(name="apps.publishing.tasks.schedule_orphan_media_cleanup")
@@ -517,6 +573,7 @@ def run_target_canary(canary_run_id: str):
         audit_context=audit_context,
     )
     stages: list[dict[str, object]] = []
+    remote_cleanup_refs: list[dict[str, str]] = []
     remote_post_id = None
     remote_media_id = None
     lookup_key = f"ww-canary-{run.id.hex}"
@@ -576,12 +633,25 @@ def run_target_canary(canary_run_id: str):
         stages.append({"code": "create", "passed": created.status == "succeeded"})
         if not remote_post_id:
             raise PublisherError("canary_create_missing_remote_id", category="permanent")
+        remote_cleanup_refs.append(
+            {"kind": "post", "remoteId": remote_post_id, "state": "pending"}
+        )
         if _kill_switch_enabled():
             raise Conflict("전역 kill switch가 활성화되어 canary 쓰기가 차단되었습니다.")
         updated = adapter.execute(command("update", remote_id=remote_post_id, revision=2))
         stages.append({"code": "update", "passed": updated.status == "succeeded"})
         fetched = adapter.fetch_remote_state(remote_post_id)
-        stages.append({"code": "read_after_write", "passed": fetched.status == "succeeded"})
+        stages.append(
+            {
+                "code": "public_verify",
+                "passed": (
+                    fetched.status == "succeeded"
+                    and fetched.remote_state == "published"
+                    and isinstance(fetched.remote_url, str)
+                    and fetched.remote_url.lower().startswith(("http://", "https://"))
+                ),
+            }
+        )
         if isinstance(adapter, WordPressPublisher):
             if _kill_switch_enabled():
                 raise Conflict("전역 kill switch가 활성화되어 canary 쓰기가 차단되었습니다.")
@@ -599,17 +669,40 @@ def run_target_canary(canary_run_id: str):
                 description_marker=marker,
             )
             remote_media_id = media.remote_post_id
-            stages.append({"code": "media_upload", "passed": media.status == "succeeded"})
+            stages.append({"code": "media", "passed": media.status == "succeeded"})
+            if remote_media_id:
+                remote_cleanup_refs.append(
+                    {"kind": "media", "remoteId": remote_media_id, "state": "pending"}
+                )
+        else:
+            stages.append({"code": "media", "passed": True, "detail": "not_applicable"})
         if _kill_switch_enabled():
             raise Conflict("전역 kill switch가 활성화되어 canary 쓰기가 차단되었습니다.")
         withdrawn = adapter.execute(command("unpublish", remote_id=remote_post_id))
-        stages.append({"code": "unpublish", "passed": withdrawn.status == "succeeded"})
+        stages.append({"code": "withdraw", "passed": withdrawn.status == "succeeded"})
         if remote_media_id and isinstance(adapter, WordPressPublisher):
             deleted_media = adapter.delete_media(remote_media_id)
-            stages.append({"code": "media_cleanup", "passed": deleted_media.status == "succeeded"})
+            if deleted_media.status == "succeeded":
+                next(
+                    ref for ref in remote_cleanup_refs
+                    if ref["kind"] == "media" and ref["remoteId"] == remote_media_id
+                )["state"] = "deleted"
             remote_media_id = None
         deleted = adapter.delete_post(remote_post_id)
-        stages.append({"code": "post_cleanup", "passed": deleted.status == "succeeded"})
+        if deleted.status == "succeeded":
+            next(
+                ref for ref in remote_cleanup_refs
+                if ref["kind"] == "post" and ref["remoteId"] == remote_post_id
+            )["state"] = "deleted"
+        stages.append(
+            {
+                "code": "cleanup",
+                "passed": (
+                    deleted.status == "succeeded"
+                    and all(ref["state"] == "deleted" for ref in remote_cleanup_refs)
+                ),
+            }
+        )
         remote_post_id = None
         passed = all(bool(row["passed"]) for row in stages)
     except Exception as exc:
@@ -618,12 +711,22 @@ def run_target_canary(canary_run_id: str):
     finally:
         if remote_media_id and isinstance(adapter, WordPressPublisher):
             try:
-                adapter.delete_media(remote_media_id)
+                result = adapter.delete_media(remote_media_id)
+                if result.status == "succeeded":
+                    next(
+                        ref for ref in remote_cleanup_refs
+                        if ref["kind"] == "media" and ref["remoteId"] == remote_media_id
+                    )["state"] = "deleted"
             except Exception:
                 stages.append({"code": "media_cleanup_pending", "passed": False})
         if remote_post_id:
             try:
-                adapter.delete_post(remote_post_id)
+                result = adapter.delete_post(remote_post_id)
+                if result.status == "succeeded":
+                    next(
+                        ref for ref in remote_cleanup_refs
+                        if ref["kind"] == "post" and ref["remoteId"] == remote_post_id
+                    )["state"] = "deleted"
             except Exception:
                 stages.append({"code": "post_cleanup_pending", "passed": False})
         adapter.close()
@@ -632,6 +735,7 @@ def run_target_canary(canary_run_id: str):
         fence,
         stages=stages,
         passed=passed,
+        remote_cleanup_refs=remote_cleanup_refs,
         audit_context=audit_context,
     )
     return {"canaryRunId": canary_run_id, "state": run.state, "reportHash": run.report_hash}

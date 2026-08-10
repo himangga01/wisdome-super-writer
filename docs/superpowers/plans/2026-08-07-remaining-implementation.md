@@ -1296,7 +1296,7 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Consumes: approved registry/profile/editorial policy, generator manifest, publisher adapter manifest, credential version, preflight/canary/pilot evidence.
 - Produces: immutable `AutoPublishValidation` and `AutoPublishActivation` hashes derived only from server state.
 
-- [ ] **Step 1: validation material builder를 서버 조회형으로 만든다.**
+- [x] **Step 1: validation material builder를 서버 조회형으로 만든다.**
 
   ```python
   def build_auto_publish_validation_material(target: PublicationTarget, topic_code: str) -> dict:
@@ -1312,19 +1312,19 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 
   API client가 hash나 implementation version을 직접 공급하지 못하게 한다.
 
-- [ ] **Step 2: canary와 pilot evidence를 validation에 결합한다.**
+- [x] **Step 2: canary와 pilot evidence를 validation에 결합한다.**
 
   test target canary의 create→update→media→public verify→withdraw/delete와 cleanup object IDs를 저장한다. production pilot는 관리자 승인 게시와 공개 URL 확인 결과를 참조한다.
 
-- [ ] **Step 3: activation freshness와 revocation을 강제한다.**
+- [x] **Step 3: activation freshness와 revocation을 강제한다.**
 
   registry/profile/policy/target/credential material 중 하나라도 바뀌면 기존 validation과 activation을 stale로 만들고 실행 직전 gate가 거부한다.
 
-- [ ] **Step 4: validation/activation decision을 재인증·CAS·감사 transaction으로 유지한다.**
+- [x] **Step 4: validation/activation decision을 재인증·CAS·감사 transaction으로 유지한다.**
 
   existing service의 expected latest decision/activation, request replay와 AuditEvent를 서버 유도 material hash 기준으로 맞춘다.
 
-- [ ] **Step 5: 사용자 승인 후 check를 검증하고 커밋한다.**
+- [x] **Step 5: 사용자 승인 후 check를 검증하고 커밋한다.**
 
   ```powershell
   git add src/apps/publishing src/apps/evidence/profiles.py src/apps/topics/services.py specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml

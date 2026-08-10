@@ -964,6 +964,11 @@ class ValidatedAutoProvenanceTests(SimpleTestCase):
                 "using",
                 return_value=validation_query,
             ),
+            patch.object(
+                services,
+                "_auto_publish_validation_is_current",
+                return_value=True,
+            ),
         ):
             self.assertFalse(
                 services._validated_auto_live_eligible(

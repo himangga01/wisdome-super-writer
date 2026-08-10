@@ -214,6 +214,8 @@ def validation_json(row: AutoPublishValidation) -> dict[str, Any]:
         "testReportObjectVersion": row.test_report_object_version,
         "testReportHash": row.test_report_hash,
         "requestKey": row.request_key,
+        "materialVersion": row.material_version,
+        "materialDocument": row.material_document,
         "materialHash": row.material_hash,
         "status": row.status,
         "latestDecisionId": str(row.latest_decision_id) if row.latest_decision_id else None,
@@ -429,7 +431,6 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
     request_key = data["requestKey"]
     row = create_canary_run(
         target_id,
-        policy_version=data["policyVersion"],
         reason=data["reason"],
         request_key=request_key,
         user=request.user,
@@ -452,12 +453,12 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
 def auto_publish_validations(request: HttpRequest, target_id: str) -> JsonResponse:
     if request.method == "POST":
         data = _body(request)
-        row = create_auto_publish_validation(
+        row, created = create_auto_publish_validation(
             target_id,
             data,
             audit_context=_admin_audit_context(request, data),
         )
-        return JsonResponse(validation_json(row), status=201)
+        return JsonResponse(validation_json(row), status=201 if created else 200)
     rows = AutoPublishValidation.objects.filter(target_id=target_id)
     return JsonResponse([validation_json(row) for row in rows], safe=False)
 
@@ -515,21 +516,49 @@ def auto_publish_validation_report(
         "overallResult": "passed" if row.status == AutoPublishValidation.State.PASSED else "failed",
         "verifiedAt": row.created_at.isoformat(),
     }
-    try:
-        raw = S3ObjectStorage().get_bytes(
-            key=row.test_report_object_key,
-            version_id=row.test_report_object_version,
+    if row.test_report_object_key.startswith("db://publishing/"):
+        evidence = row.material_document.get("validationEvidence", {})
+        if evidence.get("kind") == "production_release_evidence":
+            evidence = evidence.get("pilot", {})
+            normalized["stageResults"] = [
+                {"code": "approved_public_pilot", "result": "passed"}
+            ]
+        else:
+            normalized["stageResults"] = [
+                {
+                    "code": item.get("code"),
+                    "result": "passed" if item.get("passed") else "failed",
+                }
+                for item in evidence.get("stageResults", [])
+            ]
+        normalized["overallResult"] = (
+            "passed"
+            if row.status == AutoPublishValidation.State.PASSED
+            else "failed"
         )
-        if sha256_hex(raw) == row.test_report_hash:
-            report = json.loads(raw.decode("utf-8"))
-            for key in ("samples", "metrics", "thresholds", "stageResults", "overallResult", "verifiedAt"):
-                if key in report:
-                    normalized[key] = report[key]
-    except Exception:
-        normalized["stageResults"] = [
-            {"code": "immutable_report_unavailable", "result": "failed", "detailRedacted": "object unavailable"}
-        ]
-        normalized["overallResult"] = "failed"
+    else:
+        try:
+            raw = S3ObjectStorage().get_bytes(
+                key=row.test_report_object_key,
+                version_id=row.test_report_object_version,
+            )
+            if sha256_hex(raw) == row.test_report_hash:
+                report = json.loads(raw.decode("utf-8"))
+                for key in (
+                    "samples", "metrics", "thresholds", "stageResults",
+                    "overallResult", "verifiedAt",
+                ):
+                    if key in report:
+                        normalized[key] = report[key]
+        except Exception:
+            normalized["stageResults"] = [
+                {
+                    "code": "immutable_report_unavailable",
+                    "result": "failed",
+                    "detailRedacted": "object unavailable",
+                }
+            ]
+            normalized["overallResult"] = "failed"
     return JsonResponse(normalized)
 
 

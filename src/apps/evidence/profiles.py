@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 from adapters.extractors.base import ExtractorError, sha256_file
 from adapters.extractors.legacy_hwp import (
@@ -17,7 +18,12 @@ from adapters.extractors.legacy_hwp import (
     validate_legacy_hwp_activation_config,
 )
 
-from .models import ExtractionEngine, ExtractionProfileSnapshot
+from .models import (
+    ExtractionEngine,
+    ExtractionProfileDecision,
+    ExtractionProfileSnapshot,
+    ProfileApprovalState,
+)
 from .services import canonical_hash
 
 
@@ -309,6 +315,82 @@ def release_profile_snapshot_values(
         if expected is not None and installed != expected:
             raise ValidationError(f"Extraction package version differs: {package}")
     return profile_snapshot_values(document)
+
+
+def approved_profile_refs(
+    *,
+    using: str = "default",
+    for_update: bool = False,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve approved extraction profiles against the shipped release bytes."""
+
+    queryset = ExtractionProfileSnapshot.objects.using(using).select_related(
+        "latest_decision"
+    )
+    if for_update:
+        if not transaction.get_connection(using).in_atomic_block:
+            raise RuntimeError("A locked profile lookup requires a transaction.")
+        queryset = queryset.select_for_update()
+    profiles = list(
+        queryset.filter(approval_state=ProfileApprovalState.APPROVED).order_by(
+            "profile_key", "profile_version", "id"
+        )
+    )
+    if not profiles:
+        raise ValidationError("No approved extraction profile release exists")
+    refs: list[dict[str, Any]] = []
+    material_fields = (
+        "profile_key",
+        "profile_version",
+        "engine",
+        "extractor_version",
+        "package_version",
+        "runtime_version",
+        "pipeline_name",
+        "implementation_manifest_hash",
+        "config",
+        "config_hash",
+        "validation_mode",
+        "calibration_profile_key",
+        "calibration_profile_version",
+        "calibration_manifest_object_key",
+        "calibration_manifest_object_version",
+        "calibration_profile_hash",
+        "model_manifest",
+        "model_manifest_hash",
+        "profile_material_hash",
+    )
+    for profile in profiles:
+        decision = profile.latest_decision
+        if (
+            decision is None
+            or decision.decision != ExtractionProfileDecision.Decision.APPROVED
+            or decision.expected_material_hash != profile.profile_material_hash
+            or decision.version != profile.decision_version
+            or decision.verification_report_hash
+            != profile.verification_report_hash
+        ):
+            raise ValidationError("Approved extraction profile decision is inconsistent")
+        release = release_profile_snapshot_values(profile, root=root)
+        if any(getattr(profile, field) != release.get(field) for field in material_fields):
+            raise ValidationError("Approved extraction profile differs from its shipped release")
+        refs.append(
+            {
+                "profileId": str(profile.id),
+                "profileKey": profile.profile_key,
+                "profileVersion": profile.profile_version,
+                "engine": profile.engine,
+                "materialHash": profile.profile_material_hash,
+                "decisionId": str(decision.id),
+                "decisionVersion": decision.version,
+                "verificationReportHash": str(profile.verification_report_hash),
+            }
+        )
+    return {
+        "refs": refs,
+        "manifestHash": canonical_hash(refs),
+    }
 
 
 def implementation_manifest(document: Mapping[str, Any], repository_root: Path | None = None) -> dict[str, Any]:

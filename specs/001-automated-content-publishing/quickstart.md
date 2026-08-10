@@ -1096,3 +1096,26 @@ Publication URL in canonical URL, body, and content hash. Cross-environment/test
 Publication, subject tampering, and ambiguous legacy backfill must produce zero Blogger writes. Correction
 update/mark-withdrawn retains the linked verified URL; full unpublish waits for WordPress withdrawal and
 does not require a public URL.
+## T025 자동발행 validation 확인 절차 (한국어)
+
+1. 격리 test target에서 canary를 요청할 때 `policyVersion`을 보내지 않는다. 서버가
+   `auto-publish-canary-v1`을 선택한다.
+2. canary 결과에 `create`, `update`, `media`, `public_verify`, `withdraw`, `cleanup`이 모두
+   통과했고, 생성된 post/media reference가 모두 `deleted`인지 확인한다.
+3. validation 생성 요청에는 `topic`, `requestKey`, `reason`만 보낸다. registry/profile/
+   policy/generator/publisher/credential/test-report 해시를 보내면 422여야 한다.
+4. 응답의 `materialVersion`이 `auto-publish-validation-material-v2`이고
+   `materialDocument`가 현재 target, approved registry/profile, exact policy release,
+   canary/pilot evidence를 포함하는지 확인한다.
+5. registry 승인 변경, extraction profile 승인/retire, credential 교체 또는 target snapshot
+   변경 뒤 validation이 stale되고 자동발행이 꺼지는지 확인한다. 투영 전 경합에서도 intent와
+   worker gate가 current material 불일치로 외부 쓰기를 막아야 한다.
+
+## T025 Auto-Publish Validation Verification (English/AI-readable)
+
+Request the isolated canary without a client policy version. Require all six canonical stages and
+deleted cleanup references. Create validation with only `topic`, `requestKey`, and `reason`; reject
+all client-supplied material hashes. Assert the v2 material document contains current target and
+credential identity, approved registry/profile decisions, exact editorial/generation/quality and
+publisher releases, plus exact canary/pilot evidence. Change one upstream material source and
+verify both stale projection/auto-disable and fail-closed live execution gating.

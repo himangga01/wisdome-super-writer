@@ -866,3 +866,22 @@ historical replay or terminal outcome and never authorizes a new external write.
 - Migration rearms an in-flight requested event/receipt to pending/retry only when one exact
   immutable identity exists. Historical pending-ready keeps the v1 selected-manifest hash and must
   remain acceptable after aggregate recomputation.
+## T025 자동발행 material 변경 이벤트 (한국어)
+
+- `evidence.profile_decided@1`의 기존 exact 4필드 payload는 이제 단순 ACK가 아니라 모든
+  draft/passed 자동발행 validation을 stale 처리하는 publishing consumer로 전달된다.
+- `topics.registry_decided@1` payload는 정확히 `topic_code`, `registry_id`, `decision_id`,
+  `decision`, `manifest_hash` 다섯 필드다. 해당 topic validation을 stale 처리하고 관련
+  target 자동발행을 끄며 열린 intent를 stale 처리한다.
+- 두 consumer는 먼저 원본 outbox event/receipt capability를 검증하고, 그 뒤 target fence와
+  target/validation/intent를 정렬 잠금한다. 이벤트 투영이 지연되더라도 activation·intent·
+  attempt·pre-I/O gate의 서버 material 재계산이 외부 쓰기를 막는다.
+
+## T025 Auto-Publish Material Change Events (English/AI-readable)
+
+`evidence.profile_decided@1` retains its exact four-field public payload and now routes to the
+publishing stale projector. `topics.registry_decided@1` has exactly five fields:
+`topic_code`, `registry_id`, `decision_id`, `decision`, and `manifest_hash`. Both consumers verify
+the source event/receipt before locking sorted publishing fences and project affected validations,
+targets, and open intents fail-closed. Live server-material recomputation remains the final safety
+boundary while asynchronous projection is pending.
