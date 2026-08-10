@@ -127,6 +127,13 @@ _PUBLISHED_VISUALIZATION_SNAPSHOT_NAMESPACE = uuid.UUID(
 _PUBLISHED_VISUALIZATION_INPUT_NAMESPACE = uuid.UUID(
     "446371d4-d982-4ba7-8daf-9f11f88a519f"
 )
+_REMOTE_MEDIA_NAMESPACE = uuid.UUID("2a1d024e-350d-45ee-b13b-c6fcdb2c0c2c")
+_PUBLIC_DELIVERY_ASSET_NAMESPACE = uuid.UUID(
+    "ffcc61d0-a576-4f1b-98c0-e520dd53474e"
+)
+_PUBLICATION_MEDIA_BINDING_NAMESPACE = uuid.UUID(
+    "044a06a8-3d5c-40d4-930b-39be240560c3"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -5563,7 +5570,7 @@ def freeze_revision_asset_cohort(
         for material in evidence_snapshots:
             snapshot = existing.evidence_snapshots.filter(pk=material["id"]).first()
             if snapshot is None or any(
-                getattr(snapshot, field) != value.pk
+                getattr(snapshot, f"{field}_id") != value.pk
                 if field in {"visual_placement", "evidence"}
                 else getattr(snapshot, field) != value
                 for field, value in material.items()
@@ -5575,7 +5582,7 @@ def freeze_revision_asset_cohort(
                 pk=material["id"]
             ).first()
             if snapshot is None or any(
-                getattr(snapshot, field) != value.pk
+                getattr(snapshot, f"{field}_id") != value.pk
                 if field in {"visual_placement", "visualization"}
                 else getattr(snapshot, field) != value
                 for field, value in material.items()
@@ -5655,6 +5662,408 @@ def build_channel_media_manifest(
         }
         for item in cohort.manifest
     ]
+
+
+def _publication_asset_snapshot(
+    *,
+    cohort: PublishedAssetCohort,
+    item: dict[str, Any],
+    using: str,
+) -> PublishedEvidenceSnapshot | PublishedVisualizationSnapshot:
+    snapshot_id = item.get("snapshotId")
+    snapshot_kind = item.get("snapshotKind")
+    if snapshot_kind == "evidence":
+        snapshot = (
+            PublishedEvidenceSnapshot.objects.using(using)
+            .filter(pk=snapshot_id, cohort=cohort)
+            .first()
+        )
+        checksum = snapshot.asset_checksum if snapshot else None
+    elif snapshot_kind == "visualization":
+        snapshot = (
+            PublishedVisualizationSnapshot.objects.using(using)
+            .filter(pk=snapshot_id, cohort=cohort)
+            .first()
+        )
+        checksum = snapshot.output_checksum if snapshot else None
+    else:
+        raise Conflict("publication media snapshot kind is invalid")
+    if (
+        snapshot is None
+        or str(snapshot.id) != str(snapshot_id)
+        or checksum != item.get("assetChecksum")
+        or snapshot.presentation_hash != item.get("presentationHash")
+        or snapshot.mime_type != item.get("mimeType")
+        or snapshot.byte_size != item.get("byteSize")
+    ):
+        raise Conflict("publication media snapshot differs from the frozen manifest")
+    return snapshot
+
+
+def _snapshot_delivery_material(
+    snapshot: PublishedEvidenceSnapshot | PublishedVisualizationSnapshot,
+) -> dict[str, Any]:
+    checksum = (
+        snapshot.asset_checksum
+        if isinstance(snapshot, PublishedEvidenceSnapshot)
+        else snapshot.output_checksum
+    )
+    return {
+        "asset_checksum": checksum,
+        "presentation_hash": snapshot.presentation_hash,
+        "mime_type": snapshot.mime_type,
+        "byte_size": snapshot.byte_size,
+        "rights_status_snapshot": snapshot.rights_status_snapshot,
+        "alt_text_snapshot": snapshot.alt_text_snapshot,
+        "caption_snapshot": snapshot.caption_snapshot,
+        "attribution_snapshot": snapshot.attribution_snapshot,
+    }
+
+
+def prepare_publication_media_bindings_locked(
+    *,
+    attempt: PublicationAttempt,
+    using: str = "default",
+) -> tuple[PublicationMedia, ...]:
+    with transaction.atomic(using=using):
+        publication = (
+            Publication.objects.using(using)
+            .select_for_update()
+            .select_related("target")
+            .get(pk=attempt.publication_id)
+        )
+        if attempt.resolved_action not in _CONTENT_PUBLICATION_ACTIONS:
+            return tuple(
+                PublicationMedia.objects.using(using)
+                .filter(publication=publication)
+                .order_by("display_order", "id")
+            )
+        Revision = apps.get_model("editorial", "ArticleRevision")
+        revision = (
+            Revision.objects.using(using)
+            .select_for_update()
+            .get(pk=attempt.article_revision_id)
+        )
+        approval_render = attempt.approval.article_channel_render
+        if (
+            approval_render is None
+            or approval_render.article_revision_id != revision.id
+            or approval_render.target_id != publication.target_id
+            or approval_render.publication_intent_id
+            != attempt.publication_intent_id
+        ):
+            raise Conflict("publication media approval render is not bound to the attempt")
+        cohort = freeze_revision_asset_cohort(revision=revision, using=using)
+        expected_manifest = build_channel_media_manifest(
+            cohort=cohort,
+            channel=publication.target.channel,
+        )
+        if approval_render.media_manifest != expected_manifest:
+            raise Conflict("approved media manifest differs from the frozen cohort")
+
+        expected_binding_ids: list[uuid.UUID] = []
+        bindings: list[PublicationMedia] = []
+        for item in expected_manifest:
+            snapshot = _publication_asset_snapshot(
+                cohort=cohort,
+                item=item,
+                using=using,
+            )
+            material = _snapshot_delivery_material(snapshot)
+            mapping_identity = (
+                f"{publication.target_id}:{material['asset_checksum']}:"
+                f"{material['presentation_hash']}"
+            )
+            remote_media = None
+            public_delivery_asset = None
+            if publication.target.channel == ChannelCode.WORDPRESS:
+                mapping_id = uuid.uuid5(_REMOTE_MEDIA_NAMESPACE, mapping_identity)
+                mapping_fingerprint = sha256_hex(
+                    {
+                        "schemaVersion": "remote-media-v1",
+                        "targetId": str(publication.target_id),
+                        "assetChecksum": material["asset_checksum"],
+                        "presentationHash": material["presentation_hash"],
+                    }
+                )
+                remote_media, created = RemoteMedia.objects.using(using).get_or_create(
+                    id=mapping_id,
+                    defaults={
+                        "target": publication.target,
+                        "asset_checksum": material["asset_checksum"],
+                        "presentation_hash": material["presentation_hash"],
+                        "remote_lookup_key": f"ww-media-{mapping_id.hex}",
+                        "request_fingerprint": mapping_fingerprint,
+                    },
+                )
+                if not created and (
+                    remote_media.target_id != publication.target_id
+                    or remote_media.asset_checksum != material["asset_checksum"]
+                    or remote_media.presentation_hash
+                    != material["presentation_hash"]
+                    or remote_media.remote_lookup_key != f"ww-media-{mapping_id.hex}"
+                    or remote_media.request_fingerprint != mapping_fingerprint
+                ):
+                    raise Conflict("remote media replay differs from frozen material")
+            elif publication.target.channel == ChannelCode.BLOGGER:
+                mapping_identity = (
+                    f"{material['asset_checksum']}:{material['presentation_hash']}"
+                )
+                mapping_id = uuid.uuid5(
+                    _PUBLIC_DELIVERY_ASSET_NAMESPACE,
+                    mapping_identity,
+                )
+                delivery_key = (
+                    f"published-assets/{material['asset_checksum'][:2]}/"
+                    f"{material['asset_checksum']}-{material['presentation_hash']}"
+                )
+                public_delivery_asset, created = (
+                    PublicDeliveryAsset.objects.using(using).get_or_create(
+                        id=mapping_id,
+                        defaults={
+                            **material,
+                            "delivery_object_key": delivery_key,
+                            "delivery_object_version": "",
+                            "public_url": None,
+                        },
+                    )
+                )
+                if not created and any(
+                    getattr(public_delivery_asset, field) != value
+                    for field, value in {
+                        **material,
+                        "delivery_object_key": delivery_key,
+                    }.items()
+                ):
+                    raise Conflict(
+                        "public delivery asset replay differs from frozen material"
+                    )
+            else:
+                raise Conflict("unsupported publication media channel")
+
+            binding_id = uuid.uuid5(
+                _PUBLICATION_MEDIA_BINDING_NAMESPACE,
+                f"{publication.id}:{snapshot.id}",
+            )
+            expected_binding_ids.append(binding_id)
+            provenance = {
+                "published_evidence_snapshot": (
+                    snapshot
+                    if isinstance(snapshot, PublishedEvidenceSnapshot)
+                    else None
+                ),
+                "published_visualization_snapshot": (
+                    snapshot
+                    if isinstance(snapshot, PublishedVisualizationSnapshot)
+                    else None
+                ),
+            }
+            binding, created = PublicationMedia.objects.using(using).get_or_create(
+                id=binding_id,
+                defaults={
+                    "publication": publication,
+                    "remote_media": remote_media,
+                    "public_delivery_asset": public_delivery_asset,
+                    "article_revision": revision,
+                    "asset_cohort": cohort,
+                    **provenance,
+                    "usage": item["usage"],
+                    "block_id": item["blockId"],
+                    "display_order": item["displayOrder"],
+                    "alt_text_snapshot": material["alt_text_snapshot"],
+                    "caption_snapshot": material["caption_snapshot"],
+                    "attribution_snapshot": material["attribution_snapshot"],
+                },
+            )
+            if not created:
+                expected = {
+                    "publication_id": publication.id,
+                    "remote_media_id": remote_media.id if remote_media else None,
+                    "public_delivery_asset_id": (
+                        public_delivery_asset.id if public_delivery_asset else None
+                    ),
+                    "article_revision_id": revision.id,
+                    "asset_cohort_id": cohort.id,
+                    "published_evidence_snapshot_id": (
+                        snapshot.id
+                        if isinstance(snapshot, PublishedEvidenceSnapshot)
+                        else None
+                    ),
+                    "published_visualization_snapshot_id": (
+                        snapshot.id
+                        if isinstance(snapshot, PublishedVisualizationSnapshot)
+                        else None
+                    ),
+                    "usage": item["usage"],
+                    "block_id": item["blockId"],
+                    "display_order": item["displayOrder"],
+                    "alt_text_snapshot": material["alt_text_snapshot"],
+                    "caption_snapshot": material["caption_snapshot"],
+                    "attribution_snapshot": material["attribution_snapshot"],
+                }
+                if any(getattr(binding, field) != value for field, value in expected.items()):
+                    raise Conflict(
+                        "publication media binding replay differs from frozen material"
+                    )
+            bindings.append(binding)
+
+        persisted_ids = set(
+            PublicationMedia.objects.using(using)
+            .filter(publication=publication, asset_cohort=cohort)
+            .values_list("id", flat=True)
+        )
+        if persisted_ids != set(expected_binding_ids):
+            raise Conflict("publication media binding set differs from the manifest")
+        return tuple(sorted(bindings, key=lambda row: (row.display_order, str(row.id))))
+
+
+def _ready_publication_media_manifest(
+    *,
+    attempt: PublicationAttempt,
+    using: str = "default",
+) -> list[dict[str, Any]]:
+    if attempt.resolved_action not in _CONTENT_PUBLICATION_ACTIONS:
+        return []
+    publication = (
+        Publication.objects.using(using)
+        .select_related("target")
+        .get(pk=attempt.publication_id)
+    )
+    cohort = PublishedAssetCohort.objects.using(using).get(
+        revision_id=attempt.article_revision_id
+    )
+    expected_manifest = build_channel_media_manifest(
+        cohort=cohort,
+        channel=publication.target.channel,
+    )
+    approved_manifest = attempt.approval.article_channel_render.media_manifest
+    if approved_manifest != expected_manifest:
+        raise Conflict("approved media manifest differs from the frozen cohort")
+    bindings = tuple(
+        PublicationMedia.objects.using(using)
+        .select_related(
+            "asset_cohort",
+            "remote_media",
+            "public_delivery_asset",
+            "published_evidence_snapshot__evidence__source_item",
+            "published_visualization_snapshot__visualization",
+        )
+        .filter(publication=publication, asset_cohort=cohort)
+        .order_by("display_order", "id")
+    )
+    if len(bindings) != len(approved_manifest):
+        raise Conflict("publication media binding count is incomplete")
+    binding_by_snapshot = {}
+    for binding in bindings:
+        snapshot_id = (
+            binding.published_evidence_snapshot_id
+            or binding.published_visualization_snapshot_id
+        )
+        if snapshot_id in binding_by_snapshot:
+            raise Conflict("publication media binding snapshot is duplicated")
+        binding_by_snapshot[str(snapshot_id)] = binding
+
+    resolved = []
+    for item in approved_manifest:
+        binding = binding_by_snapshot.get(str(item.get("snapshotId")))
+        if (
+            binding is None
+            or binding.binding_state != PublicationMedia.BindingState.ACTIVE
+            or str(binding.asset_cohort_id) != str(item.get("cohortId"))
+            or binding.asset_cohort.manifest_hash
+            != item.get("cohortManifestHash")
+        ):
+            raise Conflict("publication media binding is not active and current")
+        snapshot = (
+            binding.published_evidence_snapshot
+            or binding.published_visualization_snapshot
+        )
+        material = _snapshot_delivery_material(snapshot)
+        if (
+            material["asset_checksum"] != item.get("assetChecksum")
+            or material["presentation_hash"] != item.get("presentationHash")
+            or material["rights_status_snapshot"]
+            not in {"allowed", "attribution_required"}
+        ):
+            raise Conflict("publication media rights or presentation is stale")
+        if isinstance(snapshot, PublishedEvidenceSnapshot):
+            evidence = snapshot.evidence
+            source_item = evidence.source_item
+            if (
+                not evidence.publishable
+                or evidence.review_state != "passed"
+                or evidence.rights_status != snapshot.rights_status_snapshot
+                or evidence.rights_basis_url != snapshot.rights_basis_url_snapshot
+                or evidence.checksum != snapshot.asset_checksum
+                or evidence.object_key != snapshot.object_key
+                or evidence.object_version != snapshot.object_version
+                or source_item.source_version_hash != snapshot.source_version_hash
+                or source_item.status != "active"
+            ):
+                raise Conflict("published evidence media is no longer current")
+        else:
+            visualization = snapshot.visualization
+            if (
+                visualization.state != "succeeded"
+                or visualization.checksum != snapshot.output_checksum
+                or visualization.object_key != snapshot.object_key
+                or visualization.object_version != snapshot.object_version
+                or visualization.input_manifest_hash
+                != snapshot.input_manifest_hash
+            ):
+                raise Conflict("published visualization media is no longer current")
+        if binding.remote_media_id:
+            mapping = binding.remote_media
+            if (
+                mapping.state != RemoteMedia.State.AVAILABLE
+                or not mapping.remote_media_id
+                or not mapping.remote_source_url
+                or mapping.asset_checksum != material["asset_checksum"]
+                or mapping.presentation_hash != material["presentation_hash"]
+                or binding.remote_verified_at is None
+            ):
+                raise Conflict("WordPress media mapping is not ready")
+            delivery_kind = "wordpress_media"
+            delivery_id = mapping.remote_media_id
+            delivery_url = _validated_remote_url(mapping.remote_source_url)
+        else:
+            mapping = binding.public_delivery_asset
+            if (
+                mapping is None
+                or mapping.state != PublicDeliveryAsset.State.AVAILABLE
+                or not mapping.delivery_object_version
+                or not mapping.public_url
+                or mapping.asset_checksum != material["asset_checksum"]
+                or mapping.presentation_hash != material["presentation_hash"]
+                or binding.remote_verified_at is None
+            ):
+                raise Conflict("public delivery asset is not ready")
+            delivery_kind = "public_delivery_asset"
+            delivery_id = str(mapping.id)
+            delivery_url = _validated_remote_url(mapping.public_url)
+        resolved.append(
+            {
+                **item,
+                "assetId": str(snapshot.id),
+                "deliveryKind": delivery_kind,
+                "deliveryId": delivery_id,
+                "deliveryUrl": delivery_url,
+                "checksum": material["asset_checksum"],
+                "altText": binding.alt_text_snapshot,
+                "caption": binding.caption_snapshot,
+                "attribution": binding.attribution_snapshot,
+                "rightsStatus": material["rights_status_snapshot"],
+            }
+        )
+    return resolved
+
+
+def require_publication_media_ready_locked(
+    *,
+    attempt: PublicationAttempt,
+    using: str = "default",
+) -> None:
+    _ready_publication_media_manifest(attempt=attempt, using=using)
 
 
 @transaction.atomic
@@ -6500,6 +6909,7 @@ def _dispatch_publication_atomic(
                 }
             ),
         )
+        prepare_publication_media_bindings_locked(attempt=attempt)
         attempts.append(attempt)
     attempts_manifest = _publication_attempt_manifest(attempts)
     attempts_hash = sha256_hex(attempts_manifest)
@@ -6882,6 +7292,8 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
         if not _wordpress_dependency_ready(attempt):
             raise Conflict("WordPress 대표 원문의 공개 확인을 기다리고 있습니다.")
 
+    require_publication_media_ready_locked(attempt=attempt)
+
 
 def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
     if attempt.resolved_action == PublicationAction.UNPUBLISH:
@@ -6890,6 +7302,9 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
     if not approval_render:
         raise Conflict("콘텐츠 action에는 승인된 preview render가 필요합니다.")
     target = attempt.publication.target
+    media_manifest = approval_render.media_manifest
+    if isinstance(attempt, PublicationAttempt):
+        media_manifest = _ready_publication_media_manifest(attempt=attempt)
     body = approval_render.body_html
     canonical_url = None
     canonical_state = ArticleChannelRender.CanonicalState.NOT_APPLICABLE
@@ -6930,7 +7345,7 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
             "templateHash": approval_render.template_hash,
             "contentHash": expected_content_hash,
             "sourceManifestHash": approval_render.source_manifest_hash,
-            "mediaManifest": approval_render.media_manifest,
+            "mediaManifest": media_manifest,
             "correctionHistory": approval_render.correction_history,
         }
         observed = {
@@ -6975,7 +7390,7 @@ def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
         template_hash=approval_render.template_hash,
         content_hash=expected_content_hash,
         source_manifest_hash=approval_render.source_manifest_hash,
-        media_manifest=approval_render.media_manifest,
+        media_manifest=media_manifest,
         correction_history=approval_render.correction_history,
     )
 

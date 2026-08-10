@@ -3,23 +3,105 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 
 from adapters.publishers.blogger.client import BloggerPublisher
 from adapters.publishers.wordpress.client import WordPressPublisher
+from apps.publishing import services
 from apps.publishing.contracts import (
     PublishCommand,
     PublisherError,
     RenderedArticle,
     publication_content_marker,
 )
+from apps.publishing.models import Approval, PublicationAction
 
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
+
+
+class PublicationMediaExecutionFenceTests(TestCase):
+    def test_attempt_gate_requires_exact_ready_media_before_external_write(self):
+        target = SimpleNamespace(
+            id=uuid.uuid4(),
+            current_snapshot_id=uuid.uuid4(),
+            current_config_hash=SHA_A,
+            publisher_adapter_manifest_hash=services.ADAPTER_MANIFESTS["wordpress"],
+            channel="wordpress",
+            connection_state="verified",
+            environment="test",
+        )
+        command = {
+            "targetId": str(target.id),
+            "targetSnapshotId": str(target.current_snapshot_id),
+            "targetConfigHash": target.current_config_hash,
+            "resolvedAction": PublicationAction.CREATE,
+            "targetCommandHash": SHA_B,
+        }
+        intent = SimpleNamespace(
+            id=uuid.uuid4(),
+            article_id=uuid.uuid4(),
+            state="dispatched",
+            approval_mode="manual",
+            target_commands=[command],
+        )
+        approval = SimpleNamespace(
+            id=uuid.uuid4(),
+            decision=Approval.Decision.APPROVED,
+            approval_subject_hash="c" * 64,
+            target_action=PublicationAction.CREATE,
+        )
+        attempt = SimpleNamespace(
+            publication_intent=intent,
+            publication=SimpleNamespace(
+                target=target,
+                remote_lookup_key="ww-current",
+            ),
+            remote_lookup_key="ww-current",
+            target_snapshot_id=target.current_snapshot_id,
+            target_config_hash=target.current_config_hash,
+            publisher_adapter_manifest_hash=target.publisher_adapter_manifest_hash,
+            approval=approval,
+            approval_subject_hash=approval.approval_subject_hash,
+            resolved_action=PublicationAction.CREATE,
+        )
+
+        with (
+            patch.object(services, "_require_attempt_origin_run_active"),
+            patch.object(services, "_kill_switch_enabled", return_value=False),
+            patch.object(
+                services,
+                "resolve_current_publication_intent",
+                return_value=intent,
+            ),
+            patch.object(
+                services,
+                "_latest_approval_locked",
+                return_value=approval,
+            ),
+            patch.object(
+                services,
+                "_approval_matches_frozen_subject",
+                return_value=True,
+            ),
+            patch.object(
+                services,
+                "_validated_auto_live_eligible",
+                return_value=True,
+            ),
+            patch.object(
+                services,
+                "require_publication_media_ready_locked",
+            ) as require_media,
+        ):
+            services.validate_attempt_gate(attempt)
+
+        require_media.assert_called_once_with(attempt=attempt)
 
 
 def _rendered_article(*, channel_role: str = "primary_canonical") -> RenderedArticle:

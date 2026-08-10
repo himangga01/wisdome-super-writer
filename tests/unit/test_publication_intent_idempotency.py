@@ -1069,6 +1069,11 @@ class PublicationDispatchCreateTests(SimpleTestCase):
                 side_effect=lambda **kwargs: (trace.append("attempt"), attempt)[1],
             ),
             patch.object(
+                services,
+                "prepare_publication_media_bindings_locked",
+                side_effect=lambda **kwargs: trace.append("media"),
+            ),
+            patch.object(
                 services.PublicationDispatch.objects,
                 "create",
                 side_effect=lambda **kwargs: (trace.append("ledger"), dispatch)[1],
@@ -1095,7 +1100,7 @@ class PublicationDispatchCreateTests(SimpleTestCase):
         self.assertTrue(created)
         self.assertIs(observed.dispatch, dispatch)
         self.assertEqual(observed.attempts, (attempt,))
-        self.assertEqual(trace, ["attempt", "ledger", "queue"])
+        self.assertEqual(trace, ["attempt", "media", "ledger", "queue"])
         ledger_kwargs = create_dispatch.call_args.kwargs
         self.assertEqual(ledger_kwargs["request_hash_version"], "publication-dispatch-request-v1")
         self.assertEqual(ledger_kwargs["attempt_count"], 1)

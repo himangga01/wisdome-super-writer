@@ -1967,7 +1967,89 @@ class PublishedVisualizationInput(_AppendOnlyPublishedAssetModel):
         ]
 
 
-class RemoteMedia(models.Model):
+class _FrozenMediaIdentityQuerySet(models.QuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset()
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_IDENTITY_FIELDS.intersection(fields):
+            raise TypeError("Publication media identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_frozen_fields(fields)
+        return await super().abulk_update(objs, fields, batch_size=batch_size)
+
+    def delete(self):
+        raise TypeError("Publication media lineage is append-only")
+
+    async def adelete(self):
+        raise TypeError("Publication media lineage is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("Publication media lineage is append-only")
+
+
+class _FrozenMediaIdentityModel(models.Model):
+    FROZEN_IDENTITY_ATTNAMES = frozenset()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                type(self).objects.all()._reject_frozen_fields(update_fields)
+            else:
+                stored = type(self).objects.filter(pk=self.pk).values(
+                    *self.FROZEN_IDENTITY_ATTNAMES
+                ).first()
+                if stored is None or any(
+                    getattr(self, field) != value
+                    for field, value in stored.items()
+                ):
+                    raise TypeError("Publication media identity is immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Publication media lineage is append-only")
+
+
+class RemoteMediaQuerySet(_FrozenMediaIdentityQuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "target",
+            "target_id",
+            "asset_checksum",
+            "presentation_hash",
+            "remote_lookup_key",
+            "request_fingerprint",
+        }
+    )
+
+
+class RemoteMedia(_FrozenMediaIdentityModel):
+    FROZEN_IDENTITY_ATTNAMES = frozenset(
+        {
+            "target_id",
+            "asset_checksum",
+            "presentation_hash",
+            "remote_lookup_key",
+            "request_fingerprint",
+        }
+    )
     class State(models.TextChoices):
         PENDING = "pending", "대기"
         UPLOADING = "uploading", "업로드 중"
@@ -1979,9 +2061,8 @@ class RemoteMedia(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target = models.ForeignKey(PublicationTarget, on_delete=models.PROTECT, related_name="remote_media")
-    evidence_asset_id = models.UUIDField(null=True, blank=True)
-    asset_checksum = models.CharField(max_length=64)
-    presentation_hash = models.CharField(max_length=64)
+    asset_checksum = models.CharField(max_length=64, validators=[sha256_validator])
+    presentation_hash = models.CharField(max_length=64, validators=[sha256_validator])
     remote_lookup_key = models.CharField(max_length=255)
     remote_media_id = models.CharField(max_length=255, null=True, blank=True)
     remote_source_url = models.URLField(max_length=1000, null=True, blank=True)
@@ -1994,6 +2075,7 @@ class RemoteMedia(models.Model):
     deleted_at = models.DateTimeField(null=True, blank=True)
     delete_reason = models.CharField(max_length=500, blank=True)
     last_reconcile_hash = models.CharField(max_length=64, blank=True)
+    objects = models.Manager.from_queryset(RemoteMediaQuerySet)()
 
     class Meta:
         constraints = [
@@ -2007,27 +2089,45 @@ class RemoteMedia(models.Model):
         ]
 
 
-class PublicDeliveryAsset(models.Model):
+class PublicDeliveryAssetQuerySet(_FrozenMediaIdentityQuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "asset_checksum",
+            "presentation_hash",
+            "mime_type",
+            "byte_size",
+            "delivery_object_key",
+            "rights_status_snapshot",
+            "alt_text_snapshot",
+            "caption_snapshot",
+            "attribution_snapshot",
+            "created_at",
+        }
+    )
+
+
+class PublicDeliveryAsset(_FrozenMediaIdentityModel):
+    FROZEN_IDENTITY_ATTNAMES = PublicDeliveryAssetQuerySet.FROZEN_IDENTITY_FIELDS
     class State(models.TextChoices):
+        PENDING = "pending", "Preparing"
         AVAILABLE = "available", "사용 가능"
         WITHDRAWAL_PENDING = "withdrawal_pending", "철회 대기"
         PENDING_DELETE = "pending_delete", "삭제 대기"
         DELETED = "deleted", "삭제"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    source_evidence_asset_id = models.UUIDField(null=True, blank=True)
-    asset_checksum = models.CharField(max_length=64)
-    presentation_hash = models.CharField(max_length=64)
+    asset_checksum = models.CharField(max_length=64, validators=[sha256_validator])
+    presentation_hash = models.CharField(max_length=64, validators=[sha256_validator])
     mime_type = models.CharField(max_length=255)
     byte_size = models.PositiveBigIntegerField()
     delivery_object_key = models.CharField(max_length=1000)
-    delivery_object_version = models.CharField(max_length=255)
-    public_url = models.URLField(max_length=1000, unique=True)
+    delivery_object_version = models.CharField(max_length=255, blank=True)
+    public_url = models.URLField(max_length=1000, unique=True, null=True, blank=True)
     rights_status_snapshot = models.CharField(max_length=32)
     alt_text_snapshot = models.CharField(max_length=1000)
     caption_snapshot = models.TextField(blank=True)
     attribution_snapshot = models.TextField(blank=True)
-    state = models.CharField(max_length=24, choices=State.choices, default=State.AVAILABLE)
+    state = models.CharField(max_length=24, choices=State.choices, default=State.PENDING)
     active_reference_count = models.PositiveIntegerField(default=0)
     lease_generation = models.PositiveIntegerField(default=1)
     last_remote_body_hash = models.CharField(max_length=64, blank=True)
@@ -2037,6 +2137,7 @@ class PublicDeliveryAsset(models.Model):
     deleted_at = models.DateTimeField(null=True, blank=True)
     delete_reason = models.CharField(max_length=500, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicDeliveryAssetQuerySet)()
 
     class Meta:
         constraints = [
@@ -2046,7 +2147,48 @@ class PublicDeliveryAsset(models.Model):
         ]
 
 
-class PublicationMedia(models.Model):
+class PublicationMediaQuerySet(_FrozenMediaIdentityQuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "publication",
+            "publication_id",
+            "remote_media",
+            "remote_media_id",
+            "public_delivery_asset",
+            "public_delivery_asset_id",
+            "article_revision",
+            "article_revision_id",
+            "asset_cohort",
+            "asset_cohort_id",
+            "published_evidence_snapshot",
+            "published_evidence_snapshot_id",
+            "published_visualization_snapshot",
+            "published_visualization_snapshot_id",
+            "usage",
+            "block_id",
+            "display_order",
+            "alt_text_snapshot",
+            "caption_snapshot",
+            "attribution_snapshot",
+            "created_at",
+        }
+    )
+
+
+class PublicationMedia(_FrozenMediaIdentityModel):
+    FROZEN_IDENTITY_ATTNAMES = frozenset(
+        field
+        for field in PublicationMediaQuerySet.FROZEN_IDENTITY_FIELDS
+        if field not in {
+            "publication",
+            "remote_media",
+            "public_delivery_asset",
+            "article_revision",
+            "asset_cohort",
+            "published_evidence_snapshot",
+            "published_visualization_snapshot",
+        }
+    )
     class Usage(models.TextChoices):
         INLINE = "inline", "본문"
         FEATURED = "featured", "대표"
@@ -2066,9 +2208,25 @@ class PublicationMedia(models.Model):
     article_revision = models.ForeignKey(
         "editorial.ArticleRevision", on_delete=models.PROTECT, related_name="publication_media_bindings"
     )
-    evidence_asset_id = models.UUIDField(null=True, blank=True)
-    published_evidence_snapshot_id = models.UUIDField(null=True, blank=True)
-    published_visualization_snapshot_id = models.UUIDField(null=True, blank=True)
+    asset_cohort = models.ForeignKey(
+        PublishedAssetCohort,
+        on_delete=models.PROTECT,
+        related_name="publication_media_bindings",
+    )
+    published_evidence_snapshot = models.ForeignKey(
+        PublishedEvidenceSnapshot,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="publication_media_bindings",
+    )
+    published_visualization_snapshot = models.ForeignKey(
+        PublishedVisualizationSnapshot,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="publication_media_bindings",
+    )
     usage = models.CharField(max_length=16, choices=Usage.choices)
     block_id = models.CharField(max_length=255)
     display_order = models.PositiveIntegerField(default=0)
@@ -2083,6 +2241,7 @@ class PublicationMedia(models.Model):
     remote_verified_at = models.DateTimeField(null=True, blank=True)
     removed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicationMediaQuerySet)()
 
     class Meta:
         constraints = [
@@ -2095,10 +2254,20 @@ class PublicationMedia(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
-                    Q(published_evidence_snapshot_id__isnull=False, published_visualization_snapshot_id__isnull=True)
-                    | Q(published_evidence_snapshot_id__isnull=True, published_visualization_snapshot_id__isnull=False)
+                    Q(published_evidence_snapshot__isnull=False, published_visualization_snapshot__isnull=True)
+                    | Q(published_evidence_snapshot__isnull=True, published_visualization_snapshot__isnull=False)
                 ),
                 name="ck_publication_media_provenance_xor",
+            ),
+            models.UniqueConstraint(
+                fields=["publication", "published_evidence_snapshot"],
+                condition=Q(published_evidence_snapshot__isnull=False),
+                name="uq_publication_evidence_snapshot",
+            ),
+            models.UniqueConstraint(
+                fields=["publication", "published_visualization_snapshot"],
+                condition=Q(published_visualization_snapshot__isnull=False),
+                name="uq_publication_visual_snapshot",
             ),
             models.UniqueConstraint(
                 fields=["publication", "article_revision", "remote_media", "block_id"],

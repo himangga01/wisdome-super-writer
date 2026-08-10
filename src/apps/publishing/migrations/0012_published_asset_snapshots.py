@@ -110,6 +110,144 @@ SQLITE_GUARD_SQL = (
     )
     BEGIN SELECT RAISE(ABORT, 'published visualization input cohort mismatch'); END;
     """,
+    """
+    CREATE TRIGGER pub_remote_media_identity_upd_t022
+    BEFORE UPDATE ON publishing_remotemedia
+    WHEN NEW.target_id IS NOT OLD.target_id
+      OR NEW.asset_checksum IS NOT OLD.asset_checksum
+      OR NEW.presentation_hash IS NOT OLD.presentation_hash
+      OR NEW.remote_lookup_key IS NOT OLD.remote_lookup_key
+      OR NEW.request_fingerprint IS NOT OLD.request_fingerprint
+    BEGIN SELECT RAISE(ABORT, 'remote media identity is immutable'); END;
+    """,
+    """
+    CREATE TRIGGER pub_remote_media_del_t022
+    BEFORE DELETE ON publishing_remotemedia
+    BEGIN SELECT RAISE(ABORT, 'remote media lineage is append-only'); END;
+    """,
+    """
+    CREATE TRIGGER pub_delivery_asset_identity_upd_t022
+    BEFORE UPDATE ON publishing_publicdeliveryasset
+    WHEN NEW.asset_checksum IS NOT OLD.asset_checksum
+      OR NEW.presentation_hash IS NOT OLD.presentation_hash
+      OR NEW.mime_type IS NOT OLD.mime_type
+      OR NEW.byte_size IS NOT OLD.byte_size
+      OR NEW.delivery_object_key IS NOT OLD.delivery_object_key
+      OR NEW.rights_status_snapshot IS NOT OLD.rights_status_snapshot
+      OR NEW.alt_text_snapshot IS NOT OLD.alt_text_snapshot
+      OR NEW.caption_snapshot IS NOT OLD.caption_snapshot
+      OR NEW.attribution_snapshot IS NOT OLD.attribution_snapshot
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN SELECT RAISE(ABORT, 'public delivery asset identity is immutable'); END;
+    """,
+    """
+    CREATE TRIGGER pub_delivery_asset_del_t022
+    BEFORE DELETE ON publishing_publicdeliveryasset
+    BEGIN SELECT RAISE(ABORT, 'public delivery asset lineage is append-only'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_binding_identity_upd_t022
+    BEFORE UPDATE ON publishing_publicationmedia
+    WHEN NEW.publication_id IS NOT OLD.publication_id
+      OR NEW.remote_media_id IS NOT OLD.remote_media_id
+      OR NEW.public_delivery_asset_id IS NOT OLD.public_delivery_asset_id
+      OR NEW.article_revision_id IS NOT OLD.article_revision_id
+      OR NEW.asset_cohort_id IS NOT OLD.asset_cohort_id
+      OR NEW.published_evidence_snapshot_id IS NOT OLD.published_evidence_snapshot_id
+      OR NEW.published_visualization_snapshot_id IS NOT OLD.published_visualization_snapshot_id
+      OR NEW.usage IS NOT OLD.usage
+      OR NEW.block_id IS NOT OLD.block_id
+      OR NEW.display_order IS NOT OLD.display_order
+      OR NEW.alt_text_snapshot IS NOT OLD.alt_text_snapshot
+      OR NEW.caption_snapshot IS NOT OLD.caption_snapshot
+      OR NEW.attribution_snapshot IS NOT OLD.attribution_snapshot
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN SELECT RAISE(ABORT, 'publication media binding identity is immutable'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_binding_del_t022
+    BEFORE DELETE ON publishing_publicationmedia
+    BEGIN SELECT RAISE(ABORT, 'publication media binding is append-only'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_binding_insert_t022
+    BEFORE INSERT ON publishing_publicationmedia
+    WHEN NOT EXISTS (
+        SELECT 1
+          FROM publishing_publication publication
+          JOIN editorial_articlerevision revision
+            ON revision.id = NEW.article_revision_id
+          JOIN publishing_publishedassetcohort cohort
+            ON cohort.id = NEW.asset_cohort_id
+         WHERE publication.id = NEW.publication_id
+           AND publication.article_id = revision.article_id
+           AND cohort.revision_id = revision.id
+           AND (
+             (
+               NEW.published_evidence_snapshot_id IS NOT NULL
+               AND NEW.published_visualization_snapshot_id IS NULL
+               AND EXISTS (
+                 SELECT 1
+                   FROM publishing_publishedevidencesnapshot snapshot
+                  WHERE snapshot.id = NEW.published_evidence_snapshot_id
+                    AND snapshot.cohort_id = cohort.id
+                    AND (
+                      (NEW.remote_media_id IS NOT NULL
+                       AND NEW.public_delivery_asset_id IS NULL
+                       AND EXISTS (
+                         SELECT 1 FROM publishing_remotemedia mapping
+                          WHERE mapping.id = NEW.remote_media_id
+                            AND mapping.target_id = publication.target_id
+                            AND mapping.asset_checksum = snapshot.asset_checksum
+                            AND mapping.presentation_hash = snapshot.presentation_hash
+                       ))
+                      OR
+                      (NEW.remote_media_id IS NULL
+                       AND NEW.public_delivery_asset_id IS NOT NULL
+                       AND EXISTS (
+                         SELECT 1 FROM publishing_publicdeliveryasset mapping
+                          WHERE mapping.id = NEW.public_delivery_asset_id
+                            AND mapping.asset_checksum = snapshot.asset_checksum
+                            AND mapping.presentation_hash = snapshot.presentation_hash
+                       ))
+                    )
+               )
+             )
+             OR
+             (
+               NEW.published_evidence_snapshot_id IS NULL
+               AND NEW.published_visualization_snapshot_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                   FROM publishing_publishedvisualizationsnapshot snapshot
+                  WHERE snapshot.id = NEW.published_visualization_snapshot_id
+                    AND snapshot.cohort_id = cohort.id
+                    AND (
+                      (NEW.remote_media_id IS NOT NULL
+                       AND NEW.public_delivery_asset_id IS NULL
+                       AND EXISTS (
+                         SELECT 1 FROM publishing_remotemedia mapping
+                          WHERE mapping.id = NEW.remote_media_id
+                            AND mapping.target_id = publication.target_id
+                            AND mapping.asset_checksum = snapshot.output_checksum
+                            AND mapping.presentation_hash = snapshot.presentation_hash
+                       ))
+                      OR
+                      (NEW.remote_media_id IS NULL
+                       AND NEW.public_delivery_asset_id IS NOT NULL
+                       AND EXISTS (
+                         SELECT 1 FROM publishing_publicdeliveryasset mapping
+                          WHERE mapping.id = NEW.public_delivery_asset_id
+                            AND mapping.asset_checksum = snapshot.output_checksum
+                            AND mapping.presentation_hash = snapshot.presentation_hash
+                       ))
+                    )
+               )
+             )
+           )
+    )
+    BEGIN SELECT RAISE(ABORT, 'publication media binding lineage mismatch'); END;
+    """,
 )
 
 
@@ -241,6 +379,166 @@ POSTGRES_GUARD_SQL = (
     BEFORE INSERT ON publishing_publishedvisualizationinput
     FOR EACH ROW EXECUTE FUNCTION publishing_visual_input_insert_t022_fn();
     """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_remote_media_guard_t022_fn()
+    RETURNS trigger AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'remote media lineage is append-only';
+      END IF;
+      IF NEW.target_id IS DISTINCT FROM OLD.target_id
+         OR NEW.asset_checksum IS DISTINCT FROM OLD.asset_checksum
+         OR NEW.presentation_hash IS DISTINCT FROM OLD.presentation_hash
+         OR NEW.remote_lookup_key IS DISTINCT FROM OLD.remote_lookup_key
+         OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint THEN
+        RAISE EXCEPTION 'remote media identity is immutable';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_remote_media_guard_t022
+    BEFORE UPDATE OR DELETE ON publishing_remotemedia
+    FOR EACH ROW EXECUTE FUNCTION publishing_remote_media_guard_t022_fn();
+    """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_delivery_asset_guard_t022_fn()
+    RETURNS trigger AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'public delivery asset lineage is append-only';
+      END IF;
+      IF NEW.asset_checksum IS DISTINCT FROM OLD.asset_checksum
+         OR NEW.presentation_hash IS DISTINCT FROM OLD.presentation_hash
+         OR NEW.mime_type IS DISTINCT FROM OLD.mime_type
+         OR NEW.byte_size IS DISTINCT FROM OLD.byte_size
+         OR NEW.delivery_object_key IS DISTINCT FROM OLD.delivery_object_key
+         OR NEW.rights_status_snapshot IS DISTINCT FROM OLD.rights_status_snapshot
+         OR NEW.alt_text_snapshot IS DISTINCT FROM OLD.alt_text_snapshot
+         OR NEW.caption_snapshot IS DISTINCT FROM OLD.caption_snapshot
+         OR NEW.attribution_snapshot IS DISTINCT FROM OLD.attribution_snapshot
+         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'public delivery asset identity is immutable';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_delivery_asset_guard_t022
+    BEFORE UPDATE OR DELETE ON publishing_publicdeliveryasset
+    FOR EACH ROW EXECUTE FUNCTION publishing_delivery_asset_guard_t022_fn();
+    """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_media_binding_guard_t022_fn()
+    RETURNS trigger AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'publication media binding is append-only';
+      END IF;
+      IF NEW.publication_id IS DISTINCT FROM OLD.publication_id
+         OR NEW.remote_media_id IS DISTINCT FROM OLD.remote_media_id
+         OR NEW.public_delivery_asset_id IS DISTINCT FROM OLD.public_delivery_asset_id
+         OR NEW.article_revision_id IS DISTINCT FROM OLD.article_revision_id
+         OR NEW.asset_cohort_id IS DISTINCT FROM OLD.asset_cohort_id
+         OR NEW.published_evidence_snapshot_id IS DISTINCT FROM OLD.published_evidence_snapshot_id
+         OR NEW.published_visualization_snapshot_id IS DISTINCT FROM OLD.published_visualization_snapshot_id
+         OR NEW.usage IS DISTINCT FROM OLD.usage
+         OR NEW.block_id IS DISTINCT FROM OLD.block_id
+         OR NEW.display_order IS DISTINCT FROM OLD.display_order
+         OR NEW.alt_text_snapshot IS DISTINCT FROM OLD.alt_text_snapshot
+         OR NEW.caption_snapshot IS DISTINCT FROM OLD.caption_snapshot
+         OR NEW.attribution_snapshot IS DISTINCT FROM OLD.attribution_snapshot
+         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'publication media binding identity is immutable';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_media_binding_guard_t022
+    BEFORE UPDATE OR DELETE ON publishing_publicationmedia
+    FOR EACH ROW EXECUTE FUNCTION publishing_media_binding_guard_t022_fn();
+    """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_media_binding_insert_t022_fn()
+    RETURNS trigger AS $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+          FROM publishing_publication publication
+          JOIN editorial_articlerevision revision
+            ON revision.id = NEW.article_revision_id
+          JOIN publishing_publishedassetcohort cohort
+            ON cohort.id = NEW.asset_cohort_id
+         WHERE publication.id = NEW.publication_id
+           AND publication.article_id = revision.article_id
+           AND cohort.revision_id = revision.id
+           AND (
+             (NEW.published_evidence_snapshot_id IS NOT NULL
+              AND NEW.published_visualization_snapshot_id IS NULL
+              AND EXISTS (
+                SELECT 1 FROM publishing_publishedevidencesnapshot snapshot
+                 WHERE snapshot.id = NEW.published_evidence_snapshot_id
+                   AND snapshot.cohort_id = cohort.id
+                   AND (
+                     (NEW.remote_media_id IS NOT NULL
+                      AND NEW.public_delivery_asset_id IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM publishing_remotemedia mapping
+                         WHERE mapping.id = NEW.remote_media_id
+                           AND mapping.target_id = publication.target_id
+                           AND mapping.asset_checksum = snapshot.asset_checksum
+                           AND mapping.presentation_hash = snapshot.presentation_hash))
+                     OR
+                     (NEW.remote_media_id IS NULL
+                      AND NEW.public_delivery_asset_id IS NOT NULL
+                      AND EXISTS (
+                        SELECT 1 FROM publishing_publicdeliveryasset mapping
+                         WHERE mapping.id = NEW.public_delivery_asset_id
+                           AND mapping.asset_checksum = snapshot.asset_checksum
+                           AND mapping.presentation_hash = snapshot.presentation_hash))
+                   )))
+             OR
+             (NEW.published_evidence_snapshot_id IS NULL
+              AND NEW.published_visualization_snapshot_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM publishing_publishedvisualizationsnapshot snapshot
+                 WHERE snapshot.id = NEW.published_visualization_snapshot_id
+                   AND snapshot.cohort_id = cohort.id
+                   AND (
+                     (NEW.remote_media_id IS NOT NULL
+                      AND NEW.public_delivery_asset_id IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM publishing_remotemedia mapping
+                         WHERE mapping.id = NEW.remote_media_id
+                           AND mapping.target_id = publication.target_id
+                           AND mapping.asset_checksum = snapshot.output_checksum
+                           AND mapping.presentation_hash = snapshot.presentation_hash))
+                     OR
+                     (NEW.remote_media_id IS NULL
+                      AND NEW.public_delivery_asset_id IS NOT NULL
+                      AND EXISTS (
+                        SELECT 1 FROM publishing_publicdeliveryasset mapping
+                         WHERE mapping.id = NEW.public_delivery_asset_id
+                           AND mapping.asset_checksum = snapshot.output_checksum
+                           AND mapping.presentation_hash = snapshot.presentation_hash))
+                   )))
+           )
+      ) THEN
+        RAISE EXCEPTION 'publication media binding lineage mismatch';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_media_binding_insert_t022
+    BEFORE INSERT ON publishing_publicationmedia
+    FOR EACH ROW EXECUTE FUNCTION publishing_media_binding_insert_t022_fn();
+    """,
 )
 
 
@@ -257,6 +555,13 @@ SQLITE_GUARD_NAMES = (
     "pub_evidence_snap_insert_t022",
     "pub_visual_snap_insert_t022",
     "pub_visual_input_insert_t022",
+    "pub_remote_media_identity_upd_t022",
+    "pub_remote_media_del_t022",
+    "pub_delivery_asset_identity_upd_t022",
+    "pub_delivery_asset_del_t022",
+    "pub_media_binding_identity_upd_t022",
+    "pub_media_binding_del_t022",
+    "pub_media_binding_insert_t022",
 )
 
 
@@ -269,6 +574,10 @@ POSTGRES_GUARD_NAMES = (
     "pub_evidence_snap_insert_t022",
     "pub_visual_snap_insert_t022",
     "pub_visual_input_insert_t022",
+    "pub_remote_media_guard_t022",
+    "pub_delivery_asset_guard_t022",
+    "pub_media_binding_guard_t022",
+    "pub_media_binding_insert_t022",
 )
 
 
@@ -278,6 +587,10 @@ POSTGRES_FUNCTION_NAMES = (
     "publishing_evidence_snap_insert_t022_fn",
     "publishing_visual_snap_insert_t022_fn",
     "publishing_visual_input_insert_t022_fn",
+    "publishing_remote_media_guard_t022_fn",
+    "publishing_delivery_asset_guard_t022_fn",
+    "publishing_media_binding_guard_t022_fn",
+    "publishing_media_binding_insert_t022_fn",
 )
 
 
@@ -335,6 +648,90 @@ def backfill_asset_cohorts(apps, schema_editor):
         )
 
 
+def bind_existing_publication_media(apps, schema_editor):
+    alias = schema_editor.connection.alias
+    PublicationMedia = apps.get_model("publishing", "PublicationMedia")
+    EvidenceSnapshot = apps.get_model("publishing", "PublishedEvidenceSnapshot")
+    VisualizationSnapshot = apps.get_model(
+        "publishing", "PublishedVisualizationSnapshot"
+    )
+
+    for binding in PublicationMedia.objects.using(alias).order_by("id"):
+        evidence_snapshot_id = binding.published_evidence_snapshot_id
+        visualization_snapshot_id = binding.published_visualization_snapshot_id
+        if bool(evidence_snapshot_id) == bool(visualization_snapshot_id):
+            raise RuntimeError(
+                f"publication media {binding.id} has ambiguous frozen provenance"
+            )
+
+        if evidence_snapshot_id:
+            snapshot = (
+                EvidenceSnapshot.objects.using(alias)
+                .select_related("cohort")
+                .filter(pk=evidence_snapshot_id)
+                .first()
+            )
+            if snapshot is None:
+                raise RuntimeError(
+                    f"publication media {binding.id} evidence snapshot is unverifiable"
+                )
+            if binding.evidence_asset_id not in (None, snapshot.evidence_id):
+                raise RuntimeError(
+                    f"publication media {binding.id} evidence identity mismatch"
+                )
+            asset_checksum = snapshot.asset_checksum
+            presentation_hash = snapshot.presentation_hash
+        else:
+            snapshot = (
+                VisualizationSnapshot.objects.using(alias)
+                .select_related("cohort")
+                .filter(pk=visualization_snapshot_id)
+                .first()
+            )
+            if snapshot is None:
+                raise RuntimeError(
+                    f"publication media {binding.id} visualization snapshot is unverifiable"
+                )
+            if binding.evidence_asset_id is not None:
+                raise RuntimeError(
+                    f"publication media {binding.id} has contradictory evidence identity"
+                )
+            asset_checksum = snapshot.output_checksum
+            presentation_hash = snapshot.presentation_hash
+
+        if snapshot.cohort.revision_id != binding.article_revision_id:
+            raise RuntimeError(
+                f"publication media {binding.id} revision/cohort mismatch"
+            )
+        if binding.remote_media_id:
+            remote = binding.remote_media
+            if (
+                remote.asset_checksum != asset_checksum
+                or remote.presentation_hash != presentation_hash
+            ):
+                raise RuntimeError(
+                    f"publication media {binding.id} remote material mismatch"
+                )
+        else:
+            delivery = binding.public_delivery_asset
+            if (
+                delivery.asset_checksum != asset_checksum
+                or delivery.presentation_hash != presentation_hash
+            ):
+                raise RuntimeError(
+                    f"publication media {binding.id} delivery material mismatch"
+                )
+
+        update_fields = {"asset_cohort_id": snapshot.cohort_id}
+        if evidence_snapshot_id:
+            update_fields["evidence_snapshot_ref_id"] = snapshot.id
+        else:
+            update_fields["visualization_snapshot_ref_id"] = snapshot.id
+        PublicationMedia.objects.using(alias).filter(pk=binding.id).update(
+            **update_fields
+        )
+
+
 def install_asset_guards(apps, schema_editor):
     vendor = schema_editor.connection.vendor
     statements = SQLITE_GUARD_SQL if vendor == "sqlite" else POSTGRES_GUARD_SQL
@@ -362,6 +759,10 @@ def remove_asset_guards(apps, schema_editor):
                 ("publishing_publishedevidencesnapshot", "pub_evidence_snap_insert_t022"),
                 ("publishing_publishedvisualizationsnapshot", "pub_visual_snap_insert_t022"),
                 ("publishing_publishedvisualizationinput", "pub_visual_input_insert_t022"),
+                ("publishing_remotemedia", "pub_remote_media_guard_t022"),
+                ("publishing_publicdeliveryasset", "pub_delivery_asset_guard_t022"),
+                ("publishing_publicationmedia", "pub_media_binding_guard_t022"),
+                ("publishing_publicationmedia", "pub_media_binding_insert_t022"),
             ):
                 cursor.execute(f'DROP TRIGGER IF EXISTS "{name}" ON {table}')
             for name in POSTGRES_FUNCTION_NAMES:
@@ -372,6 +773,7 @@ def remove_asset_guards(apps, schema_editor):
 
 def reject_populated_reverse(apps, schema_editor):
     for model_name in (
+        "PublicationMedia",
         "PublishedVisualizationInput",
         "PublishedVisualizationSnapshot",
         "PublishedEvidenceSnapshot",
@@ -485,6 +887,118 @@ class Migration(migrations.Migration):
             },
         ),
         migrations.RunPython(backfill_asset_cohorts, migrations.RunPython.noop),
+        migrations.AddField(
+            model_name='publicationmedia',
+            name='asset_cohort',
+            field=models.ForeignKey(null=True, on_delete=django.db.models.deletion.PROTECT, related_name='publication_media_bindings', to='publishing.publishedassetcohort'),
+        ),
+        migrations.AddField(
+            model_name='publicationmedia',
+            name='evidence_snapshot_ref',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='+', to='publishing.publishedevidencesnapshot'),
+        ),
+        migrations.AddField(
+            model_name='publicationmedia',
+            name='visualization_snapshot_ref',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='+', to='publishing.publishedvisualizationsnapshot'),
+        ),
+        migrations.RunPython(bind_existing_publication_media, migrations.RunPython.noop),
+        migrations.RemoveConstraint(
+            model_name='publicationmedia',
+            name='ck_publication_media_provenance_xor',
+        ),
+        migrations.RemoveField(
+            model_name='publicationmedia',
+            name='published_evidence_snapshot_id',
+        ),
+        migrations.RemoveField(
+            model_name='publicationmedia',
+            name='published_visualization_snapshot_id',
+        ),
+        migrations.RenameField(
+            model_name='publicationmedia',
+            old_name='evidence_snapshot_ref',
+            new_name='published_evidence_snapshot',
+        ),
+        migrations.RenameField(
+            model_name='publicationmedia',
+            old_name='visualization_snapshot_ref',
+            new_name='published_visualization_snapshot',
+        ),
+        migrations.AlterField(
+            model_name='publicationmedia',
+            name='published_evidence_snapshot',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='publication_media_bindings', to='publishing.publishedevidencesnapshot'),
+        ),
+        migrations.AlterField(
+            model_name='publicationmedia',
+            name='published_visualization_snapshot',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='publication_media_bindings', to='publishing.publishedvisualizationsnapshot'),
+        ),
+        migrations.AlterField(
+            model_name='publicationmedia',
+            name='asset_cohort',
+            field=models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='publication_media_bindings', to='publishing.publishedassetcohort'),
+        ),
+        migrations.RemoveField(
+            model_name='publicationmedia',
+            name='evidence_asset_id',
+        ),
+        migrations.RemoveField(
+            model_name='remotemedia',
+            name='evidence_asset_id',
+        ),
+        migrations.RemoveField(
+            model_name='publicdeliveryasset',
+            name='source_evidence_asset_id',
+        ),
+        migrations.AlterField(
+            model_name='remotemedia',
+            name='asset_checksum',
+            field=models.CharField(max_length=64, validators=[django.core.validators.RegexValidator('^[0-9a-f]{64}$', 'Expected a lowercase SHA-256 digest')]),
+        ),
+        migrations.AlterField(
+            model_name='remotemedia',
+            name='presentation_hash',
+            field=models.CharField(max_length=64, validators=[django.core.validators.RegexValidator('^[0-9a-f]{64}$', 'Expected a lowercase SHA-256 digest')]),
+        ),
+        migrations.AlterField(
+            model_name='publicdeliveryasset',
+            name='asset_checksum',
+            field=models.CharField(max_length=64, validators=[django.core.validators.RegexValidator('^[0-9a-f]{64}$', 'Expected a lowercase SHA-256 digest')]),
+        ),
+        migrations.AlterField(
+            model_name='publicdeliveryasset',
+            name='presentation_hash',
+            field=models.CharField(max_length=64, validators=[django.core.validators.RegexValidator('^[0-9a-f]{64}$', 'Expected a lowercase SHA-256 digest')]),
+        ),
+        migrations.AlterField(
+            model_name='publicdeliveryasset',
+            name='delivery_object_version',
+            field=models.CharField(blank=True, max_length=255),
+        ),
+        migrations.AlterField(
+            model_name='publicdeliveryasset',
+            name='public_url',
+            field=models.URLField(blank=True, max_length=1000, null=True, unique=True),
+        ),
+        migrations.AlterField(
+            model_name='publicdeliveryasset',
+            name='state',
+            field=models.CharField(choices=[('pending', 'Preparing'), ('available', '사용 가능'), ('withdrawal_pending', '철회 대기'), ('pending_delete', '삭제 대기'), ('deleted', '삭제')], default='pending', max_length=24),
+        ),
+        migrations.AddConstraint(
+            model_name='publicationmedia',
+            constraint=models.CheckConstraint(condition=models.Q(models.Q(('published_evidence_snapshot__isnull', False), ('published_visualization_snapshot__isnull', True)), models.Q(('published_evidence_snapshot__isnull', True), ('published_visualization_snapshot__isnull', False)), _connector='OR'), name='ck_publication_media_provenance_xor'),
+        ),
+        migrations.AddConstraint(
+            model_name='publicationmedia',
+            constraint=models.UniqueConstraint(condition=models.Q(('published_evidence_snapshot__isnull', False)), fields=('publication', 'published_evidence_snapshot'), name='uq_publication_evidence_snapshot'),
+        ),
+        migrations.AddConstraint(
+            model_name='publicationmedia',
+            constraint=models.UniqueConstraint(condition=models.Q(('published_visualization_snapshot__isnull', False)), fields=('publication', 'published_visualization_snapshot'), name='uq_publication_visual_snapshot'),
+        ),
         migrations.RunPython(install_asset_guards, remove_asset_guards),
         migrations.RunPython(
             migrations.RunPython.noop,
