@@ -210,23 +210,95 @@ class RetentionBatch(UUIDModel):
 
     policy_version = models.PositiveIntegerField()
     policy_hash = models.CharField(max_length=64)
+    scope = models.CharField(max_length=40, default="raw_evidence")
+    request_hash = models.CharField(
+        max_length=64,
+        default="legacy-unverifiable-v1",
+    )
+    preview_reason = models.CharField(max_length=500, default="legacy retention preview")
     cutoff_at = models.DateTimeField()
     state = models.CharField(max_length=20, choices=State.choices, default=State.PREVIEW)
     row_version = models.PositiveIntegerField(default=1)
     request_key = models.CharField(max_length=200, unique=True)
     preview_manifest_hash = models.CharField(max_length=64)
     counters = models.JSONField(default=dict)
+    expected_item_count = models.PositiveIntegerField(default=0)
+    expected_byte_count = models.PositiveBigIntegerField(default=0)
+    processed_count = models.PositiveIntegerField(default=0)
+    skipped_hold_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
     requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    authorized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="authorized_retention_batches",
+    )
+    reauth_proof_id = models.UUIDField(null=True, blank=True)
+    authorization_request_key = models.CharField(max_length=200, null=True, blank=True)
+    authorization_reason = models.CharField(max_length=500, null=True, blank=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    failure_cursor = models.CharField(max_length=200, null=True, blank=True)
+    error_code = models.CharField(max_length=100, null=True, blank=True)
     error_detail_redacted = models.CharField(max_length=500, null=True, blank=True)
+    remediation = models.CharField(max_length=500, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class RetentionBatchItemQuerySet(models.QuerySet):
+    FROZEN_FIELDS = frozenset(
+        {
+            "batch",
+            "batch_id",
+            "entity_type",
+            "entity_id",
+            "policy_code",
+            "object_key",
+            "object_version",
+            "object_checksum",
+            "byte_size",
+            "candidate_hash",
+            "precondition_hash",
+            "dependency_manifest",
+        }
+    )
+    FROZEN_ATTNAMES = (
+        "batch_id",
+        "entity_type",
+        "entity_id",
+        "policy_code",
+        "object_key",
+        "object_version",
+        "object_checksum",
+        "byte_size",
+        "candidate_hash",
+        "precondition_hash",
+        "dependency_manifest",
+    )
+
+    def update(self, **kwargs):
+        if self.FROZEN_FIELDS.intersection(kwargs):
+            raise TypeError("Retention candidate identity is immutable")
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise TypeError("Retention candidate ledger is append-only")
+
+    async def adelete(self):
+        raise TypeError("Retention candidate ledger is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("Retention candidate ledger is append-only")
 
 
 class RetentionBatchItem(UUIDModel):
     class State(models.TextChoices):
         CANDIDATE = "candidate", "Candidate"
         HELD = "held", "Held"
+        DELETION_PENDING = "deletion_pending", "Deletion pending"
         PURGED = "purged", "Purged"
         SKIPPED = "skipped", "Skipped"
         FAILED = "failed", "Failed"
@@ -234,12 +306,53 @@ class RetentionBatchItem(UUIDModel):
     batch = models.ForeignKey(RetentionBatch, on_delete=models.CASCADE, related_name="items")
     entity_type = models.CharField(max_length=100)
     entity_id = models.UUIDField()
+    policy_code = models.CharField(max_length=64, default="legacy-unverifiable-v1")
     object_key = models.CharField(max_length=1024, null=True, blank=True)
+    object_version = models.CharField(max_length=500, blank=True)
+    object_checksum = models.CharField(max_length=64, blank=True)
+    byte_size = models.PositiveBigIntegerField(default=0)
+    candidate_hash = models.CharField(
+        max_length=64,
+        default="legacy-unverifiable-v1",
+    )
+    precondition_hash = models.CharField(
+        max_length=64,
+        default="legacy-unverifiable-v1",
+    )
+    dependency_manifest = models.JSONField(default=list)
+    lease_generation = models.PositiveIntegerField(default=1)
     state = models.CharField(max_length=20, choices=State.choices, default=State.CANDIDATE)
     reason_code = models.CharField(max_length=100, blank=True)
+    hold_reason = models.CharField(max_length=500, blank=True)
+    result_hash = models.CharField(max_length=64, blank=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    error_detail_redacted = models.CharField(max_length=500, blank=True)
+    remediation = models.CharField(max_length=500, blank=True)
     processed_at = models.DateTimeField(null=True, blank=True)
+    tombstone_at = models.DateTimeField(null=True, blank=True)
+    cleanup_operation_id = models.UUIDField(null=True, blank=True)
+    objects = models.Manager.from_queryset(RetentionBatchItemQuerySet)()
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=("batch", "entity_type", "entity_id"), name="uq_retention_batch_item")
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and RetentionBatchItemQuerySet.FROZEN_FIELDS.intersection(update_fields):
+                raise TypeError("Retention candidate identity is immutable")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *RetentionBatchItemQuerySet.FROZEN_ATTNAMES
+                ).first()
+                if frozen is None or any(
+                    getattr(self, key) != value
+                    for key, value in frozen.items()
+                ):
+                    raise TypeError("Retention candidate identity is immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Retention candidate ledger is append-only")

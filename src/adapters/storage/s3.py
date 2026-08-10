@@ -6,6 +6,7 @@ from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from django.conf import settings
 
 from wisdome_writer.infrastructure.http_safety import safe_get
@@ -309,6 +310,27 @@ class S3ObjectStorage:
             Key=_validate_key(key),
             VersionId=version_id,
         )
+
+    def delete_version(self, *, key: str, version_id: str) -> None:
+        """Delete exactly one immutable object version; never create a delete marker."""
+        self.delete_exact_version(key=key, version_id=version_id)
+
+    def version_exists(self, *, key: str, version_id: str) -> bool:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("exact object version is required")
+        try:
+            observed = self.head(key=key, version_id=version_id)
+        except ClientError as exc:
+            error = exc.response.get("Error", {})
+            if str(error.get("Code")) in {
+                "404",
+                "NoSuchKey",
+                "NoSuchVersion",
+                "NotFound",
+            }:
+                return False
+            raise
+        return observed.version_id == version_id
 
     def public_url(self, *, key: str) -> str:
         if not self.public_base_url:

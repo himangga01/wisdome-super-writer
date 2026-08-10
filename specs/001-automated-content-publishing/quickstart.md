@@ -1254,3 +1254,39 @@ source in frozen material, and pass T018 before any publication intent exists. I
 reader-visible correction notice/history, preserve the remote post identity, and require WordPress
 terminal dependency before Blogger execution. Finally, compare case timestamps, SLA status, target
 attempts, and failure summary with the immutable dispatch cohort.
+
+## T030 보존 preview·삭제 확인 절차 (한국어)
+
+1. 같은 scope/cutoff/reason/request key로 preview를 두 번 만들고 같은 batch가 반환되는지 확인한다.
+   reason이나 cutoff를 바꾸면 충돌해야 한다. item의 object version/checksum/size, dependency manifest와
+   candidate hash가 preview 이후 바뀌지 않아야 한다.
+2. preview 뒤 object version 또는 checksum을 바꾸고 승인한다. `stale_retention_candidate`로 실패하고
+   S3 delete 호출은 0회여야 한다. preview 뒤 legal hold, claim/publication reference, open correction을
+   추가한 경우에도 실행 직전 held로 바뀌어야 한다.
+3. raw evidence exact version을 삭제한다. 성공 뒤 EvidenceAsset의 object/text/structured payload는 null,
+   retention item은 result hash와 tombstone 시각을 가져야 한다. delete 응답만 유실된 경우 exact version
+   부재를 확인해 동일 결과로 수렴하고, version이 남으면 failed여야 한다.
+4. SourceItem raw body를 만료한다. body/metadata/attachments는 비워지지만 URL, publisher,
+   content/source-version hash는 유지되어야 한다. 두 번째 tombstone과 일반 UPDATE/DELETE는 거부한다.
+5. unreferenced published snapshot을 만료하고 snapshot row는 남는지 확인한다. active media binding이나
+   hold가 있으면 object를 삭제하면 안 된다.
+6. WordPress media와 public delivery 후보를 실행한다. retention worker가 직접 외부 삭제하지 않고
+   T022 delete operation ID를 item에 결속하며, operation 성공/실패/supersede가 batch 상태에 정확히
+   투영되는지 확인한다.
+7. 미발행 revision과 audit expiry preview는 `manual_archive_required` held로 나타나며 별도 archive 없이
+   삭제 성공을 주장하지 않는지 확인한다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_retention_dependency_graph tests.unit.test_publication_media_cleanup tests.unit.test_public_delivery_assets -v 2
+```
+
+## T030 Retention Preview and Deletion Verification (English/AI-readable)
+
+Replay exact preview material and reject changed key reuse. Mutate object or dependency material between
+preview, authorization, and execution and require zero destructive I/O. Delete one exact raw-evidence
+version, preserve provenance, and reconcile a lost response only through exact-version absence. Exercise
+the one-way SourceItem payload tombstone, unreferenced published-snapshot deletion, and held active
+references. Require WordPress/public-delivery candidates to use T022 cleanup operations and project their
+terminal outcomes. Draft and audit candidates remain manual-held without a proven archive.

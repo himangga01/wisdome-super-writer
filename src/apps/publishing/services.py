@@ -7474,6 +7474,15 @@ def persist_media_delivery_operation_result(
             "finished_at",
         )
     )
+    if operation.action == MediaDeliveryOperation.Action.DELETE:
+        operation_id = operation.id
+
+        def _project_retention_cleanup() -> None:
+            from apps.audit.retention import finalize_retention_media_cleanup
+
+            finalize_retention_media_cleanup(operation_id=operation_id)
+
+        transaction.on_commit(_project_retention_cleanup)
     _record_publishing_audit(
         audit_context=audit_context,
         action="media_delivery_operation.finished",

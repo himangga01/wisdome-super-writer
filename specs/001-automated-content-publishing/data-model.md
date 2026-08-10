@@ -2593,3 +2593,39 @@ publishability gate. Correction publication freezes a reader-visible notice and 
 preserves the existing remote post identity, and releases Blogger only after the WordPress dependency is
 terminal. Operational detail exposes detected, verified, dispatched, and completed timestamps plus
 bounded target attempt/failure projections.
+
+## T030 의존성 기반 보존 삭제 정본 (한국어)
+
+`RetentionBatchItem`은 policy code, entity identity, exact object key/version/SHA-256/byte size,
+정렬 dependency manifest, candidate/precondition hash와 lease generation을 불변으로 보존한다. ORM과
+SQLite/PostgreSQL trigger는 이 identity의 UPDATE/DELETE를 거부한다. legacy item은 exact HTTP/object
+material을 증명할 수 없으므로 `legacy_unverifiable_candidate`로 격리하고 새 preview를 요구한다.
+
+preview request hash는 scope, cutoff, request key, reason과 요청 관리자를 결속한다. 승인 시 현재
+dependency graph와 S3 head의 version/checksum/size를 다시 계산하며 하나라도 달라지면 삭제하지 않는다.
+실행 직전에도 같은 검사를 반복한다. exact version 삭제 응답이 유실되면 해당 version의 부재를 확인해
+같은 tombstone으로 수렴하고, version이 남아 있으면 성공을 기록하지 않는다. raw EvidenceAsset은
+object와 큰 text/structured payload를 비우되 checksum/provenance identity를 유지한다. SourceItem은
+URL·publisher·content/source-version hash를 보존하면서 body/metadata/attachments만 한 번 tombstone할
+수 있고 일반 수정·삭제는 계속 거부된다.
+
+published evidence/visualization snapshot은 active publication media나 hold가 없을 때만 exact object
+version을 삭제하며 snapshot row와 retention tombstone은 남긴다. WordPress media와 Blogger public
+delivery는 직접 삭제하지 않고 T022 `MediaDeliveryOperation` delete lease를 사용한다. operation terminal
+결과는 commit 뒤 retention item과 batch에 투영된다. 미발행 revision과 AuditEvent는 안전한 별도 archive
+정본이 없으므로 `manual_archive_required` held 상태로 fail-closed한다.
+
+## T030 Dependency-Aware Retention Authority (English/AI-readable)
+
+Each immutable retention item binds policy/category, entity, exact object key/version/SHA-256/size, a
+sorted dependency manifest, candidate/precondition hash, and lease generation. ORM plus SQLite/PostgreSQL
+guards reject identity mutation and deletion; unverifiable legacy rows are quarantined. Preview request
+identity includes scope, cutoff, key, reason, and actor. Authorization and execution both recompute live
+dependencies and exact S3 head material before deletion.
+
+Exact-version deletion reconciles a lost response by proving that the same version is absent; a remaining
+version can never be tombstoned. Raw evidence drops large payloads while retaining provenance. SourceItem
+permits one database-guarded body/metadata/attachment tombstone without changing source identity. Published
+snapshots retain their immutable rows after unreferenced object deletion. WordPress media and public
+delivery reuse the separate T022 delete-operation lease and project terminal results post-commit. Draft
+revisions and append-only audit rows remain held until an independently verifiable archive exists.

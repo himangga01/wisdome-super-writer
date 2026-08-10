@@ -1652,18 +1652,20 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Modify: `src/apps/audit/models.py`
 - Modify: `src/apps/audit/retention.py`
 - Modify: `src/apps/audit/services.py`
+- Modify: `src/apps/collection/models.py`
 - Modify: `src/apps/publishing/models.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/adapters/storage/s3.py`
 - Modify: `config/retention/default.json`
 - Create: `src/apps/audit/migrations/0003_retention_object_tombstone.py`
+- Create: `src/apps/collection/migrations/0011_source_item_retention_tombstone.py`
 - Deferred integration test: `tests/integration/test_scheduling_operations.py`
 
 **Interfaces:**
 - Consumes: retention policy, legal hold, active publication/media/correction references, object key/version/checksum.
 - Produces: immutable preview items, approved deletion lease, version-aware S3 deletion and DB tombstone.
 
-- [ ] **Step 1: retention item을 immutable object candidate로 확장한다.**
+- [x] **Step 1: retention item을 immutable object candidate로 확장한다.**
 
   ```python
   policy_code = models.CharField(max_length=64)
@@ -1675,19 +1677,19 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
   tombstone_at = models.DateTimeField(null=True)
   ```
 
-- [ ] **Step 2: category handler를 명시적으로 분리한다.**
+- [x] **Step 2: category handler를 명시적으로 분리한다.**
 
   raw source/evidence, draft/revision, published snapshot, audit record, public delivery, WordPress media별 handler가 cutoff와 dependency를 계산한다.
 
-- [ ] **Step 3: hold와 active reference graph를 적용한다.**
+- [x] **Step 3: hold와 active reference graph를 적용한다.**
 
   legal hold, active publication/media binding, open correction, referenced claim evidence, not-yet-expired audit chain이 하나라도 있으면 item state를 held로 만든다.
 
-- [ ] **Step 4: 승인 전 candidate checksum/object version을 재확인한다.**
+- [x] **Step 4: 승인 전 candidate checksum/object version을 재확인한다.**
 
   preview 이후 객체나 참조가 바뀌면 stale batch로 실패하고 새 preview를 요구한다.
 
-- [ ] **Step 5: S3 object version을 실제 삭제한 뒤 tombstone을 저장한다.**
+- [x] **Step 5: S3 object version을 실제 삭제한 뒤 tombstone을 저장한다.**
 
   ```python
   storage.delete_version(key=item.object_key, version_id=item.object_version)
@@ -1697,14 +1699,14 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 
   응답 유실 시 `head_version`으로 삭제 여부를 reconcile하고 동일 version delete를 재실행해도 안전해야 한다.
 
-- [ ] **Step 6: remote public delivery/media cleanup을 별도 lease로 실행한다.**
+- [x] **Step 6: remote public delivery/media cleanup을 별도 lease로 실행한다.**
 
   active reference count 0과 grace cutoff를 다시 확인하고 remote result를 AuditEvent에 남긴다.
 
-- [ ] **Step 7: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [x] **Step 7: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
-  git add src/apps/audit src/apps/publishing src/adapters/storage/s3.py config/retention/default.json
+  git add src/apps/audit src/apps/collection src/apps/publishing src/adapters/storage config/retention/default.json
   git commit -m "feat: enforce dependency-aware retention deletion"
   ```
 

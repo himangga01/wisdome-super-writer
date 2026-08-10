@@ -930,3 +930,25 @@ reauthentication, and diff material remains in append-only database and audit ro
 payload. A verified correction reuses the existing versioned publication intent/dispatch/requested event
 chain, with the frozen revision, render, and correction history as authority. Post-commit dispatch and
 terminal attempt projections update the case without introducing a second external-write event protocol.
+
+## 한국어 — T030 보존 실행 이벤트 경계
+
+- `retention.expire_requested@1` 공개 payload는 exact `retention_batch_id` 한 필드를 유지한다. scope,
+  reason, reauth proof, preview/candidate hash와 object key/version은 DB의 불변 batch/item에서만 읽는다.
+- worker는 approved batch와 candidate lease를 잠근 뒤 dependency graph와 exact object precondition을
+  다시 확인한다. event redelivery는 purged/held/failed/deletion-pending item을 다시 물리 삭제하지 않는다.
+- S3 삭제는 exact version만 허용한다. 응답 유실은 version 부재 확인으로 수렴하며 delete marker나
+  현재 최신 version 추측을 사용하지 않는다.
+- WordPress media와 public delivery item은 새 retention 외부-write event를 만들지 않고 기존
+  versioned media delete operation을 생성한다. media operation terminal commit 뒤 retention item/batch를
+  별도 transaction에서 투영해 lock order를 유지한다.
+
+## English / AI-readable — T030 retention event boundary
+
+`retention.expire_requested@1` remains an exact one-field payload containing only `retention_batch_id`.
+Scope, reason, reauthentication, preview/candidate hashes, and object identity remain in the immutable
+database ledger. The worker locks the authorized item and revalidates dependencies and exact object
+preconditions; terminal item redelivery performs no second physical delete. S3 operations address one
+version and reconcile lost responses by exact absence. Remote media/public-delivery cleanup reuses the
+existing versioned T022 delete operation, whose post-commit terminal projection advances retention state
+without introducing an inverse lock order.

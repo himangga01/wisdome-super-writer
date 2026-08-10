@@ -112,6 +112,21 @@ class SourceItemQuerySet(models.QuerySet):
     async def abulk_update(self, objs, fields, batch_size=None):
         self._reject_mutation()
 
+    def retention_tombstone(self, *, source_item_id, tombstoned_at) -> int:
+        if tombstoned_at is None:
+            raise ValueError("retention tombstone time is required")
+        queryset = self.filter(
+            pk=source_item_id,
+            retention_tombstoned_at__isnull=True,
+        )
+        return models.QuerySet.update(
+            queryset,
+            body_text="",
+            metadata={},
+            attachments=[],
+            retention_tombstoned_at=tombstoned_at,
+        )
+
 
 class SourceItemManager(
     models.Manager.from_queryset(SourceItemQuerySet)
@@ -518,6 +533,7 @@ class SourceItem(models.Model):
     body_text = models.TextField(blank=True)
     metadata = models.JSONField(default=dict)
     attachments = models.JSONField(default=list)
+    retention_tombstoned_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=20,
         choices=SourceItemStatus.choices,

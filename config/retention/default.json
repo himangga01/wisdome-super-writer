@@ -7,5 +7,15 @@
   "auditEventDays": 365,
   "deliveryAssetGraceDays": 30,
   "previewRequired": true,
-  "legalHoldWins": true
+  "legalHoldWins": true,
+  "categories": {
+    "raw_source": {"retentionDays": 90, "handler": "source_text_tombstone"},
+    "raw_evidence": {"retentionDays": 90, "handler": "exact_object_delete"},
+    "unpublished_revision": {"retentionDays": 90, "handler": "manual_archive_required"},
+    "published_evidence_snapshot": {"retentionDays": 365, "handler": "exact_object_delete"},
+    "published_visualization_snapshot": {"retentionDays": 365, "handler": "exact_object_delete"},
+    "audit_event": {"retentionDays": 365, "handler": "manual_archive_required"},
+    "public_delivery_asset": {"retentionDays": 30, "handler": "public_delivery_delete_lease"},
+    "wordpress_media": {"retentionDays": 30, "handler": "wordpress_media_delete_lease"}
+  }
 }
