@@ -75,6 +75,7 @@ class PublicationTarget(models.Model):
     base_url = models.URLField(max_length=1000)
     username_ref = models.CharField(max_length=500, null=True, blank=True)
     credential_ref = models.CharField(max_length=500, null=True, blank=True)
+    credential_version = models.CharField(max_length=120, blank=True)
     capabilities = models.JSONField(default=dict)
     connection_state = models.CharField(
         max_length=16,
@@ -186,6 +187,7 @@ class PublicationTargetSnapshot(models.Model):
     base_url = models.URLField(max_length=1000)
     username_ref_identity_hash = models.CharField(max_length=64, null=True, blank=True)
     credential_ref_identity_hash = models.CharField(max_length=64)
+    credential_version = models.CharField(max_length=120, blank=True)
     capabilities = models.JSONField(default=dict)
     connection_state = models.CharField(max_length=16, choices=PublicationTarget.ConnectionState.choices)
     preflight_state = models.CharField(max_length=16, choices=ValidationState.choices)

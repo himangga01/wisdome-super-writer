@@ -1164,17 +1164,21 @@ run/step/channel stop and terminal aggregation.
 - Modify: `src/adapters/publishers/blogger/oauth.py`
 - Modify: `src/adapters/publishers/blogger/client.py`
 - Modify: `src/adapters/publishers/wordpress/client.py`
+- Modify: `src/apps/publishing/models.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/tasks.py`
 - Modify: `src/apps/publishing/api.py`
+- Modify: `src/apps/audit/redaction.py`
 - Modify: `.env.example`
-- Deferred contract test: `tests/contract/test_publishers.py`
+- Modify: `compose.yaml`
+- Create: `src/apps/publishing/migrations/0013_publisher_credentials.py`
+- Create: `tests/unit/test_publisher_credentials.py`
 
 **Interfaces:**
 - Consumes: credential reference only; raw token values remain in the configured secret provider.
 - Produces: scope-verified Blogger token bundle, refresh rotation, revoke result and disconnected target snapshot.
 
-- [ ] **Step 1: secret provider token bundle contract를 고정한다.**
+- [x] **Step 1: secret provider token bundle contract를 고정한다.**
 
   ```python
   class OAuthTokenBundle(TypedDict):
@@ -1188,28 +1192,40 @@ run/step/channel stop and terminal aggregation.
 
   DB와 API에는 bundle reference와 version만 저장한다.
 
-- [ ] **Step 2: authorization code exchange에서 scope와 session binding을 검증한다.**
+- [x] **Step 2: authorization code exchange에서 scope와 session binding을 검증한다.**
 
   OAuth state의 admin ID, session hash, target snapshot ID, nonce와 expiry를 검증하고 Blogger publish scope가 없으면 연결하지 않는다.
 
-- [ ] **Step 3: refresh를 single-flight로 구현한다.**
+- [x] **Step 3: refresh를 single-flight로 구현한다.**
 
   secret version CAS를 사용해 동시에 만료를 감지한 worker 중 하나만 refresh하고, 나머지는 새 version을 다시 읽는다. refresh token rotation이 있으면 같은 operation에서 교체한다.
 
-- [ ] **Step 4: disconnect를 remote revoke 후 local projection으로 처리한다.**
+- [x] **Step 4: disconnect를 remote revoke 후 local projection으로 처리한다.**
 
   remote revoke unknown outcome은 target을 disconnected로 확정하지 않고 manual required로 남긴다. 성공 후 credential ref를 새 immutable target snapshot에서 제거한다.
 
-- [ ] **Step 5: WordPress disconnect도 remote capability 확인을 기록한다.**
+- [x] **Step 5: WordPress disconnect도 remote capability 확인을 기록한다.**
 
   Application Password 폐기 결과를 확인할 수 없으면 credential ref를 조용히 삭제하지 않고 reconciliation 상태를 남긴다.
 
-- [ ] **Step 6: 로그·problem response·AuditEvent redaction을 확인하고 커밋한다.**
+- [x] **Step 6: 로그·problem response·AuditEvent redaction을 확인하고 커밋한다.**
 
   ```powershell
   git add src/wisdome_writer/infrastructure/secrets.py src/adapters/publishers src/apps/publishing .env.example
   git commit -m "feat: complete publisher credential lifecycle"
   ```
+
+#### English / AI-readable T023 boundary
+
+Persist only secret reference identity and credential version in target/snapshot material. Blogger
+OAuth state binds the initiating administrator, server session hash, exact target snapshot/config,
+redirect URI and nonce for ten minutes. The normalized secret bundle requires access and refresh tokens,
+Bearer type, the exact Blogger scope, UTC expiry and version. Refresh uses target serialization plus
+secret-store `expected_version` CAS and preserves the prior refresh token when Google does not rotate it.
+Disconnect is remote-first: Google receives the refresh token and WordPress deletes the exact
+introspected Application Password UUID and verifies 404/410 absence. Only proven success removes the
+local reference/version and snapshots the target; ambiguous outcomes stay reconciling. Never serialize
+raw credentials or credential references into API/problem/audit/log output.
 
 ### Task 13: T024 frozen WordPress canonical URL과 Blogger dependency
 

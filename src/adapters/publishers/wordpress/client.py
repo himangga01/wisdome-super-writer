@@ -527,6 +527,33 @@ class WordPressPublisher:
             f"/users/{user_id}/application-passwords/{app_uuid}",
             write=True,
         )
+        verification_path = (
+            f"/users/{user_id}/application-passwords/{app_uuid}"
+        )
+        try:
+            verification = self.client.request(
+                "GET",
+                f"{self.api_url}{verification_path}",
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise PublisherError(
+                "wordpress_revoke_verification_unknown",
+                category="unknown_outcome",
+                detail_redacted=exc.__class__.__name__,
+            ) from exc
+        if verification.status_code in (404, 410):
+            return
+        if verification.status_code >= 500 or verification.status_code in (408, 429):
+            raise PublisherError(
+                "wordpress_revoke_verification_unknown",
+                category="unknown_outcome",
+                http_status=verification.status_code,
+            )
+        raise PublisherError(
+            "wordpress_application_password_still_present",
+            category="unknown_outcome",
+            http_status=verification.status_code,
+        )
 
     def _post_result(self, response: httpx.Response) -> PublishResult:
         try:

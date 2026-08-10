@@ -723,8 +723,9 @@ class PublicationExecutionWorkerContractTests(SimpleTestCase):
         )
         captured_guard = None
 
-        def publisher_factory(_target, *, write_guard):
+        def publisher_factory(_target, *, write_guard, audit_context=None):
             nonlocal captured_guard
+            self.assertIs(audit_context, audit_context_value)
             captured_guard = write_guard
             adapter.execute.side_effect = lambda _command: (
                 write_guard(),
@@ -736,6 +737,7 @@ class PublicationExecutionWorkerContractTests(SimpleTestCase):
             )[1]
             return adapter
 
+        audit_context_value = audit_context
         with (
             patch.object(tasks, "_worker_audit_context", return_value=audit_context),
             patch.object(

@@ -42,12 +42,14 @@ class BloggerPublisher:
         *,
         blog_id: str,
         access_token: str,
+        revocation_token: str | None = None,
         timeout_seconds: float = 30.0,
         client: httpx.Client | None = None,
         write_guard: Callable[[], None] | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ):
         self.blog_id = str(blog_id)
+        self.revocation_token = str(revocation_token or "").strip()
         self.write_guard = write_guard or (lambda: None)
         self.monotonic_clock = monotonic_clock
         self.client = client or httpx.Client(
@@ -363,8 +365,7 @@ class BloggerPublisher:
         )
 
     def revoke_credentials(self) -> None:
-        authorization = self.client.headers.get("Authorization", "")
-        token = authorization.removeprefix("Bearer ").strip()
+        token = self.revocation_token
         if not token:
             raise PublisherError("blogger_token_missing", category="permanent")
         try:
@@ -379,11 +380,28 @@ class BloggerPublisher:
                 category="unknown_outcome",
                 detail_redacted=exc.__class__.__name__,
             ) from exc
-        if response.status_code not in (200, 400):
+        if response.status_code == 200:
+            return
+        error_code = ""
+        if response.status_code == 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            error_code = str(payload.get("error") or "")
+            if error_code == "invalid_token":
+                return
+        if response.status_code != 200:
             raise PublisherError(
                 "blogger_revoke_failed",
-                category="retryable" if response.status_code >= 500 else "permanent",
+                category=(
+                    "unknown_outcome"
+                    if response.status_code in (408, 429)
+                    or response.status_code >= 500
+                    else "permanent"
+                ),
                 http_status=response.status_code,
+                detail_redacted=error_code,
             )
 
     def _post_result(self, response: httpx.Response) -> PublishResult:

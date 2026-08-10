@@ -1037,3 +1037,37 @@ SHA-256. Blogger prepare requires a non-empty returned version, exact HEAD mater
 anonymous HTTPS bytes; delete sends that exact version. Cleanup fixtures independently prove every
 protected reference, the 30-day second zero-count, and zero external delete calls after a queued
 generation is superseded by re-reference.
+
+## 한국어 — T023 발행 자격 증명 수명주기 확인
+
+1. 같은 관리자·서버 session에서 Blogger OAuth를 시작하고 callback한다. 다른 session에서 같은
+   signed state를 보내면 code exchange 호출이 0회인지 확인한다.
+2. token response에서 Blogger scope, refresh token, Bearer type, timezone-aware expiry 중 하나를
+   제거하면 연결이 실패하고 DB·API·AuditEvent·로그에 raw token이 없는지 확인한다.
+3. 만료 bundle을 두 worker가 동시에 읽는 fixture에서 target lock과 secret `expected_version`
+   CAS로 refresh가 정확히 한 번만 일어나고 둘 다 같은 새 version을 읽는지 확인한다.
+4. Google이 refresh token을 회전하면 새 값을 저장하고, 생략하면 기존 refresh token을 보존한다.
+5. Blogger disconnect는 access token이 아니라 refresh token을 revoke endpoint로 보낸다. HTTP
+   200과 명시적 `invalid_token`만 성공이며 timeout·5xx·다른 400은 local ref/version을 지우지
+   않고 `reconciling`으로 남긴다.
+6. WordPress disconnect는 introspection에서 얻은 정확한 Application Password UUID만 DELETE하고
+   같은 UUID GET이 404/410인지 확인한다. 삭제 후 200, timeout 또는 5xx이면 성공으로 투영하지
+   않는다.
+7. 성공한 원격 폐기만 credential ref/version을 함께 제거하고 새 target snapshot을 만든다.
+   이전 intent·approval은 새 config hash와 불일치해 외부 쓰기 전에 stale 처리되어야 한다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_publisher_credentials -v 2
+```
+
+## English / AI-readable — T023 credential lifecycle checks
+
+Verify same-session OAuth state, exact Blogger scope and normalized versioned bundle material first.
+Two expired-token callers must converge on one target-locked, secret-CAS refresh and the same new
+version, preserving the previous refresh token unless Google rotates it. Blogger revocation sends the
+refresh token and treats only 200 or explicit `invalid_token` as success. WordPress revocation deletes
+the exact introspected Application Password UUID and verifies 404/410 absence. Only proven remote
+success clears the local reference/version and snapshots the target; ambiguous results remain in
+reconciliation. No raw token or credential reference may appear in API, problem, audit, or log output.

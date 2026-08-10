@@ -1321,7 +1321,8 @@ ID/version/decision/subject hash/decision hash/updatedAt과 요청 행의 `isCur
 | `display_name` | string | 관리자 표시명 |
 | `remote_blog_id` | string | 외부 블로그 ID |
 | `base_url` | URL | 검증된 자체 도메인 또는 블로그 기준 URL |
-| `secret_ref` | string | OAuth/자격 증명 참조 |
+| `credential_ref` | string nullable | OAuth/자격 증명 secret-store 참조; 원문 비밀 값은 금지 |
+| `credential_version` | string nullable | secret-store bundle의 CAS 버전; API에는 이 버전만 노출 |
 | `capabilities` | JSONB | 아래 7개 공통 capability boolean |
 | `connection_state` | `pending/verified/expired/revoked/blocked` | 연결 상태 |
 | `preflight_state`, `canary_state` | TargetValidationState | 읽기 전용 점검과 쓰기 검증 상태 |
@@ -1347,6 +1348,20 @@ identity다. 다른 사이트/블로그로 바꾸려면 새 PublicationTarget을
 철회 결정을 해야 한다. credential ref, capability와 검증 상태 변경만 같은 target의 새
 PublicationTargetSnapshot으로 허용한다.
 
+Blogger credential은 `access_token`, `refresh_token`, `token_type=Bearer`, Blogger scope,
+UTC `expires_at`, `version`의 정규화된 bundle로 secret provider에만 저장한다. OAuth state는
+관리자·서버 session hash·target snapshot/config·redirect URI·nonce를 10분 동안 결속한다.
+refresh는 target 행 잠금과 secret `expected_version` CAS로 single-flight 처리하며 provider가
+새 refresh token을 주지 않으면 기존 값을 유지한다. DB·API·AuditEvent·로그에는 token이나
+credential ref를 직렬화하지 않고 `credential_version`과 참조 identity hash만 남긴다.
+
+연결 해제는 먼저 원격 capability를 폐기한 뒤에만 local credential ref/version을 같은
+transaction에서 제거하고 새 target snapshot을 만든다. Google revoke는 refresh token을
+사용하며 HTTP 200 또는 명시적 `invalid_token`만 멱등 성공이다. WordPress는 현재
+Application Password의 정확한 UUID를 DELETE한 뒤 같은 UUID GET이 404/410인지 확인한다.
+timeout·5xx·삭제 후 잔존처럼 결과가 불명확하면 `reconciling`을 유지하고 local secret
+projection을 성공으로 지우지 않는다.
+
 `TargetDisconnectDecision`은 `id`, `target_id`, `expected_target_snapshot_id/config_hash`,
 `request_key`, `request_hash`, `reauth_proof_id`, `reason`, `state: accepted/revoking/reconciling/
 completed/failed`, `remote_result_hash`, `decided_by`, `decided_at`을 가진다.
@@ -1358,6 +1373,7 @@ credential local-disable, decision/AuditEvent/outbox를 원자 처리한다. rem
 
 외부 쓰기 대상을 TOCTOU 없이 고정하는 불변 snapshot이다. `id`, `target_id`, `version`,
 `channel`, `role`, `environment`, `remote_blog_id`, `base_url`, `secret_ref_identity_hash`,
+`credential_version`,
 `capabilities`, `connection_state`, preflight/canary/pilot 상태와 검증 policy/version,
 `canary_target_id`, `publisher_contract_version`, `publisher_adapter_manifest_hash`,
 `config_hash`(auto toggle을 제외하고 adapter manifest를 포함한 operational config hash),
@@ -2344,3 +2360,22 @@ processing receipt stores the all-or-none set-once `terminal_reserved_at`, inter
 deletion or success is forbidden. Exact reservation verification, projection to
 delivery-failed/manual-required, audit, dependent wake-up, and receipt/event dead-letter are atomic;
 failure rolls all of them back and replay is a no-op.
+
+## English / AI-readable — T023 publisher credential lifecycle
+
+`PublicationTarget` and every immutable target snapshot store only a secret-store reference identity
+and `credential_version`; API responses expose only the nullable version. A Blogger secret resolves to
+the exact normalized bundle `access_token`, `refresh_token`, Bearer token type, scope list containing
+the Blogger scope, UTC `expires_at`, and version. OAuth signed state binds the initiating administrator,
+server session hash, target snapshot/config, redirect URI, nonce, correlation and request provenance for
+at most ten minutes. Refresh is serialized by the target fence and row lock and committed through an
+`expected_version` secret-store CAS. A rotated refresh token replaces the previous token atomically;
+an omitted rotated token preserves the previous one.
+
+Disconnect is remote-first. Google revocation sends the refresh token and accepts only HTTP 200 or an
+explicit `invalid_token` as idempotent success. WordPress deletes the exact introspected Application
+Password UUID and then requires an exact authenticated lookup to return 404 or 410. Only proven remote
+success clears the local reference and version together and creates a new immutable target snapshot.
+Timeouts, server failures, or a still-present WordPress password keep the decision in reconciliation and
+do not erase the local credential projection. Tokens and credential references never enter response,
+problem, audit, or log material.

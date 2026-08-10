@@ -85,6 +85,7 @@ _CLASSIFICATION_CODE_KEYS = frozenset(
         "decision",
         "error_code",
         "policy_version",
+        "oauth_bundle_version",
         "reason_code",
         "result",
         "source_type",
@@ -171,6 +172,7 @@ def _policy(*extra_keys: str) -> AuditMetadataPolicy:
 _TARGET_KEYS = (
     "decision",
     "decision_id",
+    "oauth_bundle_version",
     "enabled",
     "error_code",
     "outcome_hash",
@@ -374,6 +376,7 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
         "publication_target.created",
         "publication_target.updated",
         "publication_target.oauth_connected",
+        "publication_target.oauth_refreshed",
         "publication_target.preflight_requested",
         "publication_target.preflight",
         "publication_target.preflight_stale_before_call",

@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import html
 import hashlib
-import inspect
 import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
@@ -594,6 +593,7 @@ def _audit_state(entity, **extra: Any) -> dict[str, Any]:
         "reconcile_attempt_no",
         "current_snapshot_version",
         "current_config_hash",
+        "credential_version",
         "connection_state",
         "preflight_state",
         "canary_state",
@@ -2944,9 +2944,10 @@ def publisher_for_target(
     *,
     resolver: Any | None = None,
     write_guard: Any | None = None,
+    refresh_blogger: bool = True,
+    audit_context: AuditContext | None = None,
 ):
     resolver = resolver or _secret_resolver()
-    credential = _resolve_secret(resolver, target.credential_ref)
 
     def guarded_write() -> None:
         _assert_external_writes_allowed()
@@ -2954,6 +2955,7 @@ def publisher_for_target(
             write_guard()
 
     if target.channel == ChannelCode.WORDPRESS:
+        credential = _resolve_secret(resolver, target.credential_ref)
         username = _resolve_secret(resolver, target.username_ref)
         return WordPressPublisher(
             base_url=target.base_url,
@@ -2962,12 +2964,31 @@ def publisher_for_target(
             write_guard=guarded_write,
         )
     if target.channel == ChannelCode.BLOGGER:
-        access_token = credential.get("access_token") if isinstance(credential, dict) else credential
+        if refresh_blogger:
+            bundle = resolve_blogger_token_bundle_for_target(
+                target.id,
+                resolver=resolver,
+                audit_context=audit_context,
+            )
+        else:
+            if not hasattr(resolver, "resolve_oauth_token_bundle"):
+                raise InvalidInput(
+                    "secret resolver cannot validate OAuth token bundles"
+                )
+            bundle = resolver.resolve_oauth_token_bundle(
+                target.credential_ref
+            )
+            if bundle["version"] != target.credential_version:
+                raise Conflict(
+                    "Blogger credential version differs from target state"
+                )
+        access_token = bundle["access_token"]
         if not access_token:
             raise InvalidInput("Blogger OAuth access token을 확인할 수 없습니다.")
         return BloggerPublisher(
             blog_id=str(target.remote_blog_id),
             access_token=str(access_token),
+            revocation_token=str(bundle["refresh_token"]),
             write_guard=guarded_write,
         )
     raise InvalidInput("지원하지 않는 발행 채널입니다.")
@@ -2986,10 +3007,182 @@ def _blogger_oauth_client(*, redirect_uri: str, resolver: Any | None = None) -> 
     )
 
 
+def _oauth_session_hash(request) -> str:
+    session_key = getattr(getattr(request, "session", None), "session_key", None)
+    if not isinstance(session_key, str) or not session_key:
+        raise Forbidden("OAuth requires an authenticated server session")
+    return sha256_hex(
+        {
+            "schemaVersion": "oauth-session-binding-v1",
+            "sessionKey": session_key,
+        }
+    )
+
+
+def _oauth_expiry(value: str) -> datetime:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except (TypeError, ValueError) as exc:
+        raise InvalidInput("Blogger OAuth token expiry is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidInput("Blogger OAuth token expiry is not timezone-aware")
+    return parsed.astimezone(dt_timezone.utc)
+
+
+def _next_credential_version(current: str | None) -> str:
+    match = re.fullmatch(r"v([1-9][0-9]*)", current or "")
+    if match:
+        return f"v{int(match.group(1)) + 1}"
+    return "v1"
+
+
+def _blogger_token_store(token_store=None):
+    if token_store is not None:
+        return token_store
+    store_path = getattr(settings, "BLOGGER_OAUTH_TOKEN_STORE", None)
+    if not store_path:
+        raise InvalidInput(
+            "Blogger OAuth token secret-store writer is not configured"
+        )
+    return import_string(store_path)
+
+
+def _store_blogger_token_bundle(
+    *,
+    token_store,
+    target_id,
+    token_bundle,
+    expected_version: str | None,
+    operation_key: str,
+) -> tuple[str, str]:
+    try:
+        stored = token_store(
+            target_id=str(target_id),
+            token_bundle=token_bundle,
+            expected_version=expected_version,
+            operation_key=operation_key,
+        )
+    except TypeError as exc:
+        raise InvalidInput(
+            "Blogger OAuth token store does not implement version CAS"
+        ) from exc
+    if not isinstance(stored, dict):
+        raise InvalidInput(
+            "Blogger OAuth token store must return a reference and version"
+        )
+    credential_ref = stored.get("credential_ref")
+    version = stored.get("version")
+    if (
+        not isinstance(credential_ref, str)
+        or not credential_ref
+        or len(credential_ref) > 500
+        or not isinstance(version, str)
+        or version != token_bundle["version"]
+    ):
+        raise InvalidInput("Blogger OAuth token store result is invalid")
+    return credential_ref, version
+
+
+@transaction.atomic
+def resolve_blogger_token_bundle_for_target(
+    target_id,
+    *,
+    resolver: Any | None = None,
+    token_store=None,
+    oauth_client: BloggerOAuthClient | None = None,
+    now: datetime | None = None,
+    force_refresh: bool = False,
+    audit_context: AuditContext | None = None,
+):
+    resolver = resolver or _secret_resolver()
+    _lock_target_intent_fences((target_id,))
+    target = PublicationTarget.objects.select_for_update().get(
+        id=target_id,
+        channel=ChannelCode.BLOGGER,
+    )
+    if not hasattr(resolver, "resolve_oauth_token_bundle"):
+        raise InvalidInput("secret resolver cannot validate OAuth token bundles")
+    try:
+        bundle = resolver.resolve_oauth_token_bundle(target.credential_ref)
+    except Exception as exc:
+        if isinstance(exc, (InvalidInput, PublisherError)):
+            raise
+        raise InvalidInput("Blogger OAuth token bundle is unavailable") from exc
+    if (
+        not target.credential_version
+        or bundle["version"] != target.credential_version
+    ):
+        raise Conflict("Blogger credential version differs from target state")
+    observed_at = now or timezone.now()
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise InvalidInput("OAuth refresh clock must be timezone-aware")
+    refresh_required = force_refresh or _oauth_expiry(
+        bundle["expires_at"]
+    ) <= observed_at.astimezone(dt_timezone.utc) + timedelta(seconds=60)
+    if not refresh_required:
+        return bundle
+    before_material = _audit_state(target)
+    next_version = _next_credential_version(bundle["version"])
+    owns_client = oauth_client is None
+    client = oauth_client or _blogger_oauth_client(redirect_uri="")
+    try:
+        refreshed = client.refresh_token(bundle, version=next_version)
+    finally:
+        if owns_client:
+            client.close()
+    writer = _blogger_token_store(token_store)
+    operation_key = sha256_hex(
+        {
+            "schemaVersion": "blogger-oauth-refresh-v1",
+            "targetId": str(target.id),
+            "expectedVersion": bundle["version"],
+            "nextVersion": next_version,
+        }
+    )
+    credential_ref, stored_version = _store_blogger_token_bundle(
+        token_store=writer,
+        target_id=target.id,
+        token_bundle=refreshed,
+        expected_version=bundle["version"],
+        operation_key=operation_key,
+    )
+    stored = resolver.resolve_oauth_token_bundle(credential_ref)
+    if stored != refreshed or stored["version"] != stored_version:
+        raise Conflict("stored Blogger OAuth bundle differs from refresh result")
+    locked_intents = _lock_open_target_intents(target.id)
+    target.credential_ref = credential_ref
+    target.credential_version = stored_version
+    target.save(
+        update_fields=("credential_ref", "credential_version", "updated_at")
+    )
+    _snapshot_locked(target)
+    _stale_locked_intents(locked_intents)
+    if audit_context is not None:
+        _record_publishing_audit(
+            audit_context=audit_context,
+            action="publication_target.oauth_refreshed",
+            entity=target,
+            identity_key=(
+                f"credential-refresh:{target.id}:"
+                f"{bundle['version']}:{stored_version}"
+            ),
+            before_material=before_material,
+            after_material=_audit_state(target),
+            metadata={
+                "target_id": str(target.id),
+                "result": "refreshed",
+                "oauth_bundle_version": stored_version,
+            },
+        )
+    return stored
+
+
 def start_blogger_oauth(
     target_id: str,
     *,
     user,
+    request,
     redirect_uri: str,
     audit_context: AuditContext,
 ) -> dict[str, Any]:
@@ -2999,11 +3192,13 @@ def start_blogger_oauth(
     target = PublicationTarget.objects.using(
         audit_context.database_alias
     ).get(id=target_id, channel=ChannelCode.BLOGGER)
+    session_hash = _oauth_session_hash(request)
     nonce = sha256_hex(
         {
             "schemaVersion": "blogger-oauth-operation-v1",
             "targetId": str(target.id),
             "adminId": str(user.id),
+            "sessionHash": session_hash,
             "requestKey": audit_context.request_key,
         }
     )[:32]
@@ -3015,6 +3210,7 @@ def start_blogger_oauth(
             "targetConfigHash": target.current_config_hash,
             "redirectUriHash": sha256_hex(redirect_uri),
             "adminId": str(user.id),
+            "sessionHash": session_hash,
             "requestKey": audit_context.request_key,
             "reason": audit_context.reason_code,
             "nonce": nonce,
@@ -3027,6 +3223,7 @@ def start_blogger_oauth(
             "targetSnapshotVersion": target.current_snapshot_version,
             "targetConfigHash": target.current_config_hash,
             "adminId": str(user.id),
+            "sessionHash": session_hash,
             "nonce": nonce,
             "correlationId": str(audit_context.correlation_id),
             "requestKey": audit_context.request_key,
@@ -3066,6 +3263,11 @@ def complete_blogger_oauth(
     user = request.user
     if str(state_data.get("adminId")) != str(user.id):
         raise Forbidden("OAuth를 시작한 관리자 session과 다릅니다.")
+    session_hash = _oauth_session_hash(request)
+    if state_data.get("sessionHash") != session_hash:
+        raise Forbidden(
+            "OAuth callback session differs from the initiating session"
+        )
     audit_context = AuditContext.for_admin_continuation(
         request=request,
         correlation_id=state_data.get("correlationId"),
@@ -3080,6 +3282,7 @@ def complete_blogger_oauth(
             "targetConfigHash": state_data.get("targetConfigHash"),
             "redirectUriHash": sha256_hex(redirect_uri),
             "adminId": str(user.id),
+            "sessionHash": session_hash,
             "requestKey": audit_context.request_key,
             "reason": audit_context.reason_code,
             "nonce": state_data.get("nonce"),
@@ -3136,29 +3339,19 @@ def complete_blogger_oauth(
         )
     client = _blogger_oauth_client(redirect_uri=redirect_uri)
     try:
-        token_payload = client.exchange_code(code)
+        token_bundle = client.exchange_code(
+            code,
+            version=_next_credential_version(target.credential_version),
+        )
     finally:
         client.close()
-    store_path = getattr(settings, "BLOGGER_OAUTH_TOKEN_STORE", None)
-    if not store_path:
-        raise InvalidInput("Blogger OAuth token secret-store writer가 구성되지 않았습니다.")
-    token_store = import_string(store_path)
-    token_store_parameters = inspect.signature(token_store).parameters
-    token_store_kwargs = {
-        "target_id": str(target.id),
-        "token_payload": token_payload,
-    }
-    if (
-        "operation_key" in token_store_parameters
-        or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in token_store_parameters.values()
-        )
-    ):
-        token_store_kwargs["operation_key"] = state_data["nonce"]
-    credential_ref = token_store(**token_store_kwargs)
-    if not credential_ref:
-        raise InvalidInput("OAuth token store가 credential reference를 반환하지 않았습니다.")
+    credential_ref, credential_version = _store_blogger_token_bundle(
+        token_store=_blogger_token_store(),
+        target_id=target.id,
+        token_bundle=token_bundle,
+        expected_version=target.credential_version or None,
+        operation_key=state_data["nonce"],
+    )
     with transaction.atomic(using=audit_context.database_alias):
         _lock_target_intent_fences((state_data["targetId"],))
         locked_intents = _lock_open_target_intents(
@@ -3177,6 +3370,7 @@ def complete_blogger_oauth(
             raise Conflict("OAuth 교환 중 target snapshot이 변경되었습니다.")
         before_material = _audit_state(target)
         target.credential_ref = str(credential_ref)
+        target.credential_version = credential_version
         target.connection_state = PublicationTarget.ConnectionState.PENDING
         target.preflight_state = ValidationState.NOT_RUN
         target.auto_publish_enabled = False
@@ -3209,6 +3403,7 @@ def _target_material(target: PublicationTarget) -> dict[str, Any]:
         "baseUrl": target.base_url.rstrip("/"),
         "usernameRefIdentityHash": sha256_hex(target.username_ref or "") if target.username_ref else None,
         "credentialRefIdentityHash": sha256_hex(target.credential_ref or ""),
+        "credentialVersion": target.credential_version,
         "capabilities": target.capabilities,
         "connectionState": target.connection_state,
         "preflightState": target.preflight_state,
@@ -3255,6 +3450,7 @@ def _snapshot_locked(target: PublicationTarget) -> PublicationTargetSnapshot:
         base_url=target.base_url.rstrip("/"),
         username_ref_identity_hash=material["usernameRefIdentityHash"],
         credential_ref_identity_hash=material["credentialRefIdentityHash"],
+        credential_version=material["credentialVersion"],
         capabilities=target.capabilities,
         connection_state=target.connection_state,
         preflight_state=target.preflight_state,
@@ -3320,6 +3516,8 @@ def create_target(
         (ChannelCode.BLOGGER, ChannelRole.SECONDARY),
     }:
         raise InvalidInput("WordPress는 대표 원문, Blogger는 보조 배포 역할이어야 합니다.")
+    if channel == ChannelCode.BLOGGER and data.get("credentialRef") is not None:
+        raise InvalidInput("Blogger 자격 증명은 OAuth 연결 API로만 설정할 수 있습니다.")
     base_url = str(data.get("baseUrl", "")).rstrip("/")
     if not base_url.startswith("https://"):
         raise InvalidInput("발행 대상은 HTTPS URL이어야 합니다.")
@@ -3385,6 +3583,11 @@ def update_target(
         else []
     )
     target = PublicationTarget.objects.select_for_update().get(id=target_id)
+    if (
+        target.channel == ChannelCode.BLOGGER
+        and "credentialRef" in data
+    ):
+        raise InvalidInput("Blogger 자격 증명은 OAuth 연결 API로만 변경할 수 있습니다.")
     request_hash = _admin_request_hash(
         audit_context=audit_context,
         action="publication_target.updated",
@@ -3820,7 +4023,11 @@ def run_target_preflight(
     if prepared is None:
         return PublicationTarget.objects.get(id=target_id), False
     target, fence = prepared
-    adapter = publisher_for_target(target, resolver=resolver)
+    adapter = publisher_for_target(
+        target,
+        resolver=resolver,
+        audit_context=audit_context,
+    )
     try:
         result = adapter.preflight_connection()
     finally:
@@ -12029,9 +12236,15 @@ def persist_target_credential_revoke_result(
     target_before_material = _audit_state(target)
     if succeeded and fenced:
         target.credential_ref = None
+        target.credential_version = ""
         target.username_ref = None
         target.save(
-            update_fields=("credential_ref", "username_ref", "updated_at")
+            update_fields=(
+                "credential_ref",
+                "credential_version",
+                "username_ref",
+                "updated_at",
+            )
         )
         _snapshot_locked(target)
         _stale_locked_intents(locked_intents)

@@ -267,7 +267,7 @@ def revoke_target_credentials(decision_id: str):
         decision = TargetDisconnectDecision.objects.get(id=decision_id)
         return {"decisionId": decision_id, "state": decision.state}
     decision, target, fence = prepared
-    adapter = publisher_for_target(target)
+    adapter = publisher_for_target(target, refresh_blogger=False)
     try:
         adapter.revoke_credentials()
         outcome_hash = sha256_hex({"targetId": str(target.id), "result": "revoked"})
@@ -343,6 +343,7 @@ def execute_publication_attempt(
     adapter = publisher_for_target(
         attempt.publication.target,
         write_guard=authorize_write,
+        audit_context=audit_context,
     )
     retry_after = None
     try:
@@ -430,7 +431,10 @@ def reconcile_publication_attempt(
             ),
             "duplicate": True,
         }
-    adapter = publisher_for_target(attempt.publication.target)
+    adapter = publisher_for_target(
+        attempt.publication.target,
+        audit_context=audit_context,
+    )
     retry_after = None
     try:
         result = adapter.reconcile(command)
@@ -508,7 +512,10 @@ def run_target_canary(canary_run_id: str):
     if fence is None:
         return {"canaryRunId": canary_run_id, "state": run.state}
 
-    adapter = publisher_for_target(run.target)
+    adapter = publisher_for_target(
+        run.target,
+        audit_context=audit_context,
+    )
     stages: list[dict[str, object]] = []
     remote_post_id = None
     remote_media_id = None
@@ -680,7 +687,10 @@ def reconcile_remote_media(
     )
     if fence is None:
         return {"remoteMediaId": remote_media_id, "state": remote.state}
-    adapter = publisher_for_target(remote.target)
+    adapter = publisher_for_target(
+        remote.target,
+        audit_context=audit_context,
+    )
     try:
         marker = f"wisdome-media:{remote.id}"
         result = adapter.find_media(remote.remote_lookup_key, marker)

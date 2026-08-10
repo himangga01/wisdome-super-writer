@@ -283,29 +283,28 @@ BLOGGER_OAUTH_TOKEN_STORE=my_secrets.blogger.store_token
 SECRET_PROVIDER_CLASSES={"vault":"my_secrets.vault.VaultSecretProvider"}
 ```
 
-`BLOGGER_OAUTH_TOKEN_STORE` callable은 `target_id`, `token_payload` keyword 인자를 받고 실제
-token을 외부 비밀 저장소에 기록한 뒤 `vault://...` 같은 참조 문자열만 반환해야 합니다.
-callable이 `operation_key` 또는 임의 keyword 인자를 선언하면 callback은 서명된 OAuth nonce를
-`operation_key`로 함께 전달합니다. 비밀 저장소 writer는 이 값을 멱등 key로 사용해 동일 callback의
-재실행이 새 secret을 만들지 않도록 구현하는 것을 권장합니다. 기존 두 인자 callable도 호환되지만,
-비밀 저장 성공 직후 프로세스가 중단되는 경우의 고아 secret 자동 조정은 T023 후속 범위입니다.
-`SECRET_PROVIDER_CLASSES`는 그 참조 scheme을 읽는 provider를 연결합니다.
-이미 발급한 access token으로 로컬 점검만 할 때는 `BLOGGER_ACCESS_TOKEN`을 환경에 넣고 대상의
-`credentialRef=env://BLOGGER_ACCESS_TOKEN`을 지정할 수 있습니다.
+`BLOGGER_OAUTH_TOKEN_STORE` callable은 `target_id`, 정규화된 `token_bundle`,
+`expected_version`, `operation_key` keyword 인자를 받습니다. 외부 비밀 저장소에서
+`expected_version` CAS를 수행한 뒤 `{"credential_ref":"vault://...","version":"v2"}`처럼
+참조와 실제 저장 버전을 반환해야 합니다. 같은 operation key 재실행은 같은 secret/version으로
+수렴해야 하며, provider가 refresh token을 회전하지 않으면 writer는 전달된 기존 값을 보존합니다.
+`SECRET_PROVIDER_CLASSES`는 그 참조 scheme을 읽는 provider를 연결합니다. Blogger target에는
+access token이나 `credentialRef`를 직접 주입할 수 없고 반드시 서명된 OAuth 연결 API를 사용합니다.
 대상 생성 시 대상 `remoteBlogId`도 지정합니다.
-토큰 만료·폐기 시 발행은 실패 닫힘으로 중단되며, 새 토큰을 비밀 저장소에 반영한 뒤 preflight를
-다시 통과해야 합니다. WordPress가 primary 원문이고 Blogger는 secondary 배포 채널입니다.
+만료 token은 target 잠금과 secret version CAS 아래 한 번만 refresh됩니다. 연결 해제는 Google
+refresh token 또는 WordPress의 정확한 Application Password UUID를 먼저 원격 폐기하고 부재를
+확인한 뒤 local 참조/version을 제거합니다. 불명확한 결과는 `reconciling`으로 남습니다.
+WordPress가 primary 원문이고 Blogger는 secondary 배포 채널입니다.
 
 ### Blogger OAuth secret-store contract (English)
 
-`BLOGGER_OAUTH_TOKEN_STORE` receives `target_id` and `token_payload` keyword arguments,
-writes the token to an external secret store, and returns only a reference such as
-`vault://...`. If the callable declares `operation_key` or arbitrary keyword arguments,
-the callback also passes the signed OAuth nonce as `operation_key`. Secret-store writers
-should use it as an idempotency key so replaying the same callback does not create another
-secret. Existing two-argument writers remain compatible. Automatic reconciliation of an
-orphan secret after a process crash immediately following the secret-store write remains
-in T023 scope. `SECRET_PROVIDER_CLASSES` resolves the returned reference scheme.
+`BLOGGER_OAUTH_TOKEN_STORE` receives `target_id`, normalized `token_bundle`,
+`expected_version`, and `operation_key`. It must apply version CAS and return exactly a
+`credential_ref` plus the stored `version`; operation replay converges on the same material.
+`SECRET_PROVIDER_CLASSES` resolves that reference. Blogger credentials are connected only
+through signed OAuth state. Refresh is target-serialized and version-CAS single-flight.
+Disconnect revokes the Google refresh token or exact WordPress Application Password remotely
+before local reference/version removal; ambiguous outcomes remain reconciling.
 
 ## Celery 큐
 

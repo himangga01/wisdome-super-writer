@@ -1060,6 +1060,7 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required: [authorizationUrl, expiresAt]
                 properties:
                   authorizationUrl: { type: string, format: uri }
@@ -1115,9 +1116,23 @@ paths:
         default: { $ref: '#/components/responses/Problem' }
         '200':
           description: OAuth result recorded and a safe completion page returned
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [targetId, credentialVersion, connectionState, next]
+                properties:
+                  targetId: { type: string, format: uuid }
+                  credentialVersion: { type: string, minLength: 1, maxLength: 120 }
+                  connectionState: { type: string, enum: [pending] }
+                  next: { type: string, pattern: '^/console/publishing/targets/[0-9a-f-]{36}/$' }
         '302':
           description: OAuth result recorded and browser redirected to the target page
         '400': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
 
   /targets/{targetId}/connection:
     parameters:
@@ -4298,7 +4313,7 @@ components:
             remoteBlogId: { type: [string, 'null'] }
             canaryTargetId: { type: [string, 'null'], format: uuid, description: Same-channel test target required for production automatic publication. }
             usernameRef: { type: [string, 'null'], description: Secret-store reference for the WordPress username. }
-            credentialRef: { type: [string, 'null'], description: Secret-store reference; never the credential value. }
+            credentialRef: { type: [string, 'null'], description: WordPress-only secret-store reference; Blogger credentials must be connected through the OAuth endpoint. Never the credential value. }
             requestKey: { type: string, minLength: 8, maxLength: 200 }
             reason: { type: string, minLength: 3, maxLength: 500 }
       unevaluatedProperties: false
@@ -4312,7 +4327,7 @@ components:
         displayName: { type: string, minLength: 1, maxLength: 200 }
         canaryTargetId: { type: [string, 'null'], format: uuid }
         usernameRef: { type: [string, 'null'] }
-        credentialRef: { type: [string, 'null'] }
+        credentialRef: { type: [string, 'null'], description: WordPress-only secret-store reference; Blogger credential changes use the OAuth or disconnect endpoint. }
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         reason: { type: string, minLength: 3, maxLength: 500 }
     TargetValidationState:
@@ -4456,7 +4471,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/ChannelBinding'
         - type: object
-          required: [id, currentSnapshotId, currentSnapshotVersion, currentConfigHash, publisherContractVersion, publisherAdapterManifestHash, environment, displayName, baseUrl, connectionState, preflightState, canaryState, pilotState, capabilities, autoPublishEnabled, autoPublishActivationId, autoPublishActivationVersion]
+          required: [id, currentSnapshotId, currentSnapshotVersion, currentConfigHash, publisherContractVersion, publisherAdapterManifestHash, credentialVersion, environment, displayName, baseUrl, connectionState, preflightState, canaryState, pilotState, capabilities, autoPublishEnabled, autoPublishActivationId, autoPublishActivationVersion]
           properties:
             id: { type: string, format: uuid }
             currentSnapshotId: { type: string, format: uuid }
@@ -4467,6 +4482,11 @@ components:
               description: Operational target configuration hash; the automatic-publication toggle is intentionally excluded.
             publisherContractVersion: { type: string, minLength: 1 }
             publisherAdapterManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+            credentialVersion:
+              type: [string, 'null']
+              minLength: 1
+              maxLength: 120
+              description: Version of the secret-store bundle; credential values and references are never returned.
             environment: { type: string, enum: [test, production] }
             displayName: { type: string }
             baseUrl: { type: string, format: uri }

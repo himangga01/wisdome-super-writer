@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import httpx
 
 from apps.publishing.contracts import PublisherError
+from wisdome_writer.infrastructure.secrets import (
+    OAuthTokenBundle,
+    OAuthTokenBundleError,
+    normalize_oauth_token_bundle,
+)
 
 
 class BloggerOAuthClient:
@@ -21,10 +27,12 @@ class BloggerOAuthClient:
         client_secret: str,
         redirect_uri: str,
         client: httpx.Client | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.client = client or httpx.Client(timeout=30.0, headers={"Accept": "application/json"})
 
     def authorization_url(self, *, state: str) -> str:
@@ -42,7 +50,29 @@ class BloggerOAuthClient:
         )
         return f"{self.authorization_endpoint}?{query}"
 
-    def exchange_code(self, code: str) -> dict[str, Any]:
+    def _token_response(self, response: httpx.Response) -> dict[str, Any]:
+        if response.status_code >= 400:
+            raise PublisherError(
+                "blogger_oauth_exchange_rejected",
+                category="permanent",
+                http_status=response.status_code,
+                detail_redacted=f"HTTP {response.status_code}",
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PublisherError(
+                "blogger_oauth_token_invalid",
+                category="permanent",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PublisherError(
+                "blogger_oauth_token_invalid",
+                category="permanent",
+            )
+        return payload
+
+    def exchange_code(self, code: str, *, version: str) -> OAuthTokenBundle:
         try:
             response = self.client.post(
                 self.token_endpoint,
@@ -60,20 +90,70 @@ class BloggerOAuthClient:
                 category="retryable",
                 detail_redacted=exc.__class__.__name__,
             ) from exc
-        if response.status_code >= 400:
+        try:
+            return normalize_oauth_token_bundle(
+                self._token_response(response),
+                version=version,
+                now=self.clock(),
+            )
+        except OAuthTokenBundleError as exc:
             raise PublisherError(
-                "blogger_oauth_exchange_rejected",
+                "blogger_oauth_token_invalid",
                 category="permanent",
+            ) from exc
+
+    def refresh_token(
+        self,
+        current: OAuthTokenBundle,
+        *,
+        version: str,
+    ) -> OAuthTokenBundle:
+        try:
+            response = self.client.post(
+                self.token_endpoint,
+                data={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "refresh_token": current["refresh_token"],
+                    "grant_type": "refresh_token",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise PublisherError(
+                "blogger_oauth_refresh_unavailable",
+                category="retryable",
+                detail_redacted=exc.__class__.__name__,
+            ) from exc
+        if response.status_code >= 400:
+            try:
+                error = response.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            raise PublisherError(
+                (
+                    "blogger_oauth_refresh_revoked"
+                    if error == "invalid_grant"
+                    else "blogger_oauth_refresh_rejected"
+                ),
+                category=("permanent" if error == "invalid_grant" else "retryable"),
                 http_status=response.status_code,
                 detail_redacted=f"HTTP {response.status_code}",
             )
-        payload = response.json()
-        if payload.get("token_type", "").lower() != "bearer" or not payload.get("access_token"):
-            raise PublisherError("blogger_oauth_token_invalid", category="permanent")
-        granted = set(str(payload.get("scope", "")).split())
-        if granted and self.scope not in granted:
-            raise PublisherError("blogger_oauth_scope_missing", category="permanent")
-        return payload
+        payload = self._token_response(response)
+        payload.setdefault("scope", current["scope"])
+        payload.setdefault("token_type", current["token_type"])
+        try:
+            return normalize_oauth_token_bundle(
+                payload,
+                version=version,
+                now=self.clock(),
+                previous_refresh_token=current["refresh_token"],
+            )
+        except OAuthTokenBundleError as exc:
+            raise PublisherError(
+                "blogger_oauth_token_invalid",
+                category="permanent",
+            ) from exc
 
     def close(self) -> None:
         self.client.close()

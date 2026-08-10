@@ -173,6 +173,7 @@ def target_json(row: PublicationTarget) -> dict[str, Any]:
         "currentConfigHash": row.current_config_hash,
         "publisherContractVersion": row.publisher_contract_version,
         "publisherAdapterManifestHash": row.publisher_adapter_manifest_hash,
+        "credentialVersion": row.credential_version or None,
         "connectionState": row.connection_state,
         "preflightState": row.preflight_state,
         "canaryState": row.canary_state,
@@ -576,6 +577,7 @@ def target_oauth_start(request: HttpRequest, target_id: str) -> JsonResponse:
         start_blogger_oauth(
             target_id,
             user=request.user,
+            request=request,
             redirect_uri=redirect_uri,
             audit_context=_admin_audit_context(request, data),
         )
@@ -603,6 +605,7 @@ def blogger_oauth_callback(request: HttpRequest) -> JsonResponse:
     return JsonResponse(
         {
             "targetId": str(target.id),
+            "credentialVersion": target.credential_version,
             "connectionState": target.connection_state,
             "next": f"/console/publishing/targets/{target.id}/",
         }
