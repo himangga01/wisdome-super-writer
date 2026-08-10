@@ -381,7 +381,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "wisdome_writer.infrastructure.tasks.dispatch_outbox",
         "schedule": 5.0,
         "options": {"queue": "outbox.dispatch"},
-    }
+    },
+    "detect-source-corrections": {
+        "task": "apps.editorial.tasks.detect_source_corrections",
+        "schedule": 300.0,
+        "options": {"queue": "editorial"},
+    },
 }
 CELERY_TASK_ROUTES = {
     "apps.evidence.tasks.process_paddleocr_document": {"queue": "extract.ocr.paddle"},

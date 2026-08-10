@@ -134,6 +134,8 @@ _IDENTITY_KEYS = frozenset(
         "article_id",
         "coalesced_into_id",
         "collection_run_id",
+        "corrected_revision_id",
+        "correction_case_id",
         "decision_id",
         "dispatch_id",
         "evidence_id",
@@ -153,6 +155,7 @@ _IDENTITY_KEYS = frozenset(
 _VERSION_KEYS = frozenset(
     {
         "reconcile_attempt_no",
+        "head_version",
         "revision_no",
         "row_version",
         "schedule_version",
@@ -368,6 +371,14 @@ _MEDIA_DELIVERY_OPERATION_KEYS = (
     "result_hash",
     "state",
 )
+_CORRECTION_DECISION_KEYS = (
+    "corrected_revision_id",
+    "correction_case_id",
+    "decision",
+    "decision_id",
+    "head_version",
+    "request_hash",
+)
 
 ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
     **{
@@ -497,6 +508,7 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
             "media_delivery_operation.reclaimed",
         )
     },
+    ("correction_case.decided", "1"): _policy(*_CORRECTION_DECISION_KEYS),
 }
 
 

@@ -7603,6 +7603,62 @@ def finalize_media_delivery_operation_failure(
     return operation
 
 
+def _correction_render_material(
+    intent: PublicationIntent,
+    revision,
+) -> tuple[list[dict[str, Any]], str]:
+    if intent.correction_case_id is None:
+        return [], ""
+    CorrectionCase = apps.get_model("editorial", "CorrectionCase")
+    case = (
+        CorrectionCase.objects.select_related(
+            "latest_decision",
+            "source_item",
+            "prior_source_item",
+        )
+        .filter(pk=intent.correction_case_id)
+        .first()
+    )
+    if (
+        case is None
+        or case.corrected_revision_id != revision.id
+        or case.latest_decision_id is None
+        or case.latest_decision.decision != "verified"
+        or case.latest_decision.corrected_revision_id != revision.id
+        or case.subject_hash != case.latest_decision.subject_hash
+    ):
+        raise Conflict("correction render material is not the current verified case")
+    from .corrections import build_public_correction_history
+
+    history = build_public_correction_history(case)
+    entry = history[0]
+    labels = {
+        "correction": "정정 안내",
+        "retraction": "철회 안내",
+        "source_unavailable": "원문 접근 불가 안내",
+        "restoration": "복원 안내",
+    }
+    title = labels.get(case.kind, "내용 변경 안내")
+    link_html = "".join(
+        '<li><a href="{0}" rel="nofollow noopener">{0}</a></li>'.format(
+            html.escape(url, quote=True)
+        )
+        for url in entry["sourceLinks"]
+    )
+    notice = (
+        '<aside class="correction-notice" data-correction-case="{case_id}">'
+        "<strong>{title}</strong>"
+        "<p>공식 원문 변경을 검증해 기존 게시물을 갱신했습니다.</p>"
+        "<ul>{links}</ul>"
+        "</aside>\n"
+    ).format(
+        case_id=html.escape(str(case.id), quote=True),
+        title=html.escape(title),
+        links=link_html,
+    )
+    return history, notice
+
+
 @transaction.atomic
 def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
     asset_cohort = freeze_revision_asset_cohort(revision=revision)
@@ -7610,7 +7666,11 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
         cohort=asset_cohort,
         channel=target.channel,
     )
-    body = _markdown_to_html(revision.body_markdown)
+    correction_history, correction_notice = _correction_render_material(
+        intent,
+        revision,
+    )
+    body = correction_notice + _markdown_to_html(revision.body_markdown)
     source_links = _revision_source_links(revision)
     if revision.claims.exists() and not source_links:
         raise Conflict("게시 주장에 독자가 접근할 수 있는 원출처 URL이 없습니다.")
@@ -7623,10 +7683,15 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
         "title": revision.title,
         "body": body,
         "revision": str(revision.id),
+        "correctionHistory": correction_history,
     }
     template_hash = sha256_hex(template_material)
     source_manifest_hash = sha256_hex(
-        {"inputEvidenceManifestHash": intent.input_evidence_manifest_hash, "sourceLinks": source_links}
+        {
+            "inputEvidenceManifestHash": intent.input_evidence_manifest_hash,
+            "sourceLinks": source_links,
+            "correctionHistory": correction_history,
+        }
     )
     return ArticleChannelRender.objects.create(
         publication_intent=intent,
@@ -7646,6 +7711,7 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
         content_hash=sha256_hex({"title": revision.title, "body": body}),
         source_manifest_hash=source_manifest_hash,
         media_manifest=media_manifest,
+        correction_history=correction_history,
     )
 
 
@@ -8522,6 +8588,19 @@ def _dispatch_publication_atomic(
         attempt_count=len(attempts),
         attempt_manifest_hash=attempts_hash,
     )
+    if intent.correction_case_id is not None:
+        correction_case_id = str(intent.correction_case_id)
+        accepted_at = dispatch.accepted_at
+
+        def _record_correction_dispatch() -> None:
+            from .corrections import mark_correction_dispatched
+
+            mark_correction_dispatched(
+                correction_case_id,
+                accepted_at=accepted_at,
+            )
+
+        transaction.on_commit(_record_correction_dispatch)
     _mark_origin_run_publishing_locked(intent)
     publish_at = data.get("publishAt")
     initial = [

@@ -141,6 +141,8 @@ def route_source_item_change(
 
     correction_case_count = 0
     if change_kind in {
+        SourceDiscoveryKind.NEW_VERSION,
+        SourceDiscoveryKind.CORRECTED,
         SourceDiscoveryKind.RETRACTED,
         SourceDiscoveryKind.UNAVAILABLE,
         SourceDiscoveryKind.RESTORED,

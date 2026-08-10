@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any, Iterable
 
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.views.decorators.http import require_http_methods
 
 from apps.audit.services import AuditContext
 from apps.evidence.api import (
@@ -17,8 +19,10 @@ from apps.evidence.api import (
 from apps.evidence.models import EvidenceAsset
 from wisdome_writer.api.openapi import openapi_operation
 from wisdome_writer.domain.errors import InvalidInput, StaleVersion, StateConflict
+from wisdome_writer.domain.hashing import sha256_hex
 
-from .models import CorrectionCase, DraftArticle
+from .corrections import decide_correction_case
+from .models import CorrectionCase, CorrectionDecision, DraftArticle
 from .services import (
     create_manual_revision,
     evaluate_revision_publishability_readonly,
@@ -27,6 +31,124 @@ from .services import (
 
 def _iso(value) -> str | None:
     return value.isoformat() if value else None
+
+
+def _correction_decision_payload(row: CorrectionDecision) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "decision": row.decision,
+        "subjectHash": row.subject_hash,
+        "diffManifestHash": row.diff_manifest_hash,
+        "correctedRevisionId": (
+            str(row.corrected_revision_id) if row.corrected_revision_id else None
+        ),
+        "supersedesDecisionId": (
+            str(row.supersedes_id) if row.supersedes_id else None
+        ),
+        "headVersion": row.head_version,
+        "requestKey": row.request_key,
+        "requestHash": row.request_hash,
+        "reauthProofId": str(row.reauth_proof_id),
+        "decisionReason": row.decision_reason,
+        "decidedBy": str(row.decided_by_id),
+        "decidedAt": row.decided_at.isoformat(),
+    }
+
+
+def _correction_case_payload(row: CorrectionCase) -> dict[str, Any]:
+    decisions = list(row.decisions.order_by("head_version", "id")[:100])
+    source = row.source_item
+    prior = row.prior_source_item
+    claims = list(
+        row.article.revisions.filter(
+            claims__evidence_links__evidence__source_item_id__in=(
+                [value for value in (row.source_item_id, row.prior_source_item_id) if value]
+            )
+        )
+        .values_list("claims__id", flat=True)
+        .distinct()[:200]
+    )
+    from apps.publishing.models import Publication, PublicationAttempt
+
+    publications = list(
+        Publication.objects.filter(article_id=row.article_id)
+        .select_related("target")
+        .order_by("target_id")[:20]
+    )
+    attempts = list(
+        PublicationAttempt.objects.filter(
+            publication_intent__correction_case_id=row.id
+        )
+        .select_related("publication__target")
+        .order_by("publication__target_id", "id")[:100]
+    )
+    sla_deadline = row.detected_at + timedelta(minutes=30)
+    sla_reference = row.completed_at or timezone.now()
+    return {
+        "id": str(row.id),
+        "articleId": str(row.article_id),
+        "kind": row.kind,
+        "state": row.state,
+        "subjectHash": row.subject_hash,
+        "diffManifestHash": sha256_hex(row.diff_summary),
+        "diffSummary": row.diff_summary,
+        "source": {
+            "sourceItemId": str(source.id),
+            "sourceVersionHash": source.source_version_hash,
+            "contentHash": source.content_hash,
+            "url": source.canonical_url,
+            "status": source.status,
+        },
+        "priorSource": (
+            {
+                "sourceItemId": str(prior.id),
+                "sourceVersionHash": prior.source_version_hash,
+                "contentHash": prior.content_hash,
+                "url": prior.canonical_url,
+                "status": prior.status,
+            }
+            if prior is not None
+            else None
+        ),
+        "supersedesCaseId": str(row.supersedes_id) if row.supersedes_id else None,
+        "correctedRevisionId": (
+            str(row.corrected_revision_id) if row.corrected_revision_id else None
+        ),
+        "latestDecisionId": (
+            str(row.latest_decision_id) if row.latest_decision_id else None
+        ),
+        "decisionVersion": row.decision_version,
+        "decisions": [_correction_decision_payload(value) for value in decisions],
+        "affectedClaimIds": [str(value) for value in claims],
+        "publications": [
+            {
+                "publicationId": str(value.id),
+                "targetId": str(value.target_id),
+                "channel": value.target.channel,
+                "state": value.state,
+                "remotePostId": value.remote_post_id,
+                "remoteUrl": value.remote_url,
+            }
+            for value in publications
+        ],
+        "attempts": [
+            {
+                "attemptId": str(value.id),
+                "targetId": str(value.publication.target_id),
+                "state": value.state,
+                "errorCode": value.error_code,
+                "recoveryState": value.recovery_state,
+            }
+            for value in attempts
+        ],
+        "detectedAt": row.detected_at.isoformat(),
+        "verifiedAt": _iso(row.verified_at),
+        "dispatchedAt": _iso(row.dispatched_at),
+        "completedAt": _iso(row.completed_at),
+        "slaDeadlineAt": sla_deadline.isoformat(),
+        "slaBreached": sla_reference > sla_deadline,
+        "failureSummary": row.failure_summary,
+    }
 
 
 def _rows(relation) -> list:
@@ -626,33 +748,84 @@ def revise_article(request, article_id):
 
 
 @login_required
+@openapi_operation("listArticleCorrections")
 def article_corrections(request, article_id):
-    rows = CorrectionCase.objects.filter(article_id=article_id).order_by(
-        "-detected_at"
+    if not request.user.is_active or not request.user.is_staff:
+        return JsonResponse(
+            {"type": "about:blank", "title": "forbidden", "status": 403},
+            status=403,
+        )
+    rows = (
+        CorrectionCase.objects.filter(article_id=article_id)
+        .select_related(
+            "article",
+            "source_item",
+            "prior_source_item",
+            "latest_decision",
+        )
+        .prefetch_related("decisions")
+        .order_by("-detected_at", "-id")[:100]
     )
     return JsonResponse(
         {
-            "items": [
-                {
-                    "id": str(row.id),
-                    "kind": row.kind,
-                    "state": row.state,
-                    "sourceItemId": str(row.source_item_id),
-                    "priorSourceItemId": (
-                        str(row.prior_source_item_id)
-                        if row.prior_source_item_id
-                        else None
-                    ),
-                    "subjectHash": row.subject_hash,
-                    "diffSummary": row.diff_summary,
-                    "detectedAt": row.detected_at.isoformat(),
-                    "completedAt": (
-                        row.completed_at.isoformat()
-                        if row.completed_at
-                        else None
-                    ),
-                }
-                for row in rows
-            ]
+            "items": [_correction_case_payload(row) for row in rows]
         }
+    )
+
+
+@login_required
+@openapi_operation("decideCorrection")
+@require_http_methods(["POST"])
+def correction_decisions(request, correction_id):
+    if (
+        not request.user.is_active
+        or not request.user.is_staff
+    ):
+        return JsonResponse(
+            {"type": "about:blank", "title": "forbidden", "status": 403},
+            status=403,
+        )
+    body = request.openapi_body
+    audit_context = AuditContext.for_admin(
+        request=request,
+        reason_code=body["reason"],
+        request_key=body["requestKey"],
+    )
+    try:
+        row, created = decide_correction_case(
+            case_id=correction_id,
+            decision=body["decision"],
+            expected_subject_hash=body["expectedSubjectHash"],
+            expected_diff_manifest_hash=body["expectedDiffManifestHash"],
+            corrected_revision_id=body.get("correctedRevisionId"),
+            expected_latest_decision_id=body.get("expectedLatestDecisionId"),
+            expected_decision_version=body["expectedDecisionVersion"],
+            request_key=body["requestKey"],
+            reason=body["reason"],
+            reauth_proof_id=body["reauthProofId"],
+            user=request.user,
+            request=request,
+            audit_context=audit_context,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "stale" in message or "no longer" in message:
+            raise StateConflict(message) from exc
+        raise InvalidInput(message) from exc
+    case = (
+        CorrectionCase.objects.select_related(
+            "article",
+            "source_item",
+            "prior_source_item",
+            "latest_decision",
+        )
+        .prefetch_related("decisions")
+        .get(pk=correction_id)
+    )
+    return JsonResponse(
+        {
+            "decision": _correction_decision_payload(row),
+            "correctionCase": _correction_case_payload(case),
+        },
+        status=201 if created else 200,
     )

@@ -872,6 +872,34 @@ paths:
         '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
+  /corrections/{correctionId}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/CorrectionId'
+    post:
+      tags: [Articles]
+      summary: Verify or reject a frozen correction case with dual-CAS and reauthentication
+      operationId: decideCorrection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CorrectionDecisionRequest' }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Exact immutable decision replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorrectionDecisionResult' }
+        '201':
+          description: New immutable correction decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorrectionDecisionResult' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
   /articles/{articleId}/corrections:
     parameters:
       - $ref: '#/components/parameters/ArticleId'
@@ -886,8 +914,14 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: '#/components/schemas/CorrectionCase' }
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: { $ref: '#/components/schemas/CorrectionCase' }
         '4XX': { $ref: '#/components/responses/Problem' }
 
   /schedules:
@@ -1601,7 +1635,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect, approval_revoke]
+            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect, approval_revoke, correction_decision]
     ReauthenticationProof:
       type: object
       additionalProperties: false
@@ -4773,19 +4807,123 @@ components:
 
     CorrectionCase:
       type: object
-      required: [id, kind, state, sourceIdentityHash, observedSourceVersionHash, changeKind, correctionSubjectHash, supersedesCaseId, detectedAt, diffSummary]
+      additionalProperties: false
+      required: [id, articleId, kind, state, subjectHash, diffManifestHash, diffSummary, source, priorSource, supersedesCaseId, correctedRevisionId, latestDecisionId, decisionVersion, decisions, affectedClaimIds, publications, attempts, detectedAt, verifiedAt, dispatchedAt, completedAt, slaDeadlineAt, slaBreached, failureSummary]
       properties:
         id: { type: string, format: uuid }
-        kind: { type: string, enum: [correction, retraction, source_unavailable] }
+        articleId: { type: string, format: uuid }
+        kind: { type: string, enum: [correction, retraction, source_unavailable, restoration] }
         state: { type: string, enum: [detected, verifying, verified, applying, completed, rejected, failed] }
-        sourceIdentityHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        observedSourceVersionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        changeKind: { type: string, enum: [corrected, retracted, unavailable, restored] }
-        correctionSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        supersedesCaseId: { type: [string, 'null'], format: uuid }
-        detectedAt: { type: string, format: date-time }
-        completedAt: { type: [string, 'null'], format: date-time }
+        subjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        diffManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         diffSummary: { type: object, additionalProperties: true }
+        source: { $ref: '#/components/schemas/CorrectionSourceSnapshot' }
+        priorSource:
+          oneOf:
+            - { $ref: '#/components/schemas/CorrectionSourceSnapshot' }
+            - { type: 'null' }
+        supersedesCaseId: { type: [string, 'null'], format: uuid }
+        correctedRevisionId: { type: [string, 'null'], format: uuid }
+        latestDecisionId: { type: [string, 'null'], format: uuid }
+        decisionVersion: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        decisions:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/CorrectionDecision' }
+        affectedClaimIds:
+          type: array
+          maxItems: 200
+          items: { type: string, format: uuid }
+        publications:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [publicationId, targetId, channel, state, remotePostId, remoteUrl]
+            properties:
+              publicationId: { type: string, format: uuid }
+              targetId: { type: string, format: uuid }
+              channel: { type: string, enum: [wordpress, blogger] }
+              state: { type: string }
+              remotePostId: { type: [string, 'null'] }
+              remoteUrl: { type: [string, 'null'], format: uri }
+        attempts:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [attemptId, targetId, state, errorCode, recoveryState]
+            properties:
+              attemptId: { type: string, format: uuid }
+              targetId: { type: string, format: uuid }
+              state: { type: string }
+              errorCode: { type: [string, 'null'] }
+              recoveryState: { type: string }
+        detectedAt: { type: string, format: date-time }
+        verifiedAt: { type: [string, 'null'], format: date-time }
+        dispatchedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        slaDeadlineAt: { type: string, format: date-time }
+        slaBreached: { type: boolean }
+        failureSummary: { type: object, additionalProperties: true }
+
+    CorrectionSourceSnapshot:
+      type: object
+      additionalProperties: false
+      required: [sourceItemId, sourceVersionHash, contentHash, url, status]
+      properties:
+        sourceItemId: { type: string, format: uuid }
+        sourceVersionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        contentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        url: { type: string, format: uri }
+        status: { type: string }
+
+    CorrectionDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, expectedSubjectHash, expectedDiffManifestHash, correctedRevisionId, expectedLatestDecisionId, expectedDecisionVersion, requestKey, reauthProofId, reason]
+      properties:
+        decision: { type: string, enum: [verified, rejected] }
+        expectedSubjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expectedDiffManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        correctedRevisionId:
+          type: [string, 'null']
+          format: uuid
+          description: Required for verified and null for rejected.
+        expectedLatestDecisionId: { type: [string, 'null'], format: uuid }
+        expectedDecisionVersion: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+
+    CorrectionDecision:
+      type: object
+      additionalProperties: false
+      required: [id, decision, subjectHash, diffManifestHash, correctedRevisionId, supersedesDecisionId, headVersion, requestKey, requestHash, reauthProofId, decisionReason, decidedBy, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        decision: { type: string, enum: [verified, rejected] }
+        subjectHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        diffManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        correctedRevisionId: { type: [string, 'null'], format: uuid }
+        supersedesDecisionId: { type: [string, 'null'], format: uuid }
+        headVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        requestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        reauthProofId: { type: string, format: uuid }
+        decisionReason: { type: string, minLength: 3, maxLength: 500 }
+        decidedBy: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+
+    CorrectionDecisionResult:
+      type: object
+      additionalProperties: false
+      required: [decision, correctionCase]
+      properties:
+        decision: { $ref: '#/components/schemas/CorrectionDecision' }
+        correctionCase: { $ref: '#/components/schemas/CorrectionCase' }
 
     AuditEvent:
       type: object

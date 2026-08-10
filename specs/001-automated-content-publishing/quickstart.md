@@ -1222,3 +1222,35 @@ boundary. Exercise all-source failure, required-step failure, publication failur
 successful completion through the shared projection. Retry accepts one supported failed unit only and
 does not recreate successful siblings. A terminal commit releases one queue-one root exactly once, while
 an unresolved channel dependency remains nonterminal.
+
+## T029 정정·철회 운영 확인 절차 (한국어)
+
+1. 같은 SourceItem 변경 관측을 beat와 event consumer에서 반복 처리한다. 같은 article/subject hash에는
+   하나의 `CorrectionCase`만 존재해야 한다.
+2. case 상세에서 이전·현재 source locator, 영향 claim, publication과 attempt 상태를 확인한다. 같은
+   request key/material로 verify를 재요청하면 같은 `CorrectionDecision`이 반환되고 reason, revision,
+   proof 또는 expected head를 바꾸면 충돌해야 한다.
+3. verified corrected revision이 current revision인지, 변경 source가 frozen manifest에 결속됐는지,
+   T018 gate가 passed인지 확인한다. 하나라도 아니면 외부 publication intent가 생기면 안 된다.
+4. correction preview 본문 상단과 `correctionHistory`에서 정정 유형, 검증 시각, 변경 요약과 HTTP(S)
+   source link가 동일하게 동결됐는지 확인한다.
+5. WordPress update/mark-withdrawn/unpublish가 기존 remote post ID를 유지하고 terminal이 된 뒤에만
+   Blogger가 실행되는지 확인한다. replay는 새 remote post나 attempt를 만들면 안 된다.
+6. case 상세의 detected/verified/dispatched/completed 시각, 30분 SLA 초과, target별 attempt와 실패
+   요약이 실제 immutable dispatch cohort와 일치하는지 확인한다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_correction_orchestration tests.unit.test_publishing_corrections_round2 -v 2
+```
+
+## T029 Correction and Retraction Verification (English/AI-readable)
+
+Replay source-change detection through both beat and event paths and require one case per exact
+article/subject. Exercise decision request replay, changed-material conflict, dual head CAS, and
+purpose-bound reauthentication. A verified correction must use the current revision, bind the changed
+source in frozen material, and pass T018 before any publication intent exists. Inspect the frozen
+reader-visible correction notice/history, preserve the remote post identity, and require WordPress
+terminal dependency before Blogger execution. Finally, compare case timestamps, SLA status, target
+attempts, and failure summary with the immutable dispatch cohort.

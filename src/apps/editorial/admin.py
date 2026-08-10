@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import ArticleRevision, Claim, ClaimEvidence, CorrectionCase, DraftArticle, EventCluster, GenerationAttempt, QualityCheck, VisualizationRender
+from .models import ArticleRevision, Claim, ClaimEvidence, CorrectionCase, CorrectionDecision, DraftArticle, EventCluster, GenerationAttempt, QualityCheck, VisualizationRender
 
 
 class ReadOnlyEditorialAdmin(admin.ModelAdmin):
@@ -28,6 +28,7 @@ admin.site.register(
         VisualizationRender,
         EventCluster,
         CorrectionCase,
+        CorrectionDecision,
     ],
     ReadOnlyEditorialAdmin,
 )

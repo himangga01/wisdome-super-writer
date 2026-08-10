@@ -11,4 +11,9 @@ urlpatterns = [
         api.article_corrections,
         name="article-corrections",
     ),
+    path(
+        "corrections/<uuid:correction_id>/decisions",
+        api.correction_decisions,
+        name="correction-decisions",
+    ),
 ]

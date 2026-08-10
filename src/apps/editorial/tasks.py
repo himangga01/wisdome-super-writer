@@ -48,6 +48,17 @@ from .services import (
 )
 
 
+@shared_task(name="apps.editorial.tasks.detect_source_corrections")
+def detect_source_corrections():
+    from .corrections import detect_correction_cases
+
+    cases = detect_correction_cases()
+    return {
+        "count": len(cases),
+        "correctionCaseIds": [str(case.id) for case in cases[:100]],
+    }
+
+
 def _worker_audit_context(reason_code: str) -> AuditContext:
     return AuditContext.for_worker(
         correlation_id=CURRENT_EVENT_CORRELATION_ID.get(),

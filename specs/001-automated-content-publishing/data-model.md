@@ -2561,3 +2561,35 @@ In-flight factual results remain durable, but every worker boundary rechecks sto
 or downstream fan-out. The shared terminal projection waits for all step/source/publication children,
 preserves all-source failure, gives stop precedence, and derives one scoped error summary/impact document.
 Only the first terminal commit schedules queue-one release; an unresolved Blogger dependency is nonterminal.
+
+## T029 정정·철회 결정과 공개 이력 정본 (한국어)
+
+`CorrectionCase`는 원문 변경 관측과 영향받은 article을 결속하며, 같은 subject material은 같은 case로
+재생된다. `CorrectionDecision`은 관리자 verify/reject의 append-only 정본이다. 요청 hash는 case,
+결정, subject/diff manifest, corrected revision, reason, 관리자, 재인증 proof, expected head ID/version을
+결속한다. 같은 request key와 같은 material은 기존 결정을 반환하고, 다른 material은 충돌한다.
+case의 latest decision과 version은 DB trigger가 단조 투영하며 decision·head lineage는 UPDATE/DELETE할 수
+없다.
+
+verified 결정은 같은 article의 현재 corrected revision만 허용한다. 그 revision은 변경된 SourceItem을
+verification/evidence/exclusion manifest 중 하나에 정확히 결속하고 T018 publishability gate를 통과해야
+한다. correction publication은 verified decision의 revision만 사용하며 공개 본문과
+`ArticleChannelRender.correction_history`에 정정 유형, 검증 시각, 변경 요약과 source link를 동결한다.
+기존 remote post identity를 보존하고 WordPress terminal 뒤 Blogger가 해제된다. case는
+detected/verified/dispatched/completed 시각, 실패 요약과 target별 attempt 상태를 운영 projection으로
+제공한다.
+
+## T029 Correction and Retraction Authority (English/AI-readable)
+
+`CorrectionCase` binds one source-change subject to an affected article and replays exact material.
+Append-only `CorrectionDecision` rows bind the case, decision, subject/diff manifests, corrected revision,
+reason, actor, purpose-bound reauthentication proof, and dual expected-head CAS in one canonical request
+hash. The database advances the case head/version monotonically and rejects mutation or deletion of
+decision lineage.
+
+A verified decision accepts only the article's current corrected revision. That revision must bind the
+changed SourceItem in its frozen verification/evidence/exclusion material and pass the shared T018
+publishability gate. Correction publication freezes a reader-visible notice and correction history,
+preserves the existing remote post identity, and releases Blogger only after the WordPress dependency is
+terminal. Operational detail exposes detected, verified, dispatched, and completed timestamps plus
+bounded target attempt/failure projections.

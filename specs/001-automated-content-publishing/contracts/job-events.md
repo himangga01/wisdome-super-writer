@@ -908,3 +908,25 @@ publishing stale projector. `topics.registry_decided@1` has exactly five fields:
 the source event/receipt before locking sorted publishing fences and project affected validations,
 targets, and open intents fail-closed. Live server-material recomputation remains the final safety
 boundary while asynchronous projection is pending.
+
+## 한국어 — T029 정정 감지와 발행 이벤트 경계
+
+- 5분 beat와 `source.item_changed@1` consumer는 `new_version|corrected|retracted|unavailable|restored`
+  관측을 같은 idempotent correction detection 서비스로 전달한다. 공개 event payload는 변경하지 않는다.
+- verify/reject는 동기 관리자 결정이며 별도 worker event를 만들지 않는다. 결정·재인증·CAS material은
+  append-only DB와 AuditEvent에만 남는다.
+- verified case가 만든 correction publication은 기존 versioned publication intent/dispatch/requested
+  event를 그대로 사용한다. worker payload에는 correction reason이나 source diff를 복제하지 않으며,
+  intent의 frozen revision/render/history가 정본이다.
+- dispatch 완료 표시는 transaction commit 뒤 case에 투영한다. attempt terminal 집합이 모두 닫힐 때만
+  completed/failed와 실패 요약을 case에 반영한다.
+
+## English / AI-readable — T029 correction event boundary
+
+The five-minute beat and `source.item_changed@1` consumer route
+`new_version|corrected|retracted|unavailable|restored` observations through the same idempotent detector;
+the public event ABI is unchanged. Verify/reject is a synchronous administrative decision, so its CAS,
+reauthentication, and diff material remains in append-only database and audit rows rather than a worker
+payload. A verified correction reuses the existing versioned publication intent/dispatch/requested event
+chain, with the frozen revision, render, and correction history as authority. Post-commit dispatch and
+terminal attempt projections update the case without introducing a second external-write event protocol.

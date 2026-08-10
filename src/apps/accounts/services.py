@@ -34,6 +34,7 @@ ALLOWED_ACTION_SCOPES = frozenset(
         "validation_decision",
         "credential_disconnect",
         "approval_revoke",
+        "correction_decision",
     }
 )
 

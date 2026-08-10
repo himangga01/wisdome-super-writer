@@ -1591,8 +1591,8 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Modify: `src/apps/publishing/corrections.py`
 - Modify: `src/apps/publishing/services.py`
 - Modify: `src/apps/publishing/tasks.py`
-- Create: `src/apps/editorial/migrations/0005_correction_decision.py`
-- Modify: `src/wisdome_writer/celery.py`
+- Create: `src/apps/editorial/migrations/0004_correction_decision.py`
+- Modify: `src/wisdome_writer/settings/__init__.py`
 - Modify: `specs/001-automated-content-publishing/contracts/job-events.md`
 - Deferred integration test: `tests/integration/test_corrections.py`
 
@@ -1600,7 +1600,7 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Consumes: `SourceCollectionObservation` change lineage and affected article identity.
 - Produces: idempotent `CorrectionCase`, append-only `CorrectionDecision`, corrected revision, WordPress-first correction intent.
 
-- [ ] **Step 1: correction decision과 revision binding을 추가한다.**
+- [x] **Step 1: correction decision과 revision binding을 추가한다.**
 
   ```python
   class CorrectionDecision(models.Model):
@@ -1615,34 +1615,34 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 
   `CorrectionCase.corrected_revision`과 latest decision projection/version을 추가한다.
 
-- [ ] **Step 2: source change beat/task를 연결한다.**
+- [x] **Step 2: source change beat/task를 연결한다.**
 
   terminal/restored/corrected/retracted 관측을 주기적으로 읽어 `detect_correction_cases_for_observation()`을 호출한다. 같은 article/subject hash는 같은 case를 반환한다.
 
-- [ ] **Step 3: 관리자 verify/reject API를 구현한다.**
+- [x] **Step 3: 관리자 verify/reject API를 구현한다.**
 
   source diff, prior/current evidence locator, 영향 claim과 publication을 표시하고 재인증 proof·reason·expected latest decision을 요구한다.
 
-- [ ] **Step 4: verified case에서 새 revision과 T018 gate를 실행한다.**
+- [x] **Step 4: verified case에서 새 revision과 T018 gate를 실행한다.**
 
   외부 글은 감지나 verify 직후 바꾸지 않는다. corrected revision의 claim/evidence와 quality gate가 passed가 된 뒤 correction publication intent를 생성한다.
 
-- [ ] **Step 5: channel render에 공개 정정 이력을 넣는다.**
+- [x] **Step 5: channel render에 공개 정정 이력을 넣는다.**
 
   correction type, 검증 시각, 변경 요약, source links를 `ArticleChannelRender.correction_history`와 본문 상단에 포함한다.
 
-- [ ] **Step 6: WordPress-first dependency와 remote ID 보존을 강제한다.**
+- [x] **Step 6: WordPress-first dependency와 remote ID 보존을 강제한다.**
 
   update/mark-withdrawn/unpublish는 기존 `remote_post_id`를 유지한다. WordPress terminal 후에만 Blogger를 release한다.
 
-- [ ] **Step 7: SLA와 실패 복구 상태를 기록한다.**
+- [x] **Step 7: SLA와 실패 복구 상태를 기록한다.**
 
   detected/verified/dispatched/completed timestamps와 30분 초과 여부, target별 실패·retry/reconcile 상태를 case detail에 노출한다.
 
-- [ ] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [x] **Step 8: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
-  git add src/apps/editorial src/apps/publishing src/wisdome_writer/celery.py specs/001-automated-content-publishing/contracts/job-events.md
+  git add src/apps/editorial src/apps/publishing src/wisdome_writer/settings/__init__.py specs/001-automated-content-publishing/contracts/job-events.md
   git commit -m "feat: orchestrate verified corrections and retractions"
   ```
 

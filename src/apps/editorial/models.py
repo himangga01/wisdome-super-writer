@@ -717,10 +717,158 @@ class CorrectionCase(models.Model):
     state = models.CharField(max_length=20, choices=State.choices, default=State.DETECTED)
     subject_hash = models.CharField(max_length=64)
     diff_summary = models.JSONField(default=dict)
+    supersedes = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseding_cases",
+    )
+    corrected_revision = models.ForeignKey(
+        "ArticleRevision",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="correction_cases",
+    )
+    latest_decision = models.ForeignKey(
+        "CorrectionDecision",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+    )
+    decision_version = models.PositiveIntegerField(default=0)
     detected_at = models.DateTimeField(auto_now_add=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    failure_summary = models.JSONField(default=dict)
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["article", "subject_hash"], name="uq_article_correction_subject")
+            models.UniqueConstraint(fields=["article", "subject_hash"], name="uq_article_correction_subject"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(decision_version=0, latest_decision__isnull=True)
+                    | models.Q(decision_version__gt=0, latest_decision__isnull=False)
+                ),
+                name="ck_correction_case_decision_head_complete",
+            ),
         ]
+
+
+class CorrectionDecision(models.Model):
+    class Decision(models.TextChoices):
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    correction_case = models.ForeignKey(
+        CorrectionCase,
+        on_delete=models.PROTECT,
+        related_name="decisions",
+    )
+    decision = models.CharField(max_length=16, choices=Decision.choices)
+    subject_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    diff_manifest_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    corrected_revision = models.ForeignKey(
+        "ArticleRevision",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="correction_decisions",
+    )
+    supersedes = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseding_decisions",
+    )
+    head_version = models.PositiveIntegerField()
+    request_key = models.CharField(max_length=200)
+    request_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    reauth_proof_id = models.UUIDField()
+    decision_reason = models.CharField(max_length=500)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="correction_decisions",
+    )
+    decided_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(AppendOnlyEditorialQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("correction_case", "request_key"),
+                name="uq_correction_decision_request_key",
+            ),
+            models.UniqueConstraint(
+                fields=("correction_case", "head_version"),
+                name="uq_correction_decision_head_version",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        decision="verified",
+                        corrected_revision__isnull=False,
+                    )
+                    | models.Q(
+                        decision="rejected",
+                        corrected_revision__isnull=True,
+                    )
+                ),
+                name="ck_correction_decision_revision_binding",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(head_version__gt=0),
+                name="ck_correction_decision_head_version_positive",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        case = self._state.fields_cache.get("correction_case")
+        if case is None or case.pk != self.correction_case_id:
+            case = CorrectionCase.objects.get(pk=self.correction_case_id)
+        expected_diff_hash = canonical_hash(
+            case.diff_summary,
+            schema_version=CANONICAL_HASH_SCHEMA_V1,
+        )
+        if self.subject_hash != case.subject_hash or self.diff_manifest_hash != expected_diff_hash:
+            raise ValidationError(
+                "Correction decision must match the frozen case subject and diff."
+            )
+        if self.corrected_revision_id is not None:
+            revision = self._state.fields_cache.get("corrected_revision")
+            if revision is None or revision.pk != self.corrected_revision_id:
+                revision = ArticleRevision.objects.get(pk=self.corrected_revision_id)
+            if revision.article_id != case.article_id:
+                raise ValidationError(
+                    "Corrected revision must belong to the correction article."
+                )
+        if self.supersedes_id is None:
+            if self.head_version != 1:
+                raise ValidationError("Root correction decision must use head version 1.")
+        else:
+            previous = self._state.fields_cache.get("supersedes")
+            if previous is None or previous.pk != self.supersedes_id:
+                previous = type(self).objects.get(pk=self.supersedes_id)
+            if (
+                previous.correction_case_id != self.correction_case_id
+                or self.head_version != previous.head_version + 1
+            ):
+                raise ValidationError(
+                    "Correction decision must extend the current case lineage."
+                )
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("CorrectionDecision is append-only")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("CorrectionDecision is append-only")
