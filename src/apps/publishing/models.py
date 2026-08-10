@@ -4,6 +4,7 @@ import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
 from django.db.models import Q
 
@@ -14,6 +15,13 @@ LEGACY_UNVERIFIABLE_INTENT_REQUEST_VERSION = "legacy-unverifiable-v1"
 PUBLICATION_EXECUTION_IDENTITY_VERSION = "publication-execution-v1"
 PUBLICATION_RECONCILE_IDENTITY_VERSION = "publication-reconcile-v1"
 LEGACY_UNVERIFIABLE_EXECUTION_IDENTITY_VERSION = "legacy-unverifiable-v1"
+PUBLISHED_ASSET_COHORT_VERSION = "published-assets-v1"
+
+
+sha256_validator = RegexValidator(
+    r"^[0-9a-f]{64}$",
+    "Expected a lowercase SHA-256 digest",
+)
 
 
 class ChannelCode(models.TextChoices):
@@ -1776,6 +1784,187 @@ class PublicationLateExecutionResult(models.Model):
 
     def delete(self, *args, **kwargs):
         raise TypeError("PublicationLateExecutionResult is append-only")
+
+
+class _AppendOnlyPublishedAssetQuerySet(models.QuerySet):
+    @staticmethod
+    def _reject_mutation() -> None:
+        raise TypeError("Published asset snapshot is append-only")
+
+    def update(self, **kwargs):
+        self._reject_mutation()
+
+    async def aupdate(self, **kwargs):
+        self._reject_mutation()
+
+    def delete(self):
+        self._reject_mutation()
+
+    async def adelete(self):
+        self._reject_mutation()
+
+    def _raw_delete(self, using):
+        self._reject_mutation()
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        self._reject_mutation()
+
+
+class _AppendOnlyPublishedAssetModel(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(_AppendOnlyPublishedAssetQuerySet)()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("Published asset snapshot is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Published asset snapshot is append-only")
+
+
+class PublishedAssetCohort(_AppendOnlyPublishedAssetModel):
+    class MaterialState(models.TextChoices):
+        CURRENT = "current", "현재 정본"
+        LEGACY_UNVERIFIABLE = "legacy_unverifiable", "레거시 검증 불가"
+
+    revision = models.OneToOneField(
+        "editorial.ArticleRevision",
+        on_delete=models.PROTECT,
+        related_name="published_asset_cohort",
+    )
+    schema_version = models.CharField(
+        max_length=40,
+        default=PUBLISHED_ASSET_COHORT_VERSION,
+    )
+    material_state = models.CharField(
+        max_length=24,
+        choices=MaterialState.choices,
+        default=MaterialState.CURRENT,
+    )
+    item_count = models.PositiveIntegerField()
+    manifest = models.JSONField(default=list)
+    manifest_hash = models.CharField(max_length=64, validators=[sha256_validator])
+
+
+class PublishedEvidenceSnapshot(_AppendOnlyPublishedAssetModel):
+    cohort = models.ForeignKey(
+        PublishedAssetCohort,
+        on_delete=models.PROTECT,
+        related_name="evidence_snapshots",
+    )
+    visual_placement = models.OneToOneField(
+        "editorial.VisualPlacement",
+        on_delete=models.PROTECT,
+        related_name="published_evidence_snapshot",
+    )
+    evidence = models.ForeignKey(
+        "evidence.EvidenceAsset",
+        on_delete=models.PROTECT,
+        related_name="published_asset_snapshots",
+    )
+    source_item_id = models.UUIDField()
+    source_version_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+    source_url_snapshot = models.URLField(max_length=1000)
+    source_title_snapshot = models.CharField(max_length=1000)
+    source_publisher_snapshot = models.CharField(max_length=300)
+    source_published_at_snapshot = models.DateTimeField(null=True, blank=True)
+    source_modified_at_snapshot = models.DateTimeField(null=True, blank=True)
+    source_collected_at_snapshot = models.DateTimeField()
+    evidence_content_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+    asset_checksum = models.CharField(max_length=64, validators=[sha256_validator])
+    object_key = models.CharField(max_length=1024)
+    object_version = models.CharField(max_length=500)
+    mime_type = models.CharField(max_length=255)
+    byte_size = models.PositiveBigIntegerField()
+    locator_snapshot = models.JSONField(default=dict)
+    rights_status_snapshot = models.CharField(max_length=32)
+    rights_basis_url_snapshot = models.URLField(max_length=1000)
+    attribution_snapshot = models.TextField(blank=True)
+    alt_text_snapshot = models.TextField()
+    caption_snapshot = models.TextField()
+    presentation_hash = models.CharField(max_length=64, validators=[sha256_validator])
+
+
+class PublishedVisualizationSnapshot(_AppendOnlyPublishedAssetModel):
+    cohort = models.ForeignKey(
+        PublishedAssetCohort,
+        on_delete=models.PROTECT,
+        related_name="visualization_snapshots",
+    )
+    visual_placement = models.OneToOneField(
+        "editorial.VisualPlacement",
+        on_delete=models.PROTECT,
+        related_name="published_visualization_snapshot",
+    )
+    visualization = models.ForeignKey(
+        "editorial.VisualizationRender",
+        on_delete=models.PROTECT,
+        related_name="published_snapshots",
+    )
+    output_checksum = models.CharField(max_length=64, validators=[sha256_validator])
+    object_key = models.CharField(max_length=1000)
+    object_version = models.CharField(max_length=500)
+    input_manifest_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+    transform_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    renderer_manifest_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+    mime_type = models.CharField(max_length=255)
+    byte_size = models.PositiveBigIntegerField()
+    rights_status_snapshot = models.CharField(max_length=32)
+    rights_basis_url_snapshot = models.URLField(max_length=1000)
+    attribution_snapshot = models.TextField(blank=True)
+    alt_text_snapshot = models.TextField()
+    caption_snapshot = models.TextField()
+    presentation_hash = models.CharField(max_length=64, validators=[sha256_validator])
+
+
+class PublishedVisualizationInput(_AppendOnlyPublishedAssetModel):
+    visualization_snapshot = models.ForeignKey(
+        PublishedVisualizationSnapshot,
+        on_delete=models.PROTECT,
+        related_name="input_links",
+    )
+    evidence_snapshot = models.ForeignKey(
+        PublishedEvidenceSnapshot,
+        on_delete=models.PROTECT,
+        related_name="visualization_input_links",
+    )
+    display_order = models.PositiveIntegerField()
+    input_material_hash = models.CharField(
+        max_length=64,
+        validators=[sha256_validator],
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("visualization_snapshot", "display_order"),
+                name="uq_published_visualization_input_order",
+            ),
+            models.UniqueConstraint(
+                fields=("visualization_snapshot", "evidence_snapshot"),
+                name="uq_published_visualization_input_evidence",
+            ),
+        ]
 
 
 class RemoteMedia(models.Model):
