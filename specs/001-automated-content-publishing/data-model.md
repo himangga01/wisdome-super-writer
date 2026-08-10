@@ -2447,3 +2447,39 @@ same-channel test canary plus an approved manual pilot attempt and verified publ
 registry/profile decisions and target snapshot changes project validations to `stale` and disable
 the target; every validated-auto boundary independently rebuilds the current material. Historical
 `legacy-client-material-v1` rows are permanently ineligible.
+
+## T026 발행 관리자 API와 현재 상태 투영 (한국어)
+
+관리자 API는 발행 도메인의 append-only 이력과 mutable projection을 섞지 않는다. 현재
+`PublicationIntentHead`는 `GET /articles/{articleId}/publication-intents`의 nullable `item`으로
+조회하고, 승인 이력은 별도 signed-cursor `ApprovalPage`로 조회한다. 각 Approval 응답은 해당
+행의 불변 결정과 함께 authoritative `currentHead`, `isCurrent`, `dispatchEligible`을 포함한다.
+관리자 화면은 과거의 approved 행 존재 여부를 실행 권한으로 해석하지 않고 current head의
+결정과 version만 사용한다.
+
+Publication과 PublicationAttempt 이력도 각각 bounded `PublicationPage`와
+`PublicationAttemptPage`로 분리한다. cursor는 article/publication 필터, 내림차순 timestamp/UUID
+위치와 page limit을 서명해 다른 조회에 재사용할 수 없다. retry endpoint는 새 logical attempt를
+만들지 않고 T021 service가 현재 상태에 따라 안전한 retry 또는 read-only reconcile을 선택한
+결과만 반환한다. preview 응답은 exact target snapshot/config와 sanitized HTML, render/source
+hash를 포함하며 sandboxed frame 외부의 관리자 DOM에 삽입하지 않는다.
+
+고위험 UI 결정은 `/auth/reauth`에서 목적별 proof를 받은 뒤 기존 service에 전달한다.
+validation pass/revoke는 `validation_decision`, auto-publish enable/disable은
+`auto_publish_change`, credential disconnect는 `credential_disconnect`, approval revoke는
+`approval_revoke` scope를 사용한다. 비밀번호와 MFA 값은 브라우저 요청에만 존재하며 template,
+URL, API 응답, AuditEvent 또는 로그에 보존하지 않는다.
+
+## T026 Publication Administration API and Current Projection (English/AI-readable)
+
+The current intent endpoint returns only the authoritative `PublicationIntentHead` projection; render
+and approval histories remain separate. `ApprovalPage` is signed-cursor paginated and each immutable
+row carries the authoritative current head, `isCurrent`, and `dispatchEligible`. Clients must never
+infer authorization from any historical approved row. Publication and attempt histories are separately
+bounded pages whose cursor binds the parent filter, descending timestamp/UUID position, and limit.
+
+Preview serialization binds the exact target snapshot/config plus sanitized HTML and render/source
+hashes. The console renders that HTML only inside a sandboxed frame and builds all surrounding UI with
+DOM text nodes. High-risk mutations acquire a purpose-bound reauthentication proof immediately before
+the decision: `validation_decision`, `auto_publish_change`, `credential_disconnect`, or
+`approval_revoke`. Password and MFA values are never persisted or reflected.

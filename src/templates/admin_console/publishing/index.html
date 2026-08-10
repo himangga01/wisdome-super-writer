@@ -22,7 +22,7 @@
     <label>HTTPS 기준 URL<input name="baseUrl" type="url" required placeholder="https://blog.example.com"></label>
     <label>Blogger blog ID<input name="remoteBlogId" id="remote-blog-id"></label>
     <label>WordPress 사용자 참조<input name="usernameRef" placeholder="env://WP_USERNAME"></label>
-    <label>자격 증명 참조<input name="credentialRef" required placeholder="env://PUBLISHER_CREDENTIAL"></label>
+    <label>WordPress Application Password 참조<input name="credentialRef" id="credential-ref" placeholder="env://PUBLISHER_CREDENTIAL"></label>
     <button type="submit">대상 만들기</button>
   </form>
   <p id="target-message" class="muted" role="status"></p>
@@ -66,7 +66,9 @@
   }
 
   document.getElementById('channel').addEventListener('change', event => {
-    document.getElementById('remote-blog-id').required = event.target.value === 'blogger';
+    const blogger = event.target.value === 'blogger';
+    document.getElementById('remote-blog-id').required = blogger;
+    document.getElementById('credential-ref').required = !blogger;
   });
   document.getElementById('refresh-targets').addEventListener('click', loadTargets);
   document.getElementById('target-form').addEventListener('submit', async event => {
@@ -82,16 +84,21 @@
       displayName: form.get('displayName'),
       baseUrl: form.get('baseUrl'),
       remoteBlogId: form.get('remoteBlogId') || null,
-      usernameRef: form.get('usernameRef') || null,
-      credentialRef: form.get('credentialRef') || null,
+      usernameRef: channel === 'wordpress' ? (form.get('usernameRef') || null) : null,
+      credentialRef: channel === 'wordpress' ? (form.get('credentialRef') || null) : null,
       requestKey: crypto.randomUUID(),
       reason: reason.trim()
     };
     const response = await fetch(`${api}/targets`, {method: 'POST', headers, body: JSON.stringify(payload)});
     const result = await response.json();
     message.textContent = response.ok ? '발행 대상을 만들었습니다. preflight를 실행하세요.' : (result.detail || '생성 실패');
-    if (response.ok) { event.target.reset(); await loadTargets(); }
+    if (response.ok) {
+      event.target.reset();
+      if (channel === 'blogger') window.location.assign(`/console/publishing/targets/${result.id}/`);
+      else await loadTargets();
+    }
   });
+  document.getElementById('credential-ref').required = true;
   loadTargets();
 })();
 </script>

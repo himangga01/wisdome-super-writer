@@ -1,78 +1,73 @@
 {% extends "admin_console/base.html" %}
+{% load static %}
 {% block title %}{{ target.display_name }} · 발행{% endblock %}
 {% block content %}
-<div class="page-head"><div><p class="eyebrow">PUBLISHING TARGET</p><h1>{{ target.display_name }}</h1><p class="muted">{{ target.channel }} · {{ target.environment }} · {{ target.base_url }}</p></div><a href="/console/publishing/">목록</a></div>
-
-<section class="panel">
-  <h2>현재 연결 게이트</h2>
-  <div class="grid">
-    <div class="card"><strong>연결</strong><span>{{ target.connection_state }}</span></div>
-    <div class="card"><strong>Preflight</strong><span>{{ target.preflight_state }}</span></div>
-    <div class="card"><strong>Canary</strong><span>{{ target.canary_state }}</span></div>
-    <div class="card"><strong>운영 파일럿</strong><span>{{ target.pilot_state }}</span></div>
-    <div class="card"><strong>자동발행</strong><span>{% if target.auto_publish_enabled %}ON{% else %}OFF{% endif %}</span></div>
-    <div class="card"><strong>Snapshot</strong><span>v{{ target.current_snapshot_version }} · {{ target.current_config_hash|slice:":12" }}</span></div>
+<div class="page-head">
+  <div>
+    <p class="eyebrow">PUBLISHING TARGET</p>
+    <h1>{{ target.display_name }}</h1>
+    <p class="muted">{{ target.channel }} · {{ target.environment }} · {{ target.base_url }}</p>
   </div>
-  <div class="form-row" style="margin-top:18px">
-    <button id="preflight" type="button">읽기 전용 preflight</button>
-    {% if target.environment == "test" %}<button id="canary" type="button">격리 쓰기 canary</button>{% endif %}
-  </div>
-  <p id="gate-message" class="muted" role="status"></p>
-</section>
+  <a href="/console/publishing/">목록</a>
+</div>
 
-<section class="panel">
-  <h2>자동발행 검증 후보</h2>
-  {% if validations %}
-  <div class="list">
-    {% for validation in validations %}
-    <div class="list-item"><div><strong>{{ validation.topic_code }}</strong><div class="muted">{{ validation.material_hash|slice:":16" }} · report {{ validation.test_report_hash|slice:":12" }}</div></div><span class="badge">{{ validation.status }}</span></div>
-    {% endfor %}
-  </div>
-  {% else %}<p class="muted">현재 validation 후보가 없습니다. 승인된 정책·추출·생성·품질·채널 material과 불변 보고서가 준비되면 등록합니다.</p>{% endif %}
-</section>
+<main id="publishing-target"
+      data-target-id="{{ target.id }}"
+      data-channel="{{ target.channel }}"
+      data-environment="{{ target.environment }}">
+  <section class="panel">
+    <h2>현재 연결 게이트</h2>
+    <div class="grid" id="target-state-grid">
+      <div class="card"><strong>연결</strong><span id="connection-state">{{ target.connection_state }}</span></div>
+      <div class="card"><strong>Preflight</strong><span id="preflight-state">{{ target.preflight_state }}</span></div>
+      <div class="card"><strong>Canary</strong><span id="canary-state">{{ target.canary_state }}</span></div>
+      <div class="card"><strong>운영 파일럿</strong><span id="pilot-state">{{ target.pilot_state }}</span></div>
+      <div class="card"><strong>자동 발행</strong><span id="auto-publish-state">{% if target.auto_publish_enabled %}ON{% else %}OFF{% endif %}</span></div>
+      <div class="card"><strong>Snapshot</strong><span id="snapshot-state">v{{ target.current_snapshot_version }} · {{ target.current_config_hash|slice:":12" }}</span></div>
+    </div>
+    <div class="form-row" style="margin-top:18px">
+      <button id="preflight" type="button">읽기 전용 preflight</button>
+      {% if target.environment == "test" %}<button id="canary" type="button">격리 쓰기 canary</button>{% endif %}
+      {% if target.channel == "blogger" %}<button id="oauth-connect" type="button">Google OAuth 연결</button>{% endif %}
+      <button id="disconnect" type="button">자격 증명 연결 해제</button>
+    </div>
+    <p id="gate-message" class="muted" role="status"></p>
+  </section>
 
-<section class="panel">
-  <h2>자동발행 활성화 / 중지</h2>
-  <p class="muted">활성화는 passed validation ref와 최근 재인증 proof가 필요합니다. 중지는 즉시 새 외부 쓰기를 막고 기존 intent를 되살리지 않습니다.</p>
-  <form id="activation-form" class="form-row">
-    <label>결정<select name="enabled"><option value="false">자동발행 중지</option><option value="true">자동발행 활성화</option></select></label>
-    <label>Validation refs JSON<textarea name="validationRefs" rows="4" placeholder='[{"validationId":"…","targetId":"{{ target.id }}","targetSnapshotId":"{{ target.current_snapshot_id }}","materialHash":"…"}]'></textarea></label>
-    <label>재인증 proof ID<input name="reauthProofId" required></label>
-    <label>사유<input name="reason" required minlength="3"></label>
-    <button type="submit">결정 기록</button>
-  </form>
-  <p id="activation-message" class="muted" role="status"></p>
-</section>
+  <section class="panel">
+    <h2>서버 유도 자동 발행 검증</h2>
+    <p class="muted">클라이언트는 주제만 고릅니다. registry·profile·정책·generator·publisher·credential·canary·pilot material은 서버가 현재 승인 상태에서 계산합니다.</p>
+    <form id="validation-form" class="form-row">
+      <label>주제
+        <select name="topic" required>
+          <option value="housing_subscription">청약</option>
+          <option value="semiconductor_news">반도체 뉴스</option>
+        </select>
+      </label>
+      <label>사유<input name="reason" required minlength="3" maxlength="500"></label>
+      <button type="submit">검증 material 생성</button>
+    </form>
+    <div id="validation-list" class="list"><p class="muted">검증 이력을 불러오는 중입니다.</p></div>
+    <p id="validation-message" class="muted" role="status"></p>
+  </section>
+
+  <section class="panel">
+    <h2>자동 발행 활성화 / 중지</h2>
+    <p class="muted">현재 target snapshot과 정확히 일치하는 passed validation만 자동으로 선택됩니다. 모든 변경은 재인증 proof와 CAS를 사용합니다.</p>
+    <form id="activation-form" class="form-row">
+      <label>결정
+        <select name="enabled">
+          <option value="false">자동 발행 중지</option>
+          <option value="true">자동 발행 활성화</option>
+        </select>
+      </label>
+      <label>사유<input name="reason" required minlength="3" maxlength="500"></label>
+      <button type="submit">결정 기록</button>
+    </form>
+    <p id="activation-message" class="muted" role="status"></p>
+  </section>
+</main>
 {% endblock %}
 {% block scripts %}
-<script>
-(() => {
-  const targetId = '{{ target.id }}';
-  const headers = {'Content-Type': 'application/json', 'X-CSRFToken': window.csrfToken};
-  const gateMessage = document.getElementById('gate-message');
-  document.getElementById('preflight').addEventListener('click', async () => {
-    const reason = prompt('읽기 전용 preflight 실행 사유를 입력하세요.');
-    if (!reason?.trim()) return;
-    const payload = {requestKey:crypto.randomUUID(), reason:reason.trim()};
-    const response = await fetch(`/api/v1/targets/${targetId}/preflight`, {method:'POST', headers, body:JSON.stringify(payload)});
-    const result = await response.json(); gateMessage.textContent = response.ok ? `preflight 작업 ${result.jobId} 접수` : result.detail;
-  });
-  const canary = document.getElementById('canary');
-  if (canary) canary.addEventListener('click', async () => {
-    const reason = prompt('격리 쓰기 canary 실행 사유를 입력하세요.', '공식 API 연결 검증');
-    if (!reason?.trim()) return;
-    const payload = {confirmIsolatedTestTarget:true, policyVersion:'publisher-v1', requestKey:crypto.randomUUID(), reason:reason.trim()};
-    const response = await fetch(`/api/v1/targets/${targetId}/canary`, {method:'POST', headers, body:JSON.stringify(payload)});
-    const result = await response.json(); gateMessage.textContent = response.ok ? `canary ${result.jobId} 접수` : result.detail;
-  });
-  document.getElementById('activation-form').addEventListener('submit', async event => {
-    event.preventDefault(); const form = new FormData(event.target); const enabled = form.get('enabled') === 'true';
-    let refs = []; try { refs = JSON.parse(form.get('validationRefs') || '[]'); } catch { document.getElementById('activation-message').textContent='Validation refs JSON을 확인하세요.'; return; }
-    const payload = {enabled, validationRefs: enabled ? refs : [], expectedLatestActivationId:{% if target.latest_auto_publish_activation_id %}'{{ target.latest_auto_publish_activation_id }}'{% else %}null{% endif %}, requestKey:crypto.randomUUID(), reauthProofId:form.get('reauthProofId'), reason:form.get('reason')};
-    const response = await fetch(`/api/v1/targets/${targetId}/auto-publish`, {method:'PUT', headers, body:JSON.stringify(payload)});
-    const result = await response.json(); document.getElementById('activation-message').textContent = response.ok ? `새 activation v${result.activation.version}: ${result.activation.decision}` : result.detail;
-  });
-})();
-</script>
+<script src="{% static 'admin_console/publishing_target.js' %}"></script>
 {% endblock %}
-

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from functools import wraps
 from typing import Any
 
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
+from django.db.models import Q
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.http import require_http_methods
 
@@ -13,6 +15,7 @@ from adapters.storage import S3ObjectStorage
 from apps.audit.redaction import AuditRedactionError
 from apps.audit.services import AuditContext, AuditContextError
 from wisdome_writer.api.openapi import openapi_operation, openapi_operations
+from wisdome_writer.api.pagination import decode_cursor, encode_cursor
 from wisdome_writer.api.problems import problem_response
 from wisdome_writer.domain.errors import (
     Conflict,
@@ -245,21 +248,22 @@ def activation_json(row: AutoPublishActivation) -> dict[str, Any]:
 
 def render_json(row: ArticleChannelRender) -> dict[str, Any]:
     return {
-        "id": str(row.id),
-        "publicationIntentId": str(row.publication_intent_id),
+        "renderId": str(row.id),
         "targetId": str(row.target_id),
+        "targetSnapshotId": str(row.target_snapshot_id),
+        "targetConfigHash": row.target_config_hash,
         "channelRole": row.channel_role,
         "renderStage": row.render_stage,
         "title": row.title,
-        "bodyHtml": row.body_html,
+        "sanitizedHtml": row.body_html,
         "sourceLinks": row.source_links,
         "includedClaimIds": row.included_claim_ids,
         "canonicalSourceUrl": row.canonical_source_url,
         "canonicalLinkState": row.canonical_link_state,
+        "violations": [],
         "templateHash": row.template_hash,
-        "contentHash": row.content_hash,
+        "renderHash": row.content_hash,
         "sourceManifestHash": row.source_manifest_hash,
-        "media": row.media_manifest,
     }
 
 
@@ -287,6 +291,23 @@ def intent_json(row: PublicationIntent) -> dict[str, Any]:
         "requestKey": row.request_key,
         "state": row.state,
         "createdAt": row.created_at.isoformat(),
+    }
+
+
+def accepted_job_json(
+    row,
+    *,
+    correlation_id=None,
+    accepted_at=None,
+) -> dict[str, Any]:
+    resolved_correlation_id = correlation_id or row.correlation_id
+    resolved_accepted_at = accepted_at or getattr(row, "created_at", None)
+    if resolved_accepted_at is None:
+        resolved_accepted_at = row.decided_at
+    return {
+        "jobId": str(row.id),
+        "correlationId": str(resolved_correlation_id),
+        "acceptedAt": resolved_accepted_at.isoformat(),
     }
 
 
@@ -375,6 +396,83 @@ def publication_json(row: Publication) -> dict[str, Any]:
     }
 
 
+def publication_attempt_json(row: PublicationAttempt) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "publicationId": str(row.publication_id),
+        "publicationIntentId": str(row.publication_intent_id),
+        "targetId": str(row.publication.target_id),
+        "state": row.state,
+        "action": row.resolved_action,
+        "executionAttemptNo": row.attempt_no,
+        "executionGeneration": row.execution_generation,
+        "reconcileAttemptNo": row.reconcile_attempt_no,
+        "recoveryState": row.recovery_state,
+        "errorCode": row.error_code or None,
+        "httpStatus": row.http_status,
+        "startedAt": row.started_at.isoformat() if row.started_at else None,
+        "finishedAt": row.finished_at.isoformat() if row.finished_at else None,
+        "createdAt": row.created_at.isoformat(),
+    }
+
+
+def _page_limit(query: dict[str, Any]) -> int:
+    return int(query.get("limit") or 50)
+
+
+def _descending_page(
+    *,
+    queryset,
+    request: HttpRequest,
+    resource: str,
+    filters: dict[str, Any],
+    timestamp_field: str,
+    serializer,
+) -> dict[str, Any]:
+    limit = _page_limit(request.openapi_query)
+    cursor = request.openapi_query.get("cursor")
+    order = (f"-{timestamp_field}", "-id")
+    if cursor:
+        state = decode_cursor(
+            cursor,
+            resource=resource,
+            filters=filters,
+            order=order,
+            limit=limit,
+        )
+        raw_timestamp = state.position.get("timestamp")
+        raw_id = state.position.get("id")
+        if not isinstance(raw_timestamp, str) or not isinstance(raw_id, str):
+            raise InvalidInput("history cursor position is invalid")
+        try:
+            timestamp = datetime.fromisoformat(raw_timestamp)
+        except ValueError as exc:
+            raise InvalidInput("history cursor timestamp is invalid") from exc
+        queryset = queryset.filter(
+            Q(**{f"{timestamp_field}__lt": timestamp})
+            | Q(**{timestamp_field: timestamp, "id__lt": raw_id})
+        )
+    rows = list(queryset.order_by(*order)[: limit + 1])
+    page_rows = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page_rows:
+        last = page_rows[-1]
+        next_cursor = encode_cursor(
+            resource=resource,
+            filters=filters,
+            order=order,
+            limit=limit,
+            position={
+                "timestamp": getattr(last, timestamp_field).isoformat(),
+                "id": str(last.id),
+            },
+        )
+    return {
+        "items": [serializer(row) for row in page_rows],
+        "nextCursor": next_cursor,
+    }
+
+
 @openapi_operations(
     {
         "GET": "listPublicationTargets",
@@ -394,6 +492,12 @@ def targets(request: HttpRequest) -> JsonResponse:
     return JsonResponse([target_json(row) for row in PublicationTarget.objects.all()], safe=False)
 
 
+@openapi_operations(
+    {
+        "GET": "getPublicationTarget",
+        "PATCH": "updatePublicationTarget",
+    }
+)
 @admin_api
 @require_http_methods(["GET", "PATCH"])
 def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
@@ -414,11 +518,12 @@ def target_detail(request: HttpRequest, target_id: str) -> JsonResponse:
 @require_http_methods(["POST"])
 def target_preflight(request: HttpRequest, target_id: str) -> JsonResponse:
     data = _body(request)
+    audit_context = _admin_audit_context(request, data)
     event = request_target_preflight(
         target_id,
-        audit_context=_admin_audit_context(request, data),
+        audit_context=audit_context,
     )
-    return JsonResponse({"jobId": str(event.id), "state": "queued"}, status=202)
+    return JsonResponse(accepted_job_json(event), status=202)
 
 
 @openapi_operation("canaryPublicationTarget")
@@ -429,17 +534,21 @@ def target_canary(request: HttpRequest, target_id: str) -> JsonResponse:
     if data.get("confirmIsolatedTestTarget") is not True:
         raise InvalidInput("격리된 test target 확인이 필요합니다.")
     request_key = data["requestKey"]
+    audit_context = _admin_audit_context(
+        request,
+        {**data, "requestKey": request_key},
+    )
     row = create_canary_run(
         target_id,
         reason=data["reason"],
         request_key=request_key,
         user=request.user,
-        audit_context=_admin_audit_context(
-            request,
-            {**data, "requestKey": request_key},
-        ),
+        audit_context=audit_context,
     )
-    return JsonResponse({"jobId": str(row.id), "state": row.state}, status=202)
+    return JsonResponse(
+        accepted_job_json(row, correlation_id=audit_context.correlation_id),
+        status=202,
+    )
 
 
 @openapi_operations(
@@ -587,13 +696,21 @@ def target_auto_publish(request: HttpRequest, target_id: str) -> JsonResponse:
 @require_http_methods(["DELETE"])
 def target_connection(request: HttpRequest, target_id: str) -> JsonResponse:
     data = _body(request)
+    audit_context = _admin_audit_context(request, data)
     decision = disconnect_target(
         target_id,
         data,
         request=request,
-        audit_context=_admin_audit_context(request, data),
+        audit_context=audit_context,
     )
-    return JsonResponse({"jobId": str(decision.id), "state": decision.state}, status=202)
+    return JsonResponse(
+        accepted_job_json(
+            decision,
+            correlation_id=audit_context.correlation_id,
+            accepted_at=decision.decided_at,
+        ),
+        status=202,
+    )
 
 
 @openapi_operation("startTargetOAuth")
@@ -641,7 +758,6 @@ def blogger_oauth_callback(request: HttpRequest) -> JsonResponse:
     )
 
 
-@openapi_operation("createPublicationIntent")
 def _create_publication_intent(request: HttpRequest, article_id: str) -> JsonResponse:
     data = _body(request)
     row, created = create_publication_intent(
@@ -653,6 +769,12 @@ def _create_publication_intent(request: HttpRequest, article_id: str) -> JsonRes
     return JsonResponse(intent_json(row), status=201 if created else 200)
 
 
+@openapi_operations(
+    {
+        "GET": "getCurrentPublicationIntent",
+        "POST": "createPublicationIntent",
+    }
+)
 @admin_api
 @require_http_methods(["GET", "POST"])
 def publication_intents(request: HttpRequest, article_id: str) -> JsonResponse:
@@ -662,20 +784,49 @@ def publication_intents(request: HttpRequest, article_id: str) -> JsonResponse:
     return JsonResponse({"item": intent_json(row) if row else None})
 
 
+@openapi_operation("previewArticle")
 @admin_api
 @require_http_methods(["GET"])
 def article_preview(request: HttpRequest, article_id: str) -> JsonResponse:
-    target_id = request.GET.get("targetId")
+    target_id = request.openapi_query.get("targetId")
     if not target_id:
         raise InvalidInput("targetId query가 필요합니다.")
     row = get_article_preview(article_id, target_id)
     return JsonResponse(render_json(row))
 
 
-@openapi_operation("decideArticleApproval")
+@openapi_operations(
+    {
+        "GET": "listArticleApprovals",
+        "POST": "decideArticleApproval",
+    }
+)
 @admin_api
-@require_http_methods(["POST"])
+@require_http_methods(["GET", "POST"])
 def approvals(request: HttpRequest, article_id: str) -> JsonResponse:
+    if request.method == "GET":
+        intent_id = request.openapi_query.get("publicationIntentId")
+        target_id = request.openapi_query.get("targetId")
+        rows = Approval.objects.select_related("admin").filter(
+            publication_intent__article_id=article_id
+        )
+        filters = {"articleId": str(article_id)}
+        if intent_id:
+            rows = rows.filter(publication_intent_id=intent_id)
+            filters["publicationIntentId"] = str(intent_id)
+        if target_id:
+            rows = rows.filter(target_id=target_id)
+            filters["targetId"] = str(target_id)
+        return JsonResponse(
+            _descending_page(
+                queryset=rows,
+                request=request,
+                resource="article-approval-history",
+                filters=filters,
+                timestamp_field="decided_at",
+                serializer=approval_json,
+            )
+        )
     data = _body(request)
     target_id = data.get("actionSubject", {}).get("targetId")
     if not target_id:
@@ -707,47 +858,57 @@ def publish(request: HttpRequest, article_id: str) -> JsonResponse:
     )
 
 
+@openapi_operation("listArticlePublications")
 @admin_api
 @require_http_methods(["GET"])
 def article_publications(request: HttpRequest, article_id: str) -> JsonResponse:
     rows = Publication.objects.select_related("target").filter(article_id=article_id)
-    return JsonResponse([publication_json(row) for row in rows], safe=False)
-
-
-@admin_api
-@require_http_methods(["GET"])
-def publication_attempts(request: HttpRequest, publication_id: str) -> JsonResponse:
-    rows = PublicationAttempt.objects.filter(publication_id=publication_id)
     return JsonResponse(
-        [
-            {
-                "id": str(row.id),
-                "state": row.state,
-                "action": row.resolved_action,
-                "attemptNo": row.attempt_no,
-                "reconcileAttemptNo": row.reconcile_attempt_no,
-                "errorCode": row.error_code or None,
-                "httpStatus": row.http_status,
-                "startedAt": row.started_at.isoformat() if row.started_at else None,
-                "finishedAt": row.finished_at.isoformat() if row.finished_at else None,
-            }
-            for row in rows
-        ],
-        safe=False,
+        _descending_page(
+            queryset=rows,
+            request=request,
+            resource="article-publications",
+            filters={"articleId": str(article_id)},
+            timestamp_field="updated_at",
+            serializer=publication_json,
+        )
     )
 
 
+@openapi_operation("listPublicationAttempts")
+@admin_api
+@require_http_methods(["GET"])
+def publication_attempts(request: HttpRequest, publication_id: str) -> JsonResponse:
+    rows = PublicationAttempt.objects.select_related("publication__target").filter(
+        publication_id=publication_id
+    )
+    return JsonResponse(
+        _descending_page(
+            queryset=rows,
+            request=request,
+            resource="publication-attempts",
+            filters={"publicationId": str(publication_id)},
+            timestamp_field="created_at",
+            serializer=publication_attempt_json,
+        )
+    )
+
+
+@openapi_operation("retryPublicationAttempt")
 @admin_api
 @require_http_methods(["POST"])
 def retry_publication_attempt(request: HttpRequest, attempt_id: str) -> JsonResponse:
     data = _body(request)
     row, action = retry_publication_attempt_service(
         attempt_id,
+        request=request,
+        reauth_proof_id=data["reauthProofId"],
         audit_context=_admin_audit_context(request, data),
     )
     return JsonResponse({"attemptId": str(row.id), "state": row.state, "action": action}, status=202)
 
 
+@openapi_operation("prepareCorrectionPublication")
 @admin_api
 @require_http_methods(["POST"])
 def prepare_correction(request: HttpRequest, correction_id: str) -> JsonResponse:
@@ -758,7 +919,10 @@ def prepare_correction(request: HttpRequest, correction_id: str) -> JsonResponse
         request_key=body["requestKey"],
         audit_context=_admin_audit_context(request, body),
     )
-    return JsonResponse(intent_json(intent), status=201)
+    return JsonResponse(
+        intent_json(intent),
+        status=201 if getattr(intent, "_correction_intent_created", True) else 200,
+    )
 
 
 def _console_guard(request: HttpRequest) -> HttpResponse | None:

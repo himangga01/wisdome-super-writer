@@ -12530,6 +12530,8 @@ def _has_valid_retry_reservation(attempt: PublicationAttempt) -> bool:
 def retry_publication_attempt(
     attempt_id: str,
     *,
+    request,
+    reauth_proof_id: str,
     audit_context: AuditContext,
 ) -> tuple[PublicationAttempt, str]:
     _require_audit_actor(audit_context, "admin")
@@ -12541,7 +12543,10 @@ def retry_publication_attempt(
     request_hash = _admin_request_hash(
         audit_context=audit_context,
         action="publication_attempt.retry_requested",
-        payload={"publicationAttemptId": str(attempt.id)},
+        payload={
+            "publicationAttemptId": str(attempt.id),
+            "reauthProofId": str(reauth_proof_id),
+        },
     )
     if _has_request_audit(
         audit_context=audit_context,
@@ -12556,6 +12561,19 @@ def retry_publication_attempt(
             request_hash=request_hash,
         )
         return attempt, str(replay.metadata_redacted.get("result") or "replay")
+    if attempt.state not in {
+        PublicationAttempt.State.UNKNOWN_OUTCOME,
+        PublicationAttempt.State.RECONCILING,
+        PublicationAttempt.State.RETRYABLE_FAILED,
+    }:
+        raise Conflict("only retryable or unknown publication attempts can be retried")
+    consume_reauthentication_proof(
+        request=request,
+        proof_id=reauth_proof_id,
+        action_scope="bulk_retry",
+        entity_type="publication_attempt",
+        entity_id=attempt.id,
+    )
     before_material = _audit_state(attempt)
     if attempt.state in {
         PublicationAttempt.State.UNKNOWN_OUTCOME,
@@ -12604,8 +12622,6 @@ def retry_publication_attempt(
             correlation_id=attempt.correlation_id,
         )
         action = "retry"
-    else:
-        raise Conflict("only retryable or unknown publication attempts can be retried")
     _record_publishing_audit(
         audit_context=audit_context,
         action="publication_attempt.retry_requested",

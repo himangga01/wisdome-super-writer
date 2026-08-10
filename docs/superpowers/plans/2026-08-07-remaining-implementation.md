@@ -1346,27 +1346,27 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Consumes: T019~T025 service functions only; views do not mutate models directly.
 - Produces: OpenAPI-aligned target/OAuth/preflight/canary/validation/activation/preview/approval/dispatch/retry/reconcile/disconnect operations.
 
-- [ ] **Step 1: OpenAPI operation과 URL/view 매핑 표를 만든다.**
+- [x] **Step 1: OpenAPI operation과 URL/view 매핑 표를 만든다.**
 
   각 operation ID에 정확히 하나의 URL과 view가 있는지 확인하고 누락 path를 추가한다. 문서에 있으나 지원하지 않는 operation은 삭제하지 말고 T019~T025 service로 연결한다.
 
-- [ ] **Step 2: request/response schema를 실제 serializer payload와 맞춘다.**
+- [x] **Step 2: request/response schema를 실제 serializer payload와 맞춘다.**
 
   UUID, enum, nullable, `additionalProperties: false`, cursor pagination, 201/200 replay, 409 CAS와 problem response를 공통 API 검증 계층으로 통과시킨다.
 
-- [ ] **Step 3: 관리자 target 화면을 완성한다.**
+- [x] **Step 3: 관리자 target 화면을 완성한다.**
 
   connection state, credential version, preflight, canary, pilot, validation, activation, disconnect/revoke 상태와 안전한 다음 action을 표시한다.
 
-- [ ] **Step 4: article publish 화면을 완성한다.**
+- [x] **Step 4: article publish 화면을 완성한다.**
 
   WordPress/Blogger preview, pending canonical link, claim/evidence/visual manifest, approval head, attempt/reconcile 상태와 target별 retry만 제공한다.
 
-- [ ] **Step 5: 고위험 action에 재인증 proof를 연결한다.**
+- [x] **Step 5: 고위험 action에 재인증 proof를 연결한다.**
 
   auto-publish enable/disable, approval revoke, manual retry, disconnect는 중앙 reauthentication service를 사용한다.
 
-- [ ] **Step 6: 사용자 승인 후 API schema/E2E 검증을 수행하고 커밋한다.**
+- [x] **Step 6: 사용자 승인 후 API schema/E2E 검증을 수행하고 커밋한다.**
 
   ```powershell
   git add src/apps/publishing src/templates/admin_console/publishing src/static/admin_console specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml

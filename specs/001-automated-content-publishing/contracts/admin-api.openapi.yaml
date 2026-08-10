@@ -665,6 +665,28 @@ paths:
   /articles/{articleId}/approvals:
     parameters:
       - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Articles]
+      summary: List append-only approval decisions and current-head projections
+      operationId: listArticleApprovals
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: publicationIntentId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: targetId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Descending signed-cursor approval history with authoritative current heads
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalPage' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
     post:
       tags: [Articles]
       summary: Record an article approval decision
@@ -693,6 +715,18 @@ paths:
   /articles/{articleId}/publication-intents:
     parameters:
       - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Publishing]
+      summary: Read the authoritative current publication intent head
+      operationId: getCurrentPublicationIntent
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Current intent or null when the article has no intent head
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurrentPublicationIntentResult' }
+        '403': { $ref: '#/components/responses/Problem' }
     post:
       tags: [Publishing]
       summary: Create or supersede an append-only publication intent
@@ -745,6 +779,96 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PublicationDispatchResult' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /articles/{articleId}/publications:
+    parameters:
+      - $ref: '#/components/parameters/ArticleId'
+    get:
+      tags: [Publishing]
+      summary: List channel publication projections for an article
+      operationId: listArticlePublications
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Descending signed-cursor publication page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationPage' }
+        '403': { $ref: '#/components/responses/Problem' }
+
+  /publications/{publicationId}/attempts:
+    parameters:
+      - $ref: '#/components/parameters/PublicationId'
+    get:
+      tags: [Publishing]
+      summary: List immutable execution and recovery history for one publication
+      operationId: listPublicationAttempts
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Descending signed-cursor publication-attempt page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationAttemptPage' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /publication-attempts/{attemptId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/PublicationAttemptId'
+    post:
+      tags: [Publishing]
+      summary: Request the safe retry or read-only reconcile selected by current attempt state
+      operationId: retryPublicationAttempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicationAttemptRetryRequest' }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '202':
+          description: Retry or reconcile accepted without changing the immutable dispatch cohort
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationAttemptActionResult' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  /corrections/{correctionId}/prepare-publication:
+    parameters:
+      - $ref: '#/components/parameters/CorrectionId'
+    post:
+      tags: [Publishing]
+      summary: Prepare an immutable publication intent for a verified correction
+      operationId: prepareCorrectionPublication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuditMutationRequest' }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Existing idempotent correction intent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationIntent' }
+        '201':
+          description: New correction publication intent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationIntent' }
+        '403': { $ref: '#/components/responses/Problem' }
         '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
@@ -858,6 +982,19 @@ paths:
   /targets/{targetId}:
     parameters:
       - $ref: '#/components/parameters/TargetId'
+    get:
+      tags: [Publishing]
+      summary: Read one publication target and its current operational projection
+      operationId: getPublicationTarget
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Current target projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationTarget' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
     patch:
       tags: [Publishing]
       summary: Update target metadata or secret-store references
@@ -1353,6 +1490,25 @@ components:
       name: cursor
       in: query
       schema: { type: string, minLength: 1, maxLength: 4096 }
+    PageLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    PublicationId:
+      name: publicationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PublicationAttemptId:
+      name: attemptId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CorrectionId:
+      name: correctionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     SourceId:
       name: sourceId
       in: path
@@ -1445,7 +1601,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect]
+            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect, approval_revoke]
     ReauthenticationProof:
       type: object
       additionalProperties: false
@@ -3658,8 +3814,10 @@ components:
       allOf:
         - $ref: '#/components/schemas/ChannelBinding'
         - type: object
-          required: [targetId, state, remoteState]
+          required: [id, articleId, targetId, state, remoteState, remotePostId, remoteUrl, canonicalSourceUrl, scheduledFor, canonicalReadyAt, publishedAt, publishedRevisionNo, errorCode]
           properties:
+            id: { type: string, format: uuid }
+            articleId: { type: string, format: uuid }
             targetId: { type: string, format: uuid }
             state: { $ref: '#/components/schemas/PublicationState' }
             remoteState: { $ref: '#/components/schemas/RemotePublicationState' }
@@ -3796,6 +3954,7 @@ components:
         excludedMaterialManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
     ChannelPreview:
       type: object
+      additionalProperties: false
       required: [renderId, targetId, targetSnapshotId, targetConfigHash, channelRole, renderStage, canonicalLinkState, title, sanitizedHtml, sourceLinks, includedClaimIds, canonicalSourceUrl, violations, templateHash, renderHash, sourceManifestHash]
       properties:
         renderId: { type: string, format: uuid }
@@ -3951,6 +4110,15 @@ components:
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         state: { type: string, enum: [draft, awaiting_approval, approved, stale, dispatched, cancelled] }
         createdAt: { type: string, format: date-time }
+    CurrentPublicationIntentResult:
+      type: object
+      additionalProperties: false
+      required: [item]
+      properties:
+        item:
+          oneOf:
+            - $ref: '#/components/schemas/PublicationIntent'
+            - type: 'null'
     ContentApprovalSubject:
       type: object
       additionalProperties: false
@@ -4109,6 +4277,16 @@ components:
           else:
             properties:
               decisionActorId: { type: 'null' }
+    ApprovalPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Approval' }
+        nextCursor: { type: [string, 'null'], maxLength: 4096 }
     PublishRequest:
       type: object
       additionalProperties: false
@@ -4202,6 +4380,70 @@ components:
           maxItems: 20
           uniqueItems: true
           items: { $ref: '#/components/schemas/PublicationDispatchAttemptRef' }
+    PublicationPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Publication' }
+        nextCursor: { type: [string, 'null'], maxLength: 4096 }
+    PublicationAttempt:
+      type: object
+      additionalProperties: false
+      required: [id, publicationId, publicationIntentId, targetId, state, action, executionAttemptNo, executionGeneration, reconcileAttemptNo, recoveryState, errorCode, httpStatus, startedAt, finishedAt, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        publicationId: { type: string, format: uuid }
+        publicationIntentId: { type: string, format: uuid }
+        targetId: { type: string, format: uuid }
+        state: { type: string, enum: [queued, running, succeeded, retryable_failed, permanent_failed, unknown_outcome, reconciling, manual_required, stale] }
+        action: { type: string, enum: [create, update, mark_withdrawn, unpublish] }
+        executionAttemptNo: { type: integer, minimum: 1, maximum: 5 }
+        executionGeneration: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        reconcileAttemptNo: { type: integer, minimum: 0, maximum: 5 }
+        recoveryState: { type: string, enum: [not_required, in_progress, automatic_retry, reconciling, manual_required, stopped] }
+        errorCode: { type: [string, 'null'], maxLength: 100 }
+        httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+    PublicationAttemptPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/PublicationAttempt' }
+        nextCursor: { type: [string, 'null'], maxLength: 4096 }
+    PublicationAttemptActionResult:
+      type: object
+      additionalProperties: false
+      required: [attemptId, state, action]
+      properties:
+        attemptId: { type: string, format: uuid }
+        state: { type: string, enum: [queued, running, succeeded, retryable_failed, permanent_failed, unknown_outcome, reconciling, manual_required, stale] }
+        action: { type: string, enum: [retry, reconcile, manual_required, replay] }
+    PublicationAttemptRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [requestKey, reauthProofId, reason]
+      properties:
+        requestKey:
+          type: string
+          minLength: 8
+          maxLength: 200
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:+/@~-]{7,199}$'
+        reauthProofId: { type: string, format: uuid }
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 500
+          pattern: '^\S(?:[^\x00-\x1f]*\S)?$'
 
     ScheduleConfiguration:
       description: >-
@@ -4664,6 +4906,7 @@ components:
 
     AcceptedJob:
       type: object
+      additionalProperties: false
       required: [jobId, correlationId, acceptedAt]
       properties:
         jobId: { type: string, format: uuid }

@@ -206,6 +206,7 @@ def _prepare_verified_correction_atomic(
         )
         if created or replay.id != existing_intent.id:
             raise CorrectionWorkflowError("Correction intent replay is not exact.")
+        replay._correction_intent_created = False
         return replay
     if case.state not in {
         CorrectionCase.State.VERIFIED,
@@ -257,6 +258,7 @@ def _prepare_verified_correction_atomic(
     if case.state != CorrectionCase.State.APPLYING:
         case.state = CorrectionCase.State.APPLYING
         case.save(update_fields=["state"])
+    intent._correction_intent_created = _intent_created
     return intent
 
 

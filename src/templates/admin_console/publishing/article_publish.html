@@ -1,4 +1,5 @@
 {% extends "admin_console/base.html" %}
+{% load static %}
 {% block title %}글 발행 · Wisdome{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -6,163 +7,55 @@
   <a href="/console/articles/">초안 목록</a>
 </div>
 
-<section class="panel" id="intent-builder"{% if intent and intent.state != "stale" and intent.state != "cancelled" %} hidden{% endif %}>
-  <h2>발행 대상 선택</h2>
-  <p class="muted">현재 검증을 통과한 revision과 target snapshot을 고정해 새 발행 의도를 만듭니다.</p>
-  <form id="intent-form">
-    <div id="target-selector" class="list"><p class="muted">발행 대상을 불러오는 중입니다.</p></div>
-    <button type="submit" style="margin-top:16px">채널 미리보기 만들기</button>
-  </form>
-  <p id="intent-message" class="muted" role="status"></p>
-</section>
+<main id="publishing-article" data-article-id="{{ article_id }}">
+  <section class="panel">
+    <h2>편집 근거와 발행 자격</h2>
+    <p class="muted">발행 전에 claim·evidence·visual 정본과 현재 blocking code를 확인합니다.</p>
+    <div id="editorial-material" class="list"><p class="muted">편집 정본을 불러오는 중입니다.</p></div>
+  </section>
 
-<section class="panel" id="intent-summary"{% if not intent %} hidden{% endif %}>
-  <h2>현재 발행 의도</h2>
-  <p id="intent-state">{% if intent %}<span class="badge">{{ intent.state }}</span> <span class="badge">{{ intent.approval_mode }}</span> revision {{ intent.revision_no }}{% endif %}</p>
-  {% if intent %}<p class="muted">intent {{ intent.id }} · {{ intent.intent_hash|slice:":16" }} · snapshot {{ intent.target_snapshot_manifest_hash|slice:":16" }}</p>{% endif %}
-</section>
+  <section class="panel" id="intent-builder">
+    <h2>발행 대상 선택</h2>
+    <p class="muted">현재 검증을 통과한 revision과 exact target snapshot으로 새 발행 의도를 만듭니다.</p>
+    <form id="intent-form">
+      <div id="target-selector" class="list"><p class="muted">발행 대상을 불러오는 중입니다.</p></div>
+      <button type="submit" style="margin-top:16px">채널 미리보기 만들기</button>
+    </form>
+    <p id="intent-message" class="muted" role="status"></p>
+  </section>
 
-<section class="panel" id="preview-panel"{% if not intent %} hidden{% endif %}>
-  <h2>채널 미리보기와 승인</h2>
-  <p class="muted">Blogger의 대표 원문 URL은 WordPress 공개 확인 후 최종 렌더에 결합됩니다.</p>
-  <div id="preview-list" class="grid">
-    {% for channel_render in renders %}
-    <article class="card" data-render-card="{{ channel_render.target_id }}">
-      <div><span class="badge">{{ channel_render.target.channel }}</span> <span class="badge">{{ channel_render.canonical_link_state }}</span></div>
-      <h3>{{ channel_render.title }}</h3>
-      <div class="markdown">{{ channel_render.body_html|safe }}</div>
-      <p class="muted">template {{ channel_render.template_hash|slice:":12" }} · 출처 {{ channel_render.source_links|length }}개</p>
-      <button type="button" data-approve-target="{{ channel_render.target_id }}">이 미리보기 승인</button>
-    </article>
-    {% empty %}<p class="muted">발행 의도를 만들면 미리보기가 나타납니다.</p>{% endfor %}
-  </div>
-  <p id="approval-message" class="muted" role="status"></p>
-</section>
+  <section class="panel" id="intent-summary" hidden>
+    <h2>현재 발행 의도</h2>
+    <p id="intent-state"></p>
+    <p id="intent-material" class="muted"></p>
+  </section>
 
-<section class="panel" id="dispatch-panel"{% if not intent %} hidden{% endif %}>
-  <h2>발행 실행</h2>
-  <p class="muted">모든 target 승인이 완료된 뒤 WordPress를 먼저 발행하고 공개 URL 검증 후 Blogger를 이어서 발행합니다.</p>
-  <button id="publish-button" type="button">승인된 채널 발행</button>
-  <p id="publish-message" class="muted" role="status"></p>
-</section>
+  <section class="panel" id="preview-panel" hidden>
+    <h2>채널 미리보기와 승인</h2>
+    <p class="muted">현재 approval head만 실행 권한으로 사용합니다. 과거 승인 행은 이력으로만 표시됩니다.</p>
+    <div id="preview-list" class="grid"></div>
+    <p id="approval-message" class="muted" role="status"></p>
+  </section>
 
-<section class="panel">
-  <div class="page-head"><div><h2>채널 상태와 복구</h2><p class="muted">재시도 가능 실패는 같은 멱등 attempt로 다시 실행합니다.</p></div><button id="refresh-status" type="button">새로고침</button></div>
-  <div id="publication-list" class="list">
-    {% for publication in publications %}
-    <div class="list-item"><div><strong>{{ publication.target.display_name }}</strong><div class="muted">{{ publication.remote_url|default:"URL 대기" }}</div></div><span class="badge">{{ publication.state }}</span></div>
-    {% empty %}<p class="muted">발행 시도가 없습니다.</p>{% endfor %}
-  </div>
-</section>
+  <section class="panel" id="approval-history-panel" hidden>
+    <h2>승인 이력</h2>
+    <div id="approval-history" class="list"></div>
+    <button id="more-approvals" type="button" hidden>이전 승인 더 보기</button>
+  </section>
+
+  <section class="panel" id="dispatch-panel" hidden>
+    <h2>발행 실행</h2>
+    <p class="muted">모든 target의 current head가 승인 상태일 때만 exact dispatch cohort를 생성합니다.</p>
+    <button id="publish-button" type="button">승인된 채널 발행</button>
+    <p id="publish-message" class="muted" role="status"></p>
+  </section>
+
+  <section class="panel">
+    <div class="page-head"><div><h2>채널 상태와 복구</h2><p class="muted">재시도 가능 또는 결과 불명 상태만 기존 logical attempt에서 안전하게 재시도·reconcile합니다.</p></div><button id="refresh-status" type="button">새로고침</button></div>
+    <div id="publication-list" class="list"><p class="muted">발행 상태를 불러오는 중입니다.</p></div>
+  </section>
+</main>
 {% endblock %}
-
 {% block scripts %}
-<script>
-(() => {
-  const articleId = '{{ article_id }}';
-  const headers = {'Content-Type':'application/json','X-CSRFToken':window.csrfToken};
-  const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const safeHttpUrl = window.WisdomeUrlSafety.safeHttpUrl;
-  let article = null;
-  let intent = null;
-  let targets = [];
-  let publicationRows = [];
-
-  async function api(url, options={}) {
-    const response = await fetch(url, {credentials:'same-origin', ...options, headers:{...headers, ...(options.headers||{})}});
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.detail || JSON.stringify(body));
-    return body;
-  }
-
-  async function loadContext() {
-    [article, targets] = await Promise.all([api(`/api/v1/articles/${articleId}`), api('/api/v1/targets')]);
-    intent = (await api(`/api/v1/articles/${articleId}/publication-intents`)).item;
-    renderTargetSelector();
-    renderIntent();
-    await loadPublications();
-  }
-
-  function usableTargets() {
-    return targets.filter(row => row.currentSnapshotId && row.currentConfigHash && row.connectionState === 'verified');
-  }
-
-  function renderTargetSelector() {
-    const rows = usableTargets();
-    document.getElementById('target-selector').innerHTML = rows.map(row => `<label class="list-item"><span><strong>${escapeHtml(row.displayName)}</strong><br><small>${escapeHtml(row.channel)} · ${escapeHtml(row.environment)} · snapshot v${row.currentSnapshotVersion}</small></span><input type="checkbox" name="target" value="${row.id}" style="min-width:auto"></label>`).join('') || '<p class="muted">preflight를 통과한 발행 대상이 없습니다.</p>';
-  }
-
-  function renderIntent() {
-    if (!intent) return;
-    document.getElementById('intent-builder').hidden = !['stale','cancelled'].includes(intent.state);
-    document.getElementById('intent-summary').hidden = false;
-    document.getElementById('preview-panel').hidden = false;
-    document.getElementById('dispatch-panel').hidden = false;
-    document.getElementById('intent-state').innerHTML = `<span class="badge">${escapeHtml(intent.state)}</span> revision ${intent.revisionNo}`;
-    const approved = new Set((intent.approvals || []).filter(row => row.decision === 'approved').map(row => row.targetId));
-    document.querySelectorAll('[data-approve-target]').forEach(button => {
-      button.disabled = approved.has(button.dataset.approveTarget);
-      if (button.disabled) button.textContent = '승인 완료';
-      button.onclick = () => approveTarget(button.dataset.approveTarget);
-    });
-    document.getElementById('publish-button').disabled = intent.state !== 'approved';
-  }
-
-  document.getElementById('intent-form').addEventListener('submit', async event => {
-    event.preventDefault();
-    const selected = [...event.target.querySelectorAll('input[name=target]:checked')].map(input => targets.find(row => row.id === input.value));
-    if (!selected.length) return document.getElementById('intent-message').textContent = '발행 대상을 하나 이상 선택하세요.';
-    const wordpress = selected.find(row => row.channel === 'wordpress');
-    if (selected.some(row => row.channel === 'blogger') && !wordpress) return document.getElementById('intent-message').textContent = 'Blogger와 함께 대표 WordPress 대상을 선택하세요.';
-    const reason = prompt('발행 의도 생성 사유를 입력하세요.');
-    if (!reason?.trim()) return;
-    const refs = selected.map(row => ({targetId:row.id,targetSnapshotId:row.currentSnapshotId,targetConfigHash:row.currentConfigHash}));
-    const commands = selected.map(row => ({targetId:row.id,targetSnapshotId:row.currentSnapshotId,targetConfigHash:row.currentConfigHash,resolvedAction:publicationRows.some(item => item.targetId === row.id && item.remotePostId) ? 'update' : 'create',canonicalDependencyTargetId:row.channel === 'blogger' ? wordpress.id : null}));
-    try {
-      intent = await api(`/api/v1/articles/${articleId}/publication-intents`, {method:'POST',body:JSON.stringify({revisionNo:article.revisionNo,expectedRevisionContentHash:article.revisionContentHash,correctionCaseId:null,targetSnapshots:refs,targetCommands:commands,approvalMode:'manual',autoPublishValidationRefs:[],autoPublishActivationRefs:[],expectedLatestIntentId:intent?.id||null,requestKey:crypto.randomUUID(),reason:reason.trim()})});
-      location.reload();
-    } catch (error) { document.getElementById('intent-message').textContent = error.message; }
-  });
-
-  async function approveTarget(targetId) {
-    const reason = prompt('채널 미리보기 승인 사유를 입력하세요.');
-    if (!reason?.trim()) return;
-    const render = intent.renders.find(row => row.targetId === targetId && row.renderStage === 'preview');
-    const command = intent.targetCommands.find(row => row.targetId === targetId);
-    const prior = (intent.approvals || []).filter(row => row.targetId === targetId).sort((a,b) => a.decidedAt.localeCompare(b.decidedAt)).at(-1);
-    try {
-      await api(`/api/v1/articles/${articleId}/approvals`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,expectedLatestApprovalId:prior?.id||null,requestKey:crypto.randomUUID(),reauthProofId:null,actionSubject:{kind:'content_preview',action:command.resolvedAction,renderId:render.id,targetId,targetSnapshotId:command.targetSnapshotId,targetConfigHash:command.targetConfigHash,templateHash:render.templateHash,sourceManifestHash:render.sourceManifestHash},decision:'approved',reason:reason.trim()})});
-      location.reload();
-    } catch (error) { document.getElementById('approval-message').textContent = error.message; }
-  }
-
-  document.getElementById('publish-button').addEventListener('click', async () => {
-    const reason = prompt('승인된 채널 발행 사유를 입력하세요.');
-    if (!reason?.trim()) return;
-    try {
-      const result = await api(`/api/v1/articles/${articleId}/publish`, {method:'POST',body:JSON.stringify({revisionNo:intent.revisionNo,publicationIntentId:intent.id,targetIds:intent.targetSnapshots.map(row=>row.targetId),expectedTargetSnapshots:intent.targetSnapshots,publishAt:null,requestKey:crypto.randomUUID(),reason:reason.trim()})});
-      document.getElementById('publish-message').textContent = `발행 작업 ${result.jobId} 접수 완료`;
-      setTimeout(loadPublications, 1500);
-    } catch (error) { document.getElementById('publish-message').textContent = error.message; }
-  });
-
-  async function retryAttempt(attemptId) {
-    const reason = prompt('발행 시도 재시도 사유를 입력하세요.');
-    if (!reason?.trim()) return;
-    try { await api(`/api/v1/publication-attempts/${attemptId}/retry`, {method:'POST',body:JSON.stringify({requestKey:crypto.randomUUID(),reason:reason.trim()})}); await loadPublications(); }
-    catch (error) { document.getElementById('publish-message').textContent = error.message; }
-  }
-
-  async function loadPublications() {
-    const rows = await api(`/api/v1/articles/${articleId}/publications`);
-    publicationRows = rows;
-    const enriched = await Promise.all(rows.map(async row => ({...row, attempts:await api(`/api/v1/publications/${row.id}/attempts`)})));
-    document.getElementById('publication-list').innerHTML = enriched.map(row => { const retry = row.attempts.find(item => ['retryable_failed','unknown_outcome','reconciling'].includes(item.state)); const remoteUrl = safeHttpUrl(row.remoteUrl); return `<div class="list-item"><div><strong>${escapeHtml(row.channel)}</strong><div class="muted">${remoteUrl ? `<a href="${escapeHtml(remoteUrl)}" target="_blank" rel="noopener noreferrer">게시물 열기</a>` : 'URL 대기'} · ${escapeHtml(row.errorCode||'')}</div></div><div><span class="badge">${escapeHtml(row.state)}</span>${retry ? ` <button type="button" data-retry="${retry.id}">안전 재시도</button>` : ''}</div></div>`; }).join('') || '<p class="muted">발행 시도가 없습니다.</p>';
-    document.querySelectorAll('[data-retry]').forEach(button => button.onclick=()=>retryAttempt(button.dataset.retry));
-  }
-
-  document.getElementById('refresh-status').addEventListener('click', loadPublications);
-  loadContext().catch(error => document.getElementById('intent-message').textContent = error.message);
-})();
-</script>
+<script src="{% static 'admin_console/publishing_article.js' %}"></script>
 {% endblock %}

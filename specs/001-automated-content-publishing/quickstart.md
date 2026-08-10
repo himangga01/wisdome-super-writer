@@ -1119,3 +1119,40 @@ all client-supplied material hashes. Assert the v2 material document contains cu
 credential identity, approved registry/profile decisions, exact editorial/generation/quality and
 publisher releases, plus exact canary/pilot evidence. Change one upstream material source and
 verify both stale projection/auto-disable and fail-closed live execution gating.
+
+## T026 관리자 발행 화면 확인 절차 (한국어)
+
+1. `/console/publishing/`에서 WordPress target은 secret-store 참조로 만들고 Blogger target은
+   생성 뒤 target 상세의 Google OAuth 연결을 사용한다. Blogger 요청에 WordPress credential
+   참조가 포함되지 않는지 확인한다.
+2. target 상세에서 preflight와 test canary를 실행한다. canary 요청에는 client
+   `policyVersion`이 없어야 한다. 주제만 선택해 validation을 만들고 보고서를 확인한 뒤
+   `validation_decision` 재인증으로 pass/revoke한다.
+3. 현재 snapshot의 passed validation을 자동 선택해 `auto_publish_change` proof로 activation을
+   켠다. registry/profile/credential/snapshot을 바꾸면 화면 새로고침 후 validation이 stale이고
+   target 자동 발행이 OFF인지 확인한다.
+4. article 발행 화면에서 target을 선택하고 intent를 만든다. 각 preview는 sandboxed frame에
+   표시되고 승인 이력은 current head와 HISTORY를 구분해야 한다. 최초 승인/거절은 head version
+   0 CAS, 이후 승인/철회는 응답의 latest ID와 version CAS를 사용한다.
+5. 승인 철회는 `approval_revoke` proof 없이는 422/403이어야 한다. 성공한 철회 뒤 current head가
+   revoked이고 발행 버튼이 비활성화되는지 확인한다. 다시 승인하면 새 head version으로만
+   발행 가능해야 한다.
+6. dispatch 뒤 publication/attempt page를 새로고침한다. retryable failure는 같은 logical row에서
+   안전 재시도하고 unknown/reconciling은 read-only reconcile을 요청한다. 공개 URL과 OAuth URL은
+   HTTP(S)만 링크로 만든다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_publishing_admin_contract tests.unit.test_publication_intent_contract tests.unit.test_publication_approval_contract -v 2
+```
+
+## T026 Publication Administration Verification (English/AI-readable)
+
+Create WordPress with secret references and Blogger through the OAuth flow. Run preflight/canary,
+create server-derived validation from a topic only, inspect its report, then pass/revoke with a
+`validation_decision` proof. Enable or disable with an `auto_publish_change` proof and exact current
+validation refs. On the article page, require separate current-intent, preview, approval-history,
+publication, and attempt calls. Approval controls use only the current head ID/version; revoke requires
+`approval_revoke` and immediately removes dispatch eligibility. Retry/reconcile preserves the original
+logical attempt and immutable dispatch cohort. Only HTTP(S) remote/OAuth URLs become links.
