@@ -2483,3 +2483,44 @@ hashes. The console renders that HTML only inside a sandboxed frame and builds a
 DOM text nodes. High-risk mutations acquire a purpose-bound reauthentication proof immediately before
 the decision: `validation_decision`, `auto_publish_change`, `credential_disconnect`, or
 `approval_revoke`. Password and MFA values are never persisted or reflected.
+
+## T027 일정 tick·queue-one 실행 자료 정본 (한국어)
+
+`ScheduleDispatch`의 신규 정본은 `material_version=schedule-dispatch-material-v1`이다. scheduler는
+schedule 행을 잠근 뒤 정렬한 target fence와 target, 현재 approved source registry head와 topic
+policy를 같은 transaction에서 잠근다. 그 시점의 schedule ID/version/config hash, 주제, 실행
+시각과 window, owner, approval mode, target snapshot/config/channel/role/environment/credential
+version, validation refs와 activation refs를 `schedule_material`에 저장하고 RFC 8785 SHA-256
+`schedule_material_hash`로 결속한다. manual 일정은 validation/activation refs가 모두 비어야 하고,
+validated-auto 일정은 exact target 집합과 current server material gate를 통과해야 한다.
+
+tick identity는 `(schedule_id, scheduled_for)`이며 schedule version과 enabled 상태를 다시 보기 전에
+기존 immutable audit row를 replay한다. due scan은 목록 조회에서 포착한 `next_run_at`을 dispatch에
+명시적으로 전달하므로 첫 scheduler가 schedule을 갱신해도 두 번째 scheduler가 미래 tick을 조기
+생성하지 않는다. SQLite lock 경합은 bounded retry 뒤 같은 row로 수렴하며 PostgreSQL에서는 schedule
+row lock이 single writer다.
+
+`queue_one`의 queued root는 최대 100개의 정렬 `coalesced_tick_refs`, union window,
+`coalesced_tick_manifest_hash`, 단조 `tick_set_version`을 보존한다. 실제 release 시 이 집합을 한 번만
+`schedule-execution-material-v1`/`execution_material_hash`로 동결하고 그 hash를 CollectionRun
+`request_fingerprint`에 포함한다. run은 frozen registry/policy, 최초 owner, target IDs, approval mode,
+union window를 그대로 사용한다. publishing automation은 live Schedule을 읽지 않으며 dispatch material,
+run, current target·validated-auto safety gate의 exact 일치만 확인한다. migration 이전 행은
+`legacy-unverifiable-v1`이며 완성된 immutable publication ledger replay 외의 queued/new 실행에는 사용할
+수 없다.
+
+## T027 Schedule Tick and Queue-One Execution Material (English/AI-readable)
+
+Current rows use `schedule-dispatch-material-v1`, resolved under one locked transaction from the Schedule,
+sorted target fences/targets, approved registry head, and active topic policy. The canonical document binds
+schedule/tick/window/owner, exact target operational and credential snapshots, approval mode, validation
+refs, and activation refs; its RFC 8785 SHA-256 is immutable. Manual material has no auto-publish refs;
+validated-auto material must match the exact target set and the current server-owned eligibility gate.
+
+`(schedule_id, scheduled_for)` is replayed before mutable schedule state. A due scan passes the captured
+timestamp rather than rereading `next_run_at`. Queue-one keeps one locked root with at most 100 sorted tick
+refs, a union window, manifest hash, and monotonic version. Release freezes one
+`schedule-execution-material-v1`, binds its hash into the CollectionRun request fingerprint, and preserves
+the original registry/policy/owner/targets/approval mode. Publishing consumes only this frozen material and
+separately rechecks current safety gates. `legacy-unverifiable-v1` rows are fail-closed for new or queued
+execution.

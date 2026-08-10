@@ -9,14 +9,21 @@ from apps.audit.services import (
     require_audit_replay,
 )
 from apps.collection.models import CollectionRun, RecoveryState, RunState, RunStep
-from apps.scheduling.models import ScheduleDispatch
+from apps.scheduling.models import (
+    SCHEDULE_DISPATCH_MATERIAL_VERSION,
+    SCHEDULE_EXECUTION_MATERIAL_VERSION,
+    ScheduleDispatch,
+)
 from wisdome_writer.domain.errors import Conflict, InvalidInput
+from wisdome_writer.domain.hashing import (
+    CANONICAL_HASH_SCHEMA_V1,
+    canonical_hash,
+    sha256_hex,
+)
 
 from .models import (
     Approval,
     ApprovalMode,
-    AutoPublishActivation,
-    AutoPublishValidation,
     ChannelCode,
     Publication,
     PublicationIntent,
@@ -30,6 +37,7 @@ from .services import (
     _require_intent_revision_publishable,
     _require_worker_event,
     _require_revision_for_commands,
+    _validated_auto_target_material_eligible,
     create_publication_intent,
     decide_approval,
     dispatch_publication,
@@ -37,13 +45,63 @@ from .services import (
 )
 
 
-def _require_frozen_schedule(schedule_dispatch: ScheduleDispatch):
-    schedule = schedule_dispatch.schedule
-    if int(schedule.version) != int(schedule_dispatch.schedule_version):
-        raise Conflict("schedule version changed after this run was dispatched")
-    if not schedule.enabled:
-        raise Conflict("schedule was disabled after this run was dispatched")
-    return schedule
+def _schedule_material_hash(value) -> str:
+    return canonical_hash(
+        value,
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
+    )
+
+
+def _require_frozen_schedule(
+    schedule_dispatch: ScheduleDispatch,
+    *,
+    run: CollectionRun,
+) -> dict:
+    """Verify the dispatched tick without consulting mutable Schedule state."""
+
+    material = schedule_dispatch.execution_material
+    if (
+        schedule_dispatch.material_version != SCHEDULE_DISPATCH_MATERIAL_VERSION
+        or not isinstance(material, dict)
+        or material.get("schemaVersion") != SCHEDULE_EXECUTION_MATERIAL_VERSION
+        or str(material.get("scheduleDispatchId")) != str(schedule_dispatch.id)
+        or schedule_dispatch.execution_material_hash
+        != _schedule_material_hash(material)
+        or not schedule_dispatch.run_request_fingerprint
+        or run.request_fingerprint != schedule_dispatch.run_request_fingerprint
+    ):
+        raise Conflict("scheduled execution material is missing or inconsistent")
+    registry = material.get("registry") or {}
+    policy = material.get("topicPolicy") or {}
+    target_refs = material.get("targetSnapshots")
+    if (
+        not isinstance(target_refs, list)
+        or not all(isinstance(row, dict) for row in target_refs)
+    ):
+        raise Conflict("scheduled target snapshots are invalid")
+    try:
+        expected_target_ids = sorted(
+            str(row["targetId"]) for row in target_refs
+        )
+        mismatched = (
+            run.topic_code != material.get("topic")
+            or run.approval_mode != material.get("approvalMode")
+            or sorted(str(value) for value in run.requested_target_ids)
+            != expected_target_ids
+            or str(run.requested_by_id) != str(material.get("requestedById"))
+            or str(run.source_registry_id) != str(registry.get("snapshotId"))
+            or run.registry_manifest_hash != registry.get("manifestHash")
+            or str(run.topic_policy_id) != str(policy.get("id"))
+            or int(run.policy_version) != int(policy["version"])
+            or run.policy_hash != policy.get("policyHash")
+            or run.window_start.isoformat() != material.get("windowStart")
+            or run.window_end.isoformat() != material.get("windowEnd")
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise Conflict("scheduled execution material is malformed") from exc
+    if mismatched:
+        raise Conflict("scheduled run differs from its frozen execution material")
+    return material
 
 
 def _lock_automation_targets(
@@ -290,40 +348,27 @@ def finalize_scheduled_publication_delivery_failure(
         return {"runId": str(run.id), "state": run.state}
 
 
-def _validate_automation_material(schedule, targets: dict[str, PublicationTarget]) -> None:
+def _validate_automation_material(
+    execution_material: dict,
+    targets: dict[str, PublicationTarget],
+) -> None:
     target_ids = set(targets)
-    validation_refs = schedule.auto_publish_validation_refs
-    activation_refs = schedule.auto_publish_activation_refs
+    validation_refs = execution_material["validationRefs"]
+    activation_refs = execution_material["activationRefs"]
     if {str(row.get("targetId")) for row in validation_refs} != target_ids:
         raise InvalidInput("일정의 자동발행 validation target 집합이 현재 target과 다릅니다.")
     if {str(row.get("targetId")) for row in activation_refs} != target_ids:
         raise InvalidInput("일정의 자동발행 activation target 집합이 현재 target과 다릅니다.")
-    for ref in validation_refs:
-        target = targets[str(ref["targetId"])]
-        validation = AutoPublishValidation.objects.get(
-            id=ref["validationId"],
+    validation_manifest_hash = sha256_hex(validation_refs)
+    activation_by_target = {
+        str(row["targetId"]): row for row in activation_refs
+    }
+    for target_id, target in targets.items():
+        if not _validated_auto_target_material_eligible(
             target=target,
-            status=AutoPublishValidation.State.PASSED,
-        )
-        if (
-            str(validation.target_snapshot_id) != str(ref["targetSnapshotId"])
-            or validation.material_hash != ref["materialHash"]
-            or str(target.current_snapshot_id) != str(ref["targetSnapshotId"])
-        ):
-            raise Conflict("자동발행 validation material이 현재 target과 일치하지 않습니다.")
-    for ref in activation_refs:
-        target = targets[str(ref["targetId"])]
-        activation = AutoPublishActivation.objects.get(
-            id=ref["activationId"],
-            target=target,
-            decision=AutoPublishActivation.Decision.ENABLED,
-        )
-        if (
-            str(target.latest_auto_publish_activation_id) != str(activation.id)
-            or not target.auto_publish_enabled
-            or activation.version != int(ref["version"])
-            or activation.activation_hash != ref["activationHash"]
-            or str(activation.target_snapshot_id) != str(ref["targetSnapshotId"])
+            supplied_validation_refs=validation_refs,
+            supplied_validation_manifest_hash=validation_manifest_hash,
+            activation_ref=activation_by_target[target_id],
         ):
             raise Conflict("자동발행 activation이 만료되었거나 현재 target과 다릅니다.")
 
@@ -372,7 +417,7 @@ def _dispatch_validated_schedule_run_atomic(
     }
     schedule_dispatch = (
         ScheduleDispatch.objects.select_for_update()
-        .select_related("schedule")
+        .select_related("requested_by", "source_registry", "topic_policy")
         .get(collection_run=run)
     )
     request_key = f"schedule:{schedule_dispatch.id}:intent"
@@ -437,7 +482,10 @@ def _dispatch_validated_schedule_run_atomic(
         return []
     if run.state != RunState.AWAITING_APPROVAL:
         raise Conflict("scheduled publication requires an awaiting-approval run")
-    schedule = _require_frozen_schedule(schedule_dispatch)
+    execution_material = _require_frozen_schedule(
+        schedule_dispatch,
+        run=run,
+    )
     revision = article.current_revision
     if revision is None or revision.quality_state != "passed":
         raise Conflict("자동발행할 current revision이 품질 gate를 통과하지 못했습니다.")
@@ -449,31 +497,43 @@ def _dispatch_validated_schedule_run_atomic(
         )
     else:
         intent = _require_intent_revision_publishable(intent)
-    requested_ids = [str(value) for value in run.requested_target_ids]
+    requested_ids = [
+        str(row["targetId"])
+        for row in execution_material["targetSnapshots"]
+    ]
     targets = _lock_automation_targets(requested_ids)
     if not requested_ids or set(targets) != set(requested_ids):
         raise InvalidInput("일정에 존재하지 않는 발행 target이 포함되어 있습니다.")
-    _validate_automation_material(schedule, targets)
+    _validate_automation_material(execution_material, targets)
     target_refs = []
     commands = []
+    frozen_target_refs = {
+        str(row["targetId"]): row
+        for row in execution_material["targetSnapshots"]
+    }
     for target_id in sorted(targets):
         target = targets[target_id]
-        if not target.current_snapshot_id or not target.current_config_hash:
-            raise Conflict("발행 target snapshot이 준비되지 않았습니다.")
+        frozen_target = frozen_target_refs[target_id]
+        if (
+            str(target.current_snapshot_id)
+            != str(frozen_target["targetSnapshotId"])
+            or target.current_config_hash != frozen_target["targetConfigHash"]
+        ):
+            raise Conflict("발행 target snapshot이 일정 tick 이후 변경되었습니다.")
         existing_publication = Publication.objects.filter(article_id=article.id, target=target).first()
         action = "update" if existing_publication and existing_publication.remote_post_id else "create"
         target_refs.append(
             {
                 "targetId": target_id,
-                "targetSnapshotId": str(target.current_snapshot_id),
-                "targetConfigHash": target.current_config_hash,
+                "targetSnapshotId": str(frozen_target["targetSnapshotId"]),
+                "targetConfigHash": frozen_target["targetConfigHash"],
             }
         )
         commands.append(
             {
                 "targetId": target_id,
-                "targetSnapshotId": str(target.current_snapshot_id),
-                "targetConfigHash": target.current_config_hash,
+                "targetSnapshotId": str(frozen_target["targetSnapshotId"]),
+                "targetConfigHash": frozen_target["targetConfigHash"],
                 "resolvedAction": action,
                 "canonicalDependencyTargetId": (
                     _canonical_wordpress_target_id(target, targets)
@@ -497,8 +557,8 @@ def _dispatch_validated_schedule_run_atomic(
                 "targetSnapshots": target_refs,
                 "targetCommands": commands,
                 "approvalMode": ApprovalMode.VALIDATED_AUTO,
-                "autoPublishValidationRefs": schedule.auto_publish_validation_refs,
-                "autoPublishActivationRefs": schedule.auto_publish_activation_refs,
+                "autoPublishValidationRefs": execution_material["validationRefs"],
+                "autoPublishActivationRefs": execution_material["activationRefs"],
                 "expectedLatestIntentId": str(latest.id) if latest else None,
                 "requestKey": request_key,
                 "reason": audit_context.reason_code,

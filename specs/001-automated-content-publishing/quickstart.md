@@ -1156,3 +1156,36 @@ validation refs. On the article page, require separate current-intent, preview, 
 publication, and attempt calls. Approval controls use only the current head ID/version; revoke requires
 `approval_revoke` and immediately removes dispatch eligibility. Retry/reconcile preserves the original
 logical attempt and immutable dispatch cohort. Only HTTP(S) remote/OAuth URLs become links.
+
+## T027 일정 실행 자료 확인 절차 (한국어)
+
+1. 같은 schedule과 `scheduledFor`를 두 scheduler에서 동시에 전달한다. 둘 다 같은
+   `ScheduleDispatch.id`로 수렴하고 run/outbox는 하나만 생겨야 한다. due scan 두 노드가 같은
+   `nextRunAt`을 읽은 뒤 한 노드가 schedule을 갱신해도 미래 tick이 추가 생성되면 안 된다.
+2. immediate tick의 `scheduleMaterial`이 현재 registry/policy, target snapshot/config/credential,
+   approval mode와 validation/activation refs를 포함하고 hash가 일치하는지 확인한다. schedule 설정을
+   바꾼 뒤에도 이미 만든 run fingerprint와 frozen material은 변하지 않아야 한다.
+3. active run이 있는 `queue_one` schedule에 서로 다른 세 tick을 넣는다. queued root는 하나,
+   나머지는 `coalesced`이며 root의 정렬 tick refs, union window, manifest hash와 version이 모든 tick을
+   포함해야 한다.
+4. active run을 terminal로 바꾸고 queued root를 release한다. release 직전에 schedule owner, target,
+   approval mode를 바꿔도 새 CollectionRun은 tick 당시 frozen 값을 사용해야 한다. exact release replay는
+   새 run/outbox를 만들지 않는다.
+5. `ScheduleDispatch.schedule_material`, registry/policy/target/approval/validation/activation identity를
+   instance save 또는 QuerySet update로 바꾸면 거부되어야 한다. `legacy-unverifiable-v1` queued row는
+   `legacy_unverifiable_material`로 남고 CollectionRun을 만들지 않아야 한다.
+
+승인된 focused 명령:
+
+```powershell
+python src/manage.py test tests.unit.test_schedule_dispatch_material tests.unit.test_publishing_automation_round1 -v 2
+```
+
+## T027 Schedule Execution Material Verification (English/AI-readable)
+
+Race two callers on the same `(schedule, scheduledFor)` and require one dispatch, run, and outbox. Verify
+the due scanner passes its captured timestamp. Inspect the v1 tick material and hash, then mutate the live
+Schedule and prove the existing run remains bound to the frozen owner, registry/policy, targets, approval
+mode, and execution hash. For queue-one, coalesce multiple ticks into one bounded sorted root and union
+window, release once after the active run terminates, and require exact replay. Frozen-field mutation and
+legacy queued execution must fail closed.

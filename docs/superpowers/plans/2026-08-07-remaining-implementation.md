@@ -1392,7 +1392,7 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
 - Consumes: exact schedule version, topic registry/policy, target snapshots, approval mode, validation/activation refs at tick time.
 - Produces: immutable `ScheduleDispatch` material and one `CollectionRun` request fingerprint per scheduled tick.
 
-- [ ] **Step 1: dispatch에 실행 material을 추가한다.**
+- [x] **Step 1: dispatch에 실행 material을 추가한다.**
 
   ```python
   schedule_material = models.JSONField(default=dict)
@@ -1405,19 +1405,19 @@ release, execution, final render, and reconcile follow only the FK. Unverifiable
   activation_refs = models.JSONField(default=list)
   ```
 
-- [ ] **Step 2: tick transaction에서 material을 서버 조회해 고정한다.**
+- [x] **Step 2: tick transaction에서 material을 서버 조회해 고정한다.**
 
   `_dispatch_material()`은 mutable Schedule JSON만 복사하지 않고 현재 approved registry와 exact target snapshots/activation을 조회한 뒤 RFC 8785 hash를 만든다.
 
-- [ ] **Step 3: duplicate tick와 queue-one을 row lock으로 결정한다.**
+- [x] **Step 3: duplicate tick와 queue-one을 row lock으로 결정한다.**
 
   schedule row와 active run/queued dispatch를 `select_for_update()`로 잠그고 `(schedule, scheduled_for)` replay는 기존 dispatch를 반환한다. database integrity error를 정상 제어 흐름으로 사용하지 않는다.
 
-- [ ] **Step 4: automation의 mutable schedule reread를 제거한다.**
+- [x] **Step 4: automation의 mutable schedule reread를 제거한다.**
 
   `dispatch_scheduled_run_publication()`은 `ScheduleDispatch.schedule_material`과 run에 동결된 refs만 사용한다.
 
-- [ ] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [x] **Step 5: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
 
   ```powershell
   git add src/apps/scheduling src/apps/publishing/automation.py specs/001-automated-content-publishing/data-model.md

@@ -20,8 +20,11 @@ from adapters.sources import (
     source_reconciliation_days,
 )
 from adapters.sources.errors import SourceAccessError
-from apps.topics.models import SourceDefinition, TopicPolicy
-from apps.topics.services import current_registry
+from apps.topics.models import SourceDefinition, SourceRegistrySnapshot, TopicPolicy
+from apps.topics.services import (
+    current_registry,
+    registry_manifest_hash as calculate_registry_manifest_hash,
+)
 from wisdome_writer.domain.hashing import (
     CANONICAL_HASH_SCHEMA_V1,
     canonical_hash,
@@ -73,6 +76,55 @@ def _hash(value) -> str:
 
 def _bounded_count(value: int) -> int:
     return min(max(int(value), 0), 2147483647)
+
+
+def _collection_run_request_fingerprint(
+    *,
+    topic_code: str,
+    window_start: datetime,
+    window_end: datetime,
+    trigger: str,
+    registry_id,
+    registry_hash: str,
+    policy_id,
+    policy_version: int,
+    policy_hash: str,
+    freshness_minutes: int,
+    allowed_authority_tiers: list[str],
+    requested_target_ids: list[str] | None = None,
+    approval_mode: str = "manual",
+    execution_material_hash: str | None = None,
+) -> str:
+    """Build the immutable identity for one collection-run request."""
+
+    material = {
+        "topic": topic_code,
+        "start": window_start.isoformat(),
+        "end": window_end.isoformat(),
+        "trigger": trigger,
+        "registry": str(registry_id),
+        "registryHash": registry_hash,
+        "topicPolicy": str(policy_id),
+        "policyVersion": policy_version,
+        "policyHash": policy_hash,
+        "freshnessMinutes": freshness_minutes,
+        "allowedAuthorityTiers": allowed_authority_tiers,
+    }
+    if (
+        execution_material_hash is not None
+        or requested_target_ids
+        or approval_mode != "manual"
+    ):
+        material.update(
+            {
+                "requestedTargetIds": sorted(
+                    str(value) for value in (requested_target_ids or [])
+                ),
+                "approvalMode": approval_mode,
+                "executionMaterialHash": execution_material_hash,
+            }
+        )
+    return _hash(material)
 
 
 def _terminal_impact(
@@ -196,6 +248,14 @@ def create_run(
     trigger="manual",
     correlation_id=None,
     retry_count: int = 0,
+    requested_target_ids: list[str] | None = None,
+    approval_mode: str = "manual",
+    execution_material_hash: str | None = None,
+    source_registry_id=None,
+    expected_registry_manifest_hash: str | None = None,
+    topic_policy_id=None,
+    expected_policy_version: int | None = None,
+    expected_policy_hash: str | None = None,
 ):
     if (
         not isinstance(window_start, datetime)
@@ -214,13 +274,43 @@ def create_run(
         raise ValueError(
             "Collection window_end cannot be in the future."
         )
-    registry = current_registry(topic_code, for_update=True)
-    policy = (
-        TopicPolicy.objects.select_for_update()
-        .filter(code=topic_code, active=True)
-        .order_by("-version", "-created_at")
-        .first()
-    )
+    if source_registry_id is None:
+        registry = current_registry(topic_code, for_update=True)
+    else:
+        registry = (
+            SourceRegistrySnapshot.objects.select_for_update()
+            .filter(pk=source_registry_id, topic_code=topic_code)
+            .first()
+        )
+        if (
+            registry is None
+            or expected_registry_manifest_hash is None
+            or registry.manifest_hash != expected_registry_manifest_hash
+            or calculate_registry_manifest_hash(registry)
+            != expected_registry_manifest_hash
+        ):
+            raise ValueError("The frozen source registry is inconsistent.")
+    if topic_policy_id is None:
+        policy = (
+            TopicPolicy.objects.select_for_update()
+            .filter(code=topic_code, active=True)
+            .order_by("-version", "-created_at")
+            .first()
+        )
+    else:
+        policy = (
+            TopicPolicy.objects.select_for_update()
+            .filter(pk=topic_policy_id, code=topic_code)
+            .first()
+        )
+        if (
+            policy is None
+            or expected_policy_version is None
+            or expected_policy_hash is None
+            or policy.version != expected_policy_version
+            or policy.policy_hash != expected_policy_hash
+        ):
+            raise ValueError("The frozen topic policy is inconsistent.")
     if policy is None:
         raise ValueError(
             "An active topic policy is required before collection."
@@ -255,20 +345,24 @@ def create_run(
         else current_correlation_uuid()
     )
     resolved_retry_count = _bounded_count(retry_count)
-    fingerprint = _hash(
-        {
-            "topic": topic_code,
-            "start": window_start.isoformat(),
-            "end": window_end.isoformat(),
-            "trigger": trigger,
-            "registry": str(registry.id),
-            "registryHash": registry.manifest_hash,
-            "topicPolicy": str(policy.id),
-            "policyVersion": policy.version,
-            "policyHash": policy.policy_hash,
-            "freshnessMinutes": policy.freshness_minutes,
-            "allowedAuthorityTiers": allowed_authority_tiers,
-        }
+    frozen_target_ids = sorted(
+        str(value) for value in (requested_target_ids or [])
+    )
+    fingerprint = _collection_run_request_fingerprint(
+        topic_code=topic_code,
+        window_start=window_start,
+        window_end=window_end,
+        trigger=trigger,
+        registry_id=registry.id,
+        registry_hash=registry.manifest_hash,
+        policy_id=policy.id,
+        policy_version=policy.version,
+        policy_hash=policy.policy_hash,
+        freshness_minutes=policy.freshness_minutes,
+        allowed_authority_tiers=allowed_authority_tiers,
+        requested_target_ids=frozen_target_ids,
+        approval_mode=approval_mode,
+        execution_material_hash=execution_material_hash,
     )
     run, created = CollectionRun.objects.get_or_create(
         request_fingerprint=fingerprint,
@@ -277,6 +371,7 @@ def create_run(
             "display_id": f"RUN-{timezone.now():%Y%m%d}-{secrets.token_hex(3).upper()}",
             "topic_code": topic_code,
             "trigger": trigger,
+            "approval_mode": approval_mode,
             "window_start": window_start,
             "window_end": window_end,
             "source_registry": registry,
@@ -289,6 +384,7 @@ def create_run(
                 allowed_authority_tiers
             ),
             "freshness_cutoff": freshness_cutoff,
+            "requested_target_ids": frozen_target_ids,
             "requested_by": user,
             "retry_count": resolved_retry_count,
         },

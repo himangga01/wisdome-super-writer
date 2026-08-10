@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -17,23 +18,59 @@ from wisdome_writer.domain.errors import Conflict
 
 
 class FrozenScheduleDispatchTests(TestCase):
-    def test_live_schedule_version_drift_is_rejected_before_material_use(self):
+    def _frozen_execution(self):
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        execution = {
+            "schemaVersion": "schedule-execution-material-v1",
+            "scheduleDispatchId": "dispatch-1",
+            "topic": "housing_subscription",
+            "approvalMode": "validated_auto",
+            "requestedById": "admin-1",
+            "registry": {"snapshotId": "registry-1", "manifestHash": "a" * 64},
+            "topicPolicy": {"id": "policy-1", "version": 2, "policyHash": "b" * 64},
+            "targetSnapshots": [],
+            "validationRefs": [],
+            "activationRefs": [],
+            "tickRefs": [],
+            "windowStart": (now - timedelta(hours=1)).isoformat(),
+            "windowEnd": now.isoformat(),
+        }
         dispatch = SimpleNamespace(
-            schedule_version=4,
-            schedule=SimpleNamespace(version=5),
+            id="dispatch-1",
+            material_version="schedule-dispatch-material-v1",
+            execution_material=execution,
+            execution_material_hash=automation._schedule_material_hash(execution),
+            run_request_fingerprint="c" * 64,
+        )
+        run = SimpleNamespace(
+            request_fingerprint="c" * 64,
+            topic_code="housing_subscription",
+            approval_mode="validated_auto",
+            requested_target_ids=[],
+            requested_by_id="admin-1",
+            source_registry_id="registry-1",
+            registry_manifest_hash="a" * 64,
+            topic_policy_id="policy-1",
+            policy_version=2,
+            policy_hash="b" * 64,
+            window_start=now - timedelta(hours=1),
+            window_end=now,
+        )
+        return dispatch, run
+
+    def test_frozen_execution_does_not_consult_mutable_schedule(self):
+        dispatch, run = self._frozen_execution()
+        self.assertEqual(
+            automation._require_frozen_schedule(dispatch, run=run),
+            dispatch.execution_material,
         )
 
-        with self.assertRaisesRegex(Conflict, "schedule version"):
-            automation._require_frozen_schedule(dispatch)
+    def test_tampered_frozen_execution_is_rejected(self):
+        dispatch, run = self._frozen_execution()
+        dispatch.execution_material["topic"] = "semiconductor"
 
-    def test_disabled_schedule_is_rejected_even_when_version_matches(self):
-        dispatch = SimpleNamespace(
-            schedule_version=4,
-            schedule=SimpleNamespace(version=4, enabled=False),
-        )
-
-        with self.assertRaisesRegex(Conflict, "disabled"):
-            automation._require_frozen_schedule(dispatch)
+        with self.assertRaisesRegex(Conflict, "missing or inconsistent"):
+            automation._require_frozen_schedule(dispatch, run=run)
 
     def test_completed_dispatch_replays_before_live_schedule_validation(self):
         attempts = [SimpleNamespace(id="attempt-1")]
