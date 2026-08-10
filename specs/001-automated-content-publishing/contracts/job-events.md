@@ -796,6 +796,41 @@ during recovery. A pre-attempt required-HWP failure is retained as a typed run c
 Version 1.1.0 remains an immutable inactive superseded draft; T032 creates the acceptance
 artifact and approves golden 1.2.0 without adding a retirement transition for 1.1.0.
 
+## 한국어 — T022 불변 발행 자산 전달 이벤트
+
+신규 미디어 쓰기·조정·삭제는 아래 여섯 v2 이벤트만 사용한다. payload는 표에 적힌 필드만
+허용하고 `operation_generation`은 1~5이다. raw receipt token, token hash, write marker,
+로컬 경로, 원본 bytes는 public event payload에 넣지 않는다.
+
+| 이벤트 | exact payload |
+|---|---|
+| `media.upload_requested@2` | `remote_media_id`, `publication_attempt_id`, `publication_intent_id`, `operation_generation`, `target_snapshot_id`, `target_config_hash` |
+| `media.reconcile_requested@2` | `remote_media_id`, `publication_attempt_id`, `publication_intent_id`, `operation_generation` |
+| `delivery.prepare_requested@2` | `public_delivery_asset_id`, `publication_attempt_id`, `publication_intent_id`, `operation_generation` |
+| `delivery.reconcile_requested@2` | `public_delivery_asset_id`, `publication_attempt_id`, `publication_intent_id`, `operation_generation` |
+| `media.delete_requested@2` | `remote_media_id`, `operation_generation` |
+| `delivery.delete_requested@2` | `public_delivery_asset_id`, `operation_generation` |
+
+각 이벤트는 정확히 하나의 append-only `MediaDeliveryOperation`과 결속한다. worker는 source
+event와 현재 processing receipt의 consumer·lease generation·raw token을 확인하고 operation을
+claim한다. 외부 mutation 직전 같은 capability, current intent/approval/target, run stop과 kill
+switch를 다시 확인해 write marker를 한 번만 기록한다. write 이후 소유권을 잃으면 동일 mutation을
+반복하지 않고 새 reconcile generation을 만든다. 늦은 결과는 mapping을 바꾸지 않는다. terminal
+callback은 exact terminal reservation이 있을 때만 `delivery_failed`를 투영한다. v1 미디어 이벤트는
+이미 증명된 replay/terminal 처리만 허용하고 신규 외부 쓰기에는 사용하지 않는다.
+
+## English / AI-readable — T022 immutable asset delivery events
+
+All new media prepare, reconcile, and delete work uses the six exact v2 payloads listed above.
+`operation_generation` is bounded to 1..5, and public payloads never contain raw receipt tokens,
+token hashes, write markers, local paths, or asset bytes. Each event owns exactly one append-only
+`MediaDeliveryOperation`. Claim verifies the persisted source event and current processing receipt;
+the pre-I/O fence rechecks the same capability plus current intent, approval, target, run-stop, and
+kill-switch state, then sets one write marker. Capability loss after that marker creates a new
+reconcile generation instead of repeating the mutation. Late results are factual only, and terminal
+projection requires the exact terminal reservation. Version 1 is consumption-only for a proven
+historical replay or terminal outcome and never authorizes a new external write.
+
 ## 한국어 — T016 추출 이벤트 fencing 보강
 
 - leaf/fanout handler는 outbox `event_context`의 source event, consumer, token,

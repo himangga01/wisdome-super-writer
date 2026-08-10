@@ -1004,3 +1004,36 @@ quarantined and non-publishable. The activation gate remains hard-false until T0
 exact artifact-byte and external-trust-root signature verification. The default topology is one
 concurrency-one extract worker plus one dedicated converter; scale-out requires isolated
 socket/input volumes and a converter per worker.
+
+## 한국어 — T022 발행 자산 확인 절차
+
+1. preview를 만들고 `PublishedAssetCohort.manifest_hash`와 render의 `media_manifest`가 같은 정렬
+   snapshot 집합인지 확인한다. raw evidence text나 비밀 값이 manifest에 없어야 한다.
+2. dispatch 뒤 각 target/snapshot에 `PublicationMedia`가 정확히 하나인지 확인한다. mapping이
+   `available`, binding이 `active`, current rights/source/render가 일치하기 전 publication attempt
+   외부 쓰기는 시작되면 안 된다.
+3. WordPress fixture는 0건일 때만 POST하고, 1건은 slug·marker·alt·caption·MIME와 공개 bytes
+   SHA-256을 모두 비교해 재사용한다. 복수건이나 하나라도 불일치하면 manual이다.
+4. Blogger fixture는 content-addressed key에 PUT한 뒤 반환된 non-empty version을 exact HEAD하고,
+   checksum·size·MIME 및 익명 HTTPS bounded GET bytes를 다시 확인한다. 삭제는 반드시 그 exact
+   version ID를 보낸다.
+5. cleanup fixture는 prepared/active binding, active attempt, remote-body hash, correction, hold가
+   각각 삭제를 막는지 확인한다. 0건 첫 확인은 유예만 시작하고 30일 뒤 재집계가 0일 때만 delete
+   operation을 만든다. queued delete 중 재참조는 `superseded`여야 하며 외부 delete 호출은 0회다.
+
+승인된 focused 명령:
+
+```powershell
+python -m django test tests.unit.test_published_asset_snapshots tests.unit.test_published_asset_snapshots_db tests.unit.test_publication_media_bindings tests.unit.test_media_delivery_operations tests.unit.test_media_delivery_operations_db tests.unit.test_wordpress_media_delivery tests.unit.test_public_delivery_assets tests.unit.test_publication_media_cleanup -v 2
+```
+
+## English / AI-readable — T022 publication asset checks
+
+Verify the preview cohort hash and bounded render manifest first, then require one exact
+`PublicationMedia` binding per target/snapshot. Publication I/O stays blocked until current rights and
+source/render lineage match, the mapping is available, and the binding is active. WordPress mutates
+only after a complete zero-match lookup; reuse requires exact authenticated metadata plus public-byte
+SHA-256. Blogger prepare requires a non-empty returned version, exact HEAD material, and bounded
+anonymous HTTPS bytes; delete sends that exact version. Cleanup fixtures independently prove every
+protected reference, the 30-day second zero-count, and zero external delete calls after a queued
+generation is superseded by re-reference.

@@ -2282,6 +2282,221 @@ class PublicationMedia(_FrozenMediaIdentityModel):
         ]
 
 
+class MediaDeliveryOperationQuerySet(models.QuerySet):
+    FROZEN_IDENTITY_FIELDS = frozenset(
+        {
+            "mapping_kind",
+            "remote_media",
+            "remote_media_id",
+            "public_delivery_asset",
+            "public_delivery_asset_id",
+            "publication_attempt",
+            "publication_attempt_id",
+            "publication_intent",
+            "publication_intent_id",
+            "action",
+            "generation",
+            "source_event",
+            "source_event_id",
+            "target_snapshot_id",
+            "target_config_hash",
+            "material_hash",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_IDENTITY_FIELDS.intersection(fields):
+            raise TypeError("Media delivery operation identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError("Media delivery operation is append-only")
+
+    async def adelete(self):
+        raise TypeError("Media delivery operation is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("Media delivery operation is append-only")
+
+
+class MediaDeliveryOperation(models.Model):
+    class MappingKind(models.TextChoices):
+        REMOTE_MEDIA = "remote_media", "WordPress media"
+        PUBLIC_DELIVERY_ASSET = "public_delivery_asset", "Public delivery asset"
+
+    class Action(models.TextChoices):
+        UPLOAD = "upload", "Upload"
+        PREPARE = "prepare", "Prepare"
+        RECONCILE = "reconcile", "Reconcile"
+        DELETE = "delete", "Delete"
+
+    class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
+        SUCCEEDED = "succeeded", "Succeeded"
+        UNKNOWN_OUTCOME = "unknown_outcome", "Unknown outcome"
+        MANUAL_REQUIRED = "manual_required", "Manual review required"
+        DELIVERY_FAILED = "delivery_failed", "Delivery failed"
+        SUPERSEDED = "superseded", "Superseded"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    mapping_kind = models.CharField(max_length=32, choices=MappingKind.choices)
+    remote_media = models.ForeignKey(
+        RemoteMedia,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="delivery_operations",
+    )
+    public_delivery_asset = models.ForeignKey(
+        PublicDeliveryAsset,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="delivery_operations",
+    )
+    publication_attempt = models.ForeignKey(
+        PublicationAttempt,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="media_delivery_operations",
+    )
+    publication_intent = models.ForeignKey(
+        PublicationIntent,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="media_delivery_operations",
+    )
+    action = models.CharField(max_length=16, choices=Action.choices)
+    generation = models.PositiveIntegerField()
+    source_event = models.OneToOneField(
+        "infrastructure.OutboxMessage",
+        on_delete=models.PROTECT,
+        related_name="media_delivery_operation",
+    )
+    target_snapshot_id = models.UUIDField(null=True, blank=True)
+    target_config_hash = models.CharField(max_length=64, blank=True)
+    material_hash = models.CharField(max_length=64, validators=[sha256_validator])
+    state = models.CharField(max_length=24, choices=State.choices, default=State.QUEUED)
+    consumer_name = models.CharField(max_length=160, blank=True)
+    consumer_lease_generation = models.PositiveBigIntegerField(default=0)
+    consumer_lease_token = models.UUIDField(null=True, blank=True)
+    lease_token_hash = models.CharField(max_length=64, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    write_marker = models.CharField(max_length=64, blank=True)
+    external_write_started_at = models.DateTimeField(null=True, blank=True)
+    result_hash = models.CharField(max_length=64, blank=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(MediaDeliveryOperationQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        mapping_kind="remote_media",
+                        remote_media__isnull=False,
+                        public_delivery_asset__isnull=True,
+                    )
+                    | Q(
+                        mapping_kind="public_delivery_asset",
+                        remote_media__isnull=True,
+                        public_delivery_asset__isnull=False,
+                    )
+                ),
+                name="ck_media_operation_mapping_xor",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        publication_attempt__isnull=True,
+                        publication_intent__isnull=True,
+                    )
+                    | Q(
+                        publication_attempt__isnull=False,
+                        publication_intent__isnull=False,
+                    )
+                ),
+                name="ck_media_operation_publication_pair",
+            ),
+            models.CheckConstraint(
+                condition=Q(generation__gte=1, generation__lte=5),
+                name="ck_media_operation_generation_1_5",
+            ),
+            models.UniqueConstraint(
+                fields=("remote_media", "generation"),
+                condition=Q(remote_media__isnull=False),
+                name="uq_remote_media_operation_generation",
+            ),
+            models.UniqueConstraint(
+                fields=("public_delivery_asset", "generation"),
+                condition=Q(public_delivery_asset__isnull=False),
+                name="uq_delivery_asset_operation_generation",
+            ),
+            models.UniqueConstraint(
+                fields=("remote_media",),
+                condition=Q(
+                    remote_media__isnull=False,
+                    state__in=("queued", "running"),
+                ),
+                name="uq_active_remote_media_operation",
+            ),
+            models.UniqueConstraint(
+                fields=("public_delivery_asset",),
+                condition=Q(
+                    public_delivery_asset__isnull=False,
+                    state__in=("queued", "running"),
+                ),
+                name="uq_active_delivery_asset_operation",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                MediaDeliveryOperationQuerySet._reject_frozen_fields(update_fields)
+            else:
+                frozen_names = {
+                    field
+                    for field in MediaDeliveryOperationQuerySet.FROZEN_IDENTITY_FIELDS
+                    if not field.endswith(("_media", "_asset", "_attempt", "_intent", "_event"))
+                    and field
+                    not in {
+                        "remote_media",
+                        "public_delivery_asset",
+                        "publication_attempt",
+                        "publication_intent",
+                        "source_event",
+                    }
+                }
+                stored = type(self).objects.filter(pk=self.pk).values(
+                    *frozen_names
+                ).first()
+                if stored is None or any(
+                    getattr(self, field) != value for field, value in stored.items()
+                ):
+                    raise TypeError("Media delivery operation identity is immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("Media delivery operation is append-only")
+
+
 class TargetDisconnectDecision(models.Model):
     class State(models.TextChoices):
         ACCEPTED = "accepted", "접수"

@@ -68,6 +68,7 @@ AWS_STORAGE_BUCKET_NAME = env_value(
     "wisdome-writer" if not IS_PRODUCTION else "",
 )
 AWS_S3_ENDPOINT_URL = env_value("AWS_S3_ENDPOINT_URL") or None
+AWS_S3_PUBLIC_BASE_URL = env_value("AWS_S3_PUBLIC_BASE_URL")
 AWS_S3_REGION_NAME = env_value(
     "AWS_S3_REGION_NAME",
     "ap-northeast-2" if not IS_PRODUCTION else "",

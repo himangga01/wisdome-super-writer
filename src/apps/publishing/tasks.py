@@ -24,6 +24,7 @@ from wisdome_writer.infrastructure.outbox import (
 
 from .contracts import PublishCommand, PublisherError, RenderedArticle
 from .models import (
+    MediaDeliveryOperation,
     Publication,
     PublicationAttempt,
     PublicationMedia,
@@ -35,23 +36,137 @@ from .services import (
 )
 from .services import (
     _kill_switch_enabled,
+    MediaReferenceRestored,
+    authorize_media_delivery_external_write,
     authorize_publication_external_write,
     begin_attempt,
     begin_canary_run,
+    begin_media_delivery_operation,
     begin_remote_media_reconcile,
     begin_reconcile,
     begin_target_credential_revoke,
     finalize_reconcile_delivery_failure,
+    finalize_media_delivery_operation_failure as _finalize_media_delivery_operation_failure,
     persist_canary_run_result,
+    persist_media_delivery_operation_result,
     persist_publish_result,
     persist_remote_media_reconcile_result,
     persist_target_credential_revoke_result,
     publisher_error_result,
     publisher_for_target,
     run_target_preflight,
+    schedule_orphan_media_cleanup_locked,
 )
 
 SCHEDULE_PUBLICATION_AUDIT_REASON = "Scheduled publication dispatch."
+
+
+@shared_task(name="apps.publishing.tasks.schedule_orphan_media_cleanup")
+def schedule_orphan_media_cleanup(mapping_kind: str, mapping_id: str):
+    if mapping_kind == MediaDeliveryOperation.MappingKind.REMOTE_MEDIA:
+        operation = schedule_orphan_media_cleanup_locked(
+            remote_media_id=mapping_id
+        )
+    elif mapping_kind == MediaDeliveryOperation.MappingKind.PUBLIC_DELIVERY_ASSET:
+        operation = schedule_orphan_media_cleanup_locked(
+            public_delivery_asset_id=mapping_id
+        )
+    else:
+        raise PermanentEventError("media_cleanup_mapping_kind_invalid")
+    return {
+        "mappingKind": mapping_kind,
+        "mappingId": mapping_id,
+        "operationId": str(operation.id) if operation else None,
+    }
+
+
+def _current_media_delivery_operation() -> MediaDeliveryOperation:
+    event_id = CURRENT_EVENT_ID.get()
+    if event_id is None:
+        raise PermanentEventError("media_delivery_event_context_missing")
+    operation = (
+        MediaDeliveryOperation.objects.select_related("source_event")
+        .filter(source_event_id=event_id)
+        .first()
+    )
+    if operation is None:
+        raise PermanentEventError("media_delivery_operation_missing")
+    return operation
+
+
+@shared_task(
+    name="apps.publishing.tasks.execute_media_delivery_operation",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def execute_media_delivery_operation(*_route_args):
+    audit_context = _worker_audit_context()
+    operation = _current_media_delivery_operation()
+    claimed, fence = begin_media_delivery_operation(
+        operation.id,
+        expected_generation=operation.generation,
+        audit_context=audit_context,
+    )
+    if fence is None:
+        return {
+            "operationId": str(claimed.id),
+            "state": claimed.state,
+        }
+    from .media_delivery import perform_media_delivery_operation
+
+    def authorize_write() -> None:
+        authorize_media_delivery_external_write(
+            fence,
+            audit_context=audit_context,
+        )
+
+    try:
+        if claimed.action == MediaDeliveryOperation.Action.DELETE:
+            authorize_write()
+        result = perform_media_delivery_operation(
+            claimed,
+            fence=fence,
+            write_guard=authorize_write,
+        )
+    except (MediaReferenceRestored, ValueError) as exc:
+        result = {
+            "status": "manual_required",
+            "error_code": (
+                "media_reference_restored"
+                if isinstance(exc, MediaReferenceRestored)
+                else "media_delivery_material_unverifiable"
+            ),
+        }
+    persisted = persist_media_delivery_operation_result(
+        fence,
+        result=result,
+        audit_context=audit_context,
+    )
+    return {
+        "operationId": str(persisted.id),
+        "state": persisted.state,
+    }
+
+
+@shared_task(
+    name="apps.publishing.tasks.finalize_media_delivery_operation_failure"
+)
+def finalize_media_delivery_operation_failure(*route_args):
+    if not route_args:
+        raise PermanentEventError("media_delivery_terminal_error_missing")
+    error_code = str(route_args[-1])
+    audit_context = _worker_audit_context()
+    operation = _current_media_delivery_operation()
+    persisted = _finalize_media_delivery_operation_failure(
+        operation.id,
+        expected_generation=operation.generation,
+        error_code=error_code,
+        audit_context=audit_context,
+    )
+    return {
+        "operationId": str(persisted.id),
+        "state": persisted.state,
+    }
 
 
 def _worker_audit_context(*, reason_code: str | None = None) -> AuditContext:

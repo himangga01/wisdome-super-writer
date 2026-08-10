@@ -387,6 +387,98 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "apps.publishing.tasks.reconcile_remote_media",
         ("remote_media_id", "publication_attempt_id", "publication_intent_id"),
     ),
+    ("media.upload_requested", 2): EventRoute(
+        "media-upload-v2",
+        "publish.media.wordpress",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        (
+            "remote_media_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+            "target_snapshot_id",
+            "target_config_hash",
+        ),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        (
+            "remote_media_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+            "target_snapshot_id",
+            "target_config_hash",
+        ),
+    ),
+    ("media.reconcile_requested", 2): EventRoute(
+        "media-reconcile-v2",
+        "reconcile",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        (
+            "remote_media_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        (
+            "remote_media_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+    ),
+    ("delivery.prepare_requested", 2): EventRoute(
+        "delivery-prepare-v2",
+        "publish.media.wordpress",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        (
+            "public_delivery_asset_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        (
+            "public_delivery_asset_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+    ),
+    ("delivery.reconcile_requested", 2): EventRoute(
+        "delivery-reconcile-v2",
+        "reconcile",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        (
+            "public_delivery_asset_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        (
+            "public_delivery_asset_id",
+            "publication_attempt_id",
+            "publication_intent_id",
+            "operation_generation",
+        ),
+    ),
+    ("media.delete_requested", 2): EventRoute(
+        "media-delete-v2",
+        "publish.media.wordpress",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        ("remote_media_id", "operation_generation"),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        ("remote_media_id", "operation_generation"),
+    ),
+    ("delivery.delete_requested", 2): EventRoute(
+        "delivery-delete-v2",
+        "publish.media.wordpress",
+        "apps.publishing.tasks.execute_media_delivery_operation",
+        ("public_delivery_asset_id", "operation_generation"),
+        "apps.publishing.tasks.finalize_media_delivery_operation_failure",
+        ("public_delivery_asset_id", "operation_generation"),
+    ),
 }
 
 
@@ -781,6 +873,86 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
             "publication_attempt_id": UUID_FORMAT,
             "publication_intent_id": UUID_FORMAT,
         },
+    ),
+    ("media.upload_requested", 2): _schema(
+        {
+            "remote_media_id": STR,
+            "publication_attempt_id": STR,
+            "publication_intent_id": STR,
+            "operation_generation": (int,),
+            "target_snapshot_id": STR,
+            "target_config_hash": STR,
+        },
+        formats={
+            "remote_media_id": UUID_FORMAT,
+            "publication_attempt_id": UUID_FORMAT,
+            "publication_intent_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+            "target_snapshot_id": UUID_FORMAT,
+            "target_config_hash": SHA256_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
+    ),
+    ("media.reconcile_requested", 2): _schema(
+        {
+            "remote_media_id": STR,
+            "publication_attempt_id": STR,
+            "publication_intent_id": STR,
+            "operation_generation": (int,),
+        },
+        formats={
+            "remote_media_id": UUID_FORMAT,
+            "publication_attempt_id": UUID_FORMAT,
+            "publication_intent_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
+    ),
+    ("delivery.prepare_requested", 2): _schema(
+        {
+            "public_delivery_asset_id": STR,
+            "publication_attempt_id": STR,
+            "publication_intent_id": STR,
+            "operation_generation": (int,),
+        },
+        formats={
+            "public_delivery_asset_id": UUID_FORMAT,
+            "publication_attempt_id": UUID_FORMAT,
+            "publication_intent_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
+    ),
+    ("delivery.reconcile_requested", 2): _schema(
+        {
+            "public_delivery_asset_id": STR,
+            "publication_attempt_id": STR,
+            "publication_intent_id": STR,
+            "operation_generation": (int,),
+        },
+        formats={
+            "public_delivery_asset_id": UUID_FORMAT,
+            "publication_attempt_id": UUID_FORMAT,
+            "publication_intent_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
+    ),
+    ("media.delete_requested", 2): _schema(
+        {"remote_media_id": STR, "operation_generation": (int,)},
+        formats={
+            "remote_media_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
+    ),
+    ("delivery.delete_requested", 2): _schema(
+        {"public_delivery_asset_id": STR, "operation_generation": (int,)},
+        formats={
+            "public_delivery_asset_id": UUID_FORMAT,
+            "operation_generation": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"operation_generation": {1, 2, 3, 4, 5}},
     ),
 }
 

@@ -16,7 +16,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core import signing
 from django.db import IntegrityError, OperationalError, connection, transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils.module_loading import import_string
 from django.utils import timezone
 
@@ -60,6 +60,7 @@ from .models import (
     AutoPublishValidationDecision,
     ChannelCode,
     ChannelRole,
+    MediaDeliveryOperation,
     Publication,
     PublicationAction,
     PublicationApprovalHead,
@@ -134,6 +135,9 @@ _PUBLIC_DELIVERY_ASSET_NAMESPACE = uuid.UUID(
 _PUBLICATION_MEDIA_BINDING_NAMESPACE = uuid.UUID(
     "044a06a8-3d5c-40d4-930b-39be240560c3"
 )
+_MEDIA_DELIVERY_OPERATION_NAMESPACE = uuid.UUID(
+    "94acc356-3a61-4c9f-be5a-5e3ceafdb8e8"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +157,24 @@ class PublicationExecutionFence:
     lease_token_hash: str
     lease_expires_at: Any
     write_marker: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaDeliveryOperationFence:
+    operation_id: uuid.UUID
+    mapping_kind: str
+    mapping_id: uuid.UUID
+    action: str
+    generation: int
+    source_event_id: uuid.UUID
+    consumer_name: str
+    consumer_lease_generation: int
+    lease_token_hash: str
+    lease_expires_at: Any
+
+
+class MediaReferenceRestored(Conflict):
+    """The mapping became referenced before its exact delete write."""
 
 
 def _lease_token_hash(value: uuid.UUID) -> str:
@@ -6066,6 +6088,789 @@ def require_publication_media_ready_locked(
     _ready_publication_media_manifest(attempt=attempt, using=using)
 
 
+def _media_operation_event_type(
+    *,
+    mapping_kind: str,
+    action: str,
+) -> str:
+    event_types = {
+        (MediaDeliveryOperation.MappingKind.REMOTE_MEDIA, MediaDeliveryOperation.Action.UPLOAD): "media.upload_requested",
+        (MediaDeliveryOperation.MappingKind.REMOTE_MEDIA, MediaDeliveryOperation.Action.RECONCILE): "media.reconcile_requested",
+        (MediaDeliveryOperation.MappingKind.REMOTE_MEDIA, MediaDeliveryOperation.Action.DELETE): "media.delete_requested",
+        (MediaDeliveryOperation.MappingKind.PUBLIC_DELIVERY_ASSET, MediaDeliveryOperation.Action.PREPARE): "delivery.prepare_requested",
+        (MediaDeliveryOperation.MappingKind.PUBLIC_DELIVERY_ASSET, MediaDeliveryOperation.Action.RECONCILE): "delivery.reconcile_requested",
+        (MediaDeliveryOperation.MappingKind.PUBLIC_DELIVERY_ASSET, MediaDeliveryOperation.Action.DELETE): "delivery.delete_requested",
+    }
+    try:
+        return event_types[(mapping_kind, action)]
+    except KeyError as exc:
+        raise Conflict("unsupported media delivery operation") from exc
+
+
+def _media_operation_payload(
+    *,
+    mapping_kind: str,
+    mapping_id: uuid.UUID,
+    action: str,
+    generation: int,
+    attempt: PublicationAttempt | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        (
+            "remote_media_id"
+            if mapping_kind == MediaDeliveryOperation.MappingKind.REMOTE_MEDIA
+            else "public_delivery_asset_id"
+        ): str(mapping_id),
+        "operation_generation": generation,
+    }
+    if action != MediaDeliveryOperation.Action.DELETE:
+        if attempt is None:
+            raise Conflict("media prepare/reconcile requires a publication attempt")
+        payload.update(
+            {
+                "publication_attempt_id": str(attempt.id),
+                "publication_intent_id": str(attempt.publication_intent_id),
+            }
+        )
+        if action == MediaDeliveryOperation.Action.UPLOAD:
+            payload.update(
+                {
+                    "target_snapshot_id": str(attempt.target_snapshot_id),
+                    "target_config_hash": attempt.target_config_hash,
+                }
+            )
+    return payload
+
+
+@transaction.atomic
+def enqueue_media_delivery_operation_locked(
+    *,
+    remote_media: RemoteMedia | None = None,
+    public_delivery_asset: PublicDeliveryAsset | None = None,
+    action: str,
+    attempt: PublicationAttempt | None = None,
+) -> tuple[MediaDeliveryOperation, bool]:
+    if bool(remote_media) == bool(public_delivery_asset):
+        raise Conflict("media delivery operation requires exactly one mapping")
+    mapping_kind = (
+        MediaDeliveryOperation.MappingKind.REMOTE_MEDIA
+        if remote_media is not None
+        else MediaDeliveryOperation.MappingKind.PUBLIC_DELIVERY_ASSET
+    )
+    mapping = remote_media or public_delivery_asset
+    mapping_model = RemoteMedia if remote_media is not None else PublicDeliveryAsset
+    mapping = mapping_model.objects.select_for_update().get(pk=mapping.pk)
+    active = (
+        MediaDeliveryOperation.objects.select_for_update()
+        .filter(
+            **{
+                (
+                    "remote_media"
+                    if remote_media is not None
+                    else "public_delivery_asset"
+                ): mapping,
+                "state__in": (
+                    MediaDeliveryOperation.State.QUEUED,
+                    MediaDeliveryOperation.State.RUNNING,
+                ),
+            }
+        )
+        .order_by("-generation")
+        .first()
+    )
+    if active is not None:
+        if (
+            active.action != action
+            or active.publication_attempt_id
+            != (attempt.id if attempt is not None else None)
+            or active.publication_intent_id
+            != (attempt.publication_intent_id if attempt is not None else None)
+        ):
+            raise Conflict("media mapping already has a different active operation")
+        return active, False
+    generation = (
+        MediaDeliveryOperation.objects.filter(
+            **{
+                (
+                    "remote_media"
+                    if remote_media is not None
+                    else "public_delivery_asset"
+                ): mapping,
+            }
+        ).aggregate(value=Max("generation"))["value"]
+        or 0
+    ) + 1
+    if generation > 5:
+        raise Conflict("media delivery recovery budget is exhausted")
+    event_type = _media_operation_event_type(
+        mapping_kind=mapping_kind,
+        action=action,
+    )
+    payload = _media_operation_payload(
+        mapping_kind=mapping_kind,
+        mapping_id=mapping.id,
+        action=action,
+        generation=generation,
+        attempt=attempt,
+    )
+    material_hash = sha256_hex(
+        {
+            "schemaVersion": "media-delivery-operation-v1",
+            "eventType": event_type,
+            "payload": payload,
+        }
+    )
+    operation_id = uuid.uuid5(
+        _MEDIA_DELIVERY_OPERATION_NAMESPACE,
+        f"{mapping_kind}:{mapping.id}:{generation}",
+    )
+    event = _enqueue_event(
+        event_type,
+        payload,
+        event_version=2,
+        dedupe_key=f"{event_type}:{mapping.id}:{generation}",
+        aggregate_type=mapping_kind,
+        aggregate_id=mapping.id,
+        job_id=(attempt.id if attempt is not None else mapping.id),
+        correlation_id=(
+            attempt.correlation_id if attempt is not None else uuid.uuid4()
+        ),
+    )
+    operation, created = MediaDeliveryOperation.objects.get_or_create(
+        id=operation_id,
+        defaults={
+            "mapping_kind": mapping_kind,
+            "remote_media": mapping if remote_media is not None else None,
+            "public_delivery_asset": (
+                mapping if public_delivery_asset is not None else None
+            ),
+            "publication_attempt": attempt,
+            "publication_intent_id": (
+                attempt.publication_intent_id if attempt is not None else None
+            ),
+            "action": action,
+            "generation": generation,
+            "source_event": event,
+            "target_snapshot_id": (
+                attempt.target_snapshot_id
+                if attempt is not None
+                and action == MediaDeliveryOperation.Action.UPLOAD
+                else None
+            ),
+            "target_config_hash": (
+                attempt.target_config_hash
+                if attempt is not None
+                and action == MediaDeliveryOperation.Action.UPLOAD
+                else ""
+            ),
+            "material_hash": material_hash,
+        },
+    )
+    if not created and (
+        operation.mapping_kind != mapping_kind
+        or operation.action != action
+        or operation.generation != generation
+        or operation.source_event_id != event.id
+        or operation.material_hash != material_hash
+    ):
+        raise Conflict("media delivery operation replay differs from frozen material")
+    return operation, created
+
+
+def ensure_publication_media_delivery_operations_locked(
+    *,
+    attempt: PublicationAttempt,
+) -> tuple[MediaDeliveryOperation, ...]:
+    operations = []
+    for binding in prepare_publication_media_bindings_locked(attempt=attempt):
+        if binding.remote_media_id:
+            mapping = binding.remote_media
+            if mapping.state == RemoteMedia.State.AVAILABLE:
+                continue
+            action = (
+                MediaDeliveryOperation.Action.RECONCILE
+                if mapping.state == RemoteMedia.State.RECONCILING
+                else MediaDeliveryOperation.Action.UPLOAD
+            )
+            operation, _created = enqueue_media_delivery_operation_locked(
+                remote_media=mapping,
+                action=action,
+                attempt=attempt,
+            )
+        else:
+            mapping = binding.public_delivery_asset
+            if mapping.state == PublicDeliveryAsset.State.AVAILABLE:
+                continue
+            action = (
+                MediaDeliveryOperation.Action.RECONCILE
+                if mapping.delivery_object_version
+                else MediaDeliveryOperation.Action.PREPARE
+            )
+            operation, _created = enqueue_media_delivery_operation_locked(
+                public_delivery_asset=mapping,
+                action=action,
+                attempt=attempt,
+            )
+        operations.append(operation)
+    return tuple(operations)
+
+
+@transaction.atomic
+def begin_media_delivery_operation(
+    operation_id: str | uuid.UUID,
+    *,
+    expected_generation: int,
+    audit_context: AuditContext,
+) -> tuple[MediaDeliveryOperation, MediaDeliveryOperationFence | None]:
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    _require_audit_actor(audit_context, "worker")
+    operation = (
+        MediaDeliveryOperation.objects.select_for_update()
+        .select_related(
+            "source_event",
+            "remote_media",
+            "public_delivery_asset",
+        )
+        .get(pk=operation_id)
+    )
+    mapping = operation.remote_media or operation.public_delivery_asset
+    if operation.generation != expected_generation:
+        raise Conflict("media operation generation is stale")
+    source_event = _require_worker_event(
+        audit_context,
+        topic=operation.source_event.topic,
+        aggregate_id=mapping.id,
+        payload_identity=operation.source_event.payload,
+    )
+    if source_event.id != operation.source_event_id:
+        raise Conflict("media operation source event is stale")
+    receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+        event=source_event,
+        consumer_name=audit_context.worker_consumer_name,
+        state=OutboxConsumerReceipt.State.PROCESSING,
+        lease_generation=audit_context.worker_lease_generation,
+        lease_token=audit_context.worker_lease_token,
+        claimed_until__gt=timezone.now(),
+    )
+    if operation.state in {
+        MediaDeliveryOperation.State.SUCCEEDED,
+        MediaDeliveryOperation.State.MANUAL_REQUIRED,
+        MediaDeliveryOperation.State.DELIVERY_FAILED,
+        MediaDeliveryOperation.State.SUPERSEDED,
+    }:
+        return operation, None
+    if operation.state == MediaDeliveryOperation.State.RUNNING:
+        if (
+            operation.consumer_name == receipt.consumer_name
+            and operation.consumer_lease_generation == receipt.lease_generation
+            and operation.consumer_lease_token == receipt.lease_token
+            and operation.lease_token_hash
+            == _lease_token_hash(receipt.lease_token)
+        ):
+            return operation, None
+        before_material = _audit_state(operation)
+        if operation.external_write_started_at is not None:
+            operation.state = MediaDeliveryOperation.State.UNKNOWN_OUTCOME
+            operation.error_code = "media_delivery_capability_reclaimed"
+            operation.finished_at = timezone.now()
+            operation.save(
+                update_fields=("state", "error_code", "finished_at")
+            )
+            if operation.remote_media_id:
+                mapping.state = RemoteMedia.State.RECONCILING
+                mapping.save(update_fields=("state",))
+            recovery_action = (
+                MediaDeliveryOperation.Action.DELETE
+                if operation.action == MediaDeliveryOperation.Action.DELETE
+                else MediaDeliveryOperation.Action.RECONCILE
+            )
+            enqueue_media_delivery_operation_locked(
+                remote_media=(mapping if operation.remote_media_id else None),
+                public_delivery_asset=(
+                    mapping if operation.public_delivery_asset_id else None
+                ),
+                action=recovery_action,
+                attempt=operation.publication_attempt,
+            )
+            _record_publishing_audit(
+                audit_context=audit_context,
+                action="media_delivery_operation.reclaimed",
+                entity=operation,
+                identity_key=(
+                    f"{audit_context.event_key}:media-reclaimed:"
+                    f"{operation.generation}"
+                ),
+                before_material=before_material,
+                after_material=_audit_state(operation),
+                metadata={
+                    "operation_id": str(operation.id),
+                    "generation": operation.generation,
+                    "error_code": operation.error_code,
+                    "state": operation.state,
+                },
+            )
+            return operation, None
+        operation.consumer_name = receipt.consumer_name
+        operation.consumer_lease_generation = receipt.lease_generation
+        operation.consumer_lease_token = receipt.lease_token
+        operation.lease_token_hash = _lease_token_hash(receipt.lease_token)
+        operation.lease_expires_at = receipt.claimed_until
+        operation.started_at = timezone.now()
+        operation.save(
+            update_fields=(
+                "consumer_name",
+                "consumer_lease_generation",
+                "consumer_lease_token",
+                "lease_token_hash",
+                "lease_expires_at",
+                "started_at",
+            )
+        )
+        return operation, MediaDeliveryOperationFence(
+            operation_id=operation.id,
+            mapping_kind=operation.mapping_kind,
+            mapping_id=mapping.id,
+            action=operation.action,
+            generation=operation.generation,
+            source_event_id=source_event.id,
+            consumer_name=receipt.consumer_name,
+            consumer_lease_generation=receipt.lease_generation,
+            lease_token_hash=operation.lease_token_hash,
+            lease_expires_at=receipt.claimed_until,
+        )
+    if operation.state != MediaDeliveryOperation.State.QUEUED:
+        raise Conflict("media operation is not claimable")
+    operation.state = MediaDeliveryOperation.State.RUNNING
+    operation.consumer_name = receipt.consumer_name
+    operation.consumer_lease_generation = receipt.lease_generation
+    operation.consumer_lease_token = receipt.lease_token
+    operation.lease_token_hash = _lease_token_hash(receipt.lease_token)
+    operation.lease_expires_at = receipt.claimed_until
+    operation.started_at = timezone.now()
+    operation.save(
+        update_fields=(
+            "state",
+            "consumer_name",
+            "consumer_lease_generation",
+            "consumer_lease_token",
+            "lease_token_hash",
+            "lease_expires_at",
+            "started_at",
+        )
+    )
+    return operation, MediaDeliveryOperationFence(
+        operation_id=operation.id,
+        mapping_kind=operation.mapping_kind,
+        mapping_id=mapping.id,
+        action=operation.action,
+        generation=operation.generation,
+        source_event_id=source_event.id,
+        consumer_name=receipt.consumer_name,
+        consumer_lease_generation=receipt.lease_generation,
+        lease_token_hash=operation.lease_token_hash,
+        lease_expires_at=receipt.claimed_until,
+    )
+
+
+@transaction.atomic
+def authorize_media_delivery_external_write(
+    fence: MediaDeliveryOperationFence,
+    *,
+    audit_context: AuditContext,
+) -> str:
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    _require_audit_actor(audit_context, "worker")
+    operation = (
+        MediaDeliveryOperation.objects.select_for_update()
+        .select_related(
+            "source_event",
+            "remote_media",
+            "public_delivery_asset",
+            "publication_attempt__publication_intent",
+            "publication_attempt__publication__target",
+            "publication_attempt__approval",
+        )
+        .get(pk=fence.operation_id)
+    )
+    mapping = operation.remote_media or operation.public_delivery_asset
+    source_event = _require_worker_event(
+        audit_context,
+        topic=operation.source_event.topic,
+        aggregate_id=mapping.id,
+        payload_identity=operation.source_event.payload,
+    )
+    receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+        event=source_event,
+        consumer_name=fence.consumer_name,
+        state=OutboxConsumerReceipt.State.PROCESSING,
+        lease_generation=fence.consumer_lease_generation,
+        lease_token=audit_context.worker_lease_token,
+        claimed_until__gt=timezone.now(),
+    )
+    if (
+        operation.state != MediaDeliveryOperation.State.RUNNING
+        or operation.mapping_kind != fence.mapping_kind
+        or mapping.id != fence.mapping_id
+        or operation.action != fence.action
+        or operation.generation != fence.generation
+        or operation.source_event_id != fence.source_event_id
+        or operation.consumer_name != fence.consumer_name
+        or operation.consumer_lease_generation
+        != fence.consumer_lease_generation
+        or operation.consumer_lease_token != receipt.lease_token
+        or operation.lease_token_hash != fence.lease_token_hash
+        or _lease_token_hash(receipt.lease_token) != fence.lease_token_hash
+    ):
+        raise Conflict("media delivery external-write capability is stale")
+    if operation.action == MediaDeliveryOperation.Action.DELETE:
+        reference_count, _bindings = _media_cleanup_reference_count_locked(
+            mapping=mapping
+        )
+        if reference_count:
+            raise MediaReferenceRestored(
+                "media mapping was referenced again before delete"
+            )
+    if operation.publication_attempt_id:
+        validate_attempt_gate(
+            operation.publication_attempt,
+            require_media=False,
+        )
+    _assert_external_writes_allowed()
+    marker = sha256_hex(
+        {
+            "schemaVersion": "media-delivery-write-v1",
+            "operationId": str(operation.id),
+            "generation": operation.generation,
+            "sourceEventId": str(operation.source_event_id),
+            "consumer": operation.consumer_name,
+            "consumerLeaseGeneration": operation.consumer_lease_generation,
+            "leaseTokenHash": operation.lease_token_hash,
+        }
+    )
+    if operation.write_marker:
+        if operation.write_marker != marker:
+            raise Conflict("media delivery write marker differs from capability")
+        return marker
+    operation.write_marker = marker
+    operation.external_write_started_at = timezone.now()
+    operation.save(
+        update_fields=("write_marker", "external_write_started_at")
+    )
+    return marker
+
+
+@transaction.atomic
+def persist_media_delivery_operation_result(
+    fence: MediaDeliveryOperationFence,
+    *,
+    result: dict[str, Any],
+    audit_context: AuditContext,
+) -> MediaDeliveryOperation:
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    _require_audit_actor(audit_context, "worker")
+    operation = (
+        MediaDeliveryOperation.objects.select_for_update()
+        .select_related(
+            "source_event",
+            "remote_media",
+            "public_delivery_asset",
+            "publication_attempt",
+        )
+        .get(pk=fence.operation_id)
+    )
+    mapping = operation.remote_media or operation.public_delivery_asset
+    source_event = _require_worker_event_identity(
+        audit_context,
+        topic=operation.source_event.topic,
+        aggregate_id=mapping.id,
+        payload_identity=operation.source_event.payload,
+    )
+    result_hash = sha256_hex(
+        {
+            "schemaVersion": "media-delivery-result-v1",
+            "operationId": str(operation.id),
+            "generation": operation.generation,
+            "result": result,
+        }
+    )
+    receipt = OutboxConsumerReceipt.objects.select_for_update().filter(
+        event=source_event,
+        consumer_name=operation.consumer_name,
+    ).first()
+    current_capability = (
+        operation.state == MediaDeliveryOperation.State.RUNNING
+        and operation.id == fence.operation_id
+        and operation.mapping_kind == fence.mapping_kind
+        and mapping.id == fence.mapping_id
+        and operation.action == fence.action
+        and operation.generation == fence.generation
+        and operation.source_event_id == fence.source_event_id
+        and operation.consumer_name == fence.consumer_name
+        and operation.consumer_lease_generation
+        == fence.consumer_lease_generation
+        and operation.lease_token_hash == fence.lease_token_hash
+        and audit_context.worker_consumer_name == fence.consumer_name
+        and audit_context.worker_lease_generation
+        == fence.consumer_lease_generation
+        and _lease_token_hash(audit_context.worker_lease_token)
+        == fence.lease_token_hash
+        and receipt is not None
+        and receipt.lease_generation == fence.consumer_lease_generation
+        and receipt.lease_token == audit_context.worker_lease_token
+    )
+    if not current_capability:
+        _record_publishing_audit(
+            audit_context=audit_context,
+            action="media_delivery_operation.late_result",
+            entity=operation,
+            identity_key=(
+                f"{audit_context.event_key}:media-late-result:"
+                f"{operation.generation}:{result_hash}"
+            ),
+            before_material=_audit_state(operation),
+            after_material=_audit_state(operation),
+            metadata={
+                "operation_id": str(operation.id),
+                "generation": operation.generation,
+                "result_hash": result_hash,
+                "state": operation.state,
+            },
+        )
+        return operation
+
+    status = result.get("status")
+    if status not in {"succeeded", "unknown_outcome", "manual_required"}:
+        raise Conflict("media delivery result status is invalid")
+    before_material = {
+        "operation": _audit_state(operation),
+        "mapping": _audit_state(mapping),
+    }
+    now = timezone.now()
+    if status == "succeeded":
+        if operation.mapping_kind == MediaDeliveryOperation.MappingKind.REMOTE_MEDIA:
+            if operation.action == MediaDeliveryOperation.Action.DELETE:
+                mapping.state = RemoteMedia.State.DELETED
+                mapping.deleted_at = now
+                mapping.save(update_fields=("state", "deleted_at"))
+            else:
+                remote_media_id = result.get("remote_media_id")
+                remote_url = _validated_remote_url(result.get("remote_url"))
+                if not remote_media_id or not remote_url:
+                    raise Conflict("remote media success proof is incomplete")
+                mapping.state = RemoteMedia.State.AVAILABLE
+                mapping.remote_media_id = str(remote_media_id)
+                mapping.remote_source_url = remote_url
+                mapping.last_reconciled_at = now
+                mapping.last_reconcile_hash = result_hash
+                mapping.save(
+                    update_fields=(
+                        "state",
+                        "remote_media_id",
+                        "remote_source_url",
+                        "last_reconciled_at",
+                        "last_reconcile_hash",
+                    )
+                )
+        else:
+            if operation.action == MediaDeliveryOperation.Action.DELETE:
+                mapping.state = PublicDeliveryAsset.State.DELETED
+                mapping.deleted_at = now
+                mapping.save(update_fields=("state", "deleted_at"))
+            else:
+                if (
+                    result.get("asset_checksum") != mapping.asset_checksum
+                    or result.get("presentation_hash")
+                    != mapping.presentation_hash
+                    or result.get("mime_type") != mapping.mime_type
+                    or result.get("byte_size") != mapping.byte_size
+                    or not result.get("object_version")
+                ):
+                    raise Conflict("public delivery success proof is incomplete")
+                public_url = _validated_remote_url(result.get("public_url"))
+                if not public_url:
+                    raise Conflict("public delivery URL is missing")
+                mapping.state = PublicDeliveryAsset.State.AVAILABLE
+                mapping.delivery_object_version = str(result["object_version"])
+                mapping.public_url = public_url
+                mapping.last_reconciled_at = now
+                mapping.last_remote_body_hash = result_hash
+                mapping.save(
+                    update_fields=(
+                        "state",
+                        "delivery_object_version",
+                        "public_url",
+                        "last_reconciled_at",
+                        "last_remote_body_hash",
+                    )
+                )
+        PublicationMedia.objects.filter(
+            **{
+                (
+                    "remote_media"
+                    if operation.remote_media_id
+                    else "public_delivery_asset"
+                ): mapping,
+                "binding_state": PublicationMedia.BindingState.PREPARED,
+            }
+        ).update(
+            binding_state=PublicationMedia.BindingState.ACTIVE,
+            remote_verified_at=now,
+        )
+        operation.state = MediaDeliveryOperation.State.SUCCEEDED
+    elif status == "unknown_outcome":
+        operation.state = MediaDeliveryOperation.State.UNKNOWN_OUTCOME
+        if operation.remote_media_id:
+            mapping.state = RemoteMedia.State.RECONCILING
+            mapping.save(update_fields=("state",))
+        operation.error_code = str(result.get("error_code") or "unknown_outcome")[:100]
+    else:
+        operation.state = MediaDeliveryOperation.State.MANUAL_REQUIRED
+        if operation.remote_media_id:
+            mapping.state = RemoteMedia.State.FAILED
+            mapping.save(update_fields=("state",))
+        operation.error_code = str(result.get("error_code") or "manual_required")[:100]
+    operation.result_hash = result_hash
+    operation.finished_at = now
+    operation.save(
+        update_fields=(
+            "state",
+            "result_hash",
+            "error_code",
+            "finished_at",
+        )
+    )
+    _record_publishing_audit(
+        audit_context=audit_context,
+        action="media_delivery_operation.finished",
+        entity=operation,
+        identity_key=(
+            f"{audit_context.event_key}:media-result:{operation.generation}"
+        ),
+        before_material=before_material,
+        after_material={
+            "operation": _audit_state(operation),
+            "mapping": _audit_state(mapping),
+        },
+        metadata={
+            "operation_id": str(operation.id),
+            "generation": operation.generation,
+            "result_hash": result_hash,
+            "state": operation.state,
+        },
+    )
+    if operation.state == MediaDeliveryOperation.State.UNKNOWN_OUTCOME:
+        enqueue_media_delivery_operation_locked(
+            remote_media=(mapping if operation.remote_media_id else None),
+            public_delivery_asset=(
+                mapping if operation.public_delivery_asset_id else None
+            ),
+            action=MediaDeliveryOperation.Action.RECONCILE,
+            attempt=operation.publication_attempt,
+        )
+    elif (
+        operation.state == MediaDeliveryOperation.State.SUCCEEDED
+        and operation.publication_attempt_id
+    ):
+        attempt = PublicationAttempt.objects.get(pk=operation.publication_attempt_id)
+        try:
+            require_publication_media_ready_locked(attempt=attempt)
+        except Conflict:
+            pass
+        else:
+            _queue_attempt_on_commit(attempt)
+    return operation
+
+
+@transaction.atomic
+def finalize_media_delivery_operation_failure(
+    operation_id: str | uuid.UUID,
+    *,
+    expected_generation: int,
+    error_code: str,
+    audit_context: AuditContext,
+) -> MediaDeliveryOperation:
+    _require_audit_actor(audit_context, "worker")
+    preliminary = (
+        MediaDeliveryOperation.objects.select_related("source_event")
+        .filter(pk=operation_id)
+        .first()
+    )
+    if preliminary is None:
+        raise Conflict("media delivery operation does not exist")
+    mapping_id = (
+        preliminary.remote_media_id
+        or preliminary.public_delivery_asset_id
+    )
+    source_event = _require_worker_event_identity(
+        audit_context,
+        topic=preliminary.source_event.topic,
+        aggregate_id=mapping_id,
+        payload_identity=preliminary.source_event.payload,
+    )
+    if source_event.id != preliminary.source_event_id:
+        raise Conflict("media operation source event is stale")
+    _require_terminal_reservation_locked(
+        source_event,
+        audit_context=audit_context,
+        error_code=error_code,
+    )
+    operation = MediaDeliveryOperation.objects.select_for_update().get(
+        pk=preliminary.pk
+    )
+    if operation.generation != expected_generation:
+        raise Conflict("media operation terminal generation is stale")
+    normalized_error = str(
+        error_code or "media_delivery_exhausted"
+    )[:100]
+    identity_key = (
+        f"{audit_context.event_key}:media-delivery-failure:"
+        f"{operation.generation}"
+    )
+    metadata = {
+        "operation_id": str(operation.id),
+        "generation": operation.generation,
+        "error_code": normalized_error,
+        "state": MediaDeliveryOperation.State.DELIVERY_FAILED,
+    }
+    if _worker_audit_replay(
+        audit_context,
+        entity=operation,
+        candidates=((
+            "media_delivery_operation.delivery_failed",
+            identity_key,
+            metadata,
+        ),),
+    ):
+        return operation
+    if operation.state == MediaDeliveryOperation.State.DELIVERY_FAILED:
+        raise Conflict("media delivery terminal audit is missing")
+    if operation.state not in {
+        MediaDeliveryOperation.State.QUEUED,
+        MediaDeliveryOperation.State.RUNNING,
+    }:
+        raise Conflict(
+            "completed media delivery operation cannot fail delivery"
+        )
+    before_material = _audit_state(operation)
+    operation.state = MediaDeliveryOperation.State.DELIVERY_FAILED
+    operation.error_code = normalized_error
+    operation.finished_at = timezone.now()
+    operation.save(update_fields=("state", "error_code", "finished_at"))
+    _record_publishing_audit(
+        audit_context=audit_context,
+        action="media_delivery_operation.delivery_failed",
+        entity=operation,
+        identity_key=identity_key,
+        before_material=before_material,
+        after_material=_audit_state(operation),
+        metadata=metadata,
+    )
+    return operation
+
+
 @transaction.atomic
 def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
     asset_cohort = freeze_revision_asset_cohort(revision=revision)
@@ -6844,6 +7649,7 @@ def _dispatch_publication_atomic(
         raise Conflict("withdrawal intent must be approved before dispatch")
     before_material = _audit_state(intent)
     attempts: list[PublicationAttempt] = []
+    media_pending_attempt_ids: set[uuid.UUID] = set()
     for target_id in requested_ids:
         target = target_rows.get(target_id)
         command = command_map.get(target_id)
@@ -6909,7 +7715,11 @@ def _dispatch_publication_atomic(
                 }
             ),
         )
-        prepare_publication_media_bindings_locked(attempt=attempt)
+        media_operations = ensure_publication_media_delivery_operations_locked(
+            attempt=attempt
+        )
+        if media_operations:
+            media_pending_attempt_ids.add(attempt.id)
         attempts.append(attempt)
     attempts_manifest = _publication_attempt_manifest(attempts)
     attempts_hash = sha256_hex(attempts_manifest)
@@ -6928,7 +7738,14 @@ def _dispatch_publication_atomic(
     publish_at = data.get("publishAt")
     wordpress = [row for row in attempts if row.publication.target.channel == ChannelCode.WORDPRESS]
     blogger = [row for row in attempts if row.publication.target.channel == ChannelCode.BLOGGER]
-    initial = wordpress or [row for row in blogger if _wordpress_dependency_ready(row)]
+    initial = [
+        row
+        for row in (
+            wordpress
+            or [row for row in blogger if _wordpress_dependency_ready(row)]
+        )
+        if row.id not in media_pending_attempt_ids
+    ]
     for attempt in initial:
         _queue_attempt_on_commit(attempt, publish_at=publish_at)
     _record_publishing_audit(
@@ -7199,7 +8016,11 @@ def _assert_external_writes_allowed() -> None:
         raise PublisherError("global_kill_switch_enabled", category="retryable")
 
 
-def validate_attempt_gate(attempt: PublicationAttempt) -> None:
+def validate_attempt_gate(
+    attempt: PublicationAttempt,
+    *,
+    require_media: bool = True,
+) -> None:
     _require_attempt_origin_run_active(attempt)
     if _kill_switch_enabled():
         raise Conflict("전역 kill switch가 활성화되어 외부 쓰기가 차단되었습니다.")
@@ -7292,7 +8113,8 @@ def validate_attempt_gate(attempt: PublicationAttempt) -> None:
         if not _wordpress_dependency_ready(attempt):
             raise Conflict("WordPress 대표 원문의 공개 확인을 기다리고 있습니다.")
 
-    require_publication_media_ready_locked(attempt=attempt)
+    if require_media:
+        require_publication_media_ready_locked(attempt=attempt)
 
 
 def _final_render(attempt: PublicationAttempt) -> ArticleChannelRender | None:
@@ -10622,6 +11444,243 @@ def schedule_public_delivery_deletion(asset_id: str) -> PublicDeliveryAsset:
         asset.delete_after = timezone.now() + timedelta(days=30)
     asset.save()
     return asset
+
+
+def _media_cleanup_reference_count_locked(
+    *,
+    mapping: RemoteMedia | PublicDeliveryAsset,
+) -> tuple[int, tuple[PublicationMedia, ...]]:
+    mapping_filter = (
+        {"remote_media": mapping}
+        if isinstance(mapping, RemoteMedia)
+        else {"public_delivery_asset": mapping}
+    )
+    bindings = tuple(
+        PublicationMedia.objects.select_for_update()
+        .select_related("publication")
+        .filter(**mapping_filter)
+        .order_by("id")
+    )
+    binding_ids = [row.id for row in bindings]
+    publication_ids = sorted(
+        {row.publication_id for row in bindings},
+        key=str,
+    )
+    article_ids = sorted(
+        {row.publication.article_id for row in bindings},
+        key=str,
+    )
+    protected_bindings = sum(
+        row.binding_state
+        in {
+            PublicationMedia.BindingState.PREPARED,
+            PublicationMedia.BindingState.ACTIVE,
+            PublicationMedia.BindingState.REMOVAL_PENDING,
+        }
+        for row in bindings
+    )
+    remote_body_references = sum(bool(row.remote_body_hash) for row in bindings)
+    active_attempts = 0
+    if publication_ids:
+        active_attempts = len(
+            list(
+                PublicationAttempt.objects.select_for_update()
+                .filter(
+                    publication_id__in=publication_ids,
+                    state__in=(
+                        PublicationAttempt.State.QUEUED,
+                        PublicationAttempt.State.RUNNING,
+                        PublicationAttempt.State.RETRYABLE_FAILED,
+                        PublicationAttempt.State.UNKNOWN_OUTCOME,
+                        PublicationAttempt.State.RECONCILING,
+                    ),
+                )
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+        )
+    active_corrections = 0
+    if article_ids:
+        CorrectionCase = apps.get_model("editorial", "CorrectionCase")
+        active_corrections = len(
+            list(
+                CorrectionCase.objects.select_for_update()
+                .filter(
+                    article_id__in=article_ids,
+                    state__in=(
+                        "detected",
+                        "verifying",
+                        "verified",
+                        "applying",
+                    ),
+                )
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+        )
+    operation_filter = (
+        {"remote_media": mapping}
+        if isinstance(mapping, RemoteMedia)
+        else {"public_delivery_asset": mapping}
+    )
+    active_non_delete_operations = len(
+        list(
+            MediaDeliveryOperation.objects.select_for_update()
+            .filter(
+                **operation_filter,
+                state__in=(
+                    MediaDeliveryOperation.State.QUEUED,
+                    MediaDeliveryOperation.State.RUNNING,
+                ),
+            )
+            .exclude(action=MediaDeliveryOperation.Action.DELETE)
+            .order_by("id")
+            .values_list("id", flat=True)
+        )
+    )
+    RetentionHold = apps.get_model("audit", "RetentionHold")
+    now = timezone.now()
+    hold_query = Q(
+        scope_type=mapping._meta.label_lower,
+        scope_id=mapping.id,
+    ) | Q(
+        scope_type=mapping._meta.model_name,
+        scope_id=mapping.id,
+    )
+    if binding_ids:
+        hold_query |= Q(
+            scope_type="publication_media",
+            scope_id__in=binding_ids,
+        )
+    active_holds = len(
+        list(
+            RetentionHold.objects.select_for_update()
+            .filter(active=True)
+            .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+            .filter(hold_query)
+            .order_by("id")
+            .values_list("id", flat=True)
+        )
+    )
+    return (
+        protected_bindings
+        + remote_body_references
+        + active_attempts
+        + active_corrections
+        + active_non_delete_operations
+        + active_holds,
+        bindings,
+    )
+
+
+@transaction.atomic
+def schedule_orphan_media_cleanup_locked(
+    *,
+    remote_media_id: str | uuid.UUID | None = None,
+    public_delivery_asset_id: str | uuid.UUID | None = None,
+) -> MediaDeliveryOperation | None:
+    if bool(remote_media_id) == bool(public_delivery_asset_id):
+        raise InvalidInput("cleanup requires exactly one media mapping")
+    if remote_media_id:
+        mapping = RemoteMedia.objects.select_for_update().get(
+            pk=remote_media_id
+        )
+        operation_filter = {"remote_media": mapping}
+    else:
+        mapping = PublicDeliveryAsset.objects.select_for_update().get(
+            pk=public_delivery_asset_id
+        )
+        operation_filter = {"public_delivery_asset": mapping}
+    reference_count, _bindings = _media_cleanup_reference_count_locked(
+        mapping=mapping
+    )
+    active_delete = (
+        MediaDeliveryOperation.objects.select_for_update()
+        .filter(
+            **operation_filter,
+            action=MediaDeliveryOperation.Action.DELETE,
+            state__in=(
+                MediaDeliveryOperation.State.QUEUED,
+                MediaDeliveryOperation.State.RUNNING,
+            ),
+        )
+        .order_by("generation")
+        .first()
+    )
+    now = timezone.now()
+    if reference_count:
+        if active_delete is not None:
+            if active_delete.external_write_started_at is not None:
+                raise Conflict(
+                    "media delete already crossed the external-write fence"
+                )
+            active_delete.state = MediaDeliveryOperation.State.SUPERSEDED
+            active_delete.error_code = "media_reference_restored"
+            active_delete.finished_at = now
+            active_delete.save(
+                update_fields=("state", "error_code", "finished_at")
+            )
+        if isinstance(mapping, RemoteMedia):
+            mapping.state = (
+                RemoteMedia.State.AVAILABLE
+                if mapping.remote_media_id and mapping.remote_source_url
+                else RemoteMedia.State.PENDING
+            )
+            mapping.orphaned_at = None
+            mapping.save(update_fields=("state", "orphaned_at"))
+        else:
+            mapping.state = (
+                PublicDeliveryAsset.State.AVAILABLE
+                if mapping.delivery_object_version and mapping.public_url
+                else PublicDeliveryAsset.State.PENDING
+            )
+            mapping.active_reference_count = reference_count
+            mapping.zero_reference_at = None
+            mapping.delete_after = None
+            mapping.save(
+                update_fields=(
+                    "state",
+                    "active_reference_count",
+                    "zero_reference_at",
+                    "delete_after",
+                )
+            )
+        return None
+    if active_delete is not None:
+        return active_delete
+    if isinstance(mapping, RemoteMedia):
+        if mapping.orphaned_at is None:
+            mapping.state = RemoteMedia.State.ORPHANED
+            mapping.orphaned_at = now
+            mapping.save(update_fields=("state", "orphaned_at"))
+            return None
+        if mapping.orphaned_at > now - timedelta(days=30):
+            return None
+    else:
+        if mapping.zero_reference_at is None or mapping.delete_after is None:
+            mapping.state = PublicDeliveryAsset.State.PENDING_DELETE
+            mapping.active_reference_count = 0
+            mapping.zero_reference_at = now
+            mapping.delete_after = now + timedelta(days=30)
+            mapping.save(
+                update_fields=(
+                    "state",
+                    "active_reference_count",
+                    "zero_reference_at",
+                    "delete_after",
+                )
+            )
+            return None
+        if mapping.delete_after > now:
+            return None
+    operation, _created = enqueue_media_delivery_operation_locked(
+        remote_media=(mapping if isinstance(mapping, RemoteMedia) else None),
+        public_delivery_asset=(
+            mapping if isinstance(mapping, PublicDeliveryAsset) else None
+        ),
+        action=MediaDeliveryOperation.Action.DELETE,
+    )
+    return operation
 
 
 def _has_valid_retry_reservation(attempt: PublicationAttempt) -> bool:

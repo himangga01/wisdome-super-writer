@@ -359,6 +359,13 @@ _REMOTE_MEDIA_KEYS = (
     "status",
     "target_id",
 )
+_MEDIA_DELIVERY_OPERATION_KEYS = (
+    "error_code",
+    "generation",
+    "operation_id",
+    "result_hash",
+    "state",
+)
 
 ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
     **{
@@ -476,6 +483,15 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
         for action in (
             "remote_media.reconcile_started",
             "remote_media.reconciled",
+        )
+    },
+    **{
+        (action, "1"): _policy(*_MEDIA_DELIVERY_OPERATION_KEYS)
+        for action in (
+            "media_delivery_operation.delivery_failed",
+            "media_delivery_operation.finished",
+            "media_delivery_operation.late_result",
+            "media_delivery_operation.reclaimed",
         )
     },
 }

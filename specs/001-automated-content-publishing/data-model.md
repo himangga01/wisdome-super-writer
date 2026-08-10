@@ -1794,6 +1794,50 @@ Publication 1 ── * PublicationMedia * ── 1 PublicDeliveryAsset
 PublishedEvidenceSnapshot 1 ── * PublicationMedia
 PublishedVisualizationSnapshot 1 ── * PublishedVisualizationInput * ── 1 PublishedEvidenceSnapshot
 PublishedVisualizationSnapshot 1 ── * PublicationMedia
+
+## 한국어 — T022 불변 발행 자산 정본
+
+`PublishedAssetCohort`는 revision당 하나이며 정렬된 manifest와 hash를 append-only로 보존한다.
+각 항목은 `PublishedEvidenceSnapshot` 또는 `PublishedVisualizationSnapshot` 하나이고, 원본 object
+key/version, checksum, MIME/크기, 권리·표시 문구, source/renderer/input provenance를 동결한다.
+`ArticleChannelRender.media_manifest`에는 이 bounded snapshot 정본만 들어간다.
+
+`PublicationMedia`는 publication·revision·cohort와 정확히 하나의 snapshot을 WordPress
+`RemoteMedia` 또는 Blogger `PublicDeliveryAsset` 하나에 결속한다. preview, approval, dispatch,
+publication attempt와 외부 쓰기 직전 gate는 같은 cohort/hash와 current rights/source/render
+lineage를 재검증한다. WordPress mapping은 `(target, asset_checksum, presentation_hash)`, Blogger
+mapping은 `(asset_checksum, presentation_hash)`가 content-addressed identity다.
+
+`MediaDeliveryOperation`은 mapping XOR, action, 1~5 generation, source event, optional
+attempt/intent, target snapshot/config, material hash와 receipt capability를 가진 append-only ledger다.
+identity 변경·삭제, generation gap, 교차 event/attempt/target 결속, 잘못된 상태 전이는 ORM과
+SQLite/PostgreSQL trigger가 거부한다. terminal 결과와 superseded 결정은 불변이다.
+
+삭제 후보는 캐시된 reference count만 믿지 않는다. binding, active/recovery attempt, 원격 본문
+참조, correction, retention/rights hold와 active non-delete operation을 정렬 잠금해 다시 센다.
+0건이 처음 확인되면 30일 유예를 시작하고, 유예 후 다시 0건일 때만 exact delete operation을
+만든다. 유예 또는 queued delete 중 재참조되면 외부 write 전 delete generation을
+`superseded`로 종결하고 mapping을 복구한다. WordPress는 exact media ID, Blogger는 non-empty
+exact object version을 사용한 삭제가 확인된 뒤에만 tombstone을 투영한다.
+
+## English / AI-readable — T022 immutable publication asset model
+
+Each revision owns one append-only `PublishedAssetCohort` with an ordered manifest and hash. Every
+item is exactly one evidence or visualization snapshot freezing object key/version, checksum,
+MIME/size, rights and presentation text, and source/renderer/input provenance. Channel renders store
+only this bounded snapshot manifest. `PublicationMedia` binds publication, revision, cohort, and one
+snapshot to either a WordPress `RemoteMedia` mapping or a Blogger `PublicDeliveryAsset` mapping.
+Preview, approval, dispatch, attempt, and pre-I/O gates recompute the same material and current
+eligibility.
+
+`MediaDeliveryOperation` is an append-only mapping-XOR ledger with action, contiguous generation
+1..5, exact source event, optional attempt/intent, target snapshot/config, material hash, and internal
+receipt capability. ORM plus SQLite/PostgreSQL guards reject identity mutation, deletion, generation
+gaps, cross-lineage insertion, and invalid state transitions; terminal and superseded rows are
+immutable. Cleanup locks and recounts bindings, active/recovery attempts, remote-body references,
+corrections, holds, and active non-delete operations. It starts a 30-day grace at zero references and
+creates an exact delete generation only after a second zero count. Re-reference supersedes an
+unstarted delete. Tombstones require an exact WordPress media ID or non-empty exact S3 object version.
 EvidenceAsset 1 ── * RemoteMedia * ── 1 PublicationTarget
 SourceItem/DraftArticle 1 ── * CorrectionCase
 모든 주요 엔터티 1 ── * AuditEvent
@@ -1805,7 +1849,7 @@ SourceItem/DraftArticle 1 ── * CorrectionCase
 |---|---:|---|
 | 원문·파생 객체, SourceItem, RunSourceItem, DocumentExtraction, ExtractionRun, GenericExtractionAttempt, EvidenceAsset | 마지막 관련 게시/초안 이후 90일 | 권리·분쟁 보존이 없을 때 raw bytes/text와 상세 추출 DB를 만료하고 장기 참조 FK는 SET NULL/tombstone; package/model/config 지문과 PublishedEvidenceSnapshot은 별도 정책으로 보존 |
 | 미발행 초안과 개정 | 마지막 수정 후 90일 | 주장/품질/배치와 함께 삭제 |
-| 미참조 WordPress 원격 미디어 | prepared/active/in-flight 보호 참조 0개로 고아 표시 후 7일 | 행 잠금·lease CAS로 재조정 후 외부 bytes만 삭제; mapping tombstone은 발행 감사 만료까지 유지 |
+| 미참조 WordPress 원격 미디어 | prepared/active/in-flight/remote-body/correction/hold 보호 참조 0개로 고아 표시 후 최소 30일 | 행 잠금 재집계와 append-only delete operation으로 exact media ID를 삭제한 뒤 mapping tombstone 유지; 재참조는 write 전 delete를 supersede |
 | PublicDeliveryAsset | 활성 공개/marked-withdrawn 참조가 존재하는 동안 | 참조 0·원격 조정 완료·hold 없음 이후 최소 30일 grace 뒤 재확인 삭제; 90일 evidence purge와 독립 |
 | PublishedEvidenceSnapshot, PublishedVisualizationSnapshot, EvidenceAuditSnapshot, 발행 기록, 시도, 승인, EvidenceReviewDecision, 정정, 감사 이벤트 | 발행/결정/사건 종료 중 가장 늦은 시점부터 1년 | raw FK가 null이어도 출처 identity/version·주장 관계·시각화 입력·권리/표시 snapshot을 유지; 공개 Publication이나 열린 정정/권리 hold가 참조하면 만료를 보류하고 이후 감사 보존 작업으로 삭제 |
 | SourceDefinition/Snapshot, SourceRegistrySnapshot/Membership/Mutation/Decision, ExtractionProfileSnapshot/Decision, AutoPublishValidation/Decision/Activation | 이를 참조하는 run/publication/validation/audit 중 가장 늦은 종료부터 최소 1년 | 비민감 immutable config/material/decision 지문과 FK는 hold까지 유지; 큰 calibration report/model manifest bytes는 참조 0·감사 snapshot 생성 뒤 별도 object lifecycle로 만료하되 key/version/hash metadata는 유지 |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 from collections.abc import Callable
 from dataclasses import replace
@@ -291,10 +292,18 @@ class WordPressPublisher:
         caption: str,
         description_marker: str,
     ) -> PublishResult:
-        existing = self.find_media(remote_lookup_key, description_marker)
+        expected_checksum = hashlib.sha256(content).hexdigest()
+        existing = self.find_media(
+            remote_lookup_key=remote_lookup_key,
+            description_marker=description_marker,
+            expected_alt_text=alt_text,
+            expected_caption=caption,
+            expected_checksum=expected_checksum,
+            expected_mime_type=mime_type,
+        )
         if existing.status == "succeeded":
             return existing
-        if existing.error_code == "remote_match_not_unique":
+        if existing.status != "not_found":
             return existing
         safe_name = PurePath(filename).name.replace('"', "") or "asset"
         mime_type = mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
@@ -321,16 +330,38 @@ class WordPressPublisher:
                 "description": description_marker,
             },
         )
+        verified = self.find_media(
+            remote_lookup_key=remote_lookup_key,
+            description_marker=description_marker,
+            expected_alt_text=alt_text,
+            expected_caption=caption,
+            expected_checksum=expected_checksum,
+            expected_mime_type=mime_type,
+        )
+        if verified.status == "succeeded" and verified.remote_post_id == media_id:
+            return verified
+        if verified.status == "manual_required":
+            return verified
         return PublishResult(
-            status="succeeded",
+            status="unknown_outcome",
             remote_post_id=media_id,
-            remote_url=redact_url(media["source_url"]) if media.get("source_url") else None,
-            remote_state="published",
+            remote_state="unknown",
+            reconcile_required=True,
             request_id=response.headers.get("X-WP-Request-ID"),
             http_status=response.status_code,
+            error_code="remote_media_projection_unproven",
         )
 
-    def find_media(self, remote_lookup_key: str, description_marker: str) -> PublishResult:
+    def find_media(
+        self,
+        remote_lookup_key: str,
+        description_marker: str,
+        *,
+        expected_alt_text: str | None = None,
+        expected_caption: str | None = None,
+        expected_checksum: str | None = None,
+        expected_mime_type: str | None = None,
+    ) -> PublishResult:
         response = self._request(
             "GET",
             "/media",
@@ -341,13 +372,77 @@ class WordPressPublisher:
             description = (item.get("description") or {}).get("raw") or (item.get("description") or {}).get("rendered", "")
             if description_marker in description:
                 matches.append(item)
+        exact_material_requested = all(
+            value is not None
+            for value in (
+                expected_alt_text,
+                expected_caption,
+                expected_checksum,
+                expected_mime_type,
+            )
+        )
         if len(matches) == 1:
             item = matches[0]
+            source_url = item.get("source_url")
+            caption = item.get("caption") or {}
+            caption_value = (
+                caption.get("raw")
+                or caption.get("rendered")
+                or ""
+            )
+            if exact_material_requested:
+                if (
+                    item.get("slug") != remote_lookup_key
+                    or item.get("alt_text", "") != expected_alt_text
+                    or caption_value != expected_caption
+                    or item.get("mime_type") != expected_mime_type
+                    or not source_url
+                ):
+                    return self._media_material_mismatch(response.status_code)
+                try:
+                    public_response = safe_get(
+                        source_url,
+                        max_bytes=MAX_PUBLIC_VERIFICATION_BYTES,
+                        timeout=self.timeout_seconds,
+                        allowed_hosts=self.public_hosts,
+                        headers={"User-Agent": "WisdomeWriter/1.0"},
+                        max_elapsed_seconds=self.timeout_seconds,
+                    )
+                except (HttpSafetyError, httpx.HTTPError):
+                    return PublishResult(
+                        status="unknown_outcome",
+                        remote_post_id=str(item["id"]),
+                        remote_state="unknown",
+                        reconcile_required=True,
+                        http_status=response.status_code,
+                        error_code="remote_media_public_read_unavailable",
+                    )
+                observed_type = (
+                    public_response.headers.get("Content-Type", "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .lower()
+                )
+                if (
+                    public_response.status_code != 200
+                    or observed_type != str(expected_mime_type).lower()
+                    or hashlib.sha256(public_response.content).hexdigest()
+                    != expected_checksum
+                ):
+                    return self._media_material_mismatch(response.status_code)
             return PublishResult(
                 status="succeeded",
                 remote_post_id=str(item["id"]),
-                remote_url=redact_url(item["source_url"]) if item.get("source_url") else None,
+                remote_url=redact_url(source_url) if source_url else None,
                 remote_state="published",
+                http_status=response.status_code,
+            )
+        if len(matches) == 0 and exact_material_requested:
+            return PublishResult(
+                status="not_found",
+                remote_state="unknown",
+                reconcile_required=True,
+                error_code="remote_match_not_found",
                 http_status=response.status_code,
             )
         return PublishResult(
@@ -357,9 +452,42 @@ class WordPressPublisher:
             http_status=response.status_code,
         )
 
+    @staticmethod
+    def _media_material_mismatch(http_status: int | None) -> PublishResult:
+        return PublishResult(
+            status="manual_required",
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=http_status,
+            error_code="remote_media_material_mismatch",
+        )
+
     def delete_media(self, remote_media_id: str) -> PublishResult:
         response = self._request("DELETE", f"/media/{remote_media_id}", write=True, params={"force": True})
         payload = response.json()
+        try:
+            self._request("GET", f"/media/{remote_media_id}", params={"context": "edit"})
+        except PublisherError as exc:
+            if exc.http_status not in {404, 410}:
+                return PublishResult(
+                    status="unknown_outcome",
+                    remote_post_id=str(remote_media_id),
+                    remote_state="unknown",
+                    reconcile_required=True,
+                    request_id=response.headers.get("X-WP-Request-ID"),
+                    http_status=exc.http_status or response.status_code,
+                    error_code="remote_media_delete_unproven",
+                )
+        else:
+            return PublishResult(
+                status="manual_required",
+                remote_post_id=str(remote_media_id),
+                remote_state="published",
+                reconcile_required=True,
+                request_id=response.headers.get("X-WP-Request-ID"),
+                http_status=response.status_code,
+                error_code="remote_media_delete_not_applied",
+            )
         return PublishResult(
             status="succeeded",
             remote_post_id=str((payload.get("previous") or {}).get("id") or remote_media_id),

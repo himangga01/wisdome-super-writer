@@ -248,6 +248,170 @@ SQLITE_GUARD_SQL = (
     )
     BEGIN SELECT RAISE(ABORT, 'publication media binding lineage mismatch'); END;
     """,
+    """
+    CREATE TRIGGER pub_media_operation_insert_t022
+    BEFORE INSERT ON publishing_mediadeliveryoperation
+    WHEN NOT EXISTS (
+        SELECT 1
+          FROM infrastructure_outboxmessage event
+         WHERE event.id = NEW.source_event_id
+           AND event.event_version = 2
+           AND event.aggregate_type = NEW.mapping_kind
+           AND event.aggregate_id = COALESCE(NEW.remote_media_id, NEW.public_delivery_asset_id)
+           AND event.topic = CASE
+             WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'upload'
+               THEN 'media.upload_requested'
+             WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'reconcile'
+               THEN 'media.reconcile_requested'
+             WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'delete'
+               THEN 'media.delete_requested'
+             WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'prepare'
+               THEN 'delivery.prepare_requested'
+             WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'reconcile'
+               THEN 'delivery.reconcile_requested'
+             WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'delete'
+               THEN 'delivery.delete_requested'
+             ELSE ''
+           END
+           AND CAST(json_extract(event.payload, '$.operation_generation') AS INTEGER) = NEW.generation
+           AND replace(
+                 COALESCE(
+                   json_extract(event.payload, '$.remote_media_id'),
+                   json_extract(event.payload, '$.public_delivery_asset_id')
+                 ),
+                 '-',
+                 ''
+               ) = COALESCE(NEW.remote_media_id, NEW.public_delivery_asset_id)
+           AND (
+             (NEW.action = 'delete'
+              AND NEW.publication_attempt_id IS NULL
+              AND NEW.publication_intent_id IS NULL
+              AND NEW.target_snapshot_id IS NULL
+              AND NEW.target_config_hash = '')
+             OR
+             (NEW.action <> 'delete'
+              AND NEW.publication_attempt_id IS NOT NULL
+              AND NEW.publication_intent_id IS NOT NULL
+              AND replace(json_extract(event.payload, '$.publication_attempt_id'), '-', '') = NEW.publication_attempt_id
+              AND replace(json_extract(event.payload, '$.publication_intent_id'), '-', '') = NEW.publication_intent_id
+              AND EXISTS (
+                SELECT 1
+                  FROM publishing_publicationattempt attempt
+                 WHERE attempt.id = NEW.publication_attempt_id
+                   AND attempt.publication_intent_id = NEW.publication_intent_id
+                   AND (
+                     (NEW.action = 'upload'
+                      AND attempt.target_snapshot_id = NEW.target_snapshot_id
+                      AND attempt.target_config_hash = NEW.target_config_hash
+                      AND replace(json_extract(event.payload, '$.target_snapshot_id'), '-', '') = NEW.target_snapshot_id
+                      AND json_extract(event.payload, '$.target_config_hash') = NEW.target_config_hash)
+                     OR
+                     (NEW.action <> 'upload'
+                      AND NEW.target_snapshot_id IS NULL
+                      AND NEW.target_config_hash = '')
+                   )
+              ))
+           )
+           AND NEW.generation = COALESCE(
+             (
+               SELECT MAX(prior.generation) + 1
+                 FROM publishing_mediadeliveryoperation prior
+                WHERE prior.remote_media_id IS NEW.remote_media_id
+                  AND prior.public_delivery_asset_id IS NEW.public_delivery_asset_id
+             ),
+             1
+           )
+    )
+    BEGIN SELECT RAISE(ABORT, 'media delivery operation event lineage mismatch'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_operation_identity_upd_t022
+    BEFORE UPDATE ON publishing_mediadeliveryoperation
+    WHEN NEW.mapping_kind IS NOT OLD.mapping_kind
+      OR NEW.remote_media_id IS NOT OLD.remote_media_id
+      OR NEW.public_delivery_asset_id IS NOT OLD.public_delivery_asset_id
+      OR NEW.publication_attempt_id IS NOT OLD.publication_attempt_id
+      OR NEW.publication_intent_id IS NOT OLD.publication_intent_id
+      OR NEW.action IS NOT OLD.action
+      OR NEW.generation IS NOT OLD.generation
+      OR NEW.source_event_id IS NOT OLD.source_event_id
+      OR NEW.target_snapshot_id IS NOT OLD.target_snapshot_id
+      OR NEW.target_config_hash IS NOT OLD.target_config_hash
+      OR NEW.material_hash IS NOT OLD.material_hash
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN SELECT RAISE(ABORT, 'media delivery operation identity is immutable'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_operation_state_upd_t022
+    BEFORE UPDATE ON publishing_mediadeliveryoperation
+    WHEN NOT (
+      (NEW.state = OLD.state)
+      OR (OLD.state = 'queued' AND NEW.state IN ('running', 'delivery_failed', 'superseded'))
+      OR (OLD.state = 'running' AND NEW.state IN ('succeeded', 'unknown_outcome', 'manual_required', 'delivery_failed', 'superseded'))
+    )
+    OR (
+      NEW.state = 'running'
+      AND NOT EXISTS (
+        SELECT 1
+          FROM infrastructure_outboxconsumerreceipt receipt
+         WHERE receipt.event_id = NEW.source_event_id
+           AND receipt.consumer_name = NEW.consumer_name
+           AND receipt.state = 'processing'
+           AND receipt.lease_generation = NEW.consumer_lease_generation
+           AND receipt.lease_token = NEW.consumer_lease_token
+           AND julianday(receipt.claimed_until) > julianday('now')
+           AND NEW.lease_token_hash <> ''
+           AND NEW.lease_expires_at = receipt.claimed_until
+      )
+    )
+    OR (
+      (NEW.write_marker = '') IS NOT (NEW.external_write_started_at IS NULL)
+    )
+    OR (
+      NEW.write_marker IS NOT OLD.write_marker
+      AND NOT (
+        OLD.write_marker = ''
+        AND OLD.external_write_started_at IS NULL
+        AND NEW.state = 'running'
+        AND length(NEW.write_marker) = 64
+        AND NEW.write_marker NOT GLOB '*[^0-9a-f]*'
+        AND NEW.external_write_started_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+            FROM infrastructure_outboxconsumerreceipt receipt
+           WHERE receipt.event_id = NEW.source_event_id
+             AND receipt.consumer_name = NEW.consumer_name
+             AND receipt.state = 'processing'
+             AND receipt.lease_generation = NEW.consumer_lease_generation
+             AND receipt.lease_token = NEW.consumer_lease_token
+             AND julianday(receipt.claimed_until) > julianday('now')
+        )
+      )
+    )
+    OR (
+      OLD.state IN ('succeeded', 'unknown_outcome', 'manual_required', 'delivery_failed', 'superseded')
+      AND (
+        NEW.state IS NOT OLD.state
+        OR NEW.consumer_name IS NOT OLD.consumer_name
+        OR NEW.consumer_lease_generation IS NOT OLD.consumer_lease_generation
+        OR NEW.consumer_lease_token IS NOT OLD.consumer_lease_token
+        OR NEW.lease_token_hash IS NOT OLD.lease_token_hash
+        OR NEW.lease_expires_at IS NOT OLD.lease_expires_at
+        OR NEW.write_marker IS NOT OLD.write_marker
+        OR NEW.external_write_started_at IS NOT OLD.external_write_started_at
+        OR NEW.result_hash IS NOT OLD.result_hash
+        OR NEW.error_code IS NOT OLD.error_code
+        OR NEW.started_at IS NOT OLD.started_at
+        OR NEW.finished_at IS NOT OLD.finished_at
+      )
+    )
+    BEGIN SELECT RAISE(ABORT, 'media delivery operation state transition is invalid'); END;
+    """,
+    """
+    CREATE TRIGGER pub_media_operation_del_t022
+    BEFORE DELETE ON publishing_mediadeliveryoperation
+    BEGIN SELECT RAISE(ABORT, 'media delivery operation is append-only'); END;
+    """,
 )
 
 
@@ -539,6 +703,176 @@ POSTGRES_GUARD_SQL = (
     BEFORE INSERT ON publishing_publicationmedia
     FOR EACH ROW EXECUTE FUNCTION publishing_media_binding_insert_t022_fn();
     """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_media_operation_insert_t022_fn()
+    RETURNS trigger AS $$
+    DECLARE
+      expected_topic text;
+      mapping_id uuid;
+      prior_generation integer;
+    BEGIN
+      mapping_id := COALESCE(NEW.remote_media_id, NEW.public_delivery_asset_id);
+      expected_topic := CASE
+        WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'upload' THEN 'media.upload_requested'
+        WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'reconcile' THEN 'media.reconcile_requested'
+        WHEN NEW.mapping_kind = 'remote_media' AND NEW.action = 'delete' THEN 'media.delete_requested'
+        WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'prepare' THEN 'delivery.prepare_requested'
+        WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'reconcile' THEN 'delivery.reconcile_requested'
+        WHEN NEW.mapping_kind = 'public_delivery_asset' AND NEW.action = 'delete' THEN 'delivery.delete_requested'
+        ELSE ''
+      END;
+      SELECT MAX(prior.generation)
+        INTO prior_generation
+        FROM publishing_mediadeliveryoperation prior
+       WHERE prior.remote_media_id IS NOT DISTINCT FROM NEW.remote_media_id
+         AND prior.public_delivery_asset_id IS NOT DISTINCT FROM NEW.public_delivery_asset_id;
+      IF NEW.generation IS DISTINCT FROM COALESCE(prior_generation + 1, 1)
+         OR NOT EXISTS (
+           SELECT 1
+             FROM infrastructure_outboxmessage event
+            WHERE event.id = NEW.source_event_id
+              AND event.event_version = 2
+              AND event.aggregate_type = NEW.mapping_kind
+              AND event.aggregate_id = mapping_id
+              AND event.topic = expected_topic
+              AND (event.payload ->> 'operation_generation')::integer = NEW.generation
+              AND COALESCE(
+                    event.payload ->> 'remote_media_id',
+                    event.payload ->> 'public_delivery_asset_id'
+                  )::uuid = mapping_id
+              AND (
+                (NEW.action = 'delete'
+                 AND NEW.publication_attempt_id IS NULL
+                 AND NEW.publication_intent_id IS NULL
+                 AND NEW.target_snapshot_id IS NULL
+                 AND NEW.target_config_hash = '')
+                OR
+                (NEW.action <> 'delete'
+                 AND NEW.publication_attempt_id IS NOT NULL
+                 AND NEW.publication_intent_id IS NOT NULL
+                 AND (event.payload ->> 'publication_attempt_id')::uuid = NEW.publication_attempt_id
+                 AND (event.payload ->> 'publication_intent_id')::uuid = NEW.publication_intent_id
+                 AND EXISTS (
+                   SELECT 1
+                     FROM publishing_publicationattempt attempt
+                    WHERE attempt.id = NEW.publication_attempt_id
+                      AND attempt.publication_intent_id = NEW.publication_intent_id
+                      AND (
+                        (NEW.action = 'upload'
+                         AND attempt.target_snapshot_id = NEW.target_snapshot_id
+                         AND attempt.target_config_hash = NEW.target_config_hash
+                         AND (event.payload ->> 'target_snapshot_id')::uuid = NEW.target_snapshot_id
+                         AND event.payload ->> 'target_config_hash' = NEW.target_config_hash)
+                        OR
+                        (NEW.action <> 'upload'
+                         AND NEW.target_snapshot_id IS NULL
+                         AND NEW.target_config_hash = '')
+                      )
+                 ))
+              )
+         ) THEN
+        RAISE EXCEPTION 'media delivery operation event lineage mismatch';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_media_operation_insert_t022
+    BEFORE INSERT ON publishing_mediadeliveryoperation
+    FOR EACH ROW EXECUTE FUNCTION publishing_media_operation_insert_t022_fn();
+    """,
+    """
+    CREATE OR REPLACE FUNCTION publishing_media_operation_guard_t022_fn()
+    RETURNS trigger AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'media delivery operation is append-only';
+      END IF;
+      IF NEW.mapping_kind IS DISTINCT FROM OLD.mapping_kind
+         OR NEW.remote_media_id IS DISTINCT FROM OLD.remote_media_id
+         OR NEW.public_delivery_asset_id IS DISTINCT FROM OLD.public_delivery_asset_id
+         OR NEW.publication_attempt_id IS DISTINCT FROM OLD.publication_attempt_id
+         OR NEW.publication_intent_id IS DISTINCT FROM OLD.publication_intent_id
+         OR NEW.action IS DISTINCT FROM OLD.action
+         OR NEW.generation IS DISTINCT FROM OLD.generation
+         OR NEW.source_event_id IS DISTINCT FROM OLD.source_event_id
+         OR NEW.target_snapshot_id IS DISTINCT FROM OLD.target_snapshot_id
+         OR NEW.target_config_hash IS DISTINCT FROM OLD.target_config_hash
+         OR NEW.material_hash IS DISTINCT FROM OLD.material_hash
+         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'media delivery operation identity is immutable';
+      END IF;
+      IF NOT (
+        NEW.state = OLD.state
+        OR (OLD.state = 'queued' AND NEW.state IN ('running', 'delivery_failed', 'superseded'))
+        OR (OLD.state = 'running' AND NEW.state IN ('succeeded', 'unknown_outcome', 'manual_required', 'delivery_failed', 'superseded'))
+      ) THEN
+        RAISE EXCEPTION 'media delivery operation state transition is invalid';
+      END IF;
+      IF NEW.state = 'running' AND NOT EXISTS (
+        SELECT 1
+          FROM infrastructure_outboxconsumerreceipt receipt
+         WHERE receipt.event_id = NEW.source_event_id
+           AND receipt.consumer_name = NEW.consumer_name
+           AND receipt.state = 'processing'
+           AND receipt.lease_generation = NEW.consumer_lease_generation
+           AND receipt.lease_token = NEW.consumer_lease_token
+           AND receipt.claimed_until > clock_timestamp()
+           AND NEW.lease_token_hash <> ''
+           AND NEW.lease_expires_at = receipt.claimed_until
+      ) THEN
+        RAISE EXCEPTION 'media delivery operation receipt capability mismatch';
+      END IF;
+      IF (NEW.write_marker = '') IS DISTINCT FROM (NEW.external_write_started_at IS NULL) THEN
+        RAISE EXCEPTION 'media delivery operation write marker is incomplete';
+      END IF;
+      IF NEW.write_marker IS DISTINCT FROM OLD.write_marker
+         AND NOT (
+           OLD.write_marker = ''
+           AND OLD.external_write_started_at IS NULL
+           AND NEW.state = 'running'
+           AND NEW.write_marker ~ '^[0-9a-f]{64}$'
+           AND NEW.external_write_started_at IS NOT NULL
+           AND EXISTS (
+             SELECT 1
+               FROM infrastructure_outboxconsumerreceipt receipt
+              WHERE receipt.event_id = NEW.source_event_id
+                AND receipt.consumer_name = NEW.consumer_name
+                AND receipt.state = 'processing'
+                AND receipt.lease_generation = NEW.consumer_lease_generation
+                AND receipt.lease_token = NEW.consumer_lease_token
+                AND receipt.claimed_until > clock_timestamp()
+           )
+         ) THEN
+        RAISE EXCEPTION 'media delivery operation write marker is immutable';
+      END IF;
+      IF OLD.state IN ('succeeded', 'unknown_outcome', 'manual_required', 'delivery_failed', 'superseded')
+         AND (
+           NEW.state IS DISTINCT FROM OLD.state
+           OR NEW.consumer_name IS DISTINCT FROM OLD.consumer_name
+           OR NEW.consumer_lease_generation IS DISTINCT FROM OLD.consumer_lease_generation
+           OR NEW.consumer_lease_token IS DISTINCT FROM OLD.consumer_lease_token
+           OR NEW.lease_token_hash IS DISTINCT FROM OLD.lease_token_hash
+           OR NEW.lease_expires_at IS DISTINCT FROM OLD.lease_expires_at
+           OR NEW.write_marker IS DISTINCT FROM OLD.write_marker
+           OR NEW.external_write_started_at IS DISTINCT FROM OLD.external_write_started_at
+           OR NEW.result_hash IS DISTINCT FROM OLD.result_hash
+           OR NEW.error_code IS DISTINCT FROM OLD.error_code
+           OR NEW.started_at IS DISTINCT FROM OLD.started_at
+           OR NEW.finished_at IS DISTINCT FROM OLD.finished_at
+         ) THEN
+        RAISE EXCEPTION 'media delivery operation terminal state is immutable';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER pub_media_operation_guard_t022
+    BEFORE UPDATE OR DELETE ON publishing_mediadeliveryoperation
+    FOR EACH ROW EXECUTE FUNCTION publishing_media_operation_guard_t022_fn();
+    """,
 )
 
 
@@ -562,6 +896,10 @@ SQLITE_GUARD_NAMES = (
     "pub_media_binding_identity_upd_t022",
     "pub_media_binding_del_t022",
     "pub_media_binding_insert_t022",
+    "pub_media_operation_insert_t022",
+    "pub_media_operation_identity_upd_t022",
+    "pub_media_operation_state_upd_t022",
+    "pub_media_operation_del_t022",
 )
 
 
@@ -578,6 +916,8 @@ POSTGRES_GUARD_NAMES = (
     "pub_delivery_asset_guard_t022",
     "pub_media_binding_guard_t022",
     "pub_media_binding_insert_t022",
+    "pub_media_operation_insert_t022",
+    "pub_media_operation_guard_t022",
 )
 
 
@@ -591,6 +931,8 @@ POSTGRES_FUNCTION_NAMES = (
     "publishing_delivery_asset_guard_t022_fn",
     "publishing_media_binding_guard_t022_fn",
     "publishing_media_binding_insert_t022_fn",
+    "publishing_media_operation_insert_t022_fn",
+    "publishing_media_operation_guard_t022_fn",
 )
 
 
@@ -763,6 +1105,8 @@ def remove_asset_guards(apps, schema_editor):
                 ("publishing_publicdeliveryasset", "pub_delivery_asset_guard_t022"),
                 ("publishing_publicationmedia", "pub_media_binding_guard_t022"),
                 ("publishing_publicationmedia", "pub_media_binding_insert_t022"),
+                ("publishing_mediadeliveryoperation", "pub_media_operation_insert_t022"),
+                ("publishing_mediadeliveryoperation", "pub_media_operation_guard_t022"),
             ):
                 cursor.execute(f'DROP TRIGGER IF EXISTS "{name}" ON {table}')
             for name in POSTGRES_FUNCTION_NAMES:
@@ -778,6 +1122,7 @@ def reject_populated_reverse(apps, schema_editor):
         "PublishedVisualizationSnapshot",
         "PublishedEvidenceSnapshot",
         "PublishedAssetCohort",
+        "MediaDeliveryOperation",
     ):
         model = apps.get_model("publishing", model_name)
         if model.objects.using(schema_editor.connection.alias).exists():
@@ -998,6 +1343,39 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name='publicationmedia',
             constraint=models.UniqueConstraint(condition=models.Q(('published_visualization_snapshot__isnull', False)), fields=('publication', 'published_visualization_snapshot'), name='uq_publication_visual_snapshot'),
+        ),
+        migrations.CreateModel(
+            name='MediaDeliveryOperation',
+            fields=[
+                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                ('mapping_kind', models.CharField(choices=[('remote_media', 'WordPress media'), ('public_delivery_asset', 'Public delivery asset')], max_length=32)),
+                ('action', models.CharField(choices=[('upload', 'Upload'), ('prepare', 'Prepare'), ('reconcile', 'Reconcile'), ('delete', 'Delete')], max_length=16)),
+                ('generation', models.PositiveIntegerField()),
+                ('target_snapshot_id', models.UUIDField(blank=True, null=True)),
+                ('target_config_hash', models.CharField(blank=True, max_length=64)),
+                ('material_hash', models.CharField(max_length=64, validators=[django.core.validators.RegexValidator('^[0-9a-f]{64}$', 'Expected a lowercase SHA-256 digest')])),
+                ('state', models.CharField(choices=[('queued', 'Queued'), ('running', 'Running'), ('succeeded', 'Succeeded'), ('unknown_outcome', 'Unknown outcome'), ('manual_required', 'Manual review required'), ('delivery_failed', 'Delivery failed'), ('superseded', 'Superseded')], default='queued', max_length=24)),
+                ('consumer_name', models.CharField(blank=True, max_length=160)),
+                ('consumer_lease_generation', models.PositiveBigIntegerField(default=0)),
+                ('consumer_lease_token', models.UUIDField(blank=True, null=True)),
+                ('lease_token_hash', models.CharField(blank=True, max_length=64)),
+                ('lease_expires_at', models.DateTimeField(blank=True, null=True)),
+                ('write_marker', models.CharField(blank=True, max_length=64)),
+                ('external_write_started_at', models.DateTimeField(blank=True, null=True)),
+                ('result_hash', models.CharField(blank=True, max_length=64)),
+                ('error_code', models.CharField(blank=True, max_length=100)),
+                ('started_at', models.DateTimeField(blank=True, null=True)),
+                ('finished_at', models.DateTimeField(blank=True, null=True)),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('public_delivery_asset', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='delivery_operations', to='publishing.publicdeliveryasset')),
+                ('publication_attempt', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='media_delivery_operations', to='publishing.publicationattempt')),
+                ('publication_intent', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='media_delivery_operations', to='publishing.publicationintent')),
+                ('remote_media', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='delivery_operations', to='publishing.remotemedia')),
+                ('source_event', models.OneToOneField(on_delete=django.db.models.deletion.PROTECT, related_name='media_delivery_operation', to='infrastructure.outboxmessage')),
+            ],
+            options={
+                'constraints': [models.CheckConstraint(condition=models.Q(models.Q(('mapping_kind', 'remote_media'), ('public_delivery_asset__isnull', True), ('remote_media__isnull', False)), models.Q(('mapping_kind', 'public_delivery_asset'), ('public_delivery_asset__isnull', False), ('remote_media__isnull', True)), _connector='OR'), name='ck_media_operation_mapping_xor'), models.CheckConstraint(condition=models.Q(models.Q(('publication_attempt__isnull', True), ('publication_intent__isnull', True)), models.Q(('publication_attempt__isnull', False), ('publication_intent__isnull', False)), _connector='OR'), name='ck_media_operation_publication_pair'), models.CheckConstraint(condition=models.Q(('generation__gte', 1), ('generation__lte', 5)), name='ck_media_operation_generation_1_5'), models.UniqueConstraint(condition=models.Q(('remote_media__isnull', False)), fields=('remote_media', 'generation'), name='uq_remote_media_operation_generation'), models.UniqueConstraint(condition=models.Q(('public_delivery_asset__isnull', False)), fields=('public_delivery_asset', 'generation'), name='uq_delivery_asset_operation_generation'), models.UniqueConstraint(condition=models.Q(('remote_media__isnull', False), ('state__in', ('queued', 'running'))), fields=('remote_media',), name='uq_active_remote_media_operation'), models.UniqueConstraint(condition=models.Q(('public_delivery_asset__isnull', False), ('state__in', ('queued', 'running'))), fields=('public_delivery_asset',), name='uq_active_delivery_asset_operation')],
+            },
         ),
         migrations.RunPython(install_asset_guards, remove_asset_guards),
         migrations.RunPython(

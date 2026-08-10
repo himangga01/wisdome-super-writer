@@ -1103,6 +1103,35 @@ run/step/channel stop and terminal aggregation.
 - Consumes: existing T018 `VisualPlacement`, `EvidenceAsset`, `VisualizationRender`, approved media manifest, T021 execution fence.
 - Produces: immutable `PublishedAssetCohort`, evidence/visualization snapshots, exact `PublicationMedia` binding, append-only media operation generations and safe cleanup.
 
+#### 한국어 구현 결정 보강
+
+- preview는 revision별 append-only cohort를 최초 1회 동결하고 raw evidence가 아닌 bounded snapshot
+  ID/hash만 render에 둔다.
+- dispatch는 target별 exact mapping/binding과 v2 prepare operation을 같은 transaction에 만들고,
+  media가 `available/active`가 되기 전 publication attempt outbox를 내보내지 않는다.
+- 모든 upload/prepare/reconcile/delete는 source event와 processing receipt capability에 결속된
+  `MediaDeliveryOperation` generation 1~5를 사용한다. write marker 이후 소유권 손실은 직접 재시도가
+  아니라 reconcile이다.
+- WordPress는 exact authenticated media material과 공개 bytes hash, Blogger는 exact object
+  version·HEAD·익명 HTTPS bytes를 증명한다.
+- cleanup은 보호 참조를 정렬 잠금 재집계하고 30일 뒤 두 번째 0건에서만 exact delete를 만든다.
+  재참조는 외부 write 전 queued delete를 supersede한다. T023 credential, T026 UI/history,
+  T030 retention graph 전체 연결은 각 후속 작업에 남긴다.
+
+#### English / AI-readable implementation decision addendum
+
+- Freeze one append-only cohort per revision and expose only bounded snapshot IDs/hashes in renders.
+- Dispatch atomically creates exact target mappings/bindings and v2 prepare operations, withholding the
+  publication-attempt event until every mapping/binding is available and active.
+- Every upload, prepare, reconcile, and delete uses a 1..5 `MediaDeliveryOperation` generation bound to
+  the source event and processing-receipt capability. Capability loss after the write marker reconciles;
+  it never repeats the mutation directly.
+- WordPress proves authenticated media material plus public-byte hash. Blogger proves an exact object
+  version, HEAD material, and bounded anonymous HTTPS bytes.
+- Cleanup locks and recounts protected references, requires a second zero count after 30 days, and
+  supersedes an unstarted delete on re-reference. T023 owns credentials, T026 owns UI/history, and T030
+  owns the complete retention graph.
+
 - [ ] **Step 1: publishing 0012에 revision별 asset cohort와 evidence/visualization/input snapshot을 추가한다.**
 
   기존 editorial `VisualPlacement`를 그대로 사용하고 publishing FK를 editorial에 역방향 추가하지 않는다. snapshot/cohort는 append-only이며 legacy non-empty material은 exact reconstruction이 불가능하면 quarantine한다.

@@ -1070,7 +1070,7 @@ class PublicationDispatchCreateTests(SimpleTestCase):
             ),
             patch.object(
                 services,
-                "prepare_publication_media_bindings_locked",
+                "ensure_publication_media_delivery_operations_locked",
                 side_effect=lambda **kwargs: trace.append("media"),
             ),
             patch.object(

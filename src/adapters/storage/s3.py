@@ -2,10 +2,13 @@ import hashlib
 import os
 import stat
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.config import Config
 from django.conf import settings
+
+from wisdome_writer.infrastructure.http_safety import safe_get
 
 from .base import ObjectInfo
 
@@ -18,9 +21,20 @@ def _validate_key(key: str) -> str:
 
 
 class S3ObjectStorage:
-    def __init__(self, *, bucket: str | None = None, client=None):
+    def __init__(
+        self,
+        *,
+        bucket: str | None = None,
+        client=None,
+        public_base_url: str | None = None,
+    ):
         self.bucket = bucket or settings.AWS_STORAGE_BUCKET_NAME
         self._client = client
+        self.public_base_url = (
+            public_base_url
+            if public_base_url is not None
+            else getattr(settings, "AWS_S3_PUBLIC_BASE_URL", "")
+        ).rstrip("/")
 
     @property
     def client(self):
@@ -286,6 +300,96 @@ class S3ObjectStorage:
         if version_id:
             params["VersionId"] = version_id
         self.client.delete_object(**params)
+
+    def delete_exact_version(self, *, key: str, version_id: str) -> None:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("exact object version is required")
+        self.client.delete_object(
+            Bucket=self.bucket,
+            Key=_validate_key(key),
+            VersionId=version_id,
+        )
+
+    def public_url(self, *, key: str) -> str:
+        if not self.public_base_url:
+            raise ValueError("public object base URL is not configured")
+        parsed = urlparse(self.public_base_url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            raise ValueError("public object base URL must be HTTPS")
+        encoded_key = quote(_validate_key(key), safe="/")
+        return f"{self.public_base_url}/{encoded_key}"
+
+    def put_public_bytes_exact(
+        self,
+        *,
+        key: str,
+        data: bytes,
+        content_type: str,
+        checksum_sha256: str,
+    ) -> tuple[ObjectInfo, str]:
+        info = self.put_bytes(
+            key=key,
+            data=data,
+            content_type=content_type,
+            checksum_sha256=checksum_sha256,
+            metadata={"delivery": "public"},
+        )
+        if not info.version_id:
+            raise ValueError("public delivery requires an exact object version")
+        verified, public_url = self.verify_public_bytes_exact(
+            key=key,
+            version_id=info.version_id,
+            checksum_sha256=checksum_sha256,
+            expected_size=len(data),
+            content_type=content_type,
+        )
+        return verified, public_url
+
+    def verify_public_bytes_exact(
+        self,
+        *,
+        key: str,
+        version_id: str,
+        checksum_sha256: str,
+        expected_size: int,
+        content_type: str,
+    ) -> tuple[ObjectInfo, str]:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("public delivery requires an exact object version")
+        verified = self.head(key=key, version_id=version_id)
+        if (
+            verified.version_id != version_id
+            or verified.checksum_sha256 != checksum_sha256
+            or verified.size != expected_size
+            or verified.content_type.split(";", 1)[0].strip().lower()
+            != content_type.lower()
+        ):
+            raise ValueError("public delivery object identity is not exact")
+        public_url = self.public_url(key=key)
+        host = urlparse(public_url).hostname
+        response = safe_get(
+            public_url,
+            max_bytes=expected_size + 1,
+            timeout=30.0,
+            allowed_hosts={host} if host else set(),
+            headers={"User-Agent": "WisdomeWriter/1.0"},
+            max_elapsed_seconds=30.0,
+        )
+        observed_type = (
+            response.headers.get("Content-Type", "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if (
+            response.status_code != 200
+            or len(response.content) != expected_size
+            or observed_type != content_type.lower()
+            or hashlib.sha256(response.content).hexdigest()
+            != checksum_sha256
+        ):
+            raise ValueError("public delivery URL does not expose the exact object")
+        return verified, public_url
 
     def presign_get(
         self, *, key: str, version_id: str | None = None, expires_seconds: int | None = None
