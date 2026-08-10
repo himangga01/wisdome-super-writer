@@ -1,8 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import ceil
 from typing import Any, Protocol
+
+TRANSPORT_MARKER_VERSION = "wisdome-publication-v1"
+
+
+def parse_retry_after_seconds(
+    value: str | None,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    """Parse Retry-After delta-seconds or IMF-fixdate into a non-negative delay."""
+
+    if not value:
+        return None
+    material = value.strip()
+    if material.isdigit():
+        return int(material)
+    try:
+        retry_at = parsedate_to_datetime(material)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        return None
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    delay = (retry_at.astimezone(timezone.utc) - reference.astimezone(timezone.utc)).total_seconds()
+    return max(0, ceil(delay))
 
 
 @dataclass(frozen=True)
@@ -91,6 +120,20 @@ class PublishCommand:
     publish_at: datetime | None = None
     requested_at: datetime | None = None
     correlation_id: str | None = None
+
+
+def publication_content_marker(command: PublishCommand) -> str:
+    """Return the immutable command/content marker written to remote HTML."""
+
+    content_hash = (
+        command.rendered_article.content_hash
+        if command.rendered_article is not None
+        else "none"
+    )
+    return (
+        f"<!--{TRANSPORT_MARKER_VERSION}:"
+        f"{command.remote_lookup_key}:{content_hash}:{command.target_command_hash}-->"
+    )
 
 
 @dataclass(frozen=True)

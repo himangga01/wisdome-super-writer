@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
+import time
 from typing import Any, Callable
 
 import httpx
@@ -11,7 +13,13 @@ from apps.publishing.contracts import (
     PublisherCapabilities,
     PublisherError,
     PublishResult,
+    parse_retry_after_seconds,
+    publication_content_marker,
 )
+
+MAX_RECONCILE_PAGES = 15
+MAX_RECONCILE_ITEMS = 750
+RECONCILE_DEADLINE_SECONDS = 30.0
 
 
 class BloggerPublisher:
@@ -37,9 +45,11 @@ class BloggerPublisher:
         timeout_seconds: float = 30.0,
         client: httpx.Client | None = None,
         write_guard: Callable[[], None] | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ):
         self.blog_id = str(blog_id)
         self.write_guard = write_guard or (lambda: None)
+        self.monotonic_clock = monotonic_clock
         self.client = client or httpx.Client(
             timeout=timeout_seconds,
             headers={
@@ -69,8 +79,11 @@ class BloggerPublisher:
             category, code = "refreshable_auth", "blogger_token_expired"
         elif response.status_code == 403:
             category, code = "permanent", "blogger_scope_or_owner_denied"
-        elif response.status_code == 429 or response.status_code >= 500:
-            category, code = "retryable", "blogger_temporarily_unavailable"
+        elif response.status_code in (408, 429) or response.status_code >= 500:
+            if write:
+                category, code = "unknown_outcome", "blogger_unknown_outcome"
+            else:
+                category, code = "retryable", "blogger_temporarily_unavailable"
         else:
             category, code = "permanent", "blogger_request_rejected"
         retry_after = response.headers.get("Retry-After")
@@ -78,13 +91,9 @@ class BloggerPublisher:
             code,
             category=category,
             http_status=response.status_code,
-            retry_after_seconds=int(retry_after) if retry_after and retry_after.isdigit() else None,
+            retry_after_seconds=parse_retry_after_seconds(retry_after),
             detail_redacted=f"HTTP {response.status_code}",
         )
-
-    @staticmethod
-    def marker(remote_lookup_key: str) -> str:
-        return f"<!--wisdome-publication:{remote_lookup_key}-->"
 
     @staticmethod
     def lookup_label(remote_lookup_key: str) -> str:
@@ -134,14 +143,17 @@ class BloggerPublisher:
             existing = self.reconcile(command)
             if existing.status == "succeeded":
                 return existing
-            if existing.error_code == "remote_match_not_unique":
+            if not (
+                existing.status == "retryable_failed"
+                and existing.error_code == "remote_match_not_found"
+            ):
                 return existing
             article = command.rendered_article
             assert article is not None
             if article.canonical_link_state != "resolved" or not article.canonical_source_url:
                 raise PublisherError("canonical_wordpress_url_required", category="permanent")
             labels = list(dict.fromkeys([*article.labels, self.lookup_label(command.remote_lookup_key)]))
-            body = f"{article.body_html}\n{self.marker(command.remote_lookup_key)}"
+            body = f"{article.body_html}\n{publication_content_marker(command)}"
             response = self._request(
                 "POST",
                 f"/blogs/{self.blog_id}/posts",
@@ -149,12 +161,12 @@ class BloggerPublisher:
                 params={"isDraft": "false"},
                 json={"kind": "blogger#post", "title": article.title, "content": body, "labels": labels},
             )
-            return self._post_result(response)
+            return self._verify_mutation(command, self._post_result(response))
 
         if command.action in {"update", "mark_withdrawn"}:
             article = command.rendered_article
             assert article is not None
-            body = f"{article.body_html}\n{self.marker(command.remote_lookup_key)}"
+            body = f"{article.body_html}\n{publication_content_marker(command)}"
             labels = list(
                 dict.fromkeys([*article.labels, self.lookup_label(command.remote_lookup_key)])
             )
@@ -164,7 +176,7 @@ class BloggerPublisher:
                 write=True,
                 json={"title": article.title, "content": body, "labels": labels},
             )
-            return self._post_result(response)
+            return self._verify_mutation(command, self._post_result(response))
 
         if command.action == "unpublish":
             response = self._request(
@@ -172,48 +184,164 @@ class BloggerPublisher:
                 f"/blogs/{self.blog_id}/posts/{command.remote_post_id}/revert",
                 write=True,
             )
-            result = self._post_result(response)
-            return PublishResult(
-                status=result.status,
-                remote_post_id=result.remote_post_id,
-                remote_url=result.remote_url,
-                remote_state="withdrawn",
-                remote_revision=result.remote_revision,
-                request_id=result.request_id,
-                http_status=result.http_status,
-            )
+            return self._verify_mutation(command, self._post_result(response))
         raise PublisherError("unsupported_action", category="permanent")
 
     def reconcile(self, command: PublishCommand) -> PublishResult:
-        marker = self.marker(command.remote_lookup_key)
+        if command.action != "create":
+            if not command.remote_post_id:
+                raise PublisherError("remote_post_id_required", category="permanent")
+            response = self._request(
+                "GET",
+                f"/blogs/{self.blog_id}/posts/{command.remote_post_id}",
+                params={"view": "ADMIN"},
+            )
+            item = response.json()
+            if (
+                str(item.get("id")) != str(command.remote_post_id)
+                or str((item.get("blog") or {}).get("id")) != self.blog_id
+            ):
+                return self._reconcile_mismatch(response.status_code)
+            if command.action == "unpublish":
+                if str(item.get("status", "")).lower() != "draft":
+                    return self._reconcile_mismatch(response.status_code)
+                return self._payload_result(item, response.status_code, response.headers)
+            article = command.rendered_article
+            if article is None:
+                raise PublisherError("render_required", category="permanent")
+            expected_content = (
+                f"{article.body_html}\n{publication_content_marker(command)}"
+            )
+            if (
+                item.get("content", "") != expected_content
+                or item.get("title") != article.title
+                or str(item.get("status", "")).lower() != "live"
+            ):
+                return self._reconcile_mismatch(response.status_code)
+            return self._payload_result(item, response.status_code, response.headers)
+
+        marker = publication_content_marker(command)
+        article = command.rendered_article
+        if article is None:
+            raise PublisherError("render_required", category="permanent")
+        expected_content = f"{article.body_html}\n{marker}"
         label = self.lookup_label(command.remote_lookup_key)
         matches: dict[str, dict[str, Any]] = {}
         last_status = None
+        page_count = 0
+        item_count = 0
+        deadline = self.monotonic_clock() + RECONCILE_DEADLINE_SECONDS
         for state in ("live", "draft", "scheduled"):
-            response = self._request(
-                "GET",
-                f"/blogs/{self.blog_id}/posts",
-                params={
+            page_token = None
+            for _page in range(5):
+                remaining = deadline - self.monotonic_clock()
+                if remaining <= 0:
+                    return PublishResult(
+                        status="manual_required",
+                        remote_state="unknown",
+                        reconcile_required=True,
+                        http_status=last_status,
+                        error_code="remote_reconcile_deadline_exceeded",
+                    )
+                page_count += 1
+                if page_count > MAX_RECONCILE_PAGES:
+                    return PublishResult(
+                        status="manual_required",
+                        remote_state="unknown",
+                        reconcile_required=True,
+                        http_status=last_status,
+                        error_code="remote_reconcile_page_limit_exceeded",
+                    )
+                params = {
                     "labels": label,
                     "status": state,
                     "fetchBodies": "true",
                     "maxResults": 50,
-                    "fields": "items(id,url,status,published,updated,content,labels),nextPageToken",
-                },
-            )
-            last_status = response.status_code
-            for item in response.json().get("items", []):
-                if marker in item.get("content", "") and label in item.get("labels", []):
-                    matches[str(item["id"])] = item
+                    "fields": (
+                        "items(id,blog/id,url,status,published,updated,title,content,labels),"
+                        "nextPageToken"
+                    ),
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                response = self._request(
+                    "GET",
+                    f"/blogs/{self.blog_id}/posts",
+                    params=params,
+                    timeout=remaining,
+                )
+                if self.monotonic_clock() >= deadline:
+                    return self._reconcile_deadline(last_status)
+                last_status = response.status_code
+                payload = response.json()
+                if self.monotonic_clock() >= deadline:
+                    return self._reconcile_deadline(last_status)
+                items = payload.get("items", [])
+                if not isinstance(items, list):
+                    return self._reconcile_mismatch(last_status)
+                item_count += len(items)
+                if item_count > MAX_RECONCILE_ITEMS:
+                    return PublishResult(
+                        status="manual_required",
+                        remote_state="unknown",
+                        reconcile_required=True,
+                        http_status=last_status,
+                        error_code="remote_reconcile_item_limit_exceeded",
+                    )
+                for item in items:
+                    if self.monotonic_clock() >= deadline:
+                        return self._reconcile_deadline(last_status)
+                    if marker in item.get("content", "") and label in item.get("labels", []):
+                        matches[str(item["id"])] = item
+                page_token = payload.get("nextPageToken")
+                if not page_token:
+                    break
+            if page_token:
+                return PublishResult(
+                    status="manual_required",
+                    remote_state="unknown",
+                    reconcile_required=True,
+                    http_status=last_status,
+                    error_code="remote_reconcile_page_limit_exceeded",
+                )
+        if self.monotonic_clock() >= deadline:
+            return self._reconcile_deadline(last_status)
         if len(matches) == 1:
             item = next(iter(matches.values()))
+            if (
+                str((item.get("blog") or {}).get("id")) != self.blog_id
+                or str(item.get("status", "")).lower() != "live"
+                or item.get("title") != article.title
+                or item.get("content", "") != expected_content
+            ):
+                return self._reconcile_mismatch(last_status)
             return self._payload_result(item, last_status)
         return PublishResult(
-            status="manual_required",
+            status="retryable_failed" if not matches else "manual_required",
             remote_state="unknown",
             reconcile_required=True,
             http_status=last_status,
             error_code="remote_match_not_unique" if len(matches) > 1 else "remote_match_not_found",
+        )
+
+    @staticmethod
+    def _reconcile_deadline(http_status: int | None) -> PublishResult:
+        return PublishResult(
+            status="manual_required",
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=http_status,
+            error_code="remote_reconcile_deadline_exceeded",
+        )
+
+    @staticmethod
+    def _reconcile_mismatch(http_status: int | None) -> PublishResult:
+        return PublishResult(
+            status="manual_required",
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=http_status,
+            error_code="remote_projection_mismatch",
         )
 
     def fetch_remote_state(self, remote_post_id: str) -> PublishResult:
@@ -260,6 +388,52 @@ class BloggerPublisher:
 
     def _post_result(self, response: httpx.Response) -> PublishResult:
         return self._payload_result(response.json(), response.status_code, response.headers)
+
+    def _verify_mutation(
+        self,
+        command: PublishCommand,
+        factual_result: PublishResult,
+    ) -> PublishResult:
+        remote_post_id = factual_result.remote_post_id or command.remote_post_id
+        if not remote_post_id:
+            return PublishResult(
+                status="unknown_outcome",
+                remote_state="unknown",
+                reconcile_required=True,
+                http_status=factual_result.http_status,
+                error_code="remote_projection_identity_missing",
+            )
+        verification_command = (
+            command
+            if command.action == "create"
+            else replace(command, remote_post_id=remote_post_id)
+        )
+        try:
+            verified = self.reconcile(verification_command)
+        except PublisherError as exc:
+            return PublishResult(
+                status="unknown_outcome",
+                remote_post_id=remote_post_id,
+                remote_state="unknown",
+                reconcile_required=True,
+                http_status=exc.http_status or factual_result.http_status,
+                error_code="remote_projection_verification_unavailable",
+            )
+        if (
+            verified.status == "succeeded"
+            and str(verified.remote_post_id) == str(remote_post_id)
+        ):
+            return verified
+        if verified.status == "manual_required":
+            return verified
+        return PublishResult(
+            status="unknown_outcome",
+            remote_post_id=remote_post_id,
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=verified.http_status or factual_result.http_status,
+            error_code=verified.error_code or "remote_projection_unproven",
+        )
 
     @staticmethod
     def _payload_result(

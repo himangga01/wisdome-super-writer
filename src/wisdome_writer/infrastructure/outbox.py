@@ -854,6 +854,34 @@ def dead_letter_consumer_event(
                     "lease_generation",
                 )
             )
+        if receipt.lease_token is None or receipt.lease_generation < 1:
+            raise OutboxConflict("terminal callback requires a claimed receipt capability")
+        terminal_error_code = error_code[:120]
+        terminal_token_hash = hashlib.sha256(
+            str(receipt.lease_token).encode("ascii")
+        ).hexdigest()
+        if receipt.terminal_reserved_at is None:
+            receipt.terminal_reserved_at = now
+            receipt.terminal_lease_generation = receipt.lease_generation
+            receipt.terminal_lease_token = receipt.lease_token
+            receipt.terminal_lease_token_hash = terminal_token_hash
+            receipt.terminal_error_code = terminal_error_code
+            receipt.save(
+                update_fields=(
+                    "terminal_reserved_at",
+                    "terminal_lease_generation",
+                    "terminal_lease_token",
+                    "terminal_lease_token_hash",
+                    "terminal_error_code",
+                )
+            )
+        elif (
+            receipt.terminal_lease_generation != receipt.lease_generation
+            or receipt.terminal_lease_token != receipt.lease_token
+            or receipt.terminal_lease_token_hash != terminal_token_hash
+            or receipt.terminal_error_code != terminal_error_code
+        ):
+            raise OutboxConflict("terminal callback reservation capability changed")
         with event_context(
             event_envelope(event),
             consumer_name=consumer_name,

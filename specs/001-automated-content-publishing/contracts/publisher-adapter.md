@@ -79,6 +79,12 @@ object key를 직접 노출하지 않는다.
 | `requested_at` | UTC 시각 |
 | `correlation_id` | CollectionRun 또는 CorrectionCase ID |
 
+원격 proof는 호출자가 별도 DTO 필드로 제공하지 않는다. 서버의
+`publication_content_marker(command)`가 `remote_lookup_key`,
+`rendered_article.content_hash`, `target_command_hash`를 `wisdome-publication-v1` schema로
+결속해 결정적으로 만든다. adapter는 이 server-derived marker와 exact action, remote identity,
+target/blog 및 기대 remote state를 함께 검증한다.
+
 ## 출력 DTO
 
 ```json
@@ -95,10 +101,13 @@ object key를 직접 노출하지 않는다.
 }
 ```
 
-`status`는 `succeeded`, `retryable_failed`, `permanent_failed`, `unknown_outcome` 중 하나다.
+`status`는 `succeeded`, `retryable_failed`, `permanent_failed`, `unknown_outcome`,
+`manual_required` 중 하나다.
 `remote_state`는 `draft`, `scheduled`, `published`, `withdrawn`, `deleted`, `unknown` 중
 하나이며 `scheduled_for`와 `published_at`은 해당 상태에 맞게 nullable이다.
-본문/토큰/개인정보를 오류 객체에 넣지 않는다.
+본문/토큰/개인정보를 오류 객체에 넣지 않는다. `remote_url`은 `http(s)` scheme과 최대 1000자를
+모두 만족할 때만 저장한다. invalid scheme 또는 초과 URL은 raw 값을 버리고 SHA-256만
+AuditEvent에 남긴다.
 
 ## 필수 동작
 
@@ -110,6 +119,15 @@ object key를 직접 노출하지 않는다.
    필요하다. target ID와 snapshot ref의 target ID도 같아야 하며 현재 배포 adapter manifest가
    다르면 manual/auto 모두 재-render·재승인 전 외부 호출은 0건이다. 기존 CollectionRun은
    최초 의도 감사값일 뿐 외부 dispatch의 current snapshot gate가 아니다. target 변경 또는
+   worker reclaim 뒤에는 actual mutating HTTP 직전 별도 pre-I/O fence가 statement-time의 exact
+   `execution_attempt_no`, `execution_generation`, source event와 current receipt
+   `lease_generation`을 다시 확인한다. lease가 current이고 유효하거나 같은 transaction에서
+   갱신된 경우만 write를 허용하며 이전 transaction의 시각이나 hash만으로 승인하지 않는다.
+   current raw token/generation의 결과 정산은 더 높은 reclaim이 없다면 단순 clock expiry만으로
+   거부하지 않지만, reclaim된 worker의 result는 current projection을 바꾸지 않고 factual
+   late-result observation만 남긴다. raw receipt/domain/terminal capability token은 DB·worker
+   context 내부 exact 비교에만 쓰고 event·audit·log·API는 hash만 노출한다. hash는 감사용이며
+   capability 판정에 사용하지 않는다.
    CorrectionCase는 새 superseding PublicationIntent와 새 render/Approval을 만든다.
    `approval_mode=validated_auto`이면 intent의 AutoPublishActivation ID/version/hash가 target의
    latest enabled activation과 정확히 같고 그 operational config hash 및 AutoPublishValidation
@@ -155,11 +173,20 @@ object key를 직접 노출하지 않는다.
    ref=0, 열린 정정·권리 hold 없음, 30일 grace 경과를 같은 lock/CAS에서 재확인한 뒤에만
    전달 bytes를 삭제한다. 재참조와 delete가 경합하면 lease generation이 바뀌어 stale delete가
    반드시 무효화된다.
-4. `execute(command)`는 외부 쓰기 한 번을 수행한다. WordPress create는 Publication UUID
-   기반 slug, Blogger create는 UUID 기반 전용 label+HTML comment marker를 사용한다.
+4. `execute(command)`는 fenced execution generation에서 외부 쓰기 한 번만 수행한다.
+   WordPress create는 Publication UUID 기반 slug와 versioned HTML marker, Blogger create는
+   UUID 기반 전용 label+versioned HTML marker를 사용한다. marker는 stable lookup identity와
+   `target_command_hash`, rendered `content_hash`를 포함하고 raw secret이나 관리자 사유는
+   포함하지 않는다.
 5. `reconcile()`은 응답 유실 등 `unknown_outcome`에서 `remote_lookup_key`로 원격 결과를
-   찾는다. 정확히 한 건이고 marker·대상 blog가 일치할 때만 성공으로 확정하며 0건 또는
-   복수건이면 `manual_required`로 격리한다. 확정 전 create/upload를 반복하지 않는다.
+   찾는다. create는 exact target/blog와 lookup/command/content marker, 기대 remote state가
+   모두 일치하는 정확히 한 건만 성공이다. update/mark/unpublish는 목록의 유사 객체가 아니라
+   command의 exact `remote_post_id`를 GET한다. update/mark는 command/content marker와 공개
+   상태, unpublish는 WordPress `draft|trash` 또는 Blogger `draft`처럼 실제 비공개 상태를
+   확인한다. 0건은 create를 반복하지 않고 bounded backoff로 최대 5회 read-only reconcile한
+   뒤 `manual_required`, 복수건은 즉시 `manual_required`다. Blogger 목록 조회는
+   `nextPageToken`을 따르며 live/draft/scheduled 전체 합산 최대 15 page·750 item·wall 30초
+   (`maxResults=50/page`) 한도 소진을 성공이나 0건으로 해석하지 않는다.
 6. `fetch_remote_state()`는 원격 게시물이 관리자나 외부 정책으로 바뀌었는지 확인한다.
 7. 정정은 항상 기존 `remote_post_id`를 수정하며 새 글을 만들지 않는다.
 8. 철회 API가 없으면 capability에 `unpublish=false`, `mark_withdrawn=true`를 선언하고 기존
@@ -177,12 +204,22 @@ object key를 직접 노출하지 않는다.
    Blogger `revert/delete`를 실행한다. 이 분기에는 공개 URL 200이나
    `canonical_source_url`이 필요하지 않으며 이전 URL은 감사용으로만 보존한다.
 
+create의 내부 preflight는 bounded read가 정상 완료되고 응답 schema, target/blog,
+pagination이 정확하며 lookup/marker match가 0건임을 증명할 때만 POST를 허용한다. timeout,
+408/429/5xx, JSON/schema 오류, 불완전 pagination, target/blog 불일치와 복수 match는
+`exact not-found`가 아니므로 외부 write는 0건이다. create/update/mark의 mutating 2xx도 exact
+target/blog·remote ID·기대 state·title·marker를 제거한 canonical body를 모두 검증한 뒤에만
+`succeeded`다. unpublish는 exact target/blog·remote ID와 실제 private state를 검증하고
+`withdrawn`을 합성하지 않는다. mutation 응답에 proof 필드가 없으면 인증 read-back으로
+동일 검증을 수행하며, 그래도 증명할 수 없으면 unknown/manual reconcile이다.
+
 ## 오류 분류
 
 | 분류 | 예 | 처리 |
 |---|---|---|
 | 인증 갱신 가능 | 만료 access token | 한 번 갱신 후 동일 멱등 키 재시도 |
-| 속도 제한/일시 장애 | 429, 5xx, timeout | Retry-After 우선, 지수 백오프+지터, 최대 횟수 제한 |
+| 읽기 속도 제한/일시 장애 | read 408/429/5xx/timeout | Retry-After delay-seconds 또는 IMF-fixdate를 bounded seconds로 정규화해 우선, 지수 백오프+지터, 최대 횟수 제한 |
+| mutating 결과 불명 | write timeout/연결 종료 또는 미적용을 증명하지 못한 408/429/5xx | `unknown_outcome`→read-only reconcile; create 직접 반복 금지 |
 | 영구 요청 오류 | 권한 부족, 형식/용량 위반 | 즉시 영구 실패, 관리자 조치 안내 |
 | 결과 불명 | 외부 성공 뒤 연결 종료 | `unknown_outcome`→reconcile; create 즉시 반복 금지 |
 | 정책 차단 | 공식 쓰기 수단 부재/폐기 | target을 `blocked`, 자동발행 비활성화 |
@@ -204,6 +241,7 @@ object key를 직접 노출하지 않는다.
 ## 계약 테스트
 
 - 동일 create 명령 100회 전달 시 원격 글은 하나다.
+- 첫 create가 적용됐지만 500을 반환하고 원격 검색 반영이 지연돼도 두 번째 create는 0건이다.
 - create 성공 직후 응답 유실에서 WordPress slug 또는 Blogger label+marker로 reconcile이
   원격 글을 정확히 한 건 찾아낸다.
 - WordPress 미디어 업로드 응답 유실에서 원격 media를 조정하고 같은 checksum을 다시
@@ -220,6 +258,35 @@ object key를 직접 노출하지 않는다.
 - Blogger의 `included_claim_ids`에 WordPress 원문에 없는 주장이 있거나 포함 주장의
   출처 의미가 달라지면 발행이 차단된다.
 - update가 동일 remote post를 변경하고 정정 이력을 유지한다.
+- create preflight는 schema-complete bounded 조회가 exact target/blog의 0 match를 증명한 경우에만
+  POST하며 timeout·오류·불완전 pagination·복수 match에서는 write가 0건이다.
+- create/update/mark의 mutating 2xx는 응답 자체 또는 그 직후 bounded authenticated exact GET이
+  exact target/blog·remote ID·state·title·actual canonical body를 증명하지 못하면 성공하지 않으며,
+  unpublish는 remote가 여전히 live/published이면 withdrawn으로 투영하지 않는다.
+- marker를 보존한 채 remote body 단락을 변경해도 성공하지 않는다. provider가
+  반환한 actual raw body에서 marker를 분리한 canonical body hash가 frozen render와
+  일치해야 하며 marker 내 expected hash만으로 content proof를 대체하지 않는다.
+- Blogger exact match가 두 번째 page에 있어도 bounded `nextPageToken` 순회로 찾고,
+  3개 state 합산 15 page·750 item·wall 30초(`maxResults=50/page`) 초과는 fail-closed한다.
+- execution/reconcile generation의 늦은 result와 terminal callback은 current Publication을
+  변경하지 않고 factual stale observation만 append한다.
+- mutating call 전 read/preflight 429는 write 0건, write marker 0건으로 정산하고
+  `Retry-After`의 delay-seconds와 IMF-fixdate를 모두 유지한다. 같은 source event의 running reconcile을 더 높은
+  current receipt lease가 reclaim해도 같은 reconcile generation을 재개하며, 이전
+  capability result는 exact `PublicationReconcileDeliveryObservation` FK를 가진
+  reconcile-parented `PublicationLateExecutionResult`에만 append한다. claim/reclaim마다
+  generation+receipt lease generation이 고유한 delivery observation을 남긴다.
+- terminal callback은 receipt가 `processing`인 동안 `terminal_reserved_at`,
+  internal raw `terminal_lease_token`, `terminal_lease_generation`, `terminal_lease_token_hash`,
+  `terminal_error_code`를
+  all-or-none·set-once로 먼저 저장·검증하고, domain을 `delivery_failed/manual_required`로 투영한 뒤에만
+  receipt/event를 DLQ로 전이한다. 예약된 receipt 삭제·성공 전이는 금지되고 전 단계는 한
+  transaction이다.
+- execution AuditEvent identity는 exact source event·`execution_generation`·receipt
+  consumer name·`lease_generation`·token hash·write authorization/marker를 결속하고 reconcile
+  audit는 delivery observation과 terminal reservation hash/error까지 결속한다. raw token은
+  감사에 포함하지 않는다. retry/reconcile는 T020 Dispatch ledger의 frozen
+  target/Publication/logical Attempt cohort에 행을 추가하지 않는다.
 - 철회 capability별로 unpublish 또는 mark_withdrawn이 선택된다.
 - 완전 unpublish는 WordPress terminal state 뒤 공개 URL 없이 Blogger revert/delete를
   실행하고, mark_withdrawn은 공개 URL을 유지해 두 채널 본문을 갱신한다.
@@ -237,3 +304,57 @@ object key를 직접 노출하지 않는다.
 - base URL/remote blog ID 변경 PATCH 거절; 새 target의 기존 remote post ID 재사용 0건
 - WordPress Application Password와 Blogger OAuth token 폐기 후 target이 각각
   `revoked` 또는 `expired`로 전환되고 쓰기가 거부된다.
+
+## English / AI-readable — T021 execution and reconciliation contract
+
+- T020 response `attemptNo=1` is an immutable acceptance value. A publication event uses
+  `execution_attempt_no` for business write generation 1..5 and `execution_generation`
+  for the domain claim fence; the receipt owns a separate `lease_generation` and
+  reconciliation owns `reconcile_attempt_no` 1..5.
+- New execution is routed by exact `publication.requested@2` payload
+  `{publication_attempt_id, execution_attempt_no}`. Version 1 may only replay an exact
+  existing source-event binding or bind a proven virgin generation one. Every other v1
+  delivery is an audited `legacy-unverifiable-v1` no-op quarantine and never guesses the
+  current counter.
+- The pre-write fence rechecks the current execution generation, source event, consumer
+  receipt lease, approval, intent, target snapshot, kill switch, command and marker at
+  statement time immediately before external I/O.
+  Settlement by the still-current token and generation is not rejected solely because
+  the lease clock elapsed. A reclaimed worker can append a factual late-result
+  observation but cannot write remotely or mutate the current projection. Raw receipt,
+  domain, and terminal capability tokens remain authoritative internally; their hashes
+  are audit-only and are the only values exposed by events, audit, logs, and APIs.
+- A mutating timeout, disconnect, or 408/429/5xx without proof of non-application is an
+  unknown outcome. It enters read-only reconciliation and never repeats create directly.
+- Create mutates only after a schema-complete bounded preflight proves exact target/blog,
+  complete pagination, and zero lookup/marker matches. Timeout, 408/429/5xx, malformed
+  JSON/schema, incomplete pagination, target mismatch, or multiple matches authorize no write.
+- A mutation 2xx succeeds only when either that response or an immediate bounded authenticated exact GET,
+  and every reconciliation success, proves exact action, remote identity, target/blog, expected state,
+  title, versioned server-derived lookup/command/content marker, and a canonical hash recomputed from the
+  actual provider-returned body. The marker is
+  computed by `publication_content_marker(command)` from `remote_lookup_key`, rendered
+  content hash and target command hash under `wisdome-publication-v1`; it is not a
+  caller-supplied `PublishCommand` field and its embedded expected hash is not actual-body
+  proof. Update, mark, and unpublish
+  use the exact remote ID. Zero matches receive at most five bounded reads, multiple
+  matches manualize immediately, and Blogger follows `nextPageToken` across
+  live/draft/scheduled for at most 15 pages, 750 items and 30 wall-clock seconds
+  (`maxResults=50` per page).
+- A pre-write read failure settles with no authorized external write or write marker and
+  preserves both delay-seconds and IMF-fixdate Retry-After as bounded seconds. A higher
+  current receipt lease rebinds the same running reconcile generation; every claim/reclaim
+  appends an identity-frozen `PublicationReconcileDeliveryObservation` whose state/finish time may advance
+  monotonically, and the prior capability
+  can append only a factual late result through that exact observation FK.
+- Terminal callbacks bind the exact source event and execution/reconcile generation. They
+  reserve the all-or-none, set-once `terminal_reserved_at`, internal raw
+  `terminal_lease_token`, `terminal_lease_generation`, `terminal_lease_token_hash`, and
+  `terminal_error_code` while the receipt remains processing, verify them in the domain
+  callback, then atomically project delivery-failed/manual-required, audit, release
+  dependents, and dead-letter. Reserved receipt deletion/success is forbidden. A replay is a no-op.
+- Execution/reconcile audit identity includes source event, domain/reconcile generation,
+  consumer name, receipt lease generation, token hash, write authorization/marker, delivery
+  observation, and terminal reservation hash/error; raw tokens are excluded. Valid remote
+  URLs are bounded to 1000-character HTTP(S), while invalid raw URLs are discarded and only
+  their SHA-256 is audited. Retry and reconcile never mutate the immutable Dispatch-ledger cohort.

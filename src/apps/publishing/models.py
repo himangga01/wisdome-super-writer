@@ -11,6 +11,9 @@ from django.db.models import Q
 PUBLICATION_INTENT_REQUEST_VERSION = "publication-intent-request-v1"
 PUBLICATION_DISPATCH_REQUEST_VERSION = "publication-dispatch-request-v1"
 LEGACY_UNVERIFIABLE_INTENT_REQUEST_VERSION = "legacy-unverifiable-v1"
+PUBLICATION_EXECUTION_IDENTITY_VERSION = "publication-execution-v1"
+PUBLICATION_RECONCILE_IDENTITY_VERSION = "publication-reconcile-v1"
+LEGACY_UNVERIFIABLE_EXECUTION_IDENTITY_VERSION = "legacy-unverifiable-v1"
 
 
 class ChannelCode(models.TextChoices):
@@ -974,6 +977,7 @@ class PublicationAttemptQuerySet(models.QuerySet):
             "idempotency_key",
             "remote_lookup_key",
             "request_fingerprint",
+            "execution_identity_version",
             "correlation_id",
             "created_at",
         }
@@ -996,6 +1000,7 @@ class PublicationAttemptQuerySet(models.QuerySet):
             "idempotency_key",
             "remote_lookup_key",
             "request_fingerprint",
+            "execution_identity_version",
             "correlation_id",
             "created_at",
         }
@@ -1069,6 +1074,28 @@ class PublicationAttempt(models.Model):
     correlation_id = models.UUIDField(db_index=True)
     duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
     retry_count = models.PositiveIntegerField(default=0)
+    execution_identity_version = models.CharField(
+        max_length=40,
+        default=PUBLICATION_EXECUTION_IDENTITY_VERSION,
+    )
+    execution_generation = models.PositiveBigIntegerField(default=0)
+    active_source_event = models.ForeignKey(
+        "infrastructure.OutboxMessage",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="active_publication_attempts",
+    )
+    active_consumer_name = models.CharField(max_length=160, blank=True)
+    active_consumer_lease_generation = models.PositiveBigIntegerField(default=0)
+    active_consumer_lease_token = models.UUIDField(null=True, blank=True)
+    active_lease_token_hash = models.CharField(max_length=64, blank=True)
+    active_lease_expires_at = models.DateTimeField(null=True, blank=True)
+    active_write_marker = models.CharField(max_length=64, blank=True)
+    active_write_started_at = models.DateTimeField(null=True, blank=True)
+    terminal_event_key = models.CharField(max_length=255, blank=True)
+    terminal_generation = models.PositiveBigIntegerField(default=0)
+    terminal_state = models.CharField(max_length=24, blank=True)
     terminal_impact = models.JSONField(default=dict, blank=True)
     recovery_state = models.CharField(
         max_length=32,
@@ -1158,7 +1185,81 @@ class PublicationApprovalHead(models.Model):
         ]
 
 
+class PublicationExecutionObservationQuerySet(models.QuerySet):
+    FROZEN_FIELDS = frozenset(
+        {
+            "publication_attempt",
+            "publication_attempt_id",
+            "execution_attempt_no",
+            "identity_version",
+            "execution_generation",
+            "correlation_id",
+            "source_event",
+            "source_event_id",
+            "worker_task_id",
+            "consumer_name",
+            "consumer_lease_generation",
+            "consumer_lease_token",
+            "lease_token_hash",
+            "write_marker",
+            "started_at",
+            "created_at",
+        }
+    )
+    FROZEN_ATTNAMES = frozenset(
+        {
+            "publication_attempt_id",
+            "execution_attempt_no",
+            "identity_version",
+            "execution_generation",
+            "correlation_id",
+            "source_event_id",
+            "worker_task_id",
+            "consumer_name",
+            "consumer_lease_generation",
+            "consumer_lease_token",
+            "lease_token_hash",
+            "write_marker",
+            "started_at",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_FIELDS.intersection(fields):
+            raise TypeError("PublicationExecutionObservation identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError("PublicationExecutionObservation is append-only")
+
+    async def adelete(self):
+        raise TypeError("PublicationExecutionObservation is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("PublicationExecutionObservation is append-only")
+
+
 class PublicationExecutionObservation(models.Model):
+    class State(models.TextChoices):
+        STARTED = "started", "Started"
+        COMPLETED = "completed", "Completed"
+        DELIVERY_UNKNOWN = "delivery_unknown", "Delivery unknown"
+
+    class ProjectionDisposition(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPLIED = "applied", "Applied"
+        STALE_FENCED = "stale_fenced", "Stale fenced"
+        NO_RESULT = "no_result", "No result"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     publication_attempt = models.ForeignKey(
         PublicationAttempt,
@@ -1166,6 +1267,11 @@ class PublicationExecutionObservation(models.Model):
         related_name="execution_observations",
     )
     execution_attempt_no = models.PositiveIntegerField()
+    identity_version = models.CharField(
+        max_length=40,
+        default=PUBLICATION_EXECUTION_IDENTITY_VERSION,
+    )
+    execution_generation = models.PositiveBigIntegerField(default=0)
     correlation_id = models.UUIDField(db_index=True)
     source_event = models.ForeignKey(
         "infrastructure.OutboxMessage",
@@ -1175,10 +1281,28 @@ class PublicationExecutionObservation(models.Model):
         related_name="publication_execution_observations",
     )
     worker_task_id = models.CharField(max_length=255, blank=True)
+    consumer_name = models.CharField(max_length=160, blank=True)
+    consumer_lease_generation = models.PositiveBigIntegerField(default=0)
+    consumer_lease_token = models.UUIDField(null=True, blank=True)
+    lease_token_hash = models.CharField(max_length=64, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    write_marker = models.CharField(max_length=64, blank=True)
+    external_write_started_at = models.DateTimeField(null=True, blank=True)
+    state = models.CharField(
+        max_length=24,
+        choices=State.choices,
+        default=State.STARTED,
+    )
     started_at = models.DateTimeField()
     finished_at = models.DateTimeField(null=True, blank=True)
     duration_ms = models.PositiveBigIntegerField(null=True, blank=True)
     result_state = models.CharField(max_length=24, blank=True)
+    result_identity = models.CharField(max_length=64, blank=True)
+    projection_disposition = models.CharField(
+        max_length=24,
+        choices=ProjectionDisposition.choices,
+        default=ProjectionDisposition.PENDING,
+    )
     error_code = models.CharField(max_length=100, blank=True)
     retry_at = models.DateTimeField(null=True, blank=True)
     terminal_impact = models.JSONField(default=dict, blank=True)
@@ -1188,13 +1312,27 @@ class PublicationExecutionObservation(models.Model):
         default=PublicationRecoveryState.IN_PROGRESS,
     )
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(
+        PublicationExecutionObservationQuerySet
+    )()
 
     class Meta:
         ordering = ["publication_attempt_id", "execution_attempt_no"]
+        indexes = [
+            models.Index(
+                fields=("publication_attempt", "execution_attempt_no"),
+                name="idx_pub_exec_attempt_no",
+            ),
+        ]
         constraints = [
             models.UniqueConstraint(
-                fields=("publication_attempt", "execution_attempt_no"),
-                name="uq_publication_execution_observation",
+                fields=("publication_attempt", "execution_generation"),
+                name="uq_publication_execution_generation",
+            ),
+            models.UniqueConstraint(
+                fields=("publication_attempt",),
+                condition=Q(state="started"),
+                name="uq_active_publication_execution",
             ),
             models.CheckConstraint(
                 condition=Q(
@@ -1205,11 +1343,85 @@ class PublicationExecutionObservation(models.Model):
             ),
         ]
 
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *PublicationExecutionObservationQuerySet.FROZEN_ATTNAMES
+                ).first()
+                if frozen is None:
+                    raise TypeError(
+                        "PublicationExecutionObservation is append-only"
+                    )
+                for field_name, stored in frozen.items():
+                    if getattr(self, field_name) != stored:
+                        raise TypeError(
+                            "PublicationExecutionObservation identity is immutable"
+                        )
+            else:
+                PublicationExecutionObservationQuerySet._reject_frozen_fields(
+                    update_fields
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationExecutionObservation is append-only")
+
+
+class PublicationReconcileGenerationQuerySet(models.QuerySet):
+    FROZEN_FIELDS = frozenset(
+        {
+            "publication_attempt",
+            "publication_attempt_id",
+            "generation",
+            "source_event",
+            "source_event_id",
+            "delivery_identity_version",
+            "correlation_id",
+            "created_at",
+        }
+    )
+    FROZEN_ATTNAMES = frozenset(
+        {
+            "publication_attempt_id",
+            "generation",
+            "source_event_id",
+            "delivery_identity_version",
+            "correlation_id",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_FIELDS.intersection(fields):
+            raise TypeError("PublicationReconcileGeneration identity is immutable")
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError("PublicationReconcileGeneration is append-only")
+
+    async def adelete(self):
+        raise TypeError("PublicationReconcileGeneration is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("PublicationReconcileGeneration is append-only")
+
 
 class PublicationReconcileGeneration(models.Model):
     class State(models.TextChoices):
-        STARTED = "started", "시작"
+        QUEUED = "queued", "대기"
+        RUNNING = "running", "실행"
         COMPLETED = "completed", "완료"
+        DELIVERY_FAILED = "delivery_failed", "전달 실패"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     publication_attempt = models.ForeignKey(
@@ -1223,11 +1435,20 @@ class PublicationReconcileGeneration(models.Model):
         on_delete=models.PROTECT,
         related_name="publication_reconcile_generation",
     )
+    delivery_identity_version = models.CharField(
+        max_length=40,
+        default=PUBLICATION_RECONCILE_IDENTITY_VERSION,
+    )
     state = models.CharField(
         max_length=16,
         choices=State.choices,
-        default=State.STARTED,
+        default=State.QUEUED,
     )
+    consumer_name = models.CharField(max_length=160, blank=True)
+    consumer_lease_generation = models.PositiveBigIntegerField(default=0)
+    consumer_lease_token = models.UUIDField(null=True, blank=True)
+    lease_token_hash = models.CharField(max_length=64, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
     result_identity = models.CharField(max_length=64, blank=True)
     result_state = models.CharField(max_length=24, blank=True)
     not_before = models.DateTimeField()
@@ -1245,6 +1466,9 @@ class PublicationReconcileGeneration(models.Model):
     )
     next_recovery_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(
+        PublicationReconcileGenerationQuerySet
+    )()
 
     class Meta:
         ordering = ["publication_attempt_id", "generation"]
@@ -1253,11 +1477,305 @@ class PublicationReconcileGeneration(models.Model):
                 fields=("publication_attempt", "generation"),
                 name="uq_publication_reconcile_generation",
             ),
+            models.UniqueConstraint(
+                fields=("publication_attempt",),
+                condition=Q(state__in=("queued", "running")),
+                name="uq_active_publication_reconcile",
+            ),
             models.CheckConstraint(
                 condition=Q(generation__gte=1, generation__lte=5),
                 name="ck_publication_reconcile_generation_1_5",
             ),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *PublicationReconcileGenerationQuerySet.FROZEN_ATTNAMES
+                ).first()
+                if frozen is None:
+                    raise TypeError(
+                        "PublicationReconcileGeneration is append-only"
+                    )
+                for field_name, stored in frozen.items():
+                    if getattr(self, field_name) != stored:
+                        raise TypeError(
+                            "PublicationReconcileGeneration identity is immutable"
+                        )
+            else:
+                PublicationReconcileGenerationQuerySet._reject_frozen_fields(
+                    update_fields
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationReconcileGeneration is append-only")
+
+
+class PublicationReconcileDeliveryObservationQuerySet(models.QuerySet):
+    FROZEN_FIELDS = frozenset(
+        {
+            "reconcile_generation",
+            "reconcile_generation_id",
+            "consumer_name",
+            "consumer_lease_generation",
+            "consumer_lease_token",
+            "lease_token_hash",
+            "lease_expires_at",
+            "started_at",
+            "created_at",
+        }
+    )
+    FROZEN_ATTNAMES = frozenset(
+        {
+            "reconcile_generation_id",
+            "consumer_name",
+            "consumer_lease_generation",
+            "consumer_lease_token",
+            "lease_token_hash",
+            "lease_expires_at",
+            "started_at",
+            "created_at",
+        }
+    )
+
+    @classmethod
+    def _reject_frozen_fields(cls, fields) -> None:
+        if cls.FROZEN_FIELDS.intersection(fields):
+            raise TypeError(
+                "PublicationReconcileDeliveryObservation identity is immutable"
+            )
+
+    def update(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return super().update(**kwargs)
+
+    async def aupdate(self, **kwargs):
+        self._reject_frozen_fields(kwargs)
+        return await super().aupdate(**kwargs)
+
+    def delete(self):
+        raise TypeError(
+            "PublicationReconcileDeliveryObservation is append-only"
+        )
+
+    async def adelete(self):
+        raise TypeError(
+            "PublicationReconcileDeliveryObservation is append-only"
+        )
+
+    def _raw_delete(self, using):
+        raise TypeError(
+            "PublicationReconcileDeliveryObservation is append-only"
+        )
+
+
+class PublicationReconcileDeliveryObservation(models.Model):
+    class State(models.TextChoices):
+        ACTIVE = "active", "Active"
+        SUPERSEDED = "superseded", "Superseded"
+        SETTLED = "settled", "Settled"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    reconcile_generation = models.ForeignKey(
+        PublicationReconcileGeneration,
+        on_delete=models.PROTECT,
+        related_name="delivery_observations",
+    )
+    consumer_name = models.CharField(max_length=160)
+    consumer_lease_generation = models.PositiveBigIntegerField()
+    consumer_lease_token = models.UUIDField()
+    lease_token_hash = models.CharField(max_length=64)
+    lease_expires_at = models.DateTimeField()
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.ACTIVE,
+    )
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(
+        PublicationReconcileDeliveryObservationQuerySet
+    )()
+
+    class Meta:
+        ordering = ["reconcile_generation_id", "consumer_lease_generation"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("reconcile_generation", "consumer_lease_generation"),
+                name="uq_publication_reconcile_delivery_generation",
+            ),
+            models.UniqueConstraint(
+                fields=("reconcile_generation",),
+                condition=Q(state="active"),
+                name="uq_active_publication_reconcile_delivery",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(state="active", finished_at__isnull=True)
+                    | Q(
+                        state__in=("superseded", "settled"),
+                        finished_at__isnull=False,
+                    )
+                ),
+                name="ck_publication_reconcile_delivery_state",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is None:
+                frozen = type(self).objects.filter(pk=self.pk).values(
+                    *PublicationReconcileDeliveryObservationQuerySet.FROZEN_ATTNAMES
+                ).first()
+                if frozen is None:
+                    raise TypeError(
+                        "PublicationReconcileDeliveryObservation is append-only"
+                    )
+                for field_name, stored in frozen.items():
+                    if getattr(self, field_name) != stored:
+                        raise TypeError(
+                            "PublicationReconcileDeliveryObservation identity is immutable"
+                        )
+            else:
+                PublicationReconcileDeliveryObservationQuerySet._reject_frozen_fields(
+                    update_fields
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError(
+            "PublicationReconcileDeliveryObservation is append-only"
+        )
+
+
+class PublicationLateExecutionResultQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    async def aupdate(self, **kwargs):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    def delete(self):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    async def adelete(self):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+    async def abulk_update(self, objs, fields, batch_size=None):
+        raise TypeError("PublicationLateExecutionResult is append-only")
+
+
+class PublicationLateExecutionResult(models.Model):
+    class ProjectionDisposition(models.TextChoices):
+        STALE_FENCED = "stale_fenced", "Stale fenced"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    execution_observation = models.ForeignKey(
+        PublicationExecutionObservation,
+        on_delete=models.PROTECT,
+        related_name="late_results",
+        null=True,
+        blank=True,
+    )
+    reconcile_generation = models.ForeignKey(
+        PublicationReconcileGeneration,
+        on_delete=models.PROTECT,
+        related_name="late_results",
+        null=True,
+        blank=True,
+    )
+    reconcile_delivery_observation = models.ForeignKey(
+        PublicationReconcileDeliveryObservation,
+        on_delete=models.PROTECT,
+        related_name="late_results",
+        null=True,
+        blank=True,
+    )
+    source_event = models.ForeignKey(
+        "infrastructure.OutboxMessage",
+        on_delete=models.PROTECT,
+        related_name="late_publication_results",
+        null=True,
+        blank=True,
+    )
+    consumer_name = models.CharField(max_length=160, blank=True)
+    consumer_lease_generation = models.PositiveBigIntegerField(default=0)
+    consumer_lease_token = models.UUIDField(null=True, blank=True)
+    lease_token_hash = models.CharField(max_length=64, blank=True)
+    result_identity = models.CharField(max_length=64)
+    result_state = models.CharField(max_length=24)
+    remote_post_id = models.CharField(max_length=255, blank=True)
+    remote_url = models.URLField(max_length=1000, null=True, blank=True)
+    remote_url_hash = models.CharField(max_length=64, blank=True, default="")
+    remote_state = models.CharField(max_length=24, blank=True)
+    remote_revision = models.CharField(max_length=255, blank=True)
+    remote_request_id = models.CharField(max_length=255, blank=True)
+    http_status = models.PositiveIntegerField(null=True, blank=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    projection_disposition = models.CharField(
+        max_length=24,
+        choices=ProjectionDisposition.choices,
+        default=ProjectionDisposition.STALE_FENCED,
+    )
+    observed_at = models.DateTimeField(auto_now_add=True)
+    objects = models.Manager.from_queryset(PublicationLateExecutionResultQuerySet)()
+
+    class Meta:
+        ordering = ["execution_observation_id", "observed_at", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        execution_observation__isnull=False,
+                        reconcile_generation__isnull=True,
+                        reconcile_delivery_observation__isnull=True,
+                    )
+                    | Q(
+                        execution_observation__isnull=True,
+                        reconcile_generation__isnull=False,
+                        reconcile_delivery_observation__isnull=False,
+                    )
+                ),
+                name="ck_publication_late_result_exact_parent",
+            ),
+            models.UniqueConstraint(
+                fields=("execution_observation", "result_identity"),
+                name="uq_publication_late_result_identity",
+            ),
+            models.UniqueConstraint(
+                fields=("reconcile_delivery_observation", "result_identity"),
+                condition=Q(reconcile_delivery_observation__isnull=False),
+                name="uq_publication_late_reconcile_result_identity",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(remote_url__isnull=False, remote_url_hash="")
+                    | Q(remote_url__isnull=True, remote_url_hash="")
+                    | Q(remote_url__isnull=True)
+                    & ~Q(remote_url_hash="")
+                ),
+                name="ck_publication_late_remote_url_fact",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise TypeError("PublicationLateExecutionResult is append-only")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("PublicationLateExecutionResult is append-only")
 
 
 class RemoteMedia(models.Model):

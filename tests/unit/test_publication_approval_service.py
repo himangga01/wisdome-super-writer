@@ -1139,7 +1139,16 @@ class RevokedAttemptConvergenceTests(TestCase):
         audit_context = SimpleNamespace(actor_type="worker", event_key=str(uuid.uuid4()))
 
         with (
-            patch.object(services, "_require_worker_event"),
+            patch.object(
+                services,
+                "_require_worker_event",
+                return_value=SimpleNamespace(
+                    event_version=1,
+                    payload={"publication_attempt_id": str(attempt.id)},
+                    message_key=f"publication.requested:{attempt.id}:1",
+                ),
+            ),
+            patch.object(services, "_require_terminal_reservation_locked"),
             patch.object(
                 services.PublicationAttempt.objects,
                 "select_related",
@@ -1284,12 +1293,113 @@ class CanonicalDependencyTests(TestCase):
 
 
 class OriginRunProjectionTests(TestCase):
+    def test_terminal_projection_closes_publish_step_with_the_run(self):
+        from apps.publishing.models import PublicationAttempt
+
+        run = SimpleNamespace(
+            id=uuid.uuid4(),
+            state="publishing",
+            correlation_id=uuid.uuid4(),
+            save=MagicMock(),
+        )
+        step = SimpleNamespace(
+            state="queued",
+            input_count=0,
+            output_count=0,
+            error_code=None,
+            error_detail_redacted=None,
+            retry_at=None,
+            lease_owner="",
+            lease_token=None,
+            save=MagicMock(),
+        )
+        intent = SimpleNamespace(
+            id=uuid.uuid4(),
+            origin_collection_run_id=run.id,
+            target_commands=[{"targetId": "a"}],
+            state="dispatched",
+        )
+        succeeded = SimpleNamespace(
+            id=uuid.uuid4(),
+            publication_intent=intent,
+            publication_intent_id=intent.id,
+            state=PublicationAttempt.State.SUCCEEDED,
+            correlation_id=uuid.uuid4(),
+            resolved_action="create",
+            publication=SimpleNamespace(
+                id=uuid.uuid4(),
+                target_id=uuid.uuid4(),
+                target=SimpleNamespace(channel="blogger"),
+            ),
+        )
+        succeeded.publication_id = succeeded.publication.id
+        dispatch = SimpleNamespace(
+            id=uuid.uuid4(),
+            publication_intent_id=intent.id,
+            attempt_count=1,
+            attempt_manifest_hash=services.sha256_hex(
+                services._publication_attempt_manifest([succeeded])
+            ),
+            correlation_id=succeeded.correlation_id,
+        )
+        run_query = MagicMock()
+        run_query.get.return_value = run
+        step_query = MagicMock()
+        step_query.get_or_create.return_value = (step, False)
+        intent_query = MagicMock()
+        intent_query.filter.return_value.order_by.return_value = [intent]
+        dispatch_query = MagicMock()
+        dispatch_query.filter.return_value.order_by.return_value = [dispatch]
+        attempt_query = MagicMock()
+        attempt_query.select_related.return_value.filter.return_value.order_by.return_value = [
+            succeeded
+        ]
+
+        with (
+            patch.object(
+                services.apps.get_model("collection", "CollectionRun").objects,
+                "select_for_update",
+                return_value=run_query,
+            ),
+            patch.object(
+                services.apps.get_model("collection", "RunStep").objects,
+                "select_for_update",
+                return_value=step_query,
+            ),
+            patch.object(
+                services.PublicationIntent.objects,
+                "select_for_update",
+                return_value=intent_query,
+            ),
+            patch.object(
+                services.PublicationDispatch.objects,
+                "select_for_update",
+                return_value=dispatch_query,
+            ),
+            patch.object(
+                services.PublicationAttempt.objects,
+                "select_for_update",
+                return_value=attempt_query,
+            ),
+            patch("apps.collection.services.project_run_terminal_observation"),
+            patch("apps.collection.services.project_step_terminal_observation") as project_step,
+        ):
+            services._project_origin_run_terminal_locked(succeeded)
+
+        self.assertEqual(step.state, "completed")
+        self.assertEqual(step.input_count, 1)
+        self.assertEqual(step.output_count, 1)
+        step.save.assert_called_once()
+        project_step.assert_called_once()
+        self.assertEqual(run.state, "completed")
+
     def test_terminal_projection_waits_for_every_dispatched_intent_in_the_run(self):
         from apps.publishing.models import PublicationAttempt
 
         run = SimpleNamespace(
             id=uuid.uuid4(),
             state="publishing",
+            correlation_id=uuid.uuid4(),
             save=MagicMock(),
         )
         first_intent = SimpleNamespace(
@@ -1321,6 +1431,11 @@ class OriginRunProjectionTests(TestCase):
         )
         run_query = MagicMock()
         run_query.get.return_value = run
+        step_query = MagicMock()
+        step_query.get_or_create.return_value = (
+            SimpleNamespace(state="queued"),
+            False,
+        )
         intent_query = MagicMock()
         intent_query.filter.return_value.order_by.return_value = [
             first_intent,
@@ -1343,6 +1458,11 @@ class OriginRunProjectionTests(TestCase):
                 services.apps.get_model("collection", "CollectionRun").objects,
                 "select_for_update",
                 return_value=run_query,
+            ),
+            patch.object(
+                services.apps.get_model("collection", "RunStep").objects,
+                "select_for_update",
+                return_value=step_query,
             ),
             patch.object(
                 services.PublicationIntent.objects,
@@ -1685,7 +1805,7 @@ class ApprovalDecisionDatabaseTests(DjangoTestCase):
             origin_target_snapshot_id=fixture.target.current_snapshot_id,
             remote_lookup_key=f"t019-{state}",
         )
-        return PublicationAttempt.objects.create(
+        attempt = PublicationAttempt.objects.create(
             publication=publication,
             article_revision=fixture.intent.article_revision,
             publication_intent=fixture.intent,
@@ -1703,6 +1823,18 @@ class ApprovalDecisionDatabaseTests(DjangoTestCase):
             state=state,
             correlation_id=uuid.uuid4(),
         )
+        services._enqueue_event(
+            "publication.requested",
+            {"publication_attempt_id": str(attempt.id)},
+            dedupe_key=(
+                f"publication.requested:{attempt.id}:{attempt.attempt_no}"
+            ),
+            aggregate_type="publication_attempt",
+            aggregate_id=attempt.id,
+            job_id=attempt.id,
+            correlation_id=attempt.correlation_id,
+        )
+        return attempt
 
     def _revoke_data(self, approval):
         data = self._approval_data()

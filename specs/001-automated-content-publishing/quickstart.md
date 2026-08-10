@@ -317,6 +317,67 @@ attempt/outbox/audit 추가 생성은 모두 0건이어야 하며 같은 key의 
 render/approval/attempt history가 없다. 새 route, cursor pagination, 관리자 UI와 E2E는 T026에서
 구현한다. T019와 선행 blocker가 완료되기 전에는 T020을 완료 표시하지 않는다.
 
+### 3.4 T021 실행 fencing과 원격 reconcile 확인
+
+T020 응답의 `attemptNo=1`은 acceptance 상수다. worker event의 business write 번호는
+`executionAttemptNo` 1~5, domain claim은 `executionGeneration`, receipt claim은
+`leaseGeneration`, read-only 원격 조정은 `reconcileAttemptNo` 1~5로 따로 기록되어야 한다.
+신규 실행은 exact `publication.requested@2`
+`{publication_attempt_id, execution_attempt_no}`, reconcile은 exact
+`publication.reconcile_requested@2 {publication_attempt_id, reconcile_attempt_no}`만 생산한다.
+v1 historical event는 이미 exact
+source event에 결속된 replay이거나 counter·observation·terminal lineage가 모두 빈 virgin
+generation 1일 때만 한 번 연결한다. 나머지는 세대를 추측하지 않고
+`legacy-unverifiable-v1` 감사 sentinel을 남기는 no-op quarantine으로 확인한다.
+
+격리 test target과 fault-injection transport에서 다음을 확인한다.
+
+1. 같은 requested event를 100회 전달해도 remote create는 1건, logical attempt row는 1건이다.
+2. `begin_attempt` 뒤 worker A의 receipt를 reclaim하고 worker B가 새 generation을 claim한 다음 A를
+   재개한다. A의 mutating HTTP와 current projection 변경은 0건이고 bounded
+   `PublicationLateExecutionResult`만 남는다. running reconcile을 같은 event의 더 높은
+   receipt lease가 reclaim하면 같은 generation을 `running`으로 재개하고 새 세대를
+   소모하지 않는다. 각 claim/reclaim은 identity/raw capability가 불변이고 state/finish time만 단조
+   전이하는 `PublicationReconcileDeliveryObservation`을 추가하고 이전 reconcile result는 exact
+   delivery observation FK의 late ledger로만 남는다.
+3. 첫 create가 원격 적용된 뒤 timeout 또는 500이 발생하고 조회 반영을 지연시켜도 두 번째
+   create는 0건이며 read-only reconcile만 최대 5세대 생성된다.
+4. create preflight는 schema·target/blog·pagination이 완전한 bounded 조회가 exact 0 match를
+   증명할 때만 POST한다. timeout·408/429/5xx·JSON/schema 오류·불완전 pagination·target
+   mismatch·복수 match의 write는 0건이다. create/update/mark mutation 응답은 exact
+   target/blog·remote ID·state·title·versioned command/content marker와 canonical body가 맞을
+   때만 성공한다. marker를 남긴 채 actual remote body를 변경하면 canonical body hash 비교가 실패해야 한다.
+   unpublish는 WordPress `draft|trash`, Blogger `draft`를 확인하기 전 `withdrawn` 성공이 아니다.
+5. 조회 0건은 create 없이 bounded backoff로 5회 뒤 `manual_required`, 복수건은 즉시
+   `manual_required`다. Blogger exact post를 두 번째 page에 두고 `nextPageToken` 순회를 확인하며
+   live/draft/scheduled 합산 15 page·750 item·wall 30초(`maxResults=50/page`) 초과는
+   fail-closed한다.
+6. 과거 execution/reconcile generation의 늦은 result와 terminal callback은 current state,
+   dependent release와 후속 outbox를 바꾸지 않는다. exact terminal replay는 no-op이다.
+7. receipt raw token/generation이 여전히 current이고 더 높은 reclaim이 없으면 clock expiry만으로
+   정산을 거부하지 않는다. mutating HTTP pre-I/O fence는 I/O 직전 statement-time에 current이고
+   유효하거나 원자적으로 갱신된 lease만 허용한다. hash만으로 capability를 승인하지 않는다.
+8. mutating call 전 read/preflight가 `429 Retry-After: 3600` 또는 IMF-fixdate로 실패하면
+   write와 write marker는 0건이고 정규화된 bounded seconds를 다음 execution이 우선한다.
+9. terminal callback 직전 receipt는 `processing`을 유지한 채 raw
+   `terminal_lease_token`을 포함한 set-once terminal reservation 5필드를 먼저 가진다. 예약된
+   receipt의 삭제·성공 전이는 금지된다. callback 실패는 reservation·domain·audit·DLQ 전이를 모두
+   rollback하고 성공은 generation을 `delivery_failed`, attempt를 `manual_required`로 한 번만
+   종결한다.
+10. raw receipt/domain/terminal token을 event envelope, AuditEvent, log, API 응답에서 검색해도
+    0건이고 hash만 노출된다. AuditEvent에는 source event, domain/reconcile generation,
+    consumer name·lease generation·token hash, write authorization/marker, delivery observation,
+    terminal reservation hash/error가 결속된다. invalid 또는 1000자 초과 remote URL은 raw 대신
+    SHA-256만 남는다.
+11. retry/reclaim/reconcile 후에도 T020 Dispatch ledger의 target·Publication·logical Attempt
+    cohort와 manifest는 바뀌지 않고, execution AuditEvent는 source event·domain generation·receipt
+    generation이 다르면 별도 identity다.
+
+T021은 domain/event/adapter 계약까지만 소유한다. attempt/reconcile history와 manual retry API,
+cursor pagination, 관리자 UI와 E2E는 T026에서 구현하므로 여기서 unbounded runtime 배열이나 새
+OpenAPI path를 정본으로 만들지 않는다. 선행 T020과 외부 blocker가 끝나기 전 T021을 완료
+표시하지 않는다.
+
 ## 4. 관리자·보안 검증
 
 1. 익명 사용자가 `/admin/`과 `/api/v1/*`에 접근하면 로그인 또는 401/403을 받는다.
@@ -893,6 +954,41 @@ immutable acceptance constant 1, never the mutable retry counter. An uncondition
 that row's counters. Mutable state, render,
 approval, and attempt history are excluded. T026 owns route completion, cursor-paginated history, admin UI,
 and E2E coverage. T020 remains unchecked until T019 and the active predecessor blockers are complete.
+
+## English / AI-readable — T021 execution and reconciliation procedure
+
+Keep the T020 acceptance `attemptNo=1`, business `executionAttemptNo`, domain
+`executionGeneration`, receipt `leaseGeneration`, dispatcher delivery `attempt`, and read-only
+`reconcileAttemptNo` separate. New work uses exact `publication.requested@2`
+`{publication_attempt_id, execution_attempt_no}` and exact `publication.reconcile_requested@2`
+`{publication_attempt_id, reconcile_attempt_no}`. Version 1 may only replay an exact existing
+source-event binding or bind a proven virgin generation one; every other delivery records a
+`legacy-unverifiable-v1` audit sentinel and is a no-op quarantine.
+
+Fault injection must prove: 100 duplicate deliveries create one remote post; a reclaimed worker performs
+no mutating HTTP and appends only a bounded stale result; a higher same-event receipt lease rebinds the
+same running reconcile generation, appends an identity-frozen `PublicationReconcileDeliveryObservation`
+whose state/finish time advances monotonically, and
+the prior result becomes factual late data through that exact observation FK; an
+applied create followed by timeout/500 and delayed lookup performs no second create;
+create mutates only after a schema-complete bounded preflight proves exact target/blog, complete
+pagination, and zero matches; a mutation 2xx succeeds only when either that response or an immediate
+bounded authenticated exact GET proves exact target/blog, remote identity, expected state, title, and a canonical hash
+recomputed from the actual body rather than trusting the marker alone; zero matches receive at most five read-only
+reconciliations while multiple matches manualize immediately; Blogger follows `nextPageToken` across
+live/draft/scheduled for at most 15 pages, 750 items and 30 wall-clock seconds (`maxResults=50` per
+page); and old result/terminal callbacks cannot mutate the current generation. A pre-write read 429 creates
+no write marker and preserves delay-seconds or IMF-fixdate Retry-After as bounded seconds. Terminal
+reservation includes the internal raw `terminal_lease_token`, is set once while processing, forbids
+receipt deletion/success, and rolls reservation/domain/audit/DLQ back together on callback failure. Raw
+capability tokens remain internally authoritative and API/audit/logs expose audit-only hashes. Settlement
+accepts a still-current raw token/generation despite clock expiry alone, while the pre-I/O fence checks a
+current unexpired or atomically renewed lease at statement time. Audit identity binds source event,
+domain/reconcile and receipt generations, consumer, token hash, write marker/authorization, delivery
+observation, and terminal reservation hash/error. Valid remote URLs are bounded to 1000-character
+HTTP(S); invalid values expose only their SHA-256. Retry and
+reconcile never mutate the Dispatch-ledger cohort. T026, not T021, owns OpenAPI history/retry paths,
+cursor pagination, admin UI, and E2E coverage.
 
 ## English / AI-readable — Legacy HWP deployment
 

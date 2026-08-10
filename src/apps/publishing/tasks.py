@@ -35,6 +35,7 @@ from .services import (
 )
 from .services import (
     _kill_switch_enabled,
+    authorize_publication_external_write,
     begin_attempt,
     begin_canary_run,
     begin_remote_media_reconcile,
@@ -188,10 +189,14 @@ def revoke_target_credentials(decision_id: str):
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def execute_publication_attempt(attempt_id: str):
+def execute_publication_attempt(
+    attempt_id: str,
+    execution_attempt_no: int | None = None,
+):
     audit_context = _worker_audit_context()
-    attempt, command = begin_attempt(
+    attempt, execution_fence, command = begin_attempt(
         attempt_id,
+        execution_attempt_no=execution_attempt_no,
         audit_context=audit_context,
     )
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
@@ -208,8 +213,23 @@ def execute_publication_attempt(attempt_id: str):
             "state": attempt.state,
             "reconcileQueued": True,
         }
-    adapter = publisher_for_target(attempt.publication.target)
-    error: PublisherError | None = None
+    if execution_fence is None:
+        raise Conflict("publication command is missing its execution fence")
+    external_write_authorized = False
+
+    def authorize_write() -> None:
+        nonlocal external_write_authorized
+        authorize_publication_external_write(
+            execution_fence,
+            audit_context=audit_context,
+        )
+        external_write_authorized = True
+
+    adapter = publisher_for_target(
+        attempt.publication.target,
+        write_guard=authorize_write,
+    )
+    retry_after = None
     try:
         result = adapter.execute(command)
         if (
@@ -224,17 +244,18 @@ def execute_publication_attempt(attempt_id: str):
                     http_status=result.http_status,
                 )
     except PublisherError as exc:
-        error = exc
         result = publisher_error_result(exc)
+        retry_after = exc.retry_after_seconds
     finally:
         adapter.close()
     persisted = persist_publish_result(
         attempt_id,
         result,
+        execution_fence=execution_fence,
+        external_write_authorized=external_write_authorized,
+        retry_after_seconds=retry_after,
         audit_context=audit_context,
     )
-    if persisted.state == PublicationAttempt.State.RETRYABLE_FAILED:
-        raise error or RuntimeError(persisted.error_code)
     return {"attemptId": attempt_id, "state": persisted.state, "remotePostId": persisted.publication.remote_post_id}
 
 
@@ -243,11 +264,21 @@ def execute_publication_attempt(attempt_id: str):
 )
 def finalize_publication_delivery_failure(
     attempt_id: str,
-    error_code: str,
+    execution_attempt_no_or_error_code,
+    error_code: str | None = None,
 ):
+    expected_execution_attempt_no = (
+        None if error_code is None else execution_attempt_no_or_error_code
+    )
+    effective_error_code = (
+        execution_attempt_no_or_error_code
+        if error_code is None
+        else error_code
+    )
     attempt = _finalize_publication_delivery_failure(
         attempt_id,
-        error_code=error_code,
+        expected_execution_attempt_no=expected_execution_attempt_no,
+        error_code=effective_error_code,
         audit_context=_worker_audit_context(),
     )
     if attempt is None:
@@ -320,14 +351,24 @@ def reconcile_publication_attempt(
 )
 def finalize_publication_reconcile_failure(
     attempt_id: str,
-    error_code: str,
+    reconcile_attempt_no_or_error_code,
+    error_code: str | None = None,
 ):
+    expected_reconcile_attempt_no = (
+        None if error_code is None else reconcile_attempt_no_or_error_code
+    )
+    effective_error_code = (
+        reconcile_attempt_no_or_error_code
+        if error_code is None
+        else error_code
+    )
     audit_context = _worker_audit_context()
     source_event_id = audit_context.event_key
     attempt = finalize_reconcile_delivery_failure(
         attempt_id,
         source_event_id=source_event_id,
-        error_code=error_code,
+        expected_reconcile_attempt_no=expected_reconcile_attempt_no,
+        error_code=effective_error_code,
         audit_context=audit_context,
     )
     if attempt is None:

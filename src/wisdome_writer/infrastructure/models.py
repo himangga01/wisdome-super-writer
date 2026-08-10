@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 from wisdome_writer.domain.models import TimestampedUUIDModel, UUIDModel
@@ -71,6 +72,17 @@ class OutboxMessage(UUIDModel):
         ]
 
 
+class OutboxConsumerReceiptQuerySet(models.QuerySet):
+    def delete(self):
+        raise TypeError("OutboxConsumerReceipt is append-only")
+
+    async def adelete(self):
+        raise TypeError("OutboxConsumerReceipt is append-only")
+
+    def _raw_delete(self, using):
+        raise TypeError("OutboxConsumerReceipt is append-only")
+
+
 class OutboxConsumerReceipt(UUIDModel):
     class State(models.TextChoices):
         PROCESSING = "processing", "Processing"
@@ -95,11 +107,46 @@ class OutboxConsumerReceipt(UUIDModel):
     claimed_until = models.DateTimeField(null=True, blank=True, db_index=True)
     lease_token = models.UUIDField(null=True, blank=True)
     lease_generation = models.PositiveBigIntegerField(default=0)
+    terminal_reserved_at = models.DateTimeField(null=True, blank=True)
+    terminal_lease_generation = models.PositiveBigIntegerField(default=0)
+    terminal_lease_token = models.UUIDField(null=True, blank=True)
+    terminal_lease_token_hash = models.CharField(max_length=64, blank=True, default="")
+    terminal_error_code = models.CharField(max_length=120, blank=True, default="")
+    objects = models.Manager.from_queryset(OutboxConsumerReceiptQuerySet)()
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
                 fields=("event", "consumer_name"),
                 name="unique_outbox_event_consumer",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        terminal_reserved_at__isnull=True,
+                        terminal_lease_generation=0,
+                        terminal_lease_token__isnull=True,
+                        terminal_lease_token_hash="",
+                        terminal_error_code="",
+                    )
+                    | Q(
+                        terminal_reserved_at__isnull=False,
+                        terminal_lease_generation__gte=1,
+                        terminal_lease_token__isnull=False,
+                    )
+                    & ~Q(terminal_lease_token_hash="")
+                    & ~Q(terminal_error_code="")
+                ),
+                name="ck_outbox_receipt_terminal_reservation_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(state="succeeded")
+                    | Q(terminal_reserved_at__isnull=True)
+                ),
+                name="ck_outbox_succeeded_receipt_not_terminal_reserved",
+            ),
         ]
+
+    def delete(self, *args, **kwargs):
+        raise TypeError("OutboxConsumerReceipt is append-only")

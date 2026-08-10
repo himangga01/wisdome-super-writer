@@ -98,7 +98,10 @@ _CLASSIFICATION_CODE_KEYS = frozenset(
 _CLASSIFICATION_INTEGER_KEYS = frozenset(
     {
         "attempt",
+        "consumer_lease_generation",
         "count",
+        "execution_generation",
+        "reconcile_attempt_no",
         "version",
     }
 )
@@ -111,6 +114,7 @@ _HASH_KEYS = frozenset(
     {
         "approval_hash",
         "checksum",
+        "consumer_capability_hash",
         "decision_hash",
         "intent_hash",
         "manifest_hash",
@@ -236,8 +240,11 @@ _ATTEMPT_KEYS = (
     "action",
     "attempt",
     "channel",
+    "consumer_capability_hash",
+    "consumer_lease_generation",
     "duration_ms",
     "error_code",
+    "execution_generation",
     "intent_id",
     "outcome_hash",
     "publication_attempt_id",

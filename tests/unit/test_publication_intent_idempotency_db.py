@@ -506,11 +506,14 @@ class PublicationIntentSQLiteGuardTests(TestCase):
                     ["changed-dispatch", dispatch.id.hex],
                 )
 
-        attempt.state = publishing_models.PublicationAttempt.State.RUNNING
+        attempt.state = publishing_models.PublicationAttempt.State.RETRYABLE_FAILED
         attempt.attempt_no = 2
         attempt.save(update_fields=("state", "attempt_no"))
         attempt.refresh_from_db()
-        self.assertEqual(attempt.state, publishing_models.PublicationAttempt.State.RUNNING)
+        self.assertEqual(
+            attempt.state,
+            publishing_models.PublicationAttempt.State.RETRYABLE_FAILED,
+        )
         self.assertEqual(attempt.attempt_no, 2)
 
     def test_dispatch_revalidates_every_attempt_current_approval_head(self):

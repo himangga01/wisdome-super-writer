@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import inspect
 import re
 import time
@@ -64,13 +65,16 @@ from .models import (
     PublicationApprovalHead,
     PublicationAttempt,
     PublicationExecutionObservation,
+    PublicationLateExecutionResult,
     PublicationDispatch,
+    PublicationReconcileDeliveryObservation,
     PublicationReconcileGeneration,
     PublicationRecoveryState,
     PublicationIntent,
     PublicationIntentHead,
     PublicationMedia,
     PublicationTarget,
+    PublicationTargetIntentFence,
     PublicationTargetSnapshot,
     PublicDeliveryAsset,
     RemoteMedia,
@@ -78,6 +82,9 @@ from .models import (
     TargetDisconnectDecision,
     TargetEnvironment,
     ValidationState,
+    LEGACY_UNVERIFIABLE_EXECUTION_IDENTITY_VERSION,
+    PUBLICATION_EXECUTION_IDENTITY_VERSION,
+    PUBLICATION_RECONCILE_IDENTITY_VERSION,
 )
 
 
@@ -110,6 +117,369 @@ _TARGET_CREATE_NAMESPACE = uuid.UUID("e28b5933-26ae-4e6d-83b5-1cbe64f26ba0")
 class PublicationDispatchResult:
     dispatch: PublicationDispatch
     attempts: tuple[PublicationAttempt, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationExecutionFence:
+    publication_attempt_id: uuid.UUID
+    execution_attempt_no: int
+    execution_generation: int
+    source_event_id: uuid.UUID
+    consumer_name: str
+    consumer_lease_generation: int
+    lease_token_hash: str
+    lease_expires_at: Any
+    write_marker: str
+
+
+def _lease_token_hash(value: uuid.UUID) -> str:
+    return hashlib.sha256(str(value).encode("ascii")).hexdigest()
+
+
+def _publication_execution_claim_action(
+    attempt: PublicationAttempt,
+    *,
+    source_event_id: uuid.UUID,
+    consumer_name: str,
+    consumer_lease_generation: int,
+    consumer_lease_token: uuid.UUID,
+    lease_token_hash: str,
+    now,
+) -> str:
+    if attempt.state != PublicationAttempt.State.RUNNING:
+        return "claim"
+    same_capability = (
+        attempt.active_source_event_id == source_event_id
+        and attempt.active_consumer_name == consumer_name
+        and attempt.active_consumer_lease_generation
+        == consumer_lease_generation
+        and attempt.active_consumer_lease_token == consumer_lease_token
+        and attempt.active_lease_token_hash == lease_token_hash
+    )
+    if (
+        same_capability
+        and attempt.active_lease_expires_at is not None
+        and attempt.active_lease_expires_at > now
+    ):
+        return "duplicate"
+    if (
+        attempt.active_lease_expires_at is not None
+        and attempt.active_lease_expires_at > now
+    ):
+        return "stale"
+    if attempt.active_write_started_at is not None:
+        return "reconcile"
+    return "reclaim"
+
+
+def _publication_reconcile_claim_action(
+    generation: PublicationReconcileGeneration,
+    *,
+    source_event_id: uuid.UUID,
+    consumer_name: str,
+    consumer_lease_generation: int,
+    consumer_lease_token: uuid.UUID,
+    lease_token_hash: str,
+    now,
+) -> str:
+    if generation.state == PublicationReconcileGeneration.State.QUEUED:
+        return "claim"
+    if generation.state != PublicationReconcileGeneration.State.RUNNING:
+        return "terminal"
+    if generation.source_event_id != source_event_id:
+        return "stale"
+    same_capability = (
+        generation.consumer_name == consumer_name
+        and generation.consumer_lease_generation == consumer_lease_generation
+        and generation.consumer_lease_token == consumer_lease_token
+        and generation.lease_token_hash == lease_token_hash
+    )
+    if (
+        same_capability
+        and generation.lease_expires_at is not None
+        and generation.lease_expires_at > now
+    ):
+        return "duplicate"
+    if (
+        generation.lease_expires_at is not None
+        and generation.lease_expires_at > now
+    ):
+        return "stale"
+    if consumer_lease_generation <= generation.consumer_lease_generation:
+        return "stale"
+    return "reclaim"
+
+
+def _execution_generation_for_source_event(
+    attempt: PublicationAttempt,
+    *,
+    source_event_id: uuid.UUID,
+    source_message_key: str,
+    observations: Iterable[PublicationExecutionObservation] | None = None,
+) -> int:
+    rows = (
+        list(observations)
+        if observations is not None
+        else list(
+            PublicationExecutionObservation.objects.select_for_update()
+            .filter(
+                publication_attempt=attempt,
+                source_event_id=source_event_id,
+            )
+            .only("source_event_id", "execution_generation")
+        )
+    )
+    matching = [
+        row.execution_generation
+        for row in rows
+        if row.source_event_id == source_event_id
+    ]
+    if matching:
+        return max(matching)
+    if attempt.terminal_event_key == source_message_key:
+        return attempt.terminal_generation
+    return attempt.execution_generation
+
+
+def _legacy_requested_binding_action(
+    attempt: PublicationAttempt,
+    *,
+    source_event=None,
+    source_event_id: uuid.UUID | None = None,
+    observations: Iterable[PublicationExecutionObservation],
+) -> str:
+    if source_event is None:
+        return "quarantine"
+    source_event_id = source_event.id
+    if (
+        attempt.execution_identity_version
+        != PUBLICATION_EXECUTION_IDENTITY_VERSION
+        or source_event.event_version != 1
+        or source_event.topic != "publication.requested"
+        or source_event.message_key
+        != f"publication.requested:{attempt.id}:1"
+        or source_event.aggregate_type != "publication_attempt"
+        or source_event.aggregate_id != attempt.id
+        or source_event.job_id != attempt.id
+        or source_event.correlation_id != attempt.correlation_id
+        or source_event.payload
+        != {"publication_attempt_id": str(attempt.id)}
+    ):
+        return "quarantine"
+    rows = list(observations)
+    if not rows:
+        return (
+            "bind"
+            if attempt.attempt_no == 1 and attempt.execution_generation == 0
+            else "quarantine"
+        )
+    if all(
+        row.source_event_id == source_event_id
+        and row.identity_version == PUBLICATION_EXECUTION_IDENTITY_VERSION
+        and row.execution_attempt_no == 1
+        for row in rows
+    ):
+        return "resume"
+    return "quarantine"
+
+
+def _legacy_reconcile_binding_action(
+    attempt: PublicationAttempt,
+    *,
+    source_event,
+    generation: PublicationReconcileGeneration | None,
+) -> str:
+    if (
+        source_event.event_version != 1
+        or source_event.topic != "publication.reconcile_requested"
+        or source_event.message_key
+        != f"publication.reconcile_requested:{attempt.id}:1"
+        or source_event.aggregate_type != "publication_attempt"
+        or source_event.aggregate_id != attempt.id
+        or source_event.job_id != attempt.id
+        or source_event.correlation_id != attempt.correlation_id
+        or source_event.payload
+        != {"publication_attempt_id": str(attempt.id)}
+    ):
+        return "quarantine"
+    if generation is None:
+        return "bind" if attempt.reconcile_attempt_no == 0 else "quarantine"
+    if (
+        generation.source_event_id == source_event.id
+        and generation.generation == 1
+        and generation.delivery_identity_version
+        == PUBLICATION_RECONCILE_IDENTITY_VERSION
+    ):
+        return "resume"
+    return "quarantine"
+
+
+def _quarantine_legacy_reconcile_delivery_locked(
+    attempt: PublicationAttempt,
+    *,
+    source_event,
+    generation: PublicationReconcileGeneration | None,
+    audit_context: AuditContext,
+) -> None:
+    can_terminalize = (
+        generation is None
+        and attempt.reconcile_attempt_no == 0
+        and attempt.state
+        not in {
+            PublicationAttempt.State.SUCCEEDED,
+            PublicationAttempt.State.PERMANENT_FAILED,
+            PublicationAttempt.State.MANUAL_REQUIRED,
+            PublicationAttempt.State.STALE,
+        }
+    )
+    action = (
+        "publication_attempt.finished"
+        if can_terminalize
+        else "publication_attempt.skipped"
+    )
+    identity_key = f"{audit_context.event_key}:legacy-reconcile-quarantine:0"
+    metadata_expected = {
+        "reconcile_attempt_no": 0,
+        "error_code": "legacy_reconcile_identity_unproven",
+    }
+    if _worker_audit_replay(
+        audit_context,
+        entity=attempt,
+        candidates=((action, identity_key, metadata_expected),),
+    ):
+        return
+    before_material = _audit_state(attempt)
+    if can_terminalize:
+        _manualize_reconcile_attempt_locked(
+            attempt,
+            error_code="legacy_reconcile_identity_unproven",
+            terminal_event_key=source_event.message_key,
+            terminal_generation=0,
+        )
+        _release_article_external_write_fence_locked(attempt)
+    _record_publishing_audit(
+        audit_context=audit_context,
+        action=action,
+        entity=attempt,
+        identity_key=identity_key,
+        before_material=before_material,
+        after_material=_audit_state(attempt),
+        metadata={
+            "publication_attempt_id": str(attempt.id),
+            **metadata_expected,
+            "result": "manual_required" if can_terminalize else "skipped",
+            "state": attempt.state,
+        },
+    )
+
+
+def _terminal_reservation_matches(
+    receipt,
+    *,
+    audit_context: AuditContext,
+    error_code: str,
+) -> bool:
+    token = audit_context.worker_lease_token
+    generation = audit_context.worker_lease_generation
+    return (
+        token is not None
+        and generation is not None
+        and receipt.terminal_reserved_at is not None
+        and receipt.terminal_lease_generation == generation
+        and receipt.terminal_lease_token == token
+        and receipt.terminal_lease_token_hash == _lease_token_hash(token)
+        and receipt.terminal_error_code == (error_code or "")[:120]
+    )
+
+
+def _require_terminal_reservation_locked(
+    source_event,
+    *,
+    audit_context: AuditContext,
+    error_code: str,
+):
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    receipt = (
+        OutboxConsumerReceipt.objects.select_for_update()
+        .filter(
+            event=source_event,
+            consumer_name=audit_context.worker_consumer_name,
+        )
+        .first()
+    )
+    if receipt is None or not _terminal_reservation_matches(
+        receipt,
+        audit_context=audit_context,
+        error_code=error_code,
+    ):
+        raise Conflict("publication terminal callback has no exact reservation")
+    return receipt
+
+
+def _execution_capability_audit_metadata(
+    *,
+    domain_generation: int,
+    consumer_lease_generation: int,
+    consumer_lease_token: uuid.UUID,
+    domain_field: str = "execution_generation",
+) -> dict[str, int | str]:
+    return {
+        domain_field: domain_generation,
+        "consumer_lease_generation": consumer_lease_generation,
+        "consumer_capability_hash": _lease_token_hash(consumer_lease_token),
+    }
+
+
+def _require_worker_event_identity(
+    audit_context: AuditContext,
+    *,
+    topic: str,
+    aggregate_id,
+    payload_identity: dict[str, Any],
+):
+    """Validate immutable worker-event lineage without requiring a live lease."""
+
+    from wisdome_writer.infrastructure.event_routes import route_for
+    from wisdome_writer.infrastructure.models import OutboxMessage
+
+    if audit_context.actor_type != "worker" or audit_context.event_key is None:
+        raise Conflict("worker event provenance is required")
+    event = OutboxMessage.objects.using(audit_context.database_alias).filter(
+        id=audit_context.event_key,
+        topic=topic,
+        aggregate_id=aggregate_id,
+        correlation_id=audit_context.correlation_id,
+    ).first()
+    if event is None:
+        raise Conflict("worker event identity does not match persisted lineage")
+    route = route_for(event.topic, event.event_version)
+    if route is None or route.consumer_name != audit_context.worker_consumer_name:
+        raise Conflict("worker event route does not match the consumer")
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    if any(
+        str(payload.get(key)) != str(value)
+        for key, value in payload_identity.items()
+    ):
+        raise Conflict("worker event payload does not match persisted lineage")
+    return event
+
+
+def _bounded_remote_url_fact(value: str | None) -> tuple[str | None, str]:
+    if not value:
+        return None, ""
+    material = str(value)
+    parsed = urlsplit(material)
+    if (
+        material == material.strip()
+        and len(material) <= 1000
+        and parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    ):
+        return material, ""
+    return None, hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _require_audit_actor(audit_context: AuditContext, expected: str) -> None:
@@ -1794,6 +2164,36 @@ def _publication_run_terminal_state(
     return "failed", "manual_required", "publication_terminal_failure"
 
 
+def _validated_dispatch_attempt_cohort(
+    dispatches: Iterable[PublicationDispatch],
+    attempts: Iterable[PublicationAttempt],
+) -> tuple[PublicationAttempt, ...]:
+    dispatch_rows = list(dispatches)
+    attempt_rows = sorted(attempts, key=lambda row: str(row.id))
+    dispatch_by_intent = {
+        row.publication_intent_id: row for row in dispatch_rows
+    }
+    if len(dispatch_by_intent) != len(dispatch_rows):
+        raise Conflict("publication run has duplicate immutable dispatch ledgers")
+    grouped: dict[uuid.UUID, list[PublicationAttempt]] = {
+        intent_id: [] for intent_id in dispatch_by_intent
+    }
+    for attempt in attempt_rows:
+        if attempt.publication_intent_id not in grouped:
+            raise Conflict("publication attempt is outside the immutable dispatch cohort")
+        grouped[attempt.publication_intent_id].append(attempt)
+    for intent_id, dispatch in dispatch_by_intent.items():
+        rows = grouped[intent_id]
+        if (
+            len(rows) != dispatch.attempt_count
+            or sha256_hex(_publication_attempt_manifest(rows))
+            != dispatch.attempt_manifest_hash
+            or any(row.correlation_id != dispatch.correlation_id for row in rows)
+        ):
+            raise Conflict("publication run dispatch cohort manifest is inconsistent")
+    return tuple(attempt_rows)
+
+
 def _mark_origin_run_publishing_locked(intent: PublicationIntent) -> None:
     run_id = intent.origin_collection_run_id
     if run_id is None:
@@ -1803,6 +2203,47 @@ def _mark_origin_run_publishing_locked(intent: PublicationIntent) -> None:
     if run.state == "awaiting_approval":
         run.state = "publishing"
         run.save(update_fields=("state",))
+
+
+def _requested_event_for_terminal_locked(
+    attempt: PublicationAttempt,
+):
+    """Return the immutable requested event that owns an attempt terminal tuple."""
+
+    from wisdome_writer.infrastructure.models import OutboxMessage
+
+    message_key = f"publication.requested:{attempt.id}:{attempt.attempt_no}"
+    requested = OutboxMessage.objects.filter(message_key=message_key).first()
+    if requested is None:
+        created = _enqueue_event(
+            "publication.requested",
+            {
+                "publication_attempt_id": str(attempt.id),
+                "execution_attempt_no": attempt.attempt_no,
+            },
+            event_version=2,
+            dedupe_key=message_key,
+            aggregate_type="publication_attempt",
+            aggregate_id=attempt.id,
+            job_id=attempt.id,
+            correlation_id=attempt.correlation_id,
+        )
+        requested = OutboxMessage.objects.get(pk=created.pk)
+    requested_payload = (
+        requested.payload if isinstance(requested.payload, dict) else {}
+    )
+    expected_payload = {"publication_attempt_id": str(attempt.id)}
+    if requested.event_version == 2:
+        expected_payload["execution_attempt_no"] = attempt.attempt_no
+    if (
+        requested.topic != "publication.requested"
+        or requested.aggregate_id != attempt.id
+        or requested.message_key != message_key
+        or requested.event_version not in {1, 2}
+        or requested_payload != expected_payload
+    ):
+        raise Conflict("publication event identity is invalid")
+    return requested
 
 
 def _terminalize_unreachable_dependents_locked(
@@ -1851,6 +2292,7 @@ def _terminalize_unreachable_dependents_locked(
     )
     now = timezone.now()
     for dependent in dependents:
+        requested = _requested_event_for_terminal_locked(dependent)
         dependent.state = PublicationAttempt.State.MANUAL_REQUIRED
         dependent.finished_at = now
         dependent.error_code = "canonical_dependency_failed"
@@ -1861,6 +2303,9 @@ def _terminalize_unreachable_dependents_locked(
             final_state=dependent.state,
             error_code=dependent.error_code,
         )
+        dependent.terminal_event_key = requested.message_key
+        dependent.terminal_generation = dependent.execution_generation
+        dependent.terminal_state = dependent.state
         dependent.save(
             update_fields=(
                 "state",
@@ -1869,6 +2314,9 @@ def _terminalize_unreachable_dependents_locked(
                 "recovery_state",
                 "next_recovery_at",
                 "terminal_impact",
+                "terminal_event_key",
+                "terminal_generation",
+                "terminal_state",
             )
         )
         publication = publications_by_id[dependent.publication_id]
@@ -1889,38 +2337,86 @@ def _project_origin_run_terminal_locked(
     run = CollectionRun.objects.select_for_update().get(id=run_id)
     if run.state != "publishing":
         return
-    _terminalize_unreachable_dependents_locked(attempt)
-    dispatched_intents = list(
-        PublicationIntent.objects.select_for_update()
-        .filter(
-            origin_collection_run_id=run_id,
-            state=PublicationIntent.State.DISPATCHED,
-        )
-        .order_by("id")
+    RunStep = apps.get_model("collection", "RunStep")
+    step, _ = RunStep.objects.select_for_update().get_or_create(
+        run=run,
+        name="publish",
+        attempt_no=1,
+        defaults={"correlation_id": run.correlation_id},
     )
-    attempts = list(
+    _terminalize_unreachable_dependents_locked(attempt)
+    dispatches = list(
+        PublicationDispatch.objects.select_for_update()
+        .filter(
+            publication_intent__origin_collection_run_id=run_id,
+        )
+        .order_by("publication_intent_id", "id")
+    )
+    locked_attempts = list(
         PublicationAttempt.objects.select_for_update()
+        .select_related("publication__target", "publication_intent")
         .filter(
             publication_intent_id__in=[
-                row.id for row in dispatched_intents
+                row.publication_intent_id for row in dispatches
             ]
         )
         .order_by("id")
     )
-    expected_count = sum(
-        len(row.target_commands) for row in dispatched_intents
+    attempts = list(
+        _validated_dispatch_attempt_cohort(dispatches, locked_attempts)
     )
-    if len(attempts) != expected_count:
-        return
+    expected_count = sum(row.attempt_count for row in dispatches)
     projection = _publication_run_terminal_state(
         row.state for row in attempts
     )
     if projection is None:
         return
     final_state, recovery_state, error_code = projection
-    from apps.collection.services import project_run_terminal_observation
+    from apps.collection.services import (
+        project_run_terminal_observation,
+        project_step_terminal_observation,
+    )
 
     now = timezone.now()
+    step.state = "completed" if final_state == "completed" else "failed"
+    step.input_count = expected_count
+    step.output_count = sum(
+        row.state == PublicationAttempt.State.SUCCEEDED for row in attempts
+    )
+    step.error_code = error_code
+    step.error_detail_redacted = (
+        None if error_code is None else "publication cohort did not converge"
+    )
+    step.retry_at = None
+    step.lease_owner = ""
+    step.lease_token = None
+    project_step_terminal_observation(
+        step,
+        run,
+        finished_at=now,
+        final_state=step.state,
+        affected_count=expected_count,
+        error_code=error_code,
+        recovery_state=recovery_state,
+    )
+    step.save(
+        update_fields=(
+            "correlation_id",
+            "state",
+            "input_count",
+            "output_count",
+            "error_code",
+            "error_detail_redacted",
+            "finished_at",
+            "duration_ms",
+            "retry_count",
+            "retry_at",
+            "terminal_impact",
+            "recovery_state",
+            "lease_owner",
+            "lease_token",
+        )
+    )
     run.state = final_state
     run.error_summary = (
         None
@@ -2001,6 +2497,166 @@ def _converge_revoked_attempt_redelivery_locked(
             },
         )
     _release_article_external_write_fence_locked(attempt)
+
+
+def _converge_terminal_attempt_redelivery_locked(
+    attempt: PublicationAttempt,
+    *,
+    source_event,
+    execution_generation: int,
+    audit_context: AuditContext,
+) -> None:
+    terminal_states = {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }
+    if (
+        attempt.state not in terminal_states
+        or attempt.terminal_state != attempt.state
+        or attempt.terminal_event_key != source_event.message_key
+        or attempt.terminal_generation != execution_generation
+    ):
+        raise Conflict("terminal publication attempt identity does not match delivery")
+    identity_key = (
+        f"{audit_context.event_key}:attempt-skipped:{execution_generation}"
+    )
+    metadata_expected = {
+        "attempt": attempt.attempt_no,
+        "execution_generation": execution_generation,
+        "error_code": attempt.error_code,
+    }
+    replay = _worker_audit_replay(
+        audit_context,
+        entity=attempt,
+        candidates=(
+            (
+                "publication_attempt.skipped",
+                identity_key,
+                metadata_expected,
+            ),
+        ),
+    )
+    if replay is None:
+        state = _audit_state(attempt)
+        _record_publishing_audit(
+            audit_context=audit_context,
+            action="publication_attempt.skipped",
+            entity=attempt,
+            identity_key=identity_key,
+            before_material=state,
+            after_material=state,
+            metadata={
+                "publication_attempt_id": str(attempt.id),
+                **metadata_expected,
+                "result": "skipped",
+                "state": attempt.state,
+            },
+        )
+    _release_article_external_write_fence_locked(attempt)
+
+
+def _quarantine_legacy_requested_delivery_locked(
+    attempt: PublicationAttempt,
+    *,
+    source_event,
+    execution_generation: int,
+    has_other_lineage: bool,
+    audit_context: AuditContext,
+) -> None:
+    """Fail closed for an unprovable v1 request without damaging newer lineage."""
+
+    can_terminalize = (
+        not has_other_lineage
+        and attempt.state
+        in {
+            PublicationAttempt.State.QUEUED,
+            PublicationAttempt.State.RETRYABLE_FAILED,
+        }
+    )
+    error_code = "legacy_execution_identity_unproven"
+    action = (
+        "publication_attempt.finished"
+        if can_terminalize
+        else "publication_attempt.skipped"
+    )
+    identity_key = (
+        f"{audit_context.event_key}:legacy-requested-quarantine:"
+        f"{execution_generation}"
+    )
+    metadata_expected = {
+        "attempt": attempt.attempt_no,
+        "execution_generation": execution_generation,
+        "error_code": error_code,
+    }
+    replay = _worker_audit_replay(
+        audit_context,
+        entity=attempt,
+        candidates=((action, identity_key, metadata_expected),),
+    )
+    if replay is not None:
+        return
+    before_material = _audit_state(attempt)
+    if can_terminalize:
+        now = timezone.now()
+        attempt.state = PublicationAttempt.State.MANUAL_REQUIRED
+        attempt.finished_at = now
+        attempt.error_code = error_code
+        attempt.recovery_state = PublicationRecoveryState.MANUAL_REQUIRED
+        attempt.next_recovery_at = None
+        attempt.terminal_impact = _publication_terminal_impact(
+            scope="publication_delivery",
+            stage="legacy_requested_identity",
+            final_state=attempt.state,
+            error_code=attempt.error_code,
+        )
+        _clear_active_publication_execution(attempt)
+        attempt.terminal_event_key = source_event.message_key
+        attempt.terminal_generation = execution_generation
+        attempt.terminal_state = attempt.state
+        attempt.save(
+            update_fields=(
+                "state",
+                "finished_at",
+                "error_code",
+                "recovery_state",
+                "next_recovery_at",
+                "terminal_impact",
+                "active_source_event",
+                "active_consumer_name",
+                "active_consumer_lease_generation",
+                "active_consumer_lease_token",
+                "active_lease_token_hash",
+                "active_lease_expires_at",
+                "active_write_marker",
+                "active_write_started_at",
+                "terminal_event_key",
+                "terminal_generation",
+                "terminal_state",
+            )
+        )
+        publication = attempt.publication
+        publication.state = Publication.State.MANUAL_REQUIRED
+        publication.last_error_code = error_code
+        publication.save(
+            update_fields=("state", "last_error_code", "updated_at")
+        )
+        _release_article_external_write_fence_locked(attempt)
+    _record_publishing_audit(
+        audit_context=audit_context,
+        action=action,
+        entity=attempt,
+        identity_key=identity_key,
+        before_material=before_material,
+        after_material=_audit_state(attempt),
+        metadata={
+            "publication_attempt_id": str(attempt.id),
+            **metadata_expected,
+            "result": "manual_required" if can_terminalize else "skipped",
+            "state": attempt.state,
+        },
+    )
 
 
 def _release_article_external_write_fence_locked(
@@ -2238,16 +2894,27 @@ def _resolve_secret(resolver: Any, reference: str | None) -> Any:
     raise InvalidInput("구성된 비밀 저장소 resolver가 값을 읽을 수 없습니다.")
 
 
-def publisher_for_target(target: PublicationTarget, *, resolver: Any | None = None):
+def publisher_for_target(
+    target: PublicationTarget,
+    *,
+    resolver: Any | None = None,
+    write_guard: Any | None = None,
+):
     resolver = resolver or _secret_resolver()
     credential = _resolve_secret(resolver, target.credential_ref)
+
+    def guarded_write() -> None:
+        _assert_external_writes_allowed()
+        if write_guard is not None:
+            write_guard()
+
     if target.channel == ChannelCode.WORDPRESS:
         username = _resolve_secret(resolver, target.username_ref)
         return WordPressPublisher(
             base_url=target.base_url,
             username=str(username),
             application_password=str(credential),
-            write_guard=_assert_external_writes_allowed,
+            write_guard=guarded_write,
         )
     if target.channel == ChannelCode.BLOGGER:
         access_token = credential.get("access_token") if isinstance(credential, dict) else credential
@@ -2256,7 +2923,7 @@ def publisher_for_target(target: PublicationTarget, *, resolver: Any | None = No
         return BloggerPublisher(
             blog_id=str(target.remote_blog_id),
             access_token=str(access_token),
-            write_guard=_assert_external_writes_allowed,
+            write_guard=guarded_write,
         )
     raise InvalidInput("지원하지 않는 발행 채널입니다.")
 
@@ -4917,6 +5584,7 @@ def _decide_approval_atomic(
     if data["decision"] == Approval.Decision.REVOKED:
         reset_publication_ids: set[uuid.UUID] = set()
         for attempt in staleable_revoke_attempts:
+            requested = _requested_event_for_terminal_locked(attempt)
             attempt.state = PublicationAttempt.State.STALE
             attempt.finished_at = timezone.now()
             attempt.error_code = "approval_revoked"
@@ -4928,6 +5596,9 @@ def _decide_approval_atomic(
             attempt.recovery_state = PublicationRecoveryState.STOPPED
             attempt.next_recovery_at = None
             attempt.next_retry_at = None
+            attempt.terminal_event_key = requested.message_key
+            attempt.terminal_generation = attempt.execution_generation
+            attempt.terminal_state = attempt.state
             attempt.save(
                 update_fields=(
                     "state",
@@ -4937,6 +5608,9 @@ def _decide_approval_atomic(
                     "recovery_state",
                     "next_recovery_at",
                     "next_retry_at",
+                    "terminal_event_key",
+                    "terminal_generation",
+                    "terminal_state",
                 )
             )
             if attempt.publication_id not in reset_publication_ids:
@@ -5375,7 +6049,9 @@ def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | N
         "publication.requested",
         {
             "publication_attempt_id": str(attempt.id),
+            "execution_attempt_no": attempt.attempt_no,
         },
+        event_version=2,
         dedupe_key=f"publication.requested:{attempt.id}:{attempt.attempt_no}",
         aggregate_type="publication_attempt",
         aggregate_id=attempt.id,
@@ -5567,12 +6243,19 @@ def _validated_auto_target_material_eligible(
     return True
 
 
-def _require_attempt_origin_run_active(attempt: PublicationAttempt) -> None:
+def _require_attempt_origin_run_active(
+    attempt: PublicationAttempt,
+    *,
+    lock: bool = False,
+) -> None:
     run_id = attempt.publication_intent.origin_collection_run_id
     if run_id is None:
         raise Conflict("publication attempt has no frozen origin run")
     CollectionRun = apps.get_model("collection", "CollectionRun")
-    run = CollectionRun.objects.filter(pk=run_id).first()
+    runs = CollectionRun.objects
+    if lock:
+        runs = runs.select_for_update()
+    run = runs.filter(pk=run_id).first()
     if run is None:
         raise Conflict("publication attempt origin run is missing")
     if attempt.resolved_action in _CONTENT_PUBLICATION_ACTIONS and (
@@ -5896,25 +6579,42 @@ def _publication_terminal_impact(
     }
 
 
+def _clear_active_publication_execution(attempt: PublicationAttempt) -> None:
+    attempt.active_source_event = None
+    attempt.active_consumer_name = ""
+    attempt.active_consumer_lease_generation = 0
+    attempt.active_consumer_lease_token = None
+    attempt.active_lease_token_hash = ""
+    attempt.active_lease_expires_at = None
+    attempt.active_write_marker = ""
+    attempt.active_write_started_at = None
+
+
 def _complete_execution_observation_locked(
     attempt: PublicationAttempt,
     *,
     execution_attempt_no: int,
+    execution_generation: int | None = None,
     finished_at,
     result_state: str,
+    result_identity: str = "",
     error_code: str,
     retry_at=None,
     recovery_state: str,
     terminal_state: str | None = None,
 ) -> PublicationExecutionObservation:
-    observation = (
-        PublicationExecutionObservation.objects.select_for_update()
-        .filter(
-            publication_attempt=attempt,
-            execution_attempt_no=execution_attempt_no,
-        )
-        .first()
+    observation_query = PublicationExecutionObservation.objects.select_for_update().filter(
+        publication_attempt=attempt,
     )
+    if execution_generation is not None:
+        observation_query = observation_query.filter(
+            execution_generation=execution_generation,
+        )
+    else:
+        observation_query = observation_query.filter(
+            execution_attempt_no=execution_attempt_no,
+        ).order_by("-execution_generation")
+    observation = observation_query.first()
     if observation is None:
         raise Conflict("active publication execution observation is missing")
     if observation.finished_at is not None:
@@ -5931,6 +6631,19 @@ def _complete_execution_observation_locked(
     observation.finished_at = finished_at
     observation.duration_ms = duration_ms
     observation.result_state = result_state
+    observation.result_identity = result_identity
+    if result_identity:
+        observation.state = PublicationExecutionObservation.State.COMPLETED
+        observation.projection_disposition = (
+            PublicationExecutionObservation.ProjectionDisposition.APPLIED
+        )
+    else:
+        observation.state = (
+            PublicationExecutionObservation.State.DELIVERY_UNKNOWN
+        )
+        observation.projection_disposition = (
+            PublicationExecutionObservation.ProjectionDisposition.NO_RESULT
+        )
     observation.error_code = (error_code or "")[:100]
     observation.retry_at = retry_at
     observation.terminal_impact = terminal_impact
@@ -5938,8 +6651,11 @@ def _complete_execution_observation_locked(
     observation.save(
         update_fields=(
             "finished_at",
+            "state",
             "duration_ms",
             "result_state",
+            "result_identity",
+            "projection_disposition",
             "error_code",
             "retry_at",
             "terminal_impact",
@@ -5964,7 +6680,10 @@ def _complete_reconcile_observation_locked(
     next_recovery_at=None,
     recovery_state: str,
 ) -> None:
-    if generation.state == PublicationReconcileGeneration.State.COMPLETED:
+    if generation.state in {
+        PublicationReconcileGeneration.State.COMPLETED,
+        PublicationReconcileGeneration.State.DELIVERY_FAILED,
+    }:
         return
     duration_ms = _observation_duration_ms(
         generation.started_at,
@@ -6018,6 +6737,9 @@ def _manualize_reconcile_attempt_locked(
     attempt: PublicationAttempt,
     *,
     error_code: str,
+    terminal_event_key: str,
+    terminal_generation: int,
+    terminal_impact: dict[str, Any] | None = None,
     now=None,
 ) -> str:
     now = now or timezone.now()
@@ -6034,11 +6756,14 @@ def _manualize_reconcile_attempt_locked(
     attempt.finished_at = now
     attempt.recovery_state = PublicationRecoveryState.MANUAL_REQUIRED
     attempt.next_recovery_at = None
-    attempt.terminal_impact = _publication_terminal_impact(
+    attempt.terminal_impact = terminal_impact or _publication_terminal_impact(
         stage="reconcile",
         final_state=attempt.state,
         error_code=attempt.error_code,
     )
+    attempt.terminal_event_key = terminal_event_key
+    attempt.terminal_generation = terminal_generation
+    attempt.terminal_state = attempt.state
     attempt.save(
         update_fields=(
             "state",
@@ -6047,6 +6772,9 @@ def _manualize_reconcile_attempt_locked(
             "recovery_state",
             "next_recovery_at",
             "terminal_impact",
+            "terminal_event_key",
+            "terminal_generation",
+            "terminal_state",
         )
     )
     attempt.publication.state = Publication.State.MANUAL_REQUIRED
@@ -6068,30 +6796,30 @@ def _terminalize_reconcile_generation_locked(
     *,
     error_code: str,
 ) -> None:
-    if generation.state == PublicationReconcileGeneration.State.COMPLETED:
+    if generation.state in {
+        PublicationReconcileGeneration.State.COMPLETED,
+        PublicationReconcileGeneration.State.DELIVERY_FAILED,
+    }:
         return
     now = timezone.now()
-    preserved_before = attempt.state in {
-        PublicationAttempt.State.SUCCEEDED,
-        PublicationAttempt.State.PERMANENT_FAILED,
-        PublicationAttempt.State.MANUAL_REQUIRED,
-        PublicationAttempt.State.STALE,
-    }
-    _manualize_reconcile_attempt_locked(
-        attempt,
-        error_code=error_code,
-        now=now,
-    )
     terminal_impact = _publication_terminal_impact(
         scope="publication_delivery",
         stage="reconcile_delivery",
         final_state="delivery_failed",
         error_code=error_code,
     )
+    _manualize_reconcile_attempt_locked(
+        attempt,
+        error_code=error_code,
+        terminal_event_key=generation.source_event.message_key,
+        terminal_generation=generation.generation,
+        terminal_impact=terminal_impact,
+        now=now,
+    )
     # A terminal callback means the reconcile message was never executed by the
     # publisher. Close the delivery generation without inventing a channel
     # result, duration, or retry.
-    generation.state = PublicationReconcileGeneration.State.COMPLETED
+    generation.state = PublicationReconcileGeneration.State.DELIVERY_FAILED
     generation.result_identity = ""
     generation.result_state = ""
     generation.completed_at = now
@@ -6117,9 +6845,8 @@ def _terminalize_reconcile_generation_locked(
             "next_recovery_at",
         )
     )
-    if not preserved_before or attempt.state == PublicationAttempt.State.MANUAL_REQUIRED:
-        attempt.terminal_impact = terminal_impact
-        attempt.save(update_fields=("terminal_impact",))
+    # Attempt terminal identity and impact are frozen by the first terminal
+    # write above. Never issue a second partial save against that row.
 
 
 def _reconcile_generation_delivery_dead_lettered(
@@ -6153,7 +6880,10 @@ def _enqueue_reconcile_locked(
         )
         if (
             current is not None
-            and current.state == PublicationReconcileGeneration.State.STARTED
+            and current.state in {
+                PublicationReconcileGeneration.State.QUEUED,
+                PublicationReconcileGeneration.State.RUNNING,
+            }
         ):
             if _reconcile_generation_delivery_dead_lettered(current):
                 _terminalize_reconcile_generation_locked(
@@ -6210,7 +6940,7 @@ def _enqueue_reconcile_locked(
         generation=reconcile_attempt_no,
         defaults={
             "source_event": event,
-            "state": PublicationReconcileGeneration.State.STARTED,
+            "state": PublicationReconcileGeneration.State.QUEUED,
             "not_before": event.not_before,
             "started_at": event.occurred_at,
             "correlation_id": event.correlation_id,
@@ -6227,23 +6957,154 @@ def _enqueue_reconcile_locked(
 
 
 @transaction.atomic
-def begin_attempt(
-    attempt_id: str,
+def authorize_publication_external_write(
+    fence: PublicationExecutionFence,
     *,
     audit_context: AuditContext,
-) -> tuple[PublicationAttempt, PublishCommand | None]:
+) -> None:
+    """Commit the final receipt/domain fence immediately before remote mutation."""
+
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    _require_audit_actor(audit_context, "worker")
+    source_event = _require_worker_event(
+        audit_context,
+        topic="publication.requested",
+        aggregate_id=fence.publication_attempt_id,
+        payload_identity={
+            "publication_attempt_id": str(fence.publication_attempt_id),
+        },
+    )
+    if (
+        source_event.id != fence.source_event_id
+        or audit_context.worker_consumer_name != fence.consumer_name
+        or audit_context.worker_lease_generation
+        != fence.consumer_lease_generation
+        or _lease_token_hash(audit_context.worker_lease_token)
+        != fence.lease_token_hash
+    ):
+        raise Conflict("publication execution capability changed before write")
+    now = timezone.now()
+    receipt = (
+        OutboxConsumerReceipt.objects.select_for_update()
+        .filter(
+            event=source_event,
+            consumer_name=fence.consumer_name,
+            state=OutboxConsumerReceipt.State.PROCESSING,
+            lease_generation=fence.consumer_lease_generation,
+            lease_token=audit_context.worker_lease_token,
+            claimed_until__gt=now,
+        )
+        .first()
+    )
+    if receipt is None:
+        raise Conflict("publication execution receipt lease was lost before write")
+    renewed_until = max(
+        receipt.claimed_until,
+        now
+        + timedelta(
+            seconds=max(
+                int(getattr(settings, "OUTBOX_CONSUMER_LEASE_SECONDS", 1)),
+                60,
+            )
+        ),
+    )
+    if renewed_until != receipt.claimed_until:
+        receipt.claimed_until = renewed_until
+        receipt.save(update_fields=("claimed_until",))
+
+    preliminary = PublicationAttempt.objects.select_related(
+        "publication_intent",
+        "publication__target",
+    ).get(id=fence.publication_attempt_id)
+    _require_attempt_origin_run_active(preliminary, lock=True)
+    _lock_article_external_write_fence(
+        preliminary.publication_intent.article_id
+    )
+    _lock_target_intent_fences(
+        _intent_target_ids(preliminary.publication_intent)
+    )
+    attempt = _lock_publication_attempt_domain(preliminary)
+    if (
+        attempt.state != PublicationAttempt.State.RUNNING
+        or attempt.execution_generation != fence.execution_generation
+        or attempt.attempt_no != fence.execution_attempt_no
+        or attempt.active_source_event_id != fence.source_event_id
+        or attempt.active_consumer_name != fence.consumer_name
+        or attempt.active_consumer_lease_generation
+        != fence.consumer_lease_generation
+        or attempt.active_consumer_lease_token
+        != audit_context.worker_lease_token
+        or attempt.active_lease_token_hash != fence.lease_token_hash
+        or attempt.active_write_marker != fence.write_marker
+        or attempt.active_write_started_at is not None
+    ):
+        raise Conflict("publication execution domain fence was lost before write")
+    validate_attempt_gate(attempt)
+    observation = (
+        PublicationExecutionObservation.objects.select_for_update()
+        .filter(
+            publication_attempt=attempt,
+            execution_generation=fence.execution_generation,
+            source_event_id=fence.source_event_id,
+            state=PublicationExecutionObservation.State.STARTED,
+        )
+        .first()
+    )
+    if (
+        observation is None
+        or observation.consumer_name != fence.consumer_name
+        or observation.consumer_lease_generation
+        != fence.consumer_lease_generation
+        or observation.consumer_lease_token
+        != audit_context.worker_lease_token
+        or observation.lease_token_hash != fence.lease_token_hash
+        or observation.write_marker != fence.write_marker
+        or observation.external_write_started_at is not None
+    ):
+        raise Conflict("publication execution observation fence was lost before write")
+    attempt.active_lease_expires_at = renewed_until
+    attempt.active_write_started_at = now
+    attempt.save(
+        update_fields=(
+            "active_lease_expires_at",
+            "active_write_started_at",
+        )
+    )
+    observation.lease_expires_at = renewed_until
+    observation.external_write_started_at = now
+    observation.save(
+        update_fields=(
+            "lease_expires_at",
+            "external_write_started_at",
+        )
+    )
+
+
+@transaction.atomic
+def begin_attempt(
+    attempt_id: str,
+    execution_attempt_no: int | None = None,
+    *,
+    audit_context: AuditContext,
+) -> tuple[
+    PublicationAttempt,
+    PublicationExecutionFence | None,
+    PublishCommand | None,
+]:
     _require_audit_actor(audit_context, "worker")
     preliminary = PublicationAttempt.objects.select_related(
         "publication__target",
         "publication_intent__article_revision__generation_attempt",
         "approval",
     ).get(id=attempt_id)
-    _require_worker_event(
+    source_event = _require_worker_event(
         audit_context,
         topic="publication.requested",
         aggregate_id=preliminary.id,
         payload_identity={"publication_attempt_id": str(preliminary.id)},
     )
+    _require_attempt_origin_run_active(preliminary, lock=True)
     _lock_article_external_write_fence(
         preliminary.publication_intent.article_id
     )
@@ -6290,6 +7151,9 @@ def begin_attempt(
                 )
                 attempt.recovery_state = PublicationRecoveryState.STOPPED
                 attempt.next_recovery_at = None
+                attempt.terminal_event_key = source_event.message_key
+                attempt.terminal_generation = attempt.execution_generation
+                attempt.terminal_state = attempt.state
                 attempt.save(
                     update_fields=[
                         "state",
@@ -6298,6 +7162,9 @@ def begin_attempt(
                         "terminal_impact",
                         "recovery_state",
                         "next_recovery_at",
+                        "terminal_event_key",
+                        "terminal_generation",
+                        "terminal_state",
                     ]
                 )
                 _release_article_external_write_fence_locked(attempt)
@@ -6307,7 +7174,7 @@ def begin_attempt(
                     entity=attempt,
                     identity_key=(
                         f"{audit_context.event_key}:attempt-result:"
-                        f"{attempt.attempt_no}"
+                        f"{attempt.execution_generation}"
                     ),
                     before_material=before_material,
                     after_material=_audit_state(attempt),
@@ -6319,7 +7186,7 @@ def begin_attempt(
                         "state": attempt.state,
                     },
                 )
-            return attempt, None
+            return attempt, None, None
         intent = PublicationIntent.objects.select_for_update().get(id=intent.id)
         PublicationTarget.objects.select_for_update().get(
             id=preliminary.publication.target_id
@@ -6329,15 +7196,24 @@ def begin_attempt(
         PublicationAttempt.objects.select_for_update().get(id=preliminary.id)
     else:
         _lock_publication_attempt_domain(preliminary)
-    return _begin_attempt_locked(attempt_id, audit_context=audit_context)
+    return _begin_attempt_locked(
+        attempt_id,
+        execution_attempt_no=execution_attempt_no,
+        audit_context=audit_context,
+    )
 
 
 @transaction.atomic
 def _begin_attempt_locked(
     attempt_id: str,
+    execution_attempt_no: int | None = None,
     *,
     audit_context: AuditContext,
-) -> tuple[PublicationAttempt, PublishCommand | None]:
+) -> tuple[
+    PublicationAttempt,
+    PublicationExecutionFence | None,
+    PublishCommand | None,
+]:
     _require_audit_actor(audit_context, "worker")
     attempt = PublicationAttempt.objects.select_for_update().select_related(
         "publication__target", "publication_intent", "approval__article_channel_render"
@@ -6349,6 +7225,63 @@ def _begin_attempt_locked(
         aggregate_id=attempt.id,
         payload_identity={"publication_attempt_id": str(attempt.id)},
     )
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    payload = source_event.payload if isinstance(source_event.payload, dict) else {}
+    if source_event.event_version == 2:
+        payload_attempt_no = payload.get("execution_attempt_no")
+        if (
+            type(execution_attempt_no) is not int
+            or execution_attempt_no < 1
+            or execution_attempt_no > 5
+            or payload_attempt_no != execution_attempt_no
+        ):
+            raise Conflict("publication requested v2 execution attempt is invalid")
+    elif source_event.event_version == 1:
+        if execution_attempt_no is not None:
+            raise Conflict("legacy publication request cannot carry execution attempt")
+        execution_attempt_no = attempt.attempt_no
+    else:
+        raise Conflict("unsupported publication requested event version")
+    receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+        event=source_event,
+        consumer_name=audit_context.worker_consumer_name,
+        state=OutboxConsumerReceipt.State.PROCESSING,
+        lease_token=audit_context.worker_lease_token,
+        lease_generation=audit_context.worker_lease_generation,
+        claimed_until__gt=timezone.now(),
+    )
+    lease_hash = _lease_token_hash(audit_context.worker_lease_token)
+    now = timezone.now()
+    observations = None
+    legacy_binding_action = None
+    if source_event.event_version == 1:
+        observations = list(
+            PublicationExecutionObservation.objects.select_for_update()
+            .filter(publication_attempt_id=attempt.id)
+            .only("source_event_id", "execution_generation")
+            .order_by("execution_generation")
+        )
+        legacy_binding_action = _legacy_requested_binding_action(
+            attempt,
+            source_event=source_event,
+            observations=observations,
+        )
+    event_execution_generation = _execution_generation_for_source_event(
+        attempt,
+        source_event_id=source_event.id,
+        source_message_key=source_event.message_key,
+        observations=observations,
+    )
+    if legacy_binding_action == "quarantine":
+        _quarantine_legacy_requested_delivery_locked(
+            attempt,
+            source_event=source_event,
+            execution_generation=event_execution_generation,
+            has_other_lineage=bool(observations),
+            audit_context=audit_context,
+        )
+        return attempt, None, None
     if attempt.state in {
         PublicationAttempt.State.SUCCEEDED,
         PublicationAttempt.State.PERMANENT_FAILED,
@@ -6363,7 +7296,7 @@ def _begin_attempt_locked(
                     "publication_attempt.finished",
                     (
                         f"{audit_context.event_key}:attempt-result:"
-                        f"{attempt.attempt_no}"
+                        f"{event_execution_generation}"
                     ),
                     {"attempt": attempt.attempt_no},
                 ),
@@ -6371,100 +7304,156 @@ def _begin_attempt_locked(
                     "publication_attempt.reconcile_started",
                     (
                         f"{audit_context.event_key}:delivery-redelivery:"
-                        f"{attempt.attempt_no}"
+                        f"{event_execution_generation}"
                     ),
                     {"attempt": attempt.attempt_no},
                 ),
             ),
         )
         if replay is None:
-            _converge_revoked_attempt_redelivery_locked(
-                attempt,
-                audit_context=audit_context,
-            )
-        return attempt, None
+            if (
+                attempt.state == PublicationAttempt.State.STALE
+                and attempt.error_code == "approval_revoked"
+            ):
+                _converge_revoked_attempt_redelivery_locked(
+                    attempt,
+                    audit_context=audit_context,
+                )
+            else:
+                _converge_terminal_attempt_redelivery_locked(
+                    attempt,
+                    source_event=source_event,
+                    execution_generation=event_execution_generation,
+                    audit_context=audit_context,
+                )
+        return attempt, None, None
     if attempt.state == PublicationAttempt.State.RUNNING:
-        if not _worker_audit_replay(
-            audit_context,
-            entity=attempt,
-            candidates=(
-                (
-                    "publication_attempt.started",
-                    (
-                        f"{audit_context.event_key}:attempt-start:"
-                        f"{attempt.attempt_no}"
-                    ),
-                    {"attempt": attempt.attempt_no},
-                ),
-            ),
-        ):
-            raise Conflict(
-                "running publication attempt has no matching started audit"
-            )
-        before_material = {
-            "attempt": _audit_state(attempt),
-            "publication": _audit_state(publication),
-        }
-        now = timezone.now()
-        attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
-        attempt.finished_at = now
-        attempt.error_code = "delivery_redelivered_after_begin"
-        attempt.save(update_fields=["state", "finished_at", "error_code"])
-        publication.state = Publication.State.RECONCILING
-        publication.remote_state = Publication.RemoteState.UNKNOWN
-        publication.last_error_code = attempt.error_code
-        publication.save(
-            update_fields=(
-                "state",
-                "remote_state",
-                "last_error_code",
-                "updated_at",
-            )
-        )
-        generation = _enqueue_reconcile_locked(attempt)
-        _complete_execution_observation_locked(
+        claim_action = _publication_execution_claim_action(
             attempt,
-            execution_attempt_no=attempt.attempt_no,
-            finished_at=now,
-            result_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
-            error_code=attempt.error_code,
-            retry_at=(
-                generation.not_before if generation is not None else None
-            ),
-            recovery_state=attempt.recovery_state,
-            terminal_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+            source_event_id=source_event.id,
+            consumer_name=audit_context.worker_consumer_name,
+            consumer_lease_generation=audit_context.worker_lease_generation,
+            consumer_lease_token=audit_context.worker_lease_token,
+            lease_token_hash=lease_hash,
+            now=now,
         )
-        attempt.save(
-            update_fields=(
-                "duration_ms",
-                "retry_count",
-                "terminal_impact",
-                "recovery_state",
-                "next_recovery_at",
+        if claim_action == "duplicate":
+            return attempt, None, None
+        if claim_action == "stale":
+            raise Conflict("publication execution has another active capability")
+        if claim_action == "reclaim":
+            previous = (
+                PublicationExecutionObservation.objects.select_for_update()
+                .filter(
+                    publication_attempt=attempt,
+                    execution_generation=attempt.execution_generation,
+                    state=PublicationExecutionObservation.State.STARTED,
+                )
+                .first()
             )
-        )
-        _record_publishing_audit(
-            audit_context=audit_context,
-            action="publication_attempt.reconcile_started",
-            entity=attempt,
-            identity_key=(
-                f"{audit_context.event_key}:delivery-redelivery:"
-                f"{attempt.attempt_no}"
-            ),
-            before_material=before_material,
-            after_material={
+            if previous is None or previous.external_write_started_at is not None:
+                raise Conflict("expired publication execution cannot be reclaimed")
+            previous.state = (
+                PublicationExecutionObservation.State.DELIVERY_UNKNOWN
+            )
+            previous.finished_at = now
+            previous.result_state = ""
+            previous.result_identity = ""
+            previous.projection_disposition = (
+                PublicationExecutionObservation.ProjectionDisposition.NO_RESULT
+            )
+            previous.error_code = "lease_expired_pre_write_reclaim"
+            previous.save(
+                update_fields=(
+                    "state",
+                    "finished_at",
+                    "result_state",
+                    "result_identity",
+                    "projection_disposition",
+                    "error_code",
+                )
+            )
+        elif claim_action != "reconcile":
+            raise Conflict("publication execution claim decision is invalid")
+        if claim_action == "reclaim":
+            attempt.state = PublicationAttempt.State.QUEUED
+        else:
+            before_material = {
                 "attempt": _audit_state(attempt),
                 "publication": _audit_state(publication),
-            },
-            metadata={
-                "publication_attempt_id": str(attempt.id),
-                "attempt": attempt.attempt_no,
-                "result": "unknown_outcome",
-                "error_code": attempt.error_code,
-                "state": attempt.state,
-            },
-        )
-        return attempt, None
+            }
+            attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
+            attempt.finished_at = now
+            attempt.error_code = "delivery_redelivered_after_write_start"
+            attempt.active_source_event = None
+            attempt.active_consumer_name = ""
+            attempt.active_consumer_lease_generation = 0
+            attempt.active_consumer_lease_token = None
+            attempt.active_lease_token_hash = ""
+            attempt.active_lease_expires_at = None
+            attempt.active_write_marker = ""
+            attempt.active_write_started_at = None
+            attempt.save(
+                update_fields=(
+                    "state",
+                    "finished_at",
+                    "error_code",
+                    "active_source_event",
+                    "active_consumer_name",
+                    "active_consumer_lease_generation",
+                    "active_consumer_lease_token",
+                    "active_lease_token_hash",
+                    "active_lease_expires_at",
+                    "active_write_marker",
+                    "active_write_started_at",
+                )
+            )
+            publication.state = Publication.State.RECONCILING
+            publication.remote_state = Publication.RemoteState.UNKNOWN
+            publication.last_error_code = attempt.error_code
+            publication.save(
+                update_fields=(
+                    "state",
+                    "remote_state",
+                    "last_error_code",
+                    "updated_at",
+                )
+            )
+            generation = _enqueue_reconcile_locked(attempt)
+            _complete_execution_observation_locked(
+                attempt,
+                execution_attempt_no=attempt.attempt_no,
+                execution_generation=attempt.execution_generation,
+                finished_at=now,
+                result_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+                error_code=attempt.error_code,
+                retry_at=(generation.not_before if generation else None),
+                recovery_state=attempt.recovery_state,
+                terminal_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
+            )
+            _record_publishing_audit(
+                audit_context=audit_context,
+                action="publication_attempt.reconcile_started",
+                entity=attempt,
+                identity_key=(
+                    f"{audit_context.event_key}:delivery-redelivery:"
+                    f"{attempt.execution_generation}"
+                ),
+                before_material=before_material,
+                after_material={
+                    "attempt": _audit_state(attempt),
+                    "publication": _audit_state(publication),
+                },
+                metadata={
+                    "publication_attempt_id": str(attempt.id),
+                    "attempt": attempt.attempt_no,
+                    "execution_generation": attempt.execution_generation,
+                    "result": "unknown_outcome",
+                    "error_code": attempt.error_code,
+                    "state": attempt.state,
+                },
+            )
+            return attempt, None, None
     if attempt.state in {
         PublicationAttempt.State.RECONCILING,
         PublicationAttempt.State.UNKNOWN_OUTCOME,
@@ -6477,7 +7466,7 @@ def _begin_attempt_locked(
                     "publication_attempt.finished",
                     (
                         f"{audit_context.event_key}:attempt-result:"
-                        f"{attempt.attempt_no}"
+                        f"{event_execution_generation}"
                     ),
                     {"attempt": attempt.attempt_no},
                 ),
@@ -6485,7 +7474,7 @@ def _begin_attempt_locked(
                     "publication_attempt.reconcile_started",
                     (
                         f"{audit_context.event_key}:delivery-redelivery:"
-                        f"{attempt.attempt_no}"
+                        f"{event_execution_generation}"
                     ),
                     {"attempt": attempt.attempt_no},
                 ),
@@ -6495,16 +7484,19 @@ def _begin_attempt_locked(
                 "reconciling publication attempt has no matching audit event"
             )
         _enqueue_reconcile_locked(attempt)
-        return attempt, None
+        return attempt, None, None
     if attempt.state not in {
         PublicationAttempt.State.QUEUED,
         PublicationAttempt.State.RETRYABLE_FAILED,
     }:
         raise Conflict("terminal publication attempt cannot be executed again")
+    if execution_attempt_no != attempt.attempt_no:
+        raise Conflict("publication execution attempt does not match the event")
     try:
         validate_attempt_gate(attempt)
     except Conflict:
         before_material = _audit_state(attempt)
+        _clear_active_publication_execution(attempt)
         attempt.state = PublicationAttempt.State.STALE
         attempt.finished_at = timezone.now()
         attempt.error_code = "attempt_gate_stale"
@@ -6515,6 +7507,9 @@ def _begin_attempt_locked(
         )
         attempt.recovery_state = PublicationRecoveryState.STOPPED
         attempt.next_recovery_at = None
+        attempt.terminal_event_key = source_event.message_key
+        attempt.terminal_generation = attempt.execution_generation
+        attempt.terminal_state = attempt.state
         attempt.save(
             update_fields=[
                 "state",
@@ -6523,6 +7518,17 @@ def _begin_attempt_locked(
                 "terminal_impact",
                 "recovery_state",
                 "next_recovery_at",
+                "active_source_event",
+                "active_consumer_name",
+                "active_consumer_lease_generation",
+                "active_consumer_lease_token",
+                "active_lease_token_hash",
+                "active_lease_expires_at",
+                "active_write_marker",
+                "active_write_started_at",
+                "terminal_event_key",
+                "terminal_generation",
+                "terminal_state",
             ]
         )
         _release_article_external_write_fence_locked(attempt)
@@ -6532,7 +7538,7 @@ def _begin_attempt_locked(
             entity=attempt,
             identity_key=(
                 f"{audit_context.event_key}:attempt-result:"
-                f"{attempt.attempt_no}"
+                f"{attempt.execution_generation}"
             ),
             before_material=before_material,
             after_material=_audit_state(attempt),
@@ -6544,48 +7550,64 @@ def _begin_attempt_locked(
                 "state": attempt.state,
             },
         )
-        return attempt, None
+        return attempt, None, None
     render = _final_render(attempt)
     before_material = {
         "attempt": _audit_state(attempt),
         "publication": _audit_state(publication),
     }
     _set_article_external_write_fence_locked(attempt)
-    attempt.state = PublicationAttempt.State.RUNNING
-    attempt.started_at = timezone.now()
-    attempt.finished_at = None
-    attempt.error_code = ""
-    attempt.recovery_state = PublicationRecoveryState.IN_PROGRESS
-    attempt.next_recovery_at = None
-    attempt.save(
-        update_fields=[
-            "state",
-            "started_at",
-            "finished_at",
-            "error_code",
-            "recovery_state",
-            "next_recovery_at",
-        ]
+    execution_generation = attempt.execution_generation + 1
+    write_marker = sha256_hex(
+        {
+            "schemaVersion": "publication-external-write-v1",
+            "publicationAttemptId": str(attempt.id),
+            "executionAttemptNo": execution_attempt_no,
+            "executionGeneration": execution_generation,
+            "sourceEventId": str(source_event.id),
+            "consumerName": audit_context.worker_consumer_name,
+            "consumerLeaseGeneration": receipt.lease_generation,
+            "targetCommandHash": attempt.target_command_hash,
+        }
     )
-    observation, created = PublicationExecutionObservation.objects.get_or_create(
+    started_at = timezone.now()
+    observation = PublicationExecutionObservation.objects.create(
         publication_attempt=attempt,
-        execution_attempt_no=attempt.attempt_no,
-        defaults={
-            "correlation_id": source_event.correlation_id,
-            "source_event": source_event,
-            "worker_task_id": _current_worker_task_id(),
-            "started_at": attempt.started_at,
-            "recovery_state": PublicationRecoveryState.IN_PROGRESS,
-        },
+        execution_attempt_no=execution_attempt_no,
+        execution_generation=execution_generation,
+        identity_version=attempt.execution_identity_version,
+        correlation_id=source_event.correlation_id,
+        source_event=source_event,
+        worker_task_id=_current_worker_task_id(),
+        consumer_name=audit_context.worker_consumer_name,
+        consumer_lease_generation=receipt.lease_generation,
+        consumer_lease_token=receipt.lease_token,
+        lease_token_hash=lease_hash,
+        lease_expires_at=receipt.claimed_until,
+        write_marker=write_marker,
+        started_at=started_at,
+        recovery_state=PublicationRecoveryState.IN_PROGRESS,
     )
+    attempt.refresh_from_db()
     if (
-        not created
-        and (
-            observation.finished_at is not None
-            or observation.source_event_id != source_event.id
-        )
+        attempt.state != PublicationAttempt.State.RUNNING
+        or attempt.execution_generation != execution_generation
+        or attempt.active_source_event_id != source_event.id
+        or attempt.active_consumer_name != audit_context.worker_consumer_name
+        or attempt.active_consumer_lease_generation != receipt.lease_generation
+        or attempt.active_consumer_lease_token != receipt.lease_token
+        or attempt.active_lease_token_hash != lease_hash
+        or attempt.active_lease_expires_at != receipt.claimed_until
+        or attempt.active_write_marker != write_marker
+        or attempt.active_write_started_at is not None
+        or attempt.started_at != started_at
+        or attempt.finished_at is not None
+        or attempt.error_code
+        or attempt.recovery_state != PublicationRecoveryState.IN_PROGRESS
+        or attempt.next_recovery_at is not None
+        or observation.state != PublicationExecutionObservation.State.STARTED
     ):
-        raise Conflict("publication execution observation fence conflicts")
+        raise Conflict("publication execution parent advance did not match observation")
     publication.state = {
         PublicationAction.CREATE: Publication.State.IN_PROGRESS,
         PublicationAction.UPDATE: Publication.State.UPDATING,
@@ -6599,7 +7621,7 @@ def _begin_attempt_locked(
         entity=attempt,
         identity_key=(
             f"{audit_context.event_key}:attempt-start:"
-            f"{attempt.attempt_no}"
+            f"{execution_generation}"
         ),
         before_material=before_material,
         after_material={
@@ -6609,6 +7631,11 @@ def _begin_attempt_locked(
         metadata={
             "publication_attempt_id": str(attempt.id),
             "attempt": attempt.attempt_no,
+            **_execution_capability_audit_metadata(
+                domain_generation=execution_generation,
+                consumer_lease_generation=receipt.lease_generation,
+                consumer_lease_token=receipt.lease_token,
+            ),
             "action": attempt.resolved_action,
             "channel": publication.target.channel,
             "intent_id": str(attempt.publication_intent_id),
@@ -6616,7 +7643,18 @@ def _begin_attempt_locked(
             "target_id": str(publication.target_id),
         },
     )
-    return attempt, _command_for_attempt(attempt, render)
+    fence = PublicationExecutionFence(
+        publication_attempt_id=attempt.id,
+        execution_attempt_no=execution_attempt_no,
+        execution_generation=execution_generation,
+        source_event_id=source_event.id,
+        consumer_name=audit_context.worker_consumer_name,
+        consumer_lease_generation=receipt.lease_generation,
+        lease_token_hash=lease_hash,
+        lease_expires_at=receipt.claimed_until,
+        write_marker=write_marker,
+    )
+    return attempt, fence, _command_for_attempt(attempt, render)
 
 
 def _publish_result_identity(result) -> str:
@@ -6646,11 +7684,236 @@ def _publish_result_identity(result) -> str:
     )
 
 
+def _validate_publish_result_projection(
+    attempt: PublicationAttempt,
+    result,
+) -> None:
+    """Fail closed before a publisher result is allowed to change domain state."""
+
+    if result.status != "succeeded":
+        return
+    if not result.remote_post_id:
+        raise Conflict("successful publisher result is missing remote identity")
+    allowed_states = (
+        {"draft", "deleted", "withdrawn"}
+        if attempt.resolved_action == PublicationAction.UNPUBLISH
+        else {"published"}
+    )
+    if result.remote_state not in allowed_states:
+        raise Conflict("successful publisher result does not prove the requested state")
+
+
+def _receipt_capability_is_current(
+    receipt,
+    *,
+    lease_token: uuid.UUID,
+    lease_generation: int,
+) -> bool:
+    """Match durable receipt ownership without treating clock expiry as a reclaim."""
+
+    return (
+        receipt.state == "processing"
+        and receipt.lease_token == lease_token
+        and receipt.lease_generation == lease_generation
+    )
+
+
+def _reconcile_result_capability_is_current(
+    generation: PublicationReconcileGeneration,
+    receipt,
+    *,
+    audit_context: AuditContext,
+    delivery: PublicationReconcileDeliveryObservation | None = None,
+) -> bool:
+    token = audit_context.worker_lease_token
+    lease_generation = audit_context.worker_lease_generation
+    return (
+        token is not None
+        and lease_generation is not None
+        and (
+            delivery is None
+            or (
+                delivery.state
+                == PublicationReconcileDeliveryObservation.State.ACTIVE
+                and delivery.reconcile_generation_id == generation.id
+                and delivery.consumer_name == audit_context.worker_consumer_name
+                and delivery.consumer_lease_generation == lease_generation
+                and delivery.consumer_lease_token == token
+                and delivery.lease_token_hash == _lease_token_hash(token)
+            )
+        )
+        and generation.consumer_name == audit_context.worker_consumer_name
+        and generation.consumer_lease_generation == lease_generation
+        and generation.consumer_lease_token == token
+        and generation.lease_token_hash == _lease_token_hash(token)
+        and _receipt_capability_is_current(
+            receipt,
+            lease_token=token,
+            lease_generation=lease_generation,
+        )
+    )
+
+
+def _execution_fence_receipt_owned_locked(
+    fence: PublicationExecutionFence,
+    *,
+    audit_context: AuditContext,
+) -> bool:
+    from wisdome_writer.infrastructure.models import (
+        OutboxConsumerReceipt,
+        OutboxMessage,
+    )
+
+    if (
+        audit_context.event_key != str(fence.source_event_id)
+        or audit_context.worker_consumer_name != fence.consumer_name
+        or audit_context.worker_lease_generation
+        != fence.consumer_lease_generation
+        or _lease_token_hash(audit_context.worker_lease_token)
+        != fence.lease_token_hash
+    ):
+        return False
+    event = (
+        OutboxMessage.objects.select_for_update()
+        .filter(
+            id=fence.source_event_id,
+            topic="publication.requested",
+            aggregate_id=fence.publication_attempt_id,
+        )
+        .first()
+    )
+    if event is None:
+        return False
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    if payload.get("publication_attempt_id") != str(fence.publication_attempt_id):
+        return False
+    if event.event_version == 2:
+        if payload.get("execution_attempt_no") != fence.execution_attempt_no:
+            return False
+    elif event.event_version != 1:
+        return False
+    receipt = OutboxConsumerReceipt.objects.select_for_update().filter(
+        event=event,
+        consumer_name=fence.consumer_name,
+    ).first()
+    return receipt is not None and _receipt_capability_is_current(
+        receipt,
+        lease_token=audit_context.worker_lease_token,
+        lease_generation=fence.consumer_lease_generation,
+    )
+
+
+def _append_late_execution_result_locked(
+    fence: PublicationExecutionFence,
+    result,
+    *,
+    result_identity: str,
+) -> PublicationAttempt:
+    observation = (
+        PublicationExecutionObservation.objects.select_for_update()
+        .select_related("publication_attempt")
+        .filter(
+            publication_attempt_id=fence.publication_attempt_id,
+            execution_generation=fence.execution_generation,
+            source_event_id=fence.source_event_id,
+            consumer_name=fence.consumer_name,
+            consumer_lease_generation=fence.consumer_lease_generation,
+            lease_token_hash=fence.lease_token_hash,
+            write_marker=fence.write_marker,
+        )
+        .first()
+    )
+    if observation is None:
+        raise Conflict("late publication result has no execution observation")
+    if observation.state == PublicationExecutionObservation.State.STARTED:
+        observation.state = PublicationExecutionObservation.State.COMPLETED
+        observation.finished_at = timezone.now()
+        observation.result_state = result.status
+        observation.result_identity = result_identity
+        observation.projection_disposition = (
+            PublicationExecutionObservation.ProjectionDisposition.STALE_FENCED
+        )
+        observation.error_code = (result.error_code or "")[:100]
+        observation.save(
+            update_fields=(
+                "state",
+                "finished_at",
+                "result_state",
+                "result_identity",
+                "projection_disposition",
+                "error_code",
+            )
+        )
+    remote_url, remote_url_hash = _bounded_remote_url_fact(result.remote_url)
+    PublicationLateExecutionResult.objects.get_or_create(
+        execution_observation=observation,
+        result_identity=result_identity,
+        defaults={
+            "result_state": result.status,
+            "remote_post_id": (result.remote_post_id or "")[:255],
+            "remote_url": remote_url,
+            "remote_url_hash": remote_url_hash,
+            "remote_state": (result.remote_state or "")[:24],
+            "remote_revision": (result.remote_revision or "")[:255],
+            "remote_request_id": (result.request_id or "")[:255],
+            "http_status": result.http_status,
+            "error_code": (result.error_code or "")[:100],
+        },
+    )
+    return observation.publication_attempt
+
+
+def _append_late_reconcile_result_locked(
+    delivery: PublicationReconcileDeliveryObservation,
+    result,
+    *,
+    result_identity: str,
+    audit_context: AuditContext,
+) -> PublicationAttempt:
+    token = audit_context.worker_lease_token
+    lease_generation = audit_context.worker_lease_generation
+    if token is None or lease_generation is None:
+        raise Conflict("late reconcile result has no delivery capability")
+    if (
+        delivery.consumer_name != audit_context.worker_consumer_name
+        or delivery.consumer_lease_generation != lease_generation
+        or delivery.consumer_lease_token != token
+        or delivery.lease_token_hash != _lease_token_hash(token)
+    ):
+        raise Conflict("late reconcile result capability is unproven")
+    generation = delivery.reconcile_generation
+    remote_url, remote_url_hash = _bounded_remote_url_fact(result.remote_url)
+    PublicationLateExecutionResult.objects.get_or_create(
+        reconcile_generation=generation,
+        reconcile_delivery_observation=delivery,
+        result_identity=result_identity,
+        defaults={
+            "source_event": generation.source_event,
+            "consumer_name": audit_context.worker_consumer_name or "",
+            "consumer_lease_generation": lease_generation,
+            "consumer_lease_token": token,
+            "lease_token_hash": _lease_token_hash(token),
+            "result_state": result.status,
+            "remote_post_id": (result.remote_post_id or "")[:255],
+            "remote_url": remote_url,
+            "remote_url_hash": remote_url_hash,
+            "remote_state": (result.remote_state or "")[:24],
+            "remote_revision": (result.remote_revision or "")[:255],
+            "remote_request_id": (result.request_id or "")[:255],
+            "http_status": result.http_status,
+            "error_code": (result.error_code or "")[:100],
+        },
+    )
+    return generation.publication_attempt
+
+
 @transaction.atomic
 def persist_publish_result(
     attempt_id: str,
     result,
     *,
+    execution_fence: PublicationExecutionFence | None = None,
+    external_write_authorized: bool | None = None,
     audit_context: AuditContext,
     expected_reconcile_generation: int | None = None,
     expected_reconcile_event_id: uuid.UUID | str | None = None,
@@ -6663,14 +7926,31 @@ def persist_publish_result(
         expected_reconcile_event_id is None
     ):
         raise Conflict("reconcile result fence is incomplete")
+    if execution_fence is not None and type(external_write_authorized) is not bool:
+        raise Conflict("publication execution settlement kind is missing")
     expected_event_uuid = None
+    reconcile_receipt = None
     if expected_reconcile_generation is None:
-        _require_worker_event(
-            audit_context,
-            topic="publication.requested",
-            aggregate_id=attempt_id,
-            payload_identity={"publication_attempt_id": str(attempt_id)},
-        )
+        if execution_fence is None:
+            source_event = _require_worker_event(
+                audit_context,
+                topic="publication.requested",
+                aggregate_id=attempt_id,
+                payload_identity={"publication_attempt_id": str(attempt_id)},
+            )
+            if source_event.event_version != 1:
+                raise Conflict("publication requested v2 result requires a fence")
+        else:
+            result_identity = _publish_result_identity(result)
+            if not _execution_fence_receipt_owned_locked(
+                execution_fence,
+                audit_context=audit_context,
+            ):
+                return _append_late_execution_result_locked(
+                    execution_fence,
+                    result,
+                    result_identity=result_identity,
+                )
     else:
         try:
             expected_event_uuid = uuid.UUID(
@@ -6682,7 +7962,7 @@ def persist_publish_result(
             raise Conflict(
                 "reconcile result event fence differs from audit provenance"
             )
-        source_event = _require_worker_event(
+        source_event = _require_worker_event_identity(
             audit_context,
             topic="publication.reconcile_requested",
             aggregate_id=attempt_id,
@@ -6705,6 +7985,16 @@ def persist_publish_result(
                 )
         elif source_event.event_version != 1:
             raise Conflict("unsupported reconcile event version")
+        from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+        reconcile_receipt = (
+            OutboxConsumerReceipt.objects.select_for_update()
+            .filter(
+                event=source_event,
+                consumer_name=audit_context.worker_consumer_name,
+            )
+            .first()
+        )
     preliminary = PublicationAttempt.objects.select_related(
         "publication_intent"
     ).get(id=attempt_id)
@@ -6724,6 +8014,33 @@ def persist_publish_result(
         "media": _publication_media_state_manifest(publication.id),
     }
     result_identity = _publish_result_identity(result)
+    result_execution_generation = (
+        execution_fence.execution_generation
+        if execution_fence is not None
+        else attempt.execution_generation
+    )
+    if execution_fence is not None and (
+        attempt.state != PublicationAttempt.State.RUNNING
+        or attempt.execution_generation != execution_fence.execution_generation
+        or attempt.attempt_no != execution_fence.execution_attempt_no
+        or attempt.active_source_event_id != execution_fence.source_event_id
+        or attempt.active_consumer_name != execution_fence.consumer_name
+        or attempt.active_consumer_lease_generation
+        != execution_fence.consumer_lease_generation
+        or attempt.active_consumer_lease_token
+        != audit_context.worker_lease_token
+        or attempt.active_lease_token_hash != execution_fence.lease_token_hash
+        or attempt.active_write_marker != execution_fence.write_marker
+        or (
+            bool(external_write_authorized)
+            != (attempt.active_write_started_at is not None)
+        )
+    ):
+        return _append_late_execution_result_locked(
+            execution_fence,
+            result,
+            result_identity=result_identity,
+        )
     execution_attempt_no = attempt.attempt_no
     replay_attempt_no = (
         execution_attempt_no - 1
@@ -6739,6 +8056,25 @@ def persist_publish_result(
         if expected_reconcile_generation is not None
         else "publication_attempt.finished"
     )
+    if (
+        audit_context.worker_lease_generation is None
+        or audit_context.worker_lease_token is None
+    ):
+        raise Conflict("publisher result has no receipt capability")
+    result_capability_metadata = _execution_capability_audit_metadata(
+        domain_generation=(
+            expected_reconcile_generation
+            if expected_reconcile_generation is not None
+            else result_execution_generation
+        ),
+        consumer_lease_generation=audit_context.worker_lease_generation,
+        consumer_lease_token=audit_context.worker_lease_token,
+        domain_field=(
+            "reconcile_attempt_no"
+            if expected_reconcile_generation is not None
+            else "execution_generation"
+        ),
+    )
     replay_candidates = (
         (
             replay_action,
@@ -6748,6 +8084,7 @@ def persist_publish_result(
             ),
             {
                 "reconcile_attempt_no": expected_reconcile_generation,
+                **result_capability_metadata,
             },
         ),
     ) if expected_reconcile_generation is not None else (
@@ -6755,9 +8092,9 @@ def persist_publish_result(
             replay_action,
             (
                 f"{audit_context.event_key}:attempt-result:"
-                f"{replay_attempt_no}"
+                f"{result_execution_generation}"
             ),
-            {"attempt": replay_attempt_no},
+            {"attempt": replay_attempt_no, **result_capability_metadata},
         ),
     )
     replay = _worker_audit_replay(
@@ -6784,8 +8121,42 @@ def persist_publish_result(
         )
         if (
             reconcile_generation is None
-            or reconcile_generation.state
-            != PublicationReconcileGeneration.State.STARTED
+        ):
+            raise Conflict("stale reconcile result was fenced")
+        reconcile_delivery = (
+            PublicationReconcileDeliveryObservation.objects.select_for_update()
+            .filter(
+                reconcile_generation=reconcile_generation,
+                consumer_name=audit_context.worker_consumer_name,
+                consumer_lease_generation=audit_context.worker_lease_generation,
+                consumer_lease_token=audit_context.worker_lease_token,
+                lease_token_hash=_lease_token_hash(
+                    audit_context.worker_lease_token
+                ),
+            )
+            .first()
+        )
+        if reconcile_delivery is None:
+            raise Conflict("reconcile result delivery capability is unproven")
+        capability_current = (
+            reconcile_receipt is not None
+            and _reconcile_result_capability_is_current(
+                reconcile_generation,
+                reconcile_receipt,
+                audit_context=audit_context,
+                delivery=reconcile_delivery,
+            )
+        )
+        if not capability_current:
+            return _append_late_reconcile_result_locked(
+                reconcile_delivery,
+                result,
+                result_identity=result_identity,
+                audit_context=audit_context,
+            )
+        if (
+            reconcile_generation.state
+            != PublicationReconcileGeneration.State.RUNNING
             or attempt.reconcile_attempt_no
             != expected_reconcile_generation
             or attempt.state != PublicationAttempt.State.RECONCILING
@@ -6795,6 +8166,7 @@ def persist_publish_result(
         raise Conflict(
             "publication result can only finalize the active worker attempt"
         )
+    _validate_publish_result_projection(attempt, result)
     validated_remote_url = (
         _validated_remote_url(result.remote_url)
         if result.status == "succeeded"
@@ -6877,23 +8249,106 @@ def persist_publish_result(
             retry_result = "manual_required"
         else:
             attempt.attempt_no = execution_attempt_no + 1
+            retry_delay = (
+                min(max(retry_after_seconds, 5), 3600)
+                if retry_after_seconds is not None
+                else min(15 * (2 ** max(execution_attempt_no - 1, 0)), 1800)
+            )
+            attempt.next_retry_at = now + timedelta(seconds=retry_delay)
+            _enqueue_event(
+                "publication.requested",
+                {
+                    "publication_attempt_id": str(attempt.id),
+                    "execution_attempt_no": attempt.attempt_no,
+                },
+                event_version=2,
+                dedupe_key=(
+                    f"publication.requested:{attempt.id}:"
+                    f"{attempt.attempt_no}"
+                ),
+                aggregate_type="publication_attempt",
+                aggregate_id=attempt.id,
+                job_id=attempt.id,
+                available_at=attempt.next_retry_at,
+                correlation_id=attempt.correlation_id,
+            )
             retry_audit_action = "publication_attempt.retry_scheduled"
             retry_result = "retry_scheduled"
+    if reconcile_generation is None:
+        attempt.active_source_event = None
+        attempt.active_consumer_name = ""
+        attempt.active_consumer_lease_generation = 0
+        attempt.active_consumer_lease_token = None
+        attempt.active_lease_token_hash = ""
+        attempt.active_lease_expires_at = None
+        attempt.active_write_marker = ""
+        attempt.active_write_started_at = None
+        if attempt.state in {
+            PublicationAttempt.State.SUCCEEDED,
+            PublicationAttempt.State.PERMANENT_FAILED,
+            PublicationAttempt.State.MANUAL_REQUIRED,
+            PublicationAttempt.State.STALE,
+        }:
+            from wisdome_writer.infrastructure.models import OutboxMessage
+
+            attempt.terminal_event_key = OutboxMessage.objects.only(
+                "message_key"
+            ).get(id=audit_context.event_key).message_key
+            attempt.terminal_generation = (
+                execution_fence.execution_generation
+                if execution_fence
+                else attempt.execution_generation
+            )
+            attempt.terminal_state = attempt.state
+    elif attempt.state in {
+        PublicationAttempt.State.SUCCEEDED,
+        PublicationAttempt.State.PERMANENT_FAILED,
+        PublicationAttempt.State.MANUAL_REQUIRED,
+        PublicationAttempt.State.STALE,
+    }:
+        attempt.terminal_event_key = reconcile_generation.source_event.message_key
+        attempt.terminal_generation = reconcile_generation.generation
+        attempt.terminal_state = attempt.state
     attempt.recovery_state = _publication_recovery_state(attempt.state)
-    attempt.next_recovery_at = None
-    attempt.save()
-    publication.save()
-    if reconcile_generation is not None:
-        reconcile_result_state = attempt.state
+    attempt.next_recovery_at = attempt.next_retry_at
+    if reconcile_generation is None:
+        _complete_execution_observation_locked(
+            attempt,
+            execution_attempt_no=execution_attempt_no,
+            execution_generation=result_execution_generation,
+            finished_at=now,
+            result_state=(
+                result.status
+                if result.status
+                in {
+                    "succeeded",
+                    "retryable_failed",
+                    "permanent_failed",
+                    "unknown_outcome",
+                    "manual_required",
+                }
+                else "permanent_failed"
+            ),
+            result_identity=result_identity,
+            error_code=attempt.error_code,
+            retry_at=attempt.next_recovery_at,
+            recovery_state=attempt.recovery_state,
+            terminal_state=attempt.state,
+        )
+    else:
         reconcile_generation.result_identity = result_identity
         _complete_reconcile_observation_locked(
             attempt,
             reconcile_generation,
             finished_at=now,
-            result_state=reconcile_result_state,
+            result_state=attempt.state,
             error_code=attempt.error_code,
             recovery_state=attempt.recovery_state,
         )
+    attempt.save()
+    publication.save()
+    if reconcile_generation is not None:
+        reconcile_result_state = attempt.state
         reconcile_generation.save(
             update_fields=(
                 "state",
@@ -6918,6 +8373,8 @@ def persist_publish_result(
                         attempt.error_code
                         or "reconcile_attempts_exhausted"
                     ),
+                    terminal_event_key=reconcile_generation.source_event.message_key,
+                    terminal_generation=reconcile_generation.generation,
                     now=now,
                 )
                 retry_audit_action = "publication_attempt.retry_exhausted"
@@ -6954,37 +8411,6 @@ def persist_publish_result(
         reconcile_generation.save(
             update_fields=("recovery_state", "next_recovery_at")
         )
-    else:
-        _complete_execution_observation_locked(
-            attempt,
-            execution_attempt_no=execution_attempt_no,
-            finished_at=now,
-            result_state=(
-                result.status
-                if result.status
-                in {
-                    "succeeded",
-                    "retryable_failed",
-                    "permanent_failed",
-                    "unknown_outcome",
-                    "manual_required",
-                }
-                else "permanent_failed"
-            ),
-            error_code=attempt.error_code,
-            retry_at=attempt.next_recovery_at,
-            recovery_state=attempt.recovery_state,
-            terminal_state=attempt.state,
-        )
-    attempt.save(
-        update_fields=(
-            "duration_ms",
-            "retry_count",
-            "terminal_impact",
-            "recovery_state",
-            "next_recovery_at",
-        )
-    )
     _release_article_external_write_fence_locked(attempt)
     audit_action = (
         "publication_attempt.reconciled"
@@ -6994,11 +8420,12 @@ def persist_publish_result(
     audit_identity_suffix = (
         f"reconcile-result:{reconcile_generation.generation}"
         if reconcile_generation is not None
-        else f"attempt-result:{execution_attempt_no}"
+        else f"attempt-result:{result_execution_generation}"
     )
     audit_metadata = {
         "publication_attempt_id": str(attempt.id),
         "attempt": execution_attempt_no,
+        **result_capability_metadata,
         "action": attempt.resolved_action,
         "channel": publication.target.channel,
         "error_code": attempt.error_code,
@@ -7071,16 +8498,35 @@ def persist_publish_result(
 def finalize_publication_delivery_failure(
     attempt_id: str,
     *,
+    expected_execution_attempt_no: int | None = None,
     error_code: str,
     audit_context: AuditContext,
 ) -> PublicationAttempt | None:
     _require_audit_actor(audit_context, "worker")
-    _require_worker_event(
+    source_event = _require_worker_event(
         audit_context,
         topic="publication.requested",
         aggregate_id=attempt_id,
         payload_identity={"publication_attempt_id": str(attempt_id)},
     )
+    _require_terminal_reservation_locked(
+        source_event,
+        audit_context=audit_context,
+        error_code=error_code,
+    )
+    payload = source_event.payload if isinstance(source_event.payload, dict) else {}
+    if source_event.event_version == 2:
+        if (
+            type(expected_execution_attempt_no) is not int
+            or payload.get("execution_attempt_no")
+            != expected_execution_attempt_no
+        ):
+            raise Conflict("publication terminal execution attempt is invalid")
+    elif source_event.event_version == 1:
+        if expected_execution_attempt_no is not None:
+            raise Conflict("legacy publication terminal has no execution attempt")
+    else:
+        raise Conflict("unsupported publication requested event version")
     preliminary = (
         PublicationAttempt.objects.select_related("publication_intent")
         .filter(id=attempt_id)
@@ -7095,9 +8541,52 @@ def finalize_publication_delivery_failure(
         _intent_target_ids(preliminary.publication_intent)
     )
     attempt = _lock_publication_attempt_domain(preliminary)
+    if (
+        attempt.state == PublicationAttempt.State.STALE
+        and attempt.error_code == "approval_revoked"
+    ):
+        _converge_revoked_attempt_redelivery_locked(
+            attempt,
+            audit_context=audit_context,
+        )
+        return attempt
+    observations = None
+    legacy_binding_action = None
+    if source_event.event_version == 1:
+        observations = list(
+            PublicationExecutionObservation.objects.select_for_update()
+            .filter(publication_attempt_id=attempt.id)
+            .only("source_event_id", "execution_generation")
+            .order_by("execution_generation")
+        )
+        legacy_binding_action = _legacy_requested_binding_action(
+            attempt,
+            source_event=source_event,
+            observations=observations,
+        )
+    event_execution_generation = _execution_generation_for_source_event(
+        attempt,
+        source_event_id=source_event.id,
+        source_message_key=source_event.message_key,
+        observations=observations,
+    )
+    if legacy_binding_action == "quarantine":
+        _quarantine_legacy_requested_delivery_locked(
+            attempt,
+            source_event=source_event,
+            execution_generation=event_execution_generation,
+            has_other_lineage=bool(observations),
+            audit_context=audit_context,
+        )
+        return attempt
+    if (
+        expected_execution_attempt_no is not None
+        and attempt.attempt_no != expected_execution_attempt_no
+    ):
+        return attempt
     audit_identity = (
         f"{audit_context.event_key}:delivery-failure:"
-        f"{attempt.attempt_no}"
+        f"{event_execution_generation}"
     )
     replay = _worker_audit_replay(
         audit_context,
@@ -7132,9 +8621,13 @@ def finalize_publication_delivery_failure(
         PublicationAttempt.State.MANUAL_REQUIRED,
         PublicationAttempt.State.STALE,
     }:
-        raise Conflict(
-            "terminal publication attempt has no delivery-failure audit"
+        _converge_terminal_attempt_redelivery_locked(
+            attempt,
+            source_event=source_event,
+            execution_generation=event_execution_generation,
+            audit_context=audit_context,
         )
+        return attempt
     before_material = {
         "attempt": _audit_state(attempt),
         "publication": _audit_state(attempt.publication),
@@ -7144,16 +8637,20 @@ def finalize_publication_delivery_failure(
         error_code or "publication_delivery_exhausted"
     )[:100]
     if attempt.state in {
-        PublicationAttempt.State.RUNNING,
         PublicationAttempt.State.UNKNOWN_OUTCOME,
         PublicationAttempt.State.RECONCILING,
-    }:
+    } or (
+        attempt.state == PublicationAttempt.State.RUNNING
+        and attempt.active_write_started_at is not None
+    ):
         if attempt.state == PublicationAttempt.State.RUNNING:
+            active_generation = attempt.execution_generation
             attempt.state = PublicationAttempt.State.UNKNOWN_OUTCOME
             attempt.finished_at = now
             attempt.error_code = effective_error_code
             attempt.recovery_state = PublicationRecoveryState.RECONCILING
             attempt.next_recovery_at = None
+            _clear_active_publication_execution(attempt)
             attempt.save(
                 update_fields=(
                     "state",
@@ -7161,11 +8658,20 @@ def finalize_publication_delivery_failure(
                     "error_code",
                     "recovery_state",
                     "next_recovery_at",
+                    "active_source_event",
+                    "active_consumer_name",
+                    "active_consumer_lease_generation",
+                    "active_consumer_lease_token",
+                    "active_lease_token_hash",
+                    "active_lease_expires_at",
+                    "active_write_marker",
+                    "active_write_started_at",
                 )
             )
             _complete_execution_observation_locked(
                 attempt,
                 execution_attempt_no=attempt.attempt_no,
+                execution_generation=active_generation,
                 finished_at=now,
                 result_state=PublicationAttempt.State.UNKNOWN_OUTCOME,
                 error_code=attempt.error_code,
@@ -7194,6 +8700,18 @@ def finalize_publication_delivery_failure(
         action = "publication_attempt.reconcile_started"
         result = "unknown_outcome"
     else:
+        active_generation = attempt.execution_generation
+        if attempt.state == PublicationAttempt.State.RUNNING:
+            _complete_execution_observation_locked(
+                attempt,
+                execution_attempt_no=attempt.attempt_no,
+                execution_generation=active_generation,
+                finished_at=now,
+                result_state=PublicationAttempt.State.MANUAL_REQUIRED,
+                error_code=effective_error_code,
+                recovery_state=PublicationRecoveryState.MANUAL_REQUIRED,
+                terminal_state=PublicationAttempt.State.MANUAL_REQUIRED,
+            )
         attempt.state = PublicationAttempt.State.MANUAL_REQUIRED
         attempt.finished_at = now
         attempt.error_code = effective_error_code
@@ -7205,6 +8723,10 @@ def finalize_publication_delivery_failure(
             final_state=attempt.state,
             error_code=attempt.error_code,
         )
+        _clear_active_publication_execution(attempt)
+        attempt.terminal_event_key = source_event.message_key
+        attempt.terminal_generation = active_generation
+        attempt.terminal_state = attempt.state
         attempt.save(
             update_fields=(
                 "state",
@@ -7213,6 +8735,17 @@ def finalize_publication_delivery_failure(
                 "recovery_state",
                 "next_recovery_at",
                 "terminal_impact",
+                "active_source_event",
+                "active_consumer_name",
+                "active_consumer_lease_generation",
+                "active_consumer_lease_token",
+                "active_lease_token_hash",
+                "active_lease_expires_at",
+                "active_write_marker",
+                "active_write_started_at",
+                "terminal_event_key",
+                "terminal_generation",
+                "terminal_state",
             )
         )
         attempt.publication.state = Publication.State.MANUAL_REQUIRED
@@ -7294,7 +8827,9 @@ def _release_dependents_on_commit(attempt: PublicationAttempt) -> None:
             "publication.requested",
             {
                 "publication_attempt_id": str(attempt_id),
+                "execution_attempt_no": 1,
             },
+            event_version=2,
             dedupe_key=f"publication.requested:{attempt_id}:1",
             aggregate_type="publication_attempt",
             aggregate_id=attempt_id,
@@ -7333,6 +8868,17 @@ def begin_reconcile(
         aggregate_id=attempt_id,
         payload_identity=expected_payload,
     )
+    from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+    receipt = OutboxConsumerReceipt.objects.select_for_update().get(
+        event=source_event,
+        consumer_name=audit_context.worker_consumer_name,
+        state=OutboxConsumerReceipt.State.PROCESSING,
+        lease_token=audit_context.worker_lease_token,
+        lease_generation=audit_context.worker_lease_generation,
+        claimed_until__gt=timezone.now(),
+    )
+    lease_hash = _lease_token_hash(audit_context.worker_lease_token)
     preliminary = PublicationAttempt.objects.select_related(
         "publication_intent"
     ).get(id=attempt_id)
@@ -7352,6 +8898,21 @@ def begin_reconcile(
         .filter(source_event=source_event)
         .first()
     )
+    legacy_binding_action = None
+    if source_event.event_version == 1:
+        legacy_binding_action = _legacy_reconcile_binding_action(
+            attempt,
+            source_event=source_event,
+            generation=generation,
+        )
+        if legacy_binding_action == "quarantine":
+            _quarantine_legacy_reconcile_delivery_locked(
+                attempt,
+                source_event=source_event,
+                generation=generation,
+                audit_context=audit_context,
+            )
+            return attempt, generation, None
     if generation is not None:
         if generation.publication_attempt_id != attempt.id:
             raise Conflict("reconcile source event is bound to another attempt")
@@ -7369,7 +8930,9 @@ def begin_reconcile(
         }:
             return attempt, None, None
         if source_event.event_version == 1:
-            generation_no = attempt.reconcile_attempt_no + 1
+            if legacy_binding_action != "bind":
+                raise Conflict("legacy reconcile event cannot bind this attempt")
+            generation_no = 1
         elif source_event.event_version == 2:
             payload_generation = payload.get("reconcile_attempt_no")
             if (
@@ -7388,7 +8951,7 @@ def begin_reconcile(
             publication_attempt=attempt,
             generation=generation_no,
             source_event=source_event,
-            state=PublicationReconcileGeneration.State.STARTED,
+            state=PublicationReconcileGeneration.State.QUEUED,
             not_before=source_event.not_before,
             started_at=timezone.now(),
             correlation_id=source_event.correlation_id,
@@ -7399,7 +8962,10 @@ def begin_reconcile(
         attempt.save(update_fields=("reconcile_attempt_no",))
 
     if (
-        generation.state == PublicationReconcileGeneration.State.COMPLETED
+        generation.state in {
+            PublicationReconcileGeneration.State.COMPLETED,
+            PublicationReconcileGeneration.State.DELIVERY_FAILED,
+        }
         or generation.generation < attempt.reconcile_attempt_no
     ):
         completed_audit = _worker_audit_replay(
@@ -7436,6 +9002,43 @@ def begin_reconcile(
                 "completed reconcile generation has no matching result audit"
             )
         return attempt, generation, None
+    claim_action = _publication_reconcile_claim_action(
+        generation,
+        source_event_id=source_event.id,
+        consumer_name=audit_context.worker_consumer_name,
+        consumer_lease_generation=receipt.lease_generation,
+        consumer_lease_token=receipt.lease_token,
+        lease_token_hash=lease_hash,
+        now=timezone.now(),
+    )
+    if claim_action == "duplicate":
+        return attempt, generation, None
+    if claim_action == "stale":
+        raise Conflict("reconcile generation has another active capability")
+    if claim_action not in {"claim", "reclaim"}:
+        raise Conflict("reconcile generation cannot be claimed")
+    delivery_started_at = timezone.now()
+    delivery = PublicationReconcileDeliveryObservation.objects.create(
+        reconcile_generation=generation,
+        consumer_name=audit_context.worker_consumer_name,
+        consumer_lease_generation=receipt.lease_generation,
+        consumer_lease_token=receipt.lease_token,
+        lease_token_hash=lease_hash,
+        lease_expires_at=receipt.claimed_until,
+        started_at=delivery_started_at,
+    )
+    generation.refresh_from_db()
+    if (
+        generation.state != PublicationReconcileGeneration.State.RUNNING
+        or generation.consumer_name != audit_context.worker_consumer_name
+        or generation.consumer_lease_generation != receipt.lease_generation
+        or generation.consumer_lease_token != receipt.lease_token
+        or generation.lease_token_hash != lease_hash
+        or generation.lease_expires_at != receipt.claimed_until
+        or delivery.state
+        != PublicationReconcileDeliveryObservation.State.ACTIVE
+    ):
+        raise Conflict("reconcile delivery parent projection is invalid")
     if attempt.state == PublicationAttempt.State.SUCCEEDED:
         return attempt, generation, None
     if attempt.state not in {
@@ -7461,6 +9064,12 @@ def begin_reconcile(
         generation.started_at = timezone.now()
         generation_updates.extend(("worker_task_id", "started_at"))
     generation.save(update_fields=generation_updates)
+    reconcile_capability_metadata = _execution_capability_audit_metadata(
+        domain_generation=generation.generation,
+        consumer_lease_generation=receipt.lease_generation,
+        consumer_lease_token=receipt.lease_token,
+        domain_field="reconcile_attempt_no",
+    )
     if not _worker_audit_replay(
         audit_context,
         entity=attempt,
@@ -7471,7 +9080,7 @@ def begin_reconcile(
                     f"{audit_context.event_key}:reconcile-start:"
                     f"{generation.generation}"
                 ),
-                {"reconcile_attempt_no": generation.generation},
+                reconcile_capability_metadata,
             ),
         ),
     ):
@@ -7488,7 +9097,7 @@ def begin_reconcile(
             metadata={
                 "publication_attempt_id": str(attempt.id),
                 "attempt": attempt.attempt_no,
-                "reconcile_attempt_no": generation.generation,
+                **reconcile_capability_metadata,
                 "source_event_id": str(source_event.id),
                 "state": attempt.state,
             },
@@ -7505,6 +9114,7 @@ def finalize_reconcile_delivery_failure(
     attempt_id: str,
     *,
     source_event_id: uuid.UUID | str,
+    expected_reconcile_attempt_no: int | None = None,
     error_code: str,
     audit_context: AuditContext,
 ) -> PublicationAttempt | None:
@@ -7520,6 +9130,11 @@ def finalize_reconcile_delivery_failure(
         topic="publication.reconcile_requested",
         aggregate_id=attempt_id,
         payload_identity={"publication_attempt_id": str(attempt_id)},
+    )
+    _require_terminal_reservation_locked(
+        source_event,
+        audit_context=audit_context,
+        error_code=error_code,
     )
     preliminary = PublicationAttempt.objects.select_related(
         "publication_intent"
@@ -7580,10 +9195,24 @@ def finalize_reconcile_delivery_failure(
             },
         )
     payload = source_event.payload if isinstance(source_event.payload, dict) else {}
+    if source_event.event_version == 2 and (
+        type(expected_reconcile_attempt_no) is not int
+        or payload.get("reconcile_attempt_no")
+        != expected_reconcile_attempt_no
+    ):
+        raise Conflict("reconcile terminal generation is invalid")
+    if source_event.event_version == 1 and expected_reconcile_attempt_no is not None:
+        raise Conflict("legacy reconcile terminal has no generation")
     if payload.get("publication_attempt_id") != str(attempt.id):
         _manualize_reconcile_attempt_locked(
             attempt,
             error_code="reconcile_source_event_mismatch",
+            terminal_event_key=source_event.message_key,
+            terminal_generation=(
+                expected_reconcile_attempt_no
+                if type(expected_reconcile_attempt_no) is int
+                else 0
+            ),
         )
         audit_failure()
         return attempt
@@ -7608,6 +9237,8 @@ def finalize_reconcile_delivery_failure(
             _manualize_reconcile_attempt_locked(
                 attempt,
                 error_code="reconcile_generation_invalid",
+                terminal_event_key=source_event.message_key,
+                terminal_generation=0,
             )
             audit_failure()
             return attempt
@@ -7626,6 +9257,8 @@ def finalize_reconcile_delivery_failure(
             _manualize_reconcile_attempt_locked(
                 attempt,
                 error_code="reconcile_generation_binding_conflict",
+                terminal_event_key=source_event.message_key,
+                terminal_generation=generation_no,
             )
             audit_failure()
             return attempt
@@ -7634,7 +9267,7 @@ def finalize_reconcile_delivery_failure(
                 publication_attempt=attempt,
                 generation=generation_no,
                 source_event=source_event,
-                state=PublicationReconcileGeneration.State.STARTED,
+                state=PublicationReconcileGeneration.State.QUEUED,
                 not_before=source_event.not_before,
                 started_at=source_event.occurred_at,
                 correlation_id=source_event.correlation_id,
@@ -8142,7 +9775,11 @@ def retry_publication_attempt(
         )
         _enqueue_event(
             "publication.requested",
-            {"publication_attempt_id": str(attempt.id)},
+            {
+                "publication_attempt_id": str(attempt.id),
+                "execution_attempt_no": attempt.attempt_no,
+            },
+            event_version=2,
             dedupe_key=f"publication.requested:{attempt.id}:{attempt.attempt_no}",
             aggregate_type="publication_attempt",
             aggregate_id=attempt.id,

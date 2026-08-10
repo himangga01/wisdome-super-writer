@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import Any
@@ -15,6 +16,8 @@ from apps.publishing.contracts import (
     PublisherCapabilities,
     PublisherError,
     PublishResult,
+    parse_retry_after_seconds,
+    publication_content_marker,
 )
 from wisdome_writer.infrastructure.http_safety import HttpSafetyError, redact_url, safe_get
 
@@ -79,8 +82,11 @@ class WordPressPublisher:
             return response
         if response.status_code in (401, 403):
             category, code = "permanent", "wordpress_auth_or_capability_denied"
-        elif response.status_code == 429 or response.status_code >= 500:
-            category, code = "retryable", "wordpress_temporarily_unavailable"
+        elif response.status_code in (408, 429) or response.status_code >= 500:
+            if write:
+                category, code = "unknown_outcome", "wordpress_unknown_outcome"
+            else:
+                category, code = "retryable", "wordpress_temporarily_unavailable"
         else:
             category, code = "permanent", "wordpress_request_rejected"
         retry_after = response.headers.get("Retry-After")
@@ -88,7 +94,7 @@ class WordPressPublisher:
             code,
             category=category,
             http_status=response.status_code,
-            retry_after_seconds=int(retry_after) if retry_after and retry_after.isdigit() else None,
+            retry_after_seconds=parse_retry_after_seconds(retry_after),
             detail_redacted=f"HTTP {response.status_code}",
         )
 
@@ -129,29 +135,34 @@ class WordPressPublisher:
             existing = self.reconcile(command)
             if existing.status == "succeeded":
                 return existing
-            if existing.error_code == "remote_match_not_unique":
+            if not (
+                existing.status == "retryable_failed"
+                and existing.error_code == "remote_match_not_found"
+            ):
                 return existing
             article = command.rendered_article
             assert article is not None
+            body = f"{article.body_html}\n{publication_content_marker(command)}"
             payload = {
                 "slug": command.remote_lookup_key,
                 "title": article.title,
-                "content": article.body_html,
+                "content": body,
                 "status": "publish",
             }
             response = self._request("POST", "/posts", write=True, json=payload)
-            return self._post_result(response)
+            return self._verify_mutation(command, self._post_result(response))
 
         if command.action in {"update", "mark_withdrawn"}:
             article = command.rendered_article
             assert article is not None
+            body = f"{article.body_html}\n{publication_content_marker(command)}"
             response = self._request(
                 "POST",
                 f"/posts/{command.remote_post_id}",
                 write=True,
-                json={"title": article.title, "content": article.body_html},
+                json={"title": article.title, "content": body},
             )
-            return self._post_result(response)
+            return self._verify_mutation(command, self._post_result(response))
 
         if command.action == "unpublish":
             response = self._request(
@@ -160,19 +171,43 @@ class WordPressPublisher:
                 write=True,
                 json={"status": "draft"},
             )
-            result = self._post_result(response)
-            return PublishResult(
-                status=result.status,
-                remote_post_id=result.remote_post_id,
-                remote_url=result.remote_url,
-                remote_state="withdrawn",
-                remote_revision=result.remote_revision,
-                request_id=result.request_id,
-                http_status=result.http_status,
-            )
+            return self._verify_mutation(command, self._post_result(response))
         raise PublisherError("unsupported_action", category="permanent")
 
     def reconcile(self, command: PublishCommand) -> PublishResult:
+        if command.action != "create":
+            if not command.remote_post_id:
+                raise PublisherError("remote_post_id_required", category="permanent")
+            response = self._request(
+                "GET",
+                f"/posts/{command.remote_post_id}",
+                params={"context": "edit"},
+            )
+            payload = response.json()
+            if str(payload.get("id")) != str(command.remote_post_id):
+                return self._reconcile_mismatch(response.status_code)
+            if command.action == "unpublish":
+                if payload.get("status") not in {"draft", "trash"}:
+                    return self._reconcile_mismatch(response.status_code)
+                return self._payload_result(payload, response)
+            article = command.rendered_article
+            if article is None:
+                raise PublisherError("render_required", category="permanent")
+            content = payload.get("content") or {}
+            remote_content = content.get("raw") or ""
+            title = payload.get("title") or {}
+            remote_title = title.get("raw") or ""
+            expected_content = (
+                f"{article.body_html}\n{publication_content_marker(command)}"
+            )
+            if (
+                remote_content != expected_content
+                or remote_title != article.title
+                or payload.get("status") != "publish"
+            ):
+                return self._reconcile_mismatch(response.status_code)
+            return self._payload_result(payload, response)
+
         response = self._request(
             "GET",
             "/posts",
@@ -183,15 +218,48 @@ class WordPressPublisher:
                 "per_page": 10,
             },
         )
-        matches = response.json()
+        article = command.rendered_article
+        if article is None:
+            raise PublisherError("render_required", category="permanent")
+        marker = publication_content_marker(command)
+        expected_content = f"{article.body_html}\n{marker}"
+        matches = [
+            item
+            for item in response.json()
+            if marker
+            in (
+                (item.get("content") or {}).get("raw")
+                or (item.get("content") or {}).get("rendered")
+                or ""
+            )
+        ]
         if len(matches) == 1:
-            return self._payload_result(matches[0], response)
+            item = matches[0]
+            content = item.get("content") or {}
+            title = item.get("title") or {}
+            if (
+                item.get("status") != "publish"
+                or (content.get("raw") or "") != expected_content
+                or (title.get("raw") or "") != article.title
+            ):
+                return self._reconcile_mismatch(response.status_code)
+            return self._payload_result(item, response)
         return PublishResult(
-            status="manual_required",
+            status="retryable_failed" if not matches else "manual_required",
             remote_state="unknown",
             reconcile_required=True,
             http_status=response.status_code,
             error_code="remote_match_not_unique" if len(matches) > 1 else "remote_match_not_found",
+        )
+
+    @staticmethod
+    def _reconcile_mismatch(http_status: int | None) -> PublishResult:
+        return PublishResult(
+            status="manual_required",
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=http_status,
+            error_code="remote_projection_mismatch",
         )
 
     def fetch_remote_state(self, remote_post_id: str) -> PublishResult:
@@ -333,7 +401,65 @@ class WordPressPublisher:
         )
 
     def _post_result(self, response: httpx.Response) -> PublishResult:
-        return self._payload_result(response.json(), response)
+        try:
+            payload = response.json()
+        except ValueError:
+            return PublishResult(
+                status="unknown_outcome",
+                remote_state="unknown",
+                reconcile_required=True,
+                http_status=response.status_code,
+                error_code="remote_mutation_response_invalid",
+            )
+        return self._payload_result(payload, response)
+
+    def _verify_mutation(
+        self,
+        command: PublishCommand,
+        factual_result: PublishResult,
+    ) -> PublishResult:
+        if factual_result.status != "succeeded":
+            return factual_result
+        remote_post_id = factual_result.remote_post_id or command.remote_post_id
+        if not remote_post_id:
+            return PublishResult(
+                status="unknown_outcome",
+                remote_state="unknown",
+                reconcile_required=True,
+                http_status=factual_result.http_status,
+                error_code="remote_projection_identity_missing",
+            )
+        verification_command = (
+            command
+            if command.action == "create"
+            else replace(command, remote_post_id=remote_post_id)
+        )
+        try:
+            verified = self.reconcile(verification_command)
+        except PublisherError as exc:
+            return PublishResult(
+                status="unknown_outcome",
+                remote_post_id=remote_post_id,
+                remote_state="unknown",
+                reconcile_required=True,
+                http_status=exc.http_status or factual_result.http_status,
+                error_code="remote_projection_verification_unavailable",
+            )
+        if (
+            verified.status == "succeeded"
+            and str(verified.remote_post_id) == str(remote_post_id)
+        ):
+            return verified
+        if verified.status == "manual_required":
+            return verified
+        return PublishResult(
+            status="unknown_outcome",
+            remote_post_id=remote_post_id,
+            remote_state="unknown",
+            reconcile_required=True,
+            http_status=verified.http_status or factual_result.http_status,
+            error_code=verified.error_code or "remote_projection_unproven",
+        )
 
     @staticmethod
     def _payload_result(payload: dict[str, Any], response: httpx.Response) -> PublishResult:

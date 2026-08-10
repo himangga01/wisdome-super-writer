@@ -959,50 +959,123 @@ Historical intent/dispatch rows whose exact path, actor, and body cannot be reco
 
 **Interfaces:**
 - Consumes: current approval head, target snapshot/config hash, publisher adapter manifest, kill switch.
-- Produces: fenced `PublicationExecutionObservation`, bounded `PublicationReconcileGeneration`, terminal `Publication` projection.
+- Produces: exact v2 execution event, fenced `PublicationExecutionObservation`, immutable
+  `PublicationReconcileDeliveryObservation`, factual `PublicationLateExecutionResult`, bounded
+  `PublicationReconcileGeneration`, terminal `Publication` projection.
 
-- [ ] **Step 1: attempt lease generation을 추가한다.**
+- [ ] **Step 1: 다섯 generation 용어와 event ABI를 고정한다.**
 
-  ```python
-  lease_generation = models.PositiveIntegerField(default=1)
-  lease_token_hash = models.CharField(max_length=64, blank=True)
-  lease_expires_at = models.DateTimeField(null=True, blank=True)
-  ```
+  T020 acceptance `attemptNo=1`, business `executionAttemptNo` 1~5, domain
+  `executionGeneration`, receipt `leaseGeneration`, dispatcher delivery `attempt`, read-only
+  `reconcileAttemptNo` 1~5를 분리한다. 신규 `publication.requested@2` exact payload는
+  `publication_attempt_id+execution_attempt_no`, reconcile@2는
+  `publication_attempt_id+reconcile_attempt_no`다. v1은 existing exact source-event binding replay
+  또는 counter·observation·terminal lineage가 빈 proven virgin generation 1만 결속한다. 그 밖은
+  `legacy-unverifiable-v1` 감사 sentinel을 남기는 no-op quarantine이며 current counter를 추측하지
+  않는다.
 
-  `begin_attempt()`은 row lock 안에서 generation을 증가시키고 worker event의 lease token hash를 고정한다.
+- [ ] **Step 2: attempt와 execution observation에 claim identity를 동결한다.**
 
-- [ ] **Step 2: 외부 쓰기 직전 gate를 한 번 더 확인한다.**
+  PublicationAttempt에는 `execution_identity_version=publication-execution-v1`,
+  `execution_generation`, active source event/consumer raw internal capability+hash lease envelope,
+  write marker/start와 terminal reservation을 둔다. Observation에는 identity/generation,
+  source/consumer raw capability+hash lease, write/result,
+  `state=started|completed|delivery_unknown`,
+  `projection_disposition=pending|applied|stale_fenced|no_result`를 둔다. identity는 불변이고 active
+  observation은 하나며 delete와 terminal 역행을 ORM/PostgreSQL에서 차단한다.
 
-  `validate_attempt_gate()`는 kill switch, current approval head, revision quality, target snapshot, activation, WordPress dependency와 lease generation을 모두 확인한다.
+- [ ] **Step 3: 외부 쓰기 직전 gate와 current settlement를 분리한다.**
 
-- [ ] **Step 3: late response가 최신 상태를 덮지 못하게 한다.**
+  `validate_attempt_gate()`와 짧은 pre-write transaction은 kill switch, current approval head,
+  revision quality, target snapshot, activation, WordPress dependency, source event와 execution/receipt
+  generation을 모두 확인한다. mutating HTTP는 실제 I/O 직전 statement-time에 current이고
+  유효하거나 원자적으로 갱신된 raw capability만 허용한다. 결과 정산은 higher reclaim이 없고 raw
+  token/generation이 current이면 clock expiry만으로 거부하지 않는다.
+  pre-write read/preflight 실패는 `external_write_authorized=false`, write marker 0건으로
+  정산하고 `Retry-After` delay-seconds/IMF-fixdate를 bounded seconds로 보존한다. raw token은
+  DB/event context 내부 authoritative exact 비교에만 쓰고 event·audit·log·API는 audit-only hash만
+  노출한다.
 
-  ```python
-  if attempt.lease_generation != expected_generation:
-      return attempt  # persist only an append-only stale observation
-  ```
+- [ ] **Step 4: late response를 factual child로 격리한다.**
 
-  stale worker 결과는 `PublicationExecutionObservation.result_state=stale`로 남기고 `Publication`을 변경하지 않는다.
+  `PublicationLateExecutionResult`는 execution observation XOR reconcile delivery observation 중 exact
+  한 provenance 부모와 reconcile 자식의 exact generation FK,
+  canonical result identity/state, bounded remote scalar, `projection_disposition=stale_fenced`, observed
+  time만 append한다. reclaimed worker의 remote
+  write와 current Publication/Attempt 변경은 0건이고 raw body/token은 저장하지 않는다.
 
-- [ ] **Step 4: retry와 reconcile generation 한도를 단일 규칙으로 통합한다.**
+- [ ] **Step 5: ambiguous mutating error와 generation budget을 통합한다.**
 
-  retryable failure는 새 row가 아니라 같은 논리 attempt row의 execution attempt number를 전진시키고,
-  unknown outcome은 reconcile generation을 사용한다. 최대 5회 후 `manual_required`로 종결하며 create를 다시 실행하지 않는다.
+  원격 미적용을 증명하지 못한 mutating timeout/408/429/5xx는 `unknown_outcome`이고 create를
+  직접 반복하지 않는다. 명시적 pre-write failure만 같은 logical row의 다음 execution event를
+  만들 수 있다. reconcile은 `delivery_identity_version=publication-reconcile-v1`, exact source/receipt
+  lease envelope와 `queued|running|completed|delivery_failed`를 사용하며 5회 뒤 manualize한다.
+  same-event higher receipt reclaim은 같은 running generation capability만 재결속하고
+  `delivery_failed`로 바꾸지 않는다. claim/reclaim은
+  `PublicationReconcileDeliveryObservation(active|superseded|settled)`을 append하고 late result는 그
+  exact FK를 사용한다. v1은 exact bound replay 또는 proven virgin generation 1만 사용한다.
 
-- [ ] **Step 5: adapter remote lookup contract를 확인한다.**
+- [ ] **Step 6: adapter action/content/state proof를 구현한다.**
 
-  WordPress는 결정적 slug/marker, Blogger는 label/HTML marker로 정확히 1건을 조회한다. 0건 또는 복수건은 자동 create가 아니라 manual required다.
+  WordPress는 결정적 slug+versioned marker, Blogger는 label+versioned marker를 쓴다. marker는
+  lookup, target command hash와 rendered content hash를 결속하지만 expected hash 자체를 proof로
+  믿지 않는다. actual provider raw body에서 marker를 분리한 canonical body hash를 재계산한다.
+  create preflight는 schema-complete bounded read가 exact target/blog·complete pagination·0 match를
+  증명할 때만 mutate한다. timeout/408/429/5xx, JSON/schema 오류, 불완전 pagination, target mismatch,
+  복수 match에서는 write 0건이다. mutation 2xx는 응답 자체 또는 즉시 bounded authenticated exact GET이,
+  reconcile은 해당 조회가 exact target/blog·remote ID·state를, create/update/mark는 title·actual canonical
+  body까지 증명한다. unpublish state를 합성하지 않는다.
+  유효 remote URL은 최대 1000자 `http(s)`만 저장하고 invalid/초과 값은 raw 없이 SHA-256만 감사한다. 0건은
+  create 없이 최대 5회 bounded read-only reconcile, 복수건은 즉시 manual이다. Blogger는
+  live/draft/scheduled 합산 15 page·750 item·wall 30초(`maxResults=50/page`) 안에서
+  `nextPageToken`을 따른다.
 
-- [ ] **Step 6: publication terminal projection과 dependent release를 원자적으로 처리한다.**
+- [ ] **Step 7: terminal reservation과 dependent release를 원자적으로 처리한다.**
 
-  succeeded/permanent_failed/manual_required/stale 모든 경로에서 duration, terminal impact, recovery state와 dependent Blogger 상태를 갱신한다.
+  exact source event와 execution/reconcile generation이 terminal callback identity다. receipt가
+  `processing`인 동안 raw `terminal_lease_token`을 포함한 all-or-none set-once 5필드 terminal
+  reservation을 먼저 저장하고, callback이 exact raw token/generation/hash/error reservation을
+  검증한 뒤 delivery-failed/manual-required projection, terminal impact, AuditEvent,
+  dependent wake-up과 DLQ를 한 transaction에서 기록한다. 예약된 receipt 삭제·성공 전이는
+  금지하고 과거 callback과 exact replay는 no-op이다. execution/reconcile audit identity는 source
+  event·domain/reconcile/receipt generation·consumer·token hash·write authorization/marker·delivery
+  observation·terminal reservation hash/error를 결속하고 raw token은 포함하지 않으며,
+  retry/reconcile는 immutable T020 Dispatch-ledger cohort를 변경하지 않는다.
 
-- [ ] **Step 7: 사용자 승인 후 migration/check를 검증하고 커밋한다.**
+- [ ] **Step 8: fault-injection RED를 GREEN으로 만든다.**
 
-  ```powershell
-  git add src/apps/publishing src/adapters/publishers specs/001-automated-content-publishing/contracts/publisher-adapter.md
-  git commit -m "fix: fence publication attempts and remote reconciliation"
-  ```
+  동일 event 100회, begin 후 receipt reclaim, same reconcile-generation rebind/late ledger,
+  pre-write Retry-After, applied create+500+lookup delay, actual-body/state mismatch, Blogger page 2,
+  generation 5/6, v1 bound replay/virgin gen1/quarantine, terminal raw reservation set-once/delete guard,
+  ReconcileDeliveryObservation/late exact FK, terminal reservation rollback, old result/callback,
+  execution-generation audit/Dispatch cohort, current settlement clock-expiry를
+  검증한다. OpenAPI history/retry route, cursor pagination, 관리자 UI와 E2E는 T026에 남긴다.
+
+#### English / AI-readable T021 boundary
+
+T021 owns exact execution/reconciliation event identity, domain and receipt fencing, immutable reconcile
+delivery observations, factual stale results, action/content/state-aware remote proof, bounded reconciliation and per-attempt terminal
+projection. It uses `publication-execution-v1`, `publication-reconcile-v1`, exact requested/reconcile v2
+payloads. Version 1 only replays an exact binding or binds proven virgin generation one; other deliveries
+are `legacy-unverifiable-v1` no-op quarantine. Raw capabilities are authoritative internally while
+public/audit surfaces expose audit-only hashes. Statement-time pre-I/O checks require an unexpired current
+capability; settlement ignores clock expiry alone when no reclaim occurred. Pre-write reads authorize no
+external write and preserve delay-seconds or IMF-fixdate Retry-After. A higher
+same-event receipt lease rebinds the same running reconcile generation and prior results are factual
+late ledger through the exact delivery observation FK only. Create mutates only after exact bounded
+not-found proof. A mutation 2xx succeeds only when either that response or an immediate bounded
+authenticated exact GET recomputes actual canonical body/title/target/state instead of trusting the marker.
+Terminal reservation includes the internal raw token, precedes the callback, forbids
+reserved receipt deletion/success, and reservation/projection/audit/DLQ are atomic. Execution/reconcile
+audit identity binds event, domain/reconcile/receipt generations, consumer, token hash, write marker,
+delivery observation and terminal reservation metadata; retry/reconcile cannot mutate the
+Dispatch-ledger cohort. Ambiguous mutating HTTP never repeats create. Zero
+matches receive five bounded reads, multiple matches manualize, and Blogger pagination across
+live/draft/scheduled is capped at 15 pages, 750 items and 30 wall-clock seconds (`maxResults=50` per
+page). Valid remote URLs are bounded to 1000-character HTTP(S); invalid raw values are discarded and only
+their SHA-256 is audited. T026
+owns OpenAPI operational history/retry routes, cursor pagination, admin UI and E2E; T028 owns global
+run/step/channel stop and terminal aggregation.
 
 ### Task 11: T022 visual placement와 published evidence snapshot
 

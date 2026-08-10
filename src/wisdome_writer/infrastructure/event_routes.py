@@ -332,6 +332,14 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "apps.publishing.tasks.finalize_publication_delivery_failure",
         ("publication_attempt_id",),
     ),
+    ("publication.requested", 2): EventRoute(
+        "publication-execute",
+        "publish.wordpress",
+        "apps.publishing.tasks.execute_publication_attempt",
+        ("publication_attempt_id", "execution_attempt_no"),
+        "apps.publishing.tasks.finalize_publication_delivery_failure",
+        ("publication_attempt_id", "execution_attempt_no"),
+    ),
     ("publication.reconcile_requested", 1): EventRoute(
         "publication-reconcile",
         "reconcile",
@@ -346,7 +354,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
         "apps.publishing.tasks.reconcile_publication_attempt",
         ("publication_attempt_id", "reconcile_attempt_no"),
         "apps.publishing.tasks.finalize_publication_reconcile_failure",
-        ("publication_attempt_id",),
+        ("publication_attempt_id", "reconcile_attempt_no"),
     ),
     ("publishing.target_canary.requested", 1): EventRoute(
         "target-canary",
@@ -720,6 +728,17 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
         {"publication_attempt_id": STR},
         formats={"publication_attempt_id": UUID_FORMAT},
     ),
+    ("publication.requested", 2): _schema(
+        {
+            "publication_attempt_id": STR,
+            "execution_attempt_no": (int,),
+        },
+        formats={
+            "publication_attempt_id": UUID_FORMAT,
+            "execution_attempt_no": POSITIVE_INTEGER_FORMAT,
+        },
+        choices={"execution_attempt_no": {1, 2, 3, 4, 5}},
+    ),
     ("publication.reconcile_requested", 1): _schema(
         {"publication_attempt_id": STR},
         formats={"publication_attempt_id": UUID_FORMAT},
@@ -733,6 +752,7 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
             "publication_attempt_id": UUID_FORMAT,
             "reconcile_attempt_no": POSITIVE_INTEGER_FORMAT,
         },
+        choices={"reconcile_attempt_no": {1, 2, 3, 4, 5}},
     ),
     ("publishing.target_canary.requested", 1): _schema(
         {"canary_run_id": STR, "target_id": STR},

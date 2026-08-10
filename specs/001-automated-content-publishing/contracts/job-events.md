@@ -71,9 +71,11 @@
 | `delivery.reconcile_requested` | `public_delivery_asset_id`, `publication_attempt_id`, `publication_intent_id` | 객체 checksum·익명 GET과 PublicationMedia binding/원격 본문 참조 조정 |
 | `delivery.delete_requested` | `public_delivery_asset_id`, `expected_lease_generation` | ref=0 grace 뒤 행 잠금에서 binding/in-flight/hold/원격 본문을 재검산해 bytes 삭제 또는 취소 |
 | `delivery.deleted` | `public_delivery_asset_id`, `lease_generation`, `delete_reason`, `last_reconcile_hash` | mapping tombstone을 감사 수명 동안 유지하고 physical object 삭제 결과 기록 |
-| `publication.requested` | `publication_attempt_id` | 승인·kill switch 재검증 후 채널 호출 |
+| `publication.requested@1` | `publication_attempt_id` | exact bound replay 또는 proven virgin generation 1 전용; 나머지는 `legacy-unverifiable-v1` no-op quarantine |
+| `publication.requested@2` | `publication_attempt_id`, `execution_attempt_no` | exact 1~5 business write 세대를 결속하고 승인·kill switch·execution lease를 외부 쓰기 직전에 재검증 |
 | `publication.primary_public` | `primary_publication_attempt_id`, `publication_intent_id`, `article_revision_id`, `publication_id`, `target_snapshot_id`, `target_config_hash`, `secondary_publication_attempt_ids`, `remote_url`, `public_checked_at` | 같은 current intent에 미리 생성된 Blogger attempt에만 공개 WordPress URL을 결합하고 보조 발행 요청 |
-| `publication.reconcile_requested` | `publication_attempt_id` | 원격 성공 여부 조정; create 반복 금지 |
+| `publication.reconcile_requested@1` | `publication_attempt_id` | exact bound replay 또는 proven virgin generation 1 전용; 나머지는 no-op quarantine |
+| `publication.reconcile_requested@2` | `publication_attempt_id`, `reconcile_attempt_no` | exact 1~5 read-only 원격 결과 조정; create 반복 금지 |
 | `correction.detected` | `correction_case_id` | 변경 근거 검증과 영향 글 검색 |
 | `correction.apply_primary_requested` | `publication_attempt_id` | attempt가 고정한 current intent/revision/target snapshot/resolved action으로 WordPress 기존 글 수정·철회 |
 | `correction.primary_completed` | `publication_attempt_id`, `publication_intent_id`, `correction_case_id`, `article_revision_id`, `target_snapshot_id`, `target_config_hash`, `resolved_action`, `terminal_state`, `secondary_publication_attempt_ids`, `remote_url?` | 같은 intent의 pre-created secondary attempt만 해제; update/mark는 URL 결합, unpublish는 URL 없이 철회 요청 |
@@ -92,7 +94,10 @@ revert/delete를 실행한다.
 2. 이미 성공한 기록이면 side effect 없이 ACK한다.
 3. 동일 업무를 다른 event가 요청할 수 있으므로 도메인 `dedupe_key`와 DB 고유 제약도
    함께 확인한다.
-4. 외부 API 호출 직전 `PublicationAttempt=in_progress`와 요청 지문을 원자적으로 저장한다.
+4. 외부 API 호출 직전 `PublicationAttempt=running`, exact `execution_attempt_no`,
+   `execution_generation`, source event와 current consumer receipt lease envelope를 원자적으로
+   저장한다. 실제 mutating HTTP 바로 전 짧은 pre-I/O fence에서 statement-time의 같은 current
+   ownership·미만료 raw capability와 승인, intent, target snapshot, kill switch를 다시 확인한다.
 5. 외부 결과를 저장하기 전 워커가 죽으면 `reconcile_requested`를 만들고 원격 상태를
    확인한다.
 6. 동일 profile·config·page set의 진짜 일시 오류만 같은 `event_id`의 attempt를 증가시키고
@@ -212,6 +217,20 @@ DocumentExtraction이 expected=`0..input_page_count-1`와 선택 child 결과의
   token+generation으로 receipt claim을 해제하고 domain attempt를 소비하지 않는다. claim
   해제 자체도 DB 오류로 실패하면 인프라 재시도가 소유권을 전달받아 살아 있는 40분
   lease를 즉시 재점유한다.
+- receipt 결과 정산은 처리 상태와 current raw token+`lease_generation`이 같고 더 높은
+  generation reclaim이 없으면 wall-clock `claimed_until`이 막 지났다는 이유만으로 거부하지
+  않는다. 반면 mutating HTTP를 시작하는 pre-I/O fence는 실제 I/O 직전 statement-time에
+  소유권이 current이고 lease가 아직 유효하거나 같은 transaction에서 안전하게 갱신됐음을
+  확인한 경우에만 통과한다. 이전 transaction에서 읽은 시각이나 hash만으로 쓰기를 승인하지
+  않는다. reclaim으로 generation이 바뀐 worker는 외부 쓰기와 current projection 변경을 모두
+  수행할 수 없다.
+- raw receipt `lease_token` UUID와 terminal 예약의 raw `terminal_lease_token` UUID는 DB와
+  worker event context 내부에서만 exact
+  capability로 사용한다. domain row는 exact 비교를 위한 raw capability를 내부 필드에
+  보존하되, AuditEvent·로그·event payload·API는 SHA-256 token hash만 노출하고 raw token은
+  절대 직렬화하지 않는다. hash는 감사·노출용이며 권한 판정의 근거가 아니다. terminal
+  예약 5필드(`terminal_reserved_at`, raw token, generation, token hash, error code)는
+  all-or-none·set-once이고 예약된 receipt 삭제와 성공 전이를 DB가 금지한다.
 - `run.requested`, publication/canary/disconnect 이벤트에는 queue 선택용 `topic_code` 또는
   `channel`을 넣지 않는다. dispatcher가 payload의 엔터티 ID로 DB 기준 topic/channel을
   다시 조회하며, 엔터티가 없거나 채널을 확정할 수 없으면 안전하게 DLQ 처리한다.
@@ -312,17 +331,45 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
 
 ### 발행·추출 재전달 규칙 보충
 
-- `PublicationAttempt=running`인 `publication.requested`가 재전달되면 외부 write를 다시
-  호출하지 않는다. 같은 트랜잭션에서 `unknown_outcome`으로 전환하고
-  `publication.reconcile_requested`를 영속 생성한다.
+- T020 `PublicationDispatchResult.attemptNo=1`은 immutable acceptance 값이다. 이벤트 envelope
+  `attempt`는 dispatcher delivery attempt, `execution_attempt_no`는 business write 1~5,
+  `execution_generation`은 domain claim fence, consumer receipt `lease_generation`은 transport
+  ownership, `reconcile_attempt_no`는 read-only reconcile 1~5다. 서로 대입하거나 API에서
+  같은 `attemptNo`로 직렬화하지 않는다.
+- 신규 `publication.requested@2` exact payload는 `publication_attempt_id`,
+  `execution_attempt_no`다. 같은 event는 pre-write receipt reclaim 뒤 같은 business 번호를
+  유지한 채 새 consumer lease와 domain `execution_generation`으로 다시 claim될 수 있다. 각
+  execution observation은 source event, consumer name, receipt lease generation/token hash와
+  write marker를 동결하며 generation만 고유하다. v1은 이미 exact source event에 결속된 행의
+  replay이거나, counter·observation·terminal lineage가 모두 비어 있는 virgin generation 1임이
+  증명될 때만 한 번 결속한다. 그 밖의 v1은 현재 counter를 추측하지 않고
+  `legacy-unverifiable-v1` 감사 sentinel을 남기는 no-op quarantine이며 현재 projection을
+  변경하지 않는다.
+- `PublicationAttempt=running`인 event에 write marker/start가 있으면 재전달은 외부 write를
+  반복하지 않는다. 같은 트랜잭션에서 `unknown_outcome`으로 전환하고
+  `publication.reconcile_requested`를 영속 생성한다. marker 전 receipt reclaim은 이전
+  observation을 fenced/no-result로 닫고 같은 `execution_attempt_no`의 새 domain generation만
+  claim한다.
 - reconcile의 `retryable_failed`와 반복 `unknown_outcome`은 새 dedupe key의 후속
   reconcile 이벤트로 최대 5회 이어지며, 한도를 넘으면 `manual_required`가 된다.
   `publication.reconcile_requested@2`의 exact payload는 `publication_attempt_id`,
   `reconcile_attempt_no`이고, 이 번호는 execute/admin `attempt_no`와 분리된 영속
-  counter다. 각 1~5 세대는 append-only `PublicationReconcileGeneration` 행과 정확히 한
-  source outbox event에 결합된다. 완료된 동일 이벤트는 adapter를 다시 호출하지 않고,
-  시작된 동일 이벤트는 같은 세대를 재개한다. v1은 기존 outbox event를 최초 소비할 때
-  연속된 다음 세대에 한 번만 결합해 이후 replay에서도 같은 세대를 사용한다.
+  counter다. 각 1~5 세대는 `delivery_identity_version=publication-reconcile-v1`, exact source
+  event와 consumer receipt lease envelope를 가진 append-only `PublicationReconcileGeneration`
+  행에 결합된다. state는 `queued|running|completed|delivery_failed`다. 완료/전달 실패한 동일
+  이벤트는 adapter를 다시 호출하지 않고, queued/running 동일 이벤트는 같은 세대를 재개한다.
+  v1은 이미 exact source event에 결속된 세대의 replay이거나 아무 reconcile lineage도 없는
+  virgin generation 1일 때만 한 번 결합한다. 나머지는 `legacy-unverifiable-v1` no-op
+  quarantine이며 전달 순서나 현재 counter로 generation을 추측하지 않는다.
+- running reconcile의 receipt lease가 만료된 뒤 같은 source event를 current로 클레임한
+  더 높은 `lease_generation`이 도착하면 새 reconcile 세대를 만들지 않고 같은
+  `PublicationReconcileGeneration` row의 current projection만 재결속하여 `running`을 유지한다.
+  각 claim/reclaim은 `(reconcile_generation, consumer_lease_generation)`이 고유하고 identity/raw
+  capability가 불변인 `PublicationReconcileDeliveryObservation`을 추가하고 이전
+  active observation을 `superseded`로 닫는다. 이전 worker의 늦은 result는 current projection을
+  바꾸지 않고 그 exact delivery observation FK 및 같은 generation/capability denormalization을
+  가진 factual `PublicationLateExecutionResult`로만 append한다. `delivery_failed`는 exact
+  terminal reservation/DLQ가 증명된 경우에만 허용한다.
 - 새 reconcile 세대와 event를 할당하는 transaction은 attempt와 publication projection도
   함께 `reconciling`으로 고정한다. 따라서 execute 재전달이나 관리자 retry가 열린 세대와
   경합해 외부 write 경로를 다시 열 수 없다.
@@ -331,9 +378,53 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   필요 시 다음 v2 event와 다음 세대 시작은 각각 하나의 DB transaction에서 원자적으로
   기록하며 6번째 세대는 생성하지 않는다.
 - v1/v2 reconcile 전달이 영구 실패하거나 route 예산을 소진하면 terminal callback이 그
-  source event의 세대를 완료하고 attempt/publication을 `manual_required`로 종결한다.
+  source event의 세대를 `delivery_failed`로 종결하고 attempt/publication을
+  `manual_required`로 종결한다. callback 전 receipt에
+  `terminal_reserved_at`, internal raw `terminal_lease_token`, `terminal_lease_generation`,
+  `terminal_lease_token_hash`, `terminal_error_code`를 all-or-none·set-once로 예약하고 receipt는 callback 동안
+  `processing`을 유지한다. callback이 exact reservation을 재검증해 domain projection과
+  audit를 남긴 뒤에만 receipt/event를 `dead_letter`로 전이한다. 예약부터
+  DLQ 전이까지 한 transaction이며 callback 실패는 전체를 rollback한다.
   후속 생성 및 upgrade backfill도 source outbox 또는 해당 consumer receipt의
   `dead_letter`를 감지해 같은 종결을 수행하며, 이후 replay는 no-op이다.
+- mutating HTTP의 timeout, 연결 종료와 적용 여부를 증명하지 못하는 408/429/5xx는
+  `unknown_outcome`이다. 같은 create event나 다음 execution event로 write를 반복하지 않고
+  reconcile로만 이동한다. 명시적인 pre-write failure처럼 원격 미적용이 증명된 경우만 새
+  `publication.requested@2`와 다음 execution 세대를 같은 transaction에서 만들 수 있다.
+- create preflight는 bounded read가 성공하고 응답 schema·pagination·target/blog가 정확하며
+  exact marker/lookup match가 0건임을 증명한 경우에만 mutating create를 허용한다. timeout,
+  408/429/5xx, JSON/schema 오류, 불완전 pagination, target/blog 불일치와 복수 match는 write
+  0건으로 retry/manual 처리한다.
+- reconcile과 mutating 2xx의 성공은 2xx 응답 자체 또는 그 직후의 bounded authenticated exact GET이
+  action/content/state proof를 모두 제공해야 한다. marker 내 expected
+  content hash를 믿지 않고, provider가 반환한 actual raw body에서 marker를 분리한 뒤
+  versioned canonical remote-body material을 재계산해 rendered content와 비교한다.
+  create/update/mark는 exact target/blog, remote identity, title, versioned
+  lookup/command/content marker, canonical body와 기대 공개 상태가 일치해야 한다. unpublish는
+  exact target/blog·remote identity와 WordPress `draft|trash` 또는 Blogger `draft` 같은 실제
+  비공개 상태가 확인돼야 하며 adapter가 `withdrawn`을 합성하지 않는다. 증명 필드가 없거나
+  다르면 `unknown_outcome`/manual reconcile이고 성공 projection은 없다. 0건은 create를
+  반복하지 않고 bounded backoff로 최대 5회 read-only
+  reconcile한 뒤 `manual_required`, 복수건은 즉시 `manual_required`다. Blogger list는
+  `nextPageToken`을 따르되 live/draft/scheduled 합산 최대 15 page·750 item·wall 30초
+  (`maxResults=50/page`)를 넘으면 fail-closed한다.
+- preflight/read가 mutating HTTP 전에 실패하면 `external_write_authorized=false`로 정산하고
+  write marker를 만들지 않는다. 408/429/5xx·timeout의 retryable 분류는
+  `Retry-After`의 delay-seconds 또는 IMF-fixdate를 모두 UTC 기준 bounded seconds로 보존해
+  우선 사용하며, 실제 mutating call을 시작한 뒤에는
+  `external_write_authorized=true`로 정산하고 불명확한 결과를 direct retry로 보내지 않는다.
+- execution/reconcile terminal callback은 원 consumed source event, execution/reconcile 세대와
+  receipt ownership을 exact하게 결속한다. 과거 callback과 늦은 result는 현재 state를 바꾸지
+  않고 별도 factual late-result observation만 append한다. terminal reservation, projection,
+  AuditEvent와 dependent wake-up은 한 transaction이며 exact replay는 no-op이다.
+- execution start/result AuditEvent identity는 business attempt number만이 아니라 exact source event,
+  `execution_generation`, consumer name·`lease_generation`·token hash, write authorization/marker를
+  결속한다. reconcile audit도 source event·reconcile generation·delivery observation·consumer
+  name·lease generation·token hash와 terminal reservation hash/error를 결속한다. raw token은
+  AuditEvent에 들어가지 않는다. 유효 remote URL은 `http(s)`이고 최대 1000자만 저장하며,
+  invalid scheme/초과 URL은 raw를 버리고 SHA-256만 감사한다. T020이 만든
+  `PublicationDispatch` ledger의 frozen target/Publication/Attempt cohort는 T021 retry·reclaim·reconcile로
+  추가되거나 교체되지 않고, 각 logical attempt의 counter/generation만 전진한다.
 - generic attempt 생성과 `evidence.other_extract_requested` 생성은 같은 트랜잭션이다.
   일시 추출 오류는 `queued`로 되돌리고 finalizer를 깨우지 않는다. 영구 오류 또는
   consumer 재시도 소진 시에만 `failed`와 단 하나의 terminal finalizer 이벤트를 같은
@@ -446,16 +537,24 @@ orchestrator는 이 두 이름을 축약 payload로 재사용하지 않는다. �
   timeout and worker loss requeue as well. The receipt lease exceeds the hard limit by
   ten minutes, and settlement is fenced by current token+generation ownership rather
   than lease-clock expiry alone.
+- Settlement by the still-current token and generation is not rejected only because the
+  clock passed `claimed_until`. Starting a mutating HTTP call is stricter: the pre-write
+  fence must prove an unexpired current lease or renew it atomically. A reclaimed worker
+  appends only a factual late-result observation and cannot write or mutate the current
+  projection.
+- The raw receipt lease-token UUID is an internal database/event-context capability only.
+  Domain claim rows retain the raw capability solely for exact constant-time ownership
+  checks, while events, audit, logs, and APIs expose only SHA-256 token hashes.
 - Queue selection metadata is not added to domain payloads. The dispatcher resolves the
   topic or publication channel from the referenced database entity and dead-letters an
   event when that identity cannot be resolved safely.
 
 ### Implementation-only orchestration events
 
-All entries below are version 1. Any field removal or semantic change requires a new
-event version.
+Entries are version 1 unless the event key shows another version. Any field removal or
+semantic change requires a new event version.
 
-| Event key | Exact v1 payload |
+| Event key | Exact payload |
 |---|---|
 | `run.collection_finalize_requested@1` | `run_id` |
 | `run.evidence_requested@1` | `run_id` |
@@ -472,6 +571,10 @@ event version.
 | `publishing.target_preflight.completed@1` | `target_id`, `target_snapshot_id`, `target_config_hash`, `result_hash`, `passed` |
 | `publishing.target_canary.requested@1` | `canary_run_id`, `target_id` |
 | `publishing.target_disconnect.requested@1` | `decision_id`, `target_id` |
+| `publication.requested@1` | `publication_attempt_id`; exact bound replay or proven virgin generation one only |
+| `publication.requested@2` | `publication_attempt_id`, `execution_attempt_no` |
+| `publication.reconcile_requested@1` | `publication_attempt_id`; exact bound replay or proven virgin generation one only |
+| `publication.reconcile_requested@2` | `publication_attempt_id`, `reconcile_attempt_no` |
 
 The implementation does not overload `evidence.document_extract_requested` with a
 parent-document payload, and it does not overload `article.draft_requested` with a
@@ -488,21 +591,68 @@ withdrawal, unavailability, or restoration impact. Unchanged observations emit n
 
 ### Redelivery state machine
 
-1. Redelivery of a `running` publication attempt never repeats the external write.
-   It atomically records `unknown_outcome` and enqueues reconciliation.
-2. Retryable or repeatedly unknown reconciliation creates a new durable follow-up event
+1. T020 response `attemptNo=1` is the immutable acceptance value. Envelope `attempt` is
+   the dispatcher delivery attempt; `execution_attempt_no` is business write generation
+   1..5; `execution_generation` is the domain claim fence; receipt `lease_generation` is
+   transport ownership; `reconcile_attempt_no` is read-only reconciliation generation
+   1..5. They are not interchangeable.
+2. New execution uses exact `publication.requested@2` payload
+   `publication_attempt_id` plus `execution_attempt_no`. Version 1 may only replay an
+   existing exact source-event binding or bind once to a proven virgin generation one.
+   Every other v1 delivery records a `legacy-unverifiable-v1` audit sentinel and is a
+   no-op quarantine; it never guesses from the current counter.
+3. Redelivery of a `running` publication attempt with a write marker/start never repeats
+   the external write. It atomically records `unknown_outcome` and enqueues reconciliation.
+   A pre-write receipt reclaim instead fences the prior observation as no-result and
+   claims a new domain generation with the same business attempt number.
+4. Retryable or repeatedly unknown reconciliation creates a new durable follow-up event
    and becomes `manual_required` after five bounded attempts. Version 2 carries the exact
    payload `publication_attempt_id` plus `reconcile_attempt_no`; this persisted counter is
-   independent of execute/admin `attempt_no`. Version 1 remains a legacy-consumption path.
-3. Generic attempt creation and its request event are atomic. Retryable extraction
+   independent of the execution and delivery counters. Version 1 may only replay an
+   exact existing binding or bind a proven virgin generation one; every other delivery is
+   a `legacy-unverifiable-v1` no-op quarantine. Expired
+   `running` delivery reclaimed by a higher current receipt lease rebinds the same
+   reconciliation generation and remains `running`; it never becomes `delivery_failed`
+   and never consumes another reconciliation attempt. A result from the prior capability
+   appends through the exact `PublicationReconcileDeliveryObservation` foreign key to the
+   reconcile-parented factual late-result ledger only. Each claim/reclaim has one identity-frozen
+   observation keyed by reconciliation generation plus receipt lease generation; only its state
+   and finish time may advance monotonically.
+5. A create preflight may mutate only after a bounded, schema-complete read proves exact
+   target/blog pagination and zero marker/lookup matches. Timeout, 408/429/5xx, malformed
+   JSON/schema, incomplete pagination, target mismatch, or multiple matches authorize no
+   write. Ambiguous mutating HTTP outcomes enter read-only reconciliation rather than
+   repeating create. A mutation 2xx succeeds only when either that response or an immediate
+   bounded authenticated exact GET, and every reconciliation success, proves exact target/blog,
+   remote identity, action-aware state, title, and a canonical hash recomputed from the actual
+   provider-returned body after separating its marker; the marker's embedded expected content
+   hash is not proof by itself.
+   Zero matches receive at most five bounded reads, multiple matches manualize immediately,
+   and Blogger follows `nextPageToken` for at most 15 pages, 750 items and 30 wall-clock
+   seconds across live/draft/scheduled (`maxResults=50` per page).
+6. A read/preflight failure before mutating HTTP settles with
+   `external_write_authorized=false`, creates no write marker, and preserves both
+   delay-seconds and IMF-fixdate forms of Retry-After as bounded seconds.
+   After mutating HTTP authorization it settles with `external_write_authorized=true`,
+   so ambiguous application is reconciled rather than retried directly.
+7. The pre-I/O authorization evaluates current ownership and lease validity at statement
+   time immediately before external I/O. Settlement accepts the same raw token/generation
+   after clock expiry when no higher generation reclaimed it. Raw tokens are authoritative
+   internally; hashes are audit-only. Execution/reconcile audit identity binds source event,
+   domain/reconcile generation, consumer name, receipt lease generation, token hash,
+   write authorization/marker, delivery observation, and terminal reservation hash/error.
+   Valid remote URLs are bounded to 1000-character HTTP(S); invalid values are discarded
+   and only their SHA-256 is audited. Retry/reclaim/reconcile never adds to or
+   replaces the immutable PublicationDispatch target/publication/attempt cohort.
+8. Generic attempt creation and its request event are atomic. Retryable extraction
    failures return to `queued`; only permanent failure or exhausted consumer retries
    records `failed` and one terminal finalizer wake-up.
-4. Target preflight is split into a short database fence snapshot, external I/O outside
+9. Target preflight is split into a short database fence snapshot, external I/O outside
    a database transaction, and a fenced result/audit/completion-event transaction.
-5. The evidence parent atomically persists `RunStep.fanout_completed_at`, counters, and a
+10. The evidence parent atomically persists `RunStep.fanout_completed_at`, counters, and a
    finalizer wake-up after all child attempt/outbox fan-out. Finalizers cannot advance the
    run before that marker, including zero-child, fast-child, and partial-failure paths.
-6. Permanent/exhausted terminal handlers run inside the original consumed event context,
+11. Permanent/exhausted terminal handlers run inside the original consumed event context,
    preserving correlation and setting the terminal wake-up causation to the consumed
    event ID in the same receipt-terminal transaction.
 
@@ -513,17 +663,29 @@ withdrawal, unavailability, or restoration impact. Unchanged observations emit n
    token/generation and restores the consumed domain-attempt count. If that release
    cannot reach the database, the infrastructure retry carries ownership and may
    immediately reclaim the still-live lease.
-2. Every reconciliation generation from one through five is an append-only row bound
-   one-to-one to its source outbox event. Completed replay is a no-op, started replay
-   resumes the same generation, and a legacy v1 event is assigned once to the next
-   contiguous generation.
-3. Result persistence fences on both source event and generation. A late older result
+2. Every reconciliation generation from one through five uses
+   `delivery_identity_version=publication-reconcile-v1`, exact source/consumer receipt
+   lease identity, and state `queued|running|completed|delivery_failed`. It is append-only
+   and bound one-to-one to its source outbox event. Completed/delivery-failed replay is a
+   no-op. A higher current receipt lease for the same source event rebinds the existing
+   running generation; it does not create a new row or mark delivery failed. A legacy v1
+   event is assigned exactly once only when its contiguous historical identity is proven.
+3. One requested event may have multiple fenced observations after pre-write receipt
+   reclaim: `execution_attempt_no` remains unchanged, while receipt lease generation and
+   domain `execution_generation` advance. Only `(publication_attempt_id,
+   execution_generation)` is unique; the business attempt number is indexed but not
+   unique. Result persistence fences on current source event and generation. A late older result
    cannot overwrite current publication state. Result completion and any next v2
    generation/event allocation are atomic; generation six is forbidden. Allocating a
    generation also projects attempt and publication to reconciling in that transaction,
    so execute redelivery or admin retry cannot reopen the external-write path. Terminal
-   v1/v2 delivery callbacks, source-event DLQ, and receipt DLQ complete the bound
-   generation and manualize the attempt; replay is a no-op.
+   v1/v2 delivery callbacks first set the receipt's all-or-none, set-once
+   `terminal_reserved_at`, internal raw `terminal_lease_token`, `terminal_lease_generation`,
+   `terminal_lease_token_hash`, and `terminal_error_code` while it remains processing.
+   A reserved receipt cannot be deleted or become succeeded. The callback verifies that exact
+   reservation, projects the bound generation to `delivery_failed`, and manualizes the
+   attempt before the receipt/event become dead-letter in the same transaction. Failure
+   rolls back the reservation, projection, audit, and DLQ transition; replay is a no-op.
 4. `DocumentExtraction.input_fingerprint` is the stable SHA-256 of schema
    `document-input-v1`, run-source-item identity, input kind, and input checksum. It
    provides one active canonical document and one route event for normal and legacy-HWP
