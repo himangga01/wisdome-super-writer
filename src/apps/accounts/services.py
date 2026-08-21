@@ -26,6 +26,7 @@ ALLOWED_ACTION_SCOPES = frozenset(
     {
         "auto_publish_change",
         "kill_switch_disable",
+        "run_stop",
         "unpublish",
         "bulk_retry",
         "retention_execute",

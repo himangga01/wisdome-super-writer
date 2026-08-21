@@ -677,6 +677,7 @@ def create_schedule(
 def update_schedule(
     *,
     schedule_id,
+    expected_version: int,
     changes: dict,
     user,
     audit_context: AuditContext,
@@ -687,6 +688,7 @@ def update_schedule(
         {
             "schema_version": "schedule-update-request-v1",
             "schedule_id": str(schedule_id),
+            "expected_version": expected_version,
             "changes": changes,
             "request_key": audit_context.request_key,
             "reason": audit_context.reason_code,
@@ -714,6 +716,9 @@ def update_schedule(
                 request_hash=payload_hash,
             )
             return schedule, False
+
+        if schedule.version != expected_version:
+            raise ValueError("stale_schedule_version")
 
         before_material = _schedule_material(schedule)
         for field, value in changes.items():
@@ -744,6 +749,7 @@ def update_schedule(
 def disable_schedule(
     *,
     schedule_id,
+    expected_version: int,
     user,
     audit_context: AuditContext,
 ) -> tuple[Schedule, bool]:
@@ -753,6 +759,7 @@ def disable_schedule(
         {
             "schema_version": "schedule-disable-request-v1",
             "schedule_id": str(schedule_id),
+            "expected_version": expected_version,
             "request_key": audit_context.request_key,
             "reason": audit_context.reason_code,
             "actor_id": str(user.pk),
@@ -779,6 +786,10 @@ def disable_schedule(
                 request_hash=payload_hash,
             )
             return schedule, False
+
+
+        if schedule.version != expected_version:
+            raise ValueError("stale_schedule_version")
 
         before_material = _schedule_material(schedule)
         schedule.enabled = False

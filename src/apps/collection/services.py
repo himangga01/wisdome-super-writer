@@ -325,6 +325,8 @@ def run_control_request_hash(
     request_key: str,
     reason: str,
     actor_id: uuid.UUID | str,
+    expected_state: str | None = None,
+    reauth_proof_id: uuid.UUID | str | None = None,
 ) -> str:
     normalized_action = str(action).strip()
     if normalized_action not in RunControlDecision.Action.values:
@@ -349,6 +351,10 @@ def run_control_request_hash(
         "reason": normalized_reason,
         "actorId": str(uuid.UUID(str(actor_id))),
     }
+    if expected_state is not None:
+        material["expectedState"] = str(expected_state)
+    if reauth_proof_id is not None:
+        material["reauthProofId"] = str(uuid.UUID(str(reauth_proof_id)))
     return _hash(material)
 
 
@@ -372,6 +378,8 @@ def _record_run_control_decision_locked(
     reason: str,
     user: Any,
     reauth_proof_id: uuid.UUID | str | None = None,
+    expected_state: str | None = None,
+    audit_context: Any | None = None,
 ) -> tuple[RunControlDecision, bool]:
     _require_run_control_actor(user)
     normalized_action = str(action).strip()
@@ -391,6 +399,8 @@ def _record_run_control_decision_locked(
         request_key=normalized_key,
         reason=normalized_reason,
         actor_id=user.pk,
+        expected_state=expected_state,
+        reauth_proof_id=reauth_proof_id,
     )
     existing = (
         RunControlDecision.objects.select_for_update()
@@ -409,9 +419,18 @@ def _record_run_control_decision_locked(
             or existing.reauth_proof_id != normalized_proof
         ):
             raise ValueError("request_key_conflict")
+        if audit_context is not None:
+            from apps.audit.services import require_audit_replay
+
+            require_audit_replay(
+                context=audit_context,
+                action="collection_run.control_decided",
+                entity=existing,
+                identity_key=normalized_key,
+                request_hash=request_hash,
+            )
         return existing, False
-    return (
-        RunControlDecision.objects.create(
+    decision = RunControlDecision.objects.create(
             run=run,
             action=normalized_action,
             scope=normalized_scope,
@@ -419,9 +438,42 @@ def _record_run_control_decision_locked(
             request_hash=request_hash,
             reauth_proof_id=normalized_proof,
             decided_by=user,
-        ),
-        True,
-    )
+        )
+    if audit_context is not None:
+        from apps.audit.services import record_audit_event
+
+        record_audit_event(
+            context=audit_context,
+            action="collection_run.control_decided",
+            entity=decision,
+            identity_key=normalized_key,
+            material_schema_version="run-control-audit-v1",
+            before_material={"state": "not_created"},
+            after_material={
+                "runId": str(run.id),
+                "action": decision.action,
+                "scope": decision.scope,
+                "requestHash": decision.request_hash,
+                "reauthProofId": (
+                    str(decision.reauth_proof_id)
+                    if decision.reauth_proof_id
+                    else None
+                ),
+            },
+            metadata={
+                "collection_run_id": str(run.id),
+                "decision": decision.action,
+                "decision_id": str(decision.id),
+                "request_hash": decision.request_hash,
+                "reauth_proof_id": (
+                    str(decision.reauth_proof_id)
+                    if decision.reauth_proof_id
+                    else None
+                ),
+                "result": "created",
+            },
+        )
+    return decision, True
 
 
 @transaction.atomic
@@ -547,6 +599,10 @@ def request_run_stop(
     request_key: str,
     reason: str,
     user: Any,
+    expected_state: str | None = None,
+    request=None,
+    reauth_proof_id: uuid.UUID | str | None = None,
+    audit_context: Any | None = None,
 ) -> tuple[RunControlDecision, bool]:
     run = CollectionRun.objects.select_for_update().get(pk=run_id)
     decision, created = _record_run_control_decision_locked(
@@ -556,9 +612,26 @@ def request_run_stop(
         request_key=request_key,
         reason=reason,
         user=user,
+        reauth_proof_id=reauth_proof_id,
+        expected_state=expected_state,
+        audit_context=audit_context,
     )
     if not created:
         return decision, False
+    if expected_state is not None and run.state != expected_state:
+        raise ValueError("stale_run_state")
+    if request is not None or reauth_proof_id is not None:
+        if request is None or reauth_proof_id is None:
+            raise ValueError("run stop reauthentication is required")
+        from apps.accounts.services import consume_reauthentication_proof
+
+        consume_reauthentication_proof(
+            request=request,
+            proof_id=reauth_proof_id,
+            action_scope="run_stop",
+            entity_type="collection_run",
+            entity_id=run.id,
+        )
     if run.state in {RunState.COMPLETED, RunState.FAILED, RunState.STOPPED}:
         return decision, True
     now = timezone.now()
@@ -762,6 +835,8 @@ def request_selective_retry(
     reason: str,
     user: Any,
     reauth_proof_id: uuid.UUID | str,
+    request=None,
+    audit_context: Any | None = None,
 ) -> tuple[RunControlDecision, Any, bool]:
     run = CollectionRun.objects.select_for_update().get(pk=run_id)
     decision, created = _record_run_control_decision_locked(
@@ -772,12 +847,25 @@ def request_selective_retry(
         reason=reason,
         user=user,
         reauth_proof_id=reauth_proof_id,
+        audit_context=audit_context,
     )
     target = selective_retry_target(
         run,
         decision.scope,
         require_retryable=created,
     )
+    if created:
+        if request is None:
+            raise ValueError("retry reauthentication request is required")
+        from apps.accounts.services import consume_reauthentication_proof
+
+        consume_reauthentication_proof(
+            request=request,
+            proof_id=reauth_proof_id,
+            action_scope="bulk_retry",
+            entity_type="collection_run",
+            entity_id=run.id,
+        )
     return decision, target, created
 
 

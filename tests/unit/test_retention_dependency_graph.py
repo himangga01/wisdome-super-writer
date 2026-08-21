@@ -6,13 +6,13 @@ import uuid
 
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, connection, transaction
-from django.test import SimpleTestCase, TestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase
 from django.utils import timezone
 
 from adapters.storage.base import ObjectInfo
 from adapters.storage.s3 import S3ObjectStorage
 from apps.audit import retention
-from apps.audit.models import RetentionBatch, RetentionBatchItem
+from apps.audit.models import AuditEvent, RetentionBatch, RetentionBatchItem
 from apps.audit.services import AuditContext, record_audit_event
 from apps.evidence.models import EvidenceAsset
 from apps.collection.models import SourceItem
@@ -298,6 +298,7 @@ class RetentionServiceTests(TestCase):
         self.user = get_user_model().objects.create_user(
             email="retention@example.com",
             password="test-password",
+            is_staff=True,
         )
 
     def _asset(self, *, suffix: str = "1") -> EvidenceAsset:
@@ -400,6 +401,41 @@ class RetentionServiceTests(TestCase):
                 user=self.user,
             )
 
+    def test_preview_records_exact_admin_audit_when_context_is_supplied(self):
+        self._asset(suffix="audit")
+        request = RequestFactory().post("/api/v1/retention/previews")
+        request.user = self.user
+        request.correlation_id = uuid.uuid4()
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code="보존 삭제 후보 검토",
+            request_key="retention-preview-audit",
+        )
+
+        batch = retention.create_retention_preview(
+            scope="raw_evidence",
+            cutoff_at=timezone.now() - timezone.timedelta(days=90),
+            request_key="retention-preview-audit",
+            reason="보존 삭제 후보 검토",
+            user=self.user,
+            audit_context=audit_context,
+        )
+        replay = retention.create_retention_preview(
+            scope="raw_evidence",
+            cutoff_at=batch.cutoff_at,
+            request_key="retention-preview-audit",
+            reason="보존 삭제 후보 검토",
+            user=self.user,
+            audit_context=audit_context,
+        )
+
+        self.assertEqual(replay.id, batch.id)
+        event = AuditEvent.objects.get(
+            action="retention_batch.previewed",
+            entity_id=batch.id,
+        )
+        self.assertEqual(event.metadata_redacted["request_hash"], batch.request_hash)
+
     def test_approval_revalidates_and_execution_tombstones_exact_object(self):
         asset = self._asset()
         batch = retention.create_retention_preview(
@@ -431,6 +467,69 @@ class RetentionServiceTests(TestCase):
         self.assertIsNone(asset.object_version)
         self.assertIsNone(asset.extracted_text)
         self.assertIsNone(asset.structured_data)
+
+    def test_failed_batch_resume_revalidates_only_failed_items(self):
+        asset = self._asset(suffix="resume")
+        batch = retention.create_retention_preview(
+            scope="raw_evidence",
+            cutoff_at=timezone.now() - timezone.timedelta(days=90),
+            request_key="retention-preview-resume",
+            reason="실패 재개 대상 미리보기",
+            user=self.user,
+        )
+        item = batch.items.get(entity_id=asset.id)
+        item.state = RetentionBatchItem.State.FAILED
+        item.error_code = "TimeoutError"
+        item.error_detail_redacted = "Retention candidate could not be purged."
+        item.processed_at = timezone.now()
+        item.save(
+            update_fields=(
+                "state",
+                "error_code",
+                "error_detail_redacted",
+                "processed_at",
+            )
+        )
+        RetentionBatch.objects.filter(pk=batch.id).update(
+            state=RetentionBatch.State.FAILED,
+            row_version=2,
+            failed_count=1,
+        )
+        batch.refresh_from_db()
+        proof_id = uuid.uuid4()
+        request = RequestFactory().post("/api/v1/retention/resume")
+        request.user = self.user
+        request.correlation_id = uuid.uuid4()
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code="실패 원인 해소 후 재개",
+            request_key="retention-resume-1",
+        )
+
+        resumed = retention.resume_failed_retention_batch(
+            batch.id,
+            expected_version=2,
+            expected_preview_hash=batch.preview_manifest_hash,
+            authorized_by=self.user,
+            authorization_request_key="retention-resume-1",
+            authorization_reason="실패 원인 해소 후 재개",
+            reauth_proof_id=proof_id,
+            storage=self._storage_for(asset),
+            audit_context=audit_context,
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(resumed.state, RetentionBatch.State.APPROVED)
+        self.assertEqual(resumed.row_version, 3)
+        self.assertEqual(item.state, RetentionBatchItem.State.CANDIDATE)
+        self.assertEqual(item.lease_generation, 2)
+        self.assertEqual(item.error_code, "")
+        self.assertIsNone(item.processed_at)
+        event = AuditEvent.objects.get(
+            action="retention_batch.authorized",
+            entity_id=batch.id,
+        )
+        self.assertEqual(event.metadata_redacted["result"], "resumed")
 
     def test_new_hold_after_preview_blocks_external_delete(self):
         asset = self._asset(suffix="2")

@@ -1,12 +1,123 @@
 {% extends "admin_console/base.html" %}
 {% load static %}
-{% block title %}일정·운영 · Wisdome{% endblock %}
+{% block title %}운영 제어 · Wisdome{% endblock %}
 {% block content %}
-<div class="page-head"><div><p class="eyebrow">OPERATIONS</p><h1>일정과 운영 제어</h1></div></div>
-<section class="panel danger-zone">
-  <h2>전체 Kill Switch</h2><p>켜져 있으면 새 수집 dispatch와 외부 발행 호출이 차단됩니다.</p>
-  <div id="kill-state"></div><button id="kill-toggle">상태 전환</button>
-</section>
-<section class="panel"><h2>일정</h2><div id="schedule-list" class="list"></div></section>
+<div class="operations-console">
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">OPERATIONS</p>
+      <h1>운영 제어</h1>
+      <p class="muted">일정, 실행 복구, 정정, 보존 삭제와 감사 이력을 한곳에서 확인합니다.</p>
+    </div>
+  </div>
+  <p id="operations-message" class="console-message hidden" role="status"></p>
+
+  <section class="panel danger-zone" aria-labelledby="kill-heading">
+    <div class="section-head">
+      <div>
+        <h2 id="kill-heading">전체 Kill Switch</h2>
+        <p class="muted">켜짐은 새 외부 쓰기를 차단합니다. 다시 허용할 때는 재인증이 필요합니다.</p>
+      </div>
+      <button id="kill-toggle" type="button">상태 전환</button>
+    </div>
+    <div id="kill-state" class="operations-summary"></div>
+    <label>변경 사유<input id="kill-reason" maxlength="500" value="운영 안전 상태 변경"></label>
+  </section>
+
+  <section class="panel" aria-labelledby="schedule-heading">
+    <div class="section-head">
+      <div><h2 id="schedule-heading">일정</h2><p class="muted">expected-version CAS로 생성·수정·중지합니다.</p></div>
+      <button id="schedule-new" type="button" class="secondary-button">새 일정</button>
+    </div>
+    <div class="operations-split">
+      <div id="schedule-list" class="list"></div>
+      <form id="schedule-form" class="operations-form">
+        <input id="schedule-id" type="hidden">
+        <input id="schedule-version" type="hidden">
+        <label>이름<input id="schedule-name" maxlength="200" required></label>
+        <label>주제
+          <select id="schedule-topic">
+            <option value="housing_subscription">주택 청약</option>
+            <option value="semiconductor_news">반도체 뉴스</option>
+          </select>
+        </label>
+        <label>cron 표현식<input id="schedule-cron" value="0 */2 * * *" required></label>
+        <label>시간대<input id="schedule-timezone" value="Asia/Seoul" required></label>
+        <label>수집 창(분)<input id="schedule-window" type="number" min="1" max="10080" value="1440"></label>
+        <label>대상 UUID (쉼표 또는 줄바꿈)<textarea id="schedule-targets" required></textarea></label>
+        <label>승인 모드<select id="schedule-mode"><option value="manual">수동 승인</option><option value="validated_auto">검증된 자동 발행</option></select></label>
+        <label>validation refs JSON<textarea id="schedule-validations">[]</textarea></label>
+        <label>activation refs JSON<textarea id="schedule-activations">[]</textarea></label>
+        <label>중복 정책<select id="schedule-overlap"><option value="skip">건너뛰기</option><option value="queue_one">한 건 대기</option></select></label>
+        <label class="checkbox-label"><input id="schedule-enabled" type="checkbox">활성화</label>
+        <label>변경 사유<input id="schedule-reason" maxlength="500" value="관리자 일정 변경" required></label>
+        <div class="form-actions">
+          <button type="submit">저장</button>
+          <button id="schedule-disable" type="button" class="danger-button">일정 중지</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="run-heading">
+    <div class="section-head"><div><h2 id="run-heading">실행 복구</h2><p class="muted">전체 실행 재생성이 아니라 실패한 terminal 단위만 선택합니다.</p></div></div>
+    <div class="operations-split">
+      <div id="run-list" class="list"></div>
+      <div>
+        <div id="run-detail" class="operations-summary"></div>
+        <label>제어 사유<input id="run-reason" maxlength="500" value="관리자 운영 복구"></label>
+        <div class="form-actions">
+          <button id="run-stop" type="button" class="danger-button">안전 중지</button>
+        </div>
+        <div id="run-retry-list" class="list compact-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="correction-heading">
+    <div class="section-head"><div><h2 id="correction-heading">정정 검증</h2><p class="muted">출처 변경, 근거 영향, 채널 진행 상태를 확인한 뒤 결정합니다.</p></div></div>
+    <div class="operations-split">
+      <div id="correction-list" class="list"></div>
+      <div>
+        <div id="correction-detail" class="operations-summary"></div>
+        <label>교정 revision UUID (검증 승인 시 필수)<input id="correction-revision"></label>
+        <label>결정 사유<input id="correction-reason" maxlength="500" value="출처 변경과 영향 범위를 검토했습니다"></label>
+        <div class="form-actions">
+          <button id="correction-verify" type="button">검증 승인</button>
+          <button id="correction-reject" type="button" class="danger-button">거부</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="retention-heading">
+    <div class="section-head"><div><h2 id="retention-heading">보존 삭제</h2><p class="muted">preview와 hold를 먼저 검토하고 재인증 후 실행합니다. 원본 object key는 표시하지 않습니다.</p></div></div>
+    <form id="retention-form" class="form-row">
+      <label>범위<select id="retention-scope"><option value="raw_evidence">원시 근거</option><option value="unpublished_drafts">미발행 초안</option><option value="wordpress_media">WordPress 미디어</option><option value="public_delivery_assets">공개 전달 자산</option><option value="audit_expiry">감사 만료</option></select></label>
+      <label>cutoff<input id="retention-cutoff" type="datetime-local" required></label>
+      <label>사유<input id="retention-reason" maxlength="500" value="보존 정책 preview 및 실행"></label>
+      <button type="submit">preview 생성</button>
+    </form>
+    <div id="retention-summary" class="operations-summary"></div>
+    <div class="form-actions">
+      <button id="retention-execute" type="button">재인증 후 승인·실행</button>
+      <button id="retention-more" type="button" class="secondary-button">항목 더 보기</button>
+    </div>
+    <div id="retention-items" class="list compact-list"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="audit-heading">
+    <div class="section-head"><div><h2 id="audit-heading">감사 이력</h2><p class="muted">민감정보가 제거된 append-only cursor 결과입니다.</p></div></div>
+    <form id="audit-form" class="form-row">
+      <label>행위자 유형<select id="audit-actor-type"><option value="">전체</option><option value="admin">관리자</option><option value="system">시스템</option><option value="worker">워커</option></select></label>
+      <label>행위자 UUID<input id="audit-actor-id"></label>
+      <label>correlation UUID<input id="audit-correlation"></label>
+      <label>action<input id="audit-action"></label>
+      <button type="submit">조회</button>
+    </form>
+    <div id="audit-list" class="list compact-list"></div>
+    <button id="audit-more" type="button" class="secondary-button">더 보기</button>
+  </section>
+</div>
 {% endblock %}
 {% block scripts %}<script src="{% static 'admin_console/operations.js' %}"></script>{% endblock %}

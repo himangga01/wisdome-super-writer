@@ -730,6 +730,55 @@ def _is_held(entity_type: str, entity_id) -> bool:
     )
 
 
+def retention_authorization_request_hash(
+    *,
+    batch_id,
+    expected_version: int,
+    expected_preview_hash: str,
+    authorization_request_key: str,
+    authorization_reason: str,
+    reauth_proof_id,
+    actor_id,
+) -> str:
+    return canonical_hash(
+        {
+            "schemaVersion": "retention-authorization-v1",
+            "batchId": str(batch_id),
+            "expectedVersion": expected_version,
+            "previewHash": expected_preview_hash,
+            "requestKey": authorization_request_key,
+            "reason": authorization_reason,
+            "reauthProofId": str(reauth_proof_id),
+            "actorId": str(actor_id),
+        },
+        schema_version=CANONICAL_HASH_SCHEMA_V1,
+    )
+
+
+def _retention_batch_audit_material(batch: RetentionBatch) -> dict:
+    return {
+        "id": str(batch.id),
+        "state": batch.state,
+        "version": batch.row_version,
+        "scope": batch.scope,
+        "previewHash": batch.preview_manifest_hash,
+        "expectedItemCount": batch.expected_item_count,
+        "counters": batch.counters,
+    }
+
+
+def _require_retention_admin_context(*, audit_context, user, request_key, reason):
+    if audit_context is None:
+        return
+    if (
+        audit_context.actor_type != "admin"
+        or audit_context.actor_id != user.pk
+        or audit_context.request_key != request_key
+        or audit_context.reason_code != reason
+    ):
+        raise ValueError("retention audit context does not match request")
+
+
 @transaction.atomic
 def create_retention_preview(
     *,
@@ -738,6 +787,7 @@ def create_retention_preview(
     scope: str = "raw_evidence",
     cutoff_at=None,
     reason: str = "retention policy preview",
+    audit_context=None,
 ) -> RetentionBatch:
     if scope not in SUPPORTED_RETENTION_SCOPES:
         raise ValueError("unsupported_retention_scope")
@@ -746,6 +796,12 @@ def create_retention_preview(
     if not isinstance(reason, str) or not 3 <= len(reason.strip()) <= 500:
         raise ValueError("invalid_retention_reason")
     reason = reason.strip()
+    _require_retention_admin_context(
+        audit_context=audit_context,
+        user=user,
+        request_key=request_key,
+        reason=reason,
+    )
     policy = load_retention_policy()
     if cutoff_at is None:
         cutoff_at = timezone.now() - timedelta(days=int(policy["rawEvidenceDays"]))
@@ -762,6 +818,16 @@ def create_retention_preview(
     if existing:
         if existing.request_hash != request_hash or existing.requested_by_id != user.pk:
             raise ValueError("retention_request_key_conflict")
+        if audit_context is not None:
+            from apps.audit.services import require_audit_replay
+
+            require_audit_replay(
+                context=audit_context,
+                action="retention_batch.previewed",
+                entity=existing,
+                identity_key=request_key,
+                request_hash=request_hash,
+            )
         return existing
     candidates = _collect_retention_candidates(scope=scope, cutoff_at=cutoff_at)
     manifest = [
@@ -825,6 +891,25 @@ def create_retention_preview(
             for row in candidates
         ]
     )
+    if audit_context is not None:
+        from apps.audit.services import record_audit_event
+
+        record_audit_event(
+            context=audit_context,
+            action="retention_batch.previewed",
+            entity=batch,
+            identity_key=request_key,
+            material_schema_version="retention-batch-audit-v1",
+            before_material={"state": "not_created"},
+            after_material=_retention_batch_audit_material(batch),
+            metadata={
+                "request_hash": request_hash,
+                "result": "created",
+                "state": batch.state,
+                "version": batch.row_version,
+                "count": batch.expected_item_count,
+            },
+        )
     return batch
 
 
@@ -837,13 +922,22 @@ def approve_retention_batch(
     authorized_by=None,
     authorization_request_key: str | None = None,
     authorization_reason: str | None = None,
+    reauth_proof_id=None,
     storage=None,
+    audit_context=None,
 ) -> RetentionBatch:
     if storage is None:
         from adapters.storage.s3 import S3ObjectStorage
 
         storage = S3ObjectStorage()
     batch = RetentionBatch.objects.select_for_update().get(id=batch_id)
+    _require_retention_admin_context(
+        audit_context=audit_context,
+        user=authorized_by or batch.requested_by,
+        request_key=authorization_request_key,
+        reason=authorization_reason,
+    )
+    before_material = _retention_batch_audit_material(batch)
     if (
         batch.row_version != expected_version
         or batch.state != RetentionBatch.State.PREVIEW
@@ -864,6 +958,7 @@ def approve_retention_batch(
     batch.row_version += 1
     batch.approved_at = timezone.now()
     batch.authorized_by = authorized_by or batch.requested_by
+    batch.reauth_proof_id = reauth_proof_id
     batch.authorization_request_key = authorization_request_key
     batch.authorization_reason = authorization_reason
     batch.save(
@@ -872,10 +967,199 @@ def approve_retention_batch(
             "row_version",
             "approved_at",
             "authorized_by",
+            "reauth_proof_id",
             "authorization_request_key",
             "authorization_reason",
         ]
     )
+    if audit_context is not None:
+        from apps.audit.services import record_audit_event
+
+        request_hash = retention_authorization_request_hash(
+            batch_id=batch.id,
+            expected_version=expected_version,
+            expected_preview_hash=(
+                expected_preview_hash or batch.preview_manifest_hash
+            ),
+            authorization_request_key=authorization_request_key,
+            authorization_reason=authorization_reason,
+            reauth_proof_id=reauth_proof_id,
+            actor_id=batch.authorized_by_id,
+        )
+        record_audit_event(
+            context=audit_context,
+            action="retention_batch.authorized",
+            entity=batch,
+            identity_key=authorization_request_key,
+            material_schema_version="retention-batch-audit-v1",
+            before_material=before_material,
+            after_material=_retention_batch_audit_material(batch),
+            metadata={
+                "request_hash": request_hash,
+                "result": "authorized",
+                "state": batch.state,
+                "version": batch.row_version,
+                "count": batch.expected_item_count,
+                "reauth_proof_id": str(reauth_proof_id),
+            },
+        )
+    return batch
+
+
+@transaction.atomic
+def resume_failed_retention_batch(
+    batch_id,
+    *,
+    expected_version: int,
+    expected_preview_hash: str,
+    authorized_by,
+    authorization_request_key: str,
+    authorization_reason: str,
+    reauth_proof_id,
+    storage=None,
+    audit_context=None,
+) -> RetentionBatch:
+    if storage is None:
+        from adapters.storage.s3 import S3ObjectStorage
+
+        storage = S3ObjectStorage()
+    batch = RetentionBatch.objects.select_for_update().get(id=batch_id)
+    _require_retention_admin_context(
+        audit_context=audit_context,
+        user=authorized_by,
+        request_key=authorization_request_key,
+        reason=authorization_reason,
+    )
+    before_material = _retention_batch_audit_material(batch)
+    if (
+        batch.state != RetentionBatch.State.FAILED
+        or batch.row_version != expected_version
+        or batch.preview_manifest_hash != expected_preview_hash
+    ):
+        raise ValueError("stale_retention_batch")
+    failed_items = list(
+        batch.items.select_for_update()
+        .filter(state=RetentionBatchItem.State.FAILED)
+        .order_by("id")
+    )
+    if not failed_items:
+        raise ValueError("failed_retention_batch_has_no_failed_items")
+    for item in failed_items:
+        current = _candidate_for_item(item)
+        if current.candidate_hash != item.candidate_hash:
+            item.state = RetentionBatchItem.State.HELD
+            item.reason_code = "dependency_changed_before_resume"
+            item.hold_reason = ",".join(
+                blocking_dependency_codes(current.dependency_manifest)
+            )
+        else:
+            if item.object_key:
+                verify_retention_object_precondition(item=item, storage=storage)
+            item.state = RetentionBatchItem.State.CANDIDATE
+            item.lease_generation += 1
+            item.reason_code = ""
+            item.hold_reason = ""
+        item.result_hash = ""
+        item.error_code = ""
+        item.error_detail_redacted = ""
+        item.remediation = ""
+        item.processed_at = None
+        item.tombstone_at = None
+        item.cleanup_operation_id = None
+        item.save(
+            update_fields=(
+                "state",
+                "lease_generation",
+                "reason_code",
+                "hold_reason",
+                "result_hash",
+                "error_code",
+                "error_detail_redacted",
+                "remediation",
+                "processed_at",
+                "tombstone_at",
+                "cleanup_operation_id",
+            )
+        )
+    counts = {
+        state: batch.items.filter(state=state).count()
+        for state in RetentionBatchItem.State.values
+    }
+    open_count = counts[RetentionBatchItem.State.CANDIDATE] + counts[
+        RetentionBatchItem.State.DELETION_PENDING
+    ]
+    batch.state = RetentionBatch.State.APPROVED
+    batch.row_version += 1
+    batch.approved_at = timezone.now()
+    batch.authorized_by = authorized_by
+    batch.reauth_proof_id = reauth_proof_id
+    batch.authorization_request_key = authorization_request_key
+    batch.authorization_reason = authorization_reason
+    batch.counters = {
+        "candidate": counts[RetentionBatchItem.State.CANDIDATE],
+        "deletionPending": counts[RetentionBatchItem.State.DELETION_PENDING],
+        "held": counts[RetentionBatchItem.State.HELD],
+        "purged": counts[RetentionBatchItem.State.PURGED],
+        "skipped": counts[RetentionBatchItem.State.SKIPPED],
+        "failed": counts[RetentionBatchItem.State.FAILED],
+    }
+    batch.processed_count = sum(counts.values()) - open_count
+    batch.skipped_hold_count = counts[RetentionBatchItem.State.HELD]
+    batch.failed_count = counts[RetentionBatchItem.State.FAILED]
+    batch.completed_at = None
+    batch.failure_cursor = None
+    batch.error_code = None
+    batch.error_detail_redacted = None
+    batch.remediation = None
+    batch.save(
+        update_fields=(
+            "state",
+            "row_version",
+            "approved_at",
+            "authorized_by",
+            "reauth_proof_id",
+            "authorization_request_key",
+            "authorization_reason",
+            "counters",
+            "processed_count",
+            "skipped_hold_count",
+            "failed_count",
+            "completed_at",
+            "failure_cursor",
+            "error_code",
+            "error_detail_redacted",
+            "remediation",
+        )
+    )
+    if audit_context is not None:
+        from apps.audit.services import record_audit_event
+
+        request_hash = retention_authorization_request_hash(
+            batch_id=batch.id,
+            expected_version=expected_version,
+            expected_preview_hash=expected_preview_hash,
+            authorization_request_key=authorization_request_key,
+            authorization_reason=authorization_reason,
+            reauth_proof_id=reauth_proof_id,
+            actor_id=batch.authorized_by_id,
+        )
+        record_audit_event(
+            context=audit_context,
+            action="retention_batch.authorized",
+            entity=batch,
+            identity_key=authorization_request_key,
+            material_schema_version="retention-batch-audit-v1",
+            before_material=before_material,
+            after_material=_retention_batch_audit_material(batch),
+            metadata={
+                "request_hash": request_hash,
+                "result": "resumed",
+                "state": batch.state,
+                "version": batch.row_version,
+                "count": batch.expected_item_count,
+                "reauth_proof_id": str(reauth_proof_id),
+            },
+        )
     return batch
 
 

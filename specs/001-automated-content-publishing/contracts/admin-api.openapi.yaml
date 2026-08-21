@@ -393,8 +393,13 @@ paths:
             schema: { $ref: '#/components/schemas/CreateRunRequest' }
       responses:
         default: { $ref: '#/components/responses/Problem' }
-        '202':
-          description: Idempotent run accepted
+        '200':
+          description: Exact idempotent run replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionRun' }
+        '201':
+          description: New collection run accepted
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CollectionRun' }
@@ -427,19 +432,19 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [reason]
-              properties:
-                reason: { type: string, minLength: 3, maxLength: 500 }
+            schema: { $ref: '#/components/schemas/RunStopRequest' }
       responses:
         default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Stop requested; already-started external calls are reconciled
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/CollectionRun' }
+              schema: { $ref: '#/components/schemas/RunControlResult' }
+        '200':
+          description: Exact idempotent stop replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunControlResult' }
         '409': { $ref: '#/components/responses/Problem' }
 
   /runs/{runId}/retry:
@@ -453,27 +458,19 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [fromStep, requestKey, reauthProofId, reason]
-              properties:
-                fromStep:
-                  type: string
-                  enum: [collect, extract, validate, draft, publish, reconcile]
-                targetIds:
-                  type: array
-                  items: { type: string, format: uuid }
-                requestKey: { type: string, minLength: 8, maxLength: 200 }
-                reauthProofId: { type: string, format: uuid }
-                reason: { type: string, minLength: 3, maxLength: 500 }
+            schema: { $ref: '#/components/schemas/RunRetryRequest' }
       responses:
         default: { $ref: '#/components/responses/Problem' }
         '202':
           description: Safe retry accepted
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/AcceptedJob' }
+              schema: { $ref: '#/components/schemas/RunControlResult' }
+        '200':
+          description: Exact idempotent retry replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunControlResult' }
         '409': { $ref: '#/components/responses/Problem' }
 
   /runs/{runId}/evidence:
@@ -872,6 +869,29 @@ paths:
         '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
+  /corrections:
+    get:
+      tags: [Articles]
+      summary: List correction cases requiring operational verification
+      operationId: listCorrections
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            enum: [detected, verifying, verified, rejected, applying, completed, failed]
+        - $ref: '#/components/parameters/Cursor'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Descending bounded correction cases
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CorrectionCasePage' }
+
   /corrections/{correctionId}/decisions:
     parameters:
       - $ref: '#/components/parameters/CorrectionId'
@@ -935,9 +955,7 @@ paths:
           description: Schedules
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/Schedule' }
+              schema: { $ref: '#/components/schemas/SchedulePage' }
         '4XX': { $ref: '#/components/responses/Problem' }
     post:
       tags: [Schedules]
@@ -950,16 +968,34 @@ paths:
             schema: { $ref: '#/components/schemas/ScheduleInput' }
       responses:
         default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Exact idempotent create replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
         '201':
           description: Schedule created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Schedule' }
+        '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
   /schedules/{scheduleId}:
     parameters:
       - $ref: '#/components/parameters/ScheduleId'
+    get:
+      tags: [Schedules]
+      summary: Get one schedule and its current CAS version
+      operationId: getSchedule
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Current schedule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '404': { $ref: '#/components/responses/Problem' }
     patch:
       tags: [Schedules]
       summary: Update a topic schedule
@@ -978,6 +1014,25 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Schedule' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Schedules]
+      summary: Disable a schedule using expected-version CAS
+      operationId: disableSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleDisableRequest' }
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Disabled schedule or exact replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '409': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
 
   /targets:
@@ -1336,6 +1391,17 @@ paths:
         '409': { $ref: '#/components/responses/Problem' }
 
   /operations/kill-switch:
+    get:
+      tags: [Operations]
+      summary: Read the global external-write kill switch
+      operationId: getKillSwitch
+      responses:
+        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: Current global kill-switch state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KillSwitchState' }
     put:
       tags: [Operations]
       summary: Enable or disable the global kill switch
@@ -1371,14 +1437,7 @@ paths:
           description: Global dispatch/publish state changed; in-flight calls reconcile
           content:
             application/json:
-              schema:
-                type: object
-                required: [decisionId, enabled, version, changedAt]
-                properties:
-                  decisionId: { type: string, format: uuid }
-                  enabled: { type: boolean }
-                  version: { type: integer, minimum: 1 }
-                  changedAt: { type: string, format: date-time }
+              schema: { $ref: '#/components/schemas/KillSwitchState' }
         '403': { $ref: '#/components/responses/Problem' }
         '409': { $ref: '#/components/responses/Problem' }
 
@@ -1413,6 +1472,12 @@ paths:
       operationId: listAuditEvents
       parameters:
         - $ref: '#/components/parameters/Cursor'
+        - name: actorType
+          in: query
+          schema: { type: string, enum: [admin, system, worker] }
+        - name: actorId
+          in: query
+          schema: { type: string, format: uuid }
         - name: correlationId
           in: query
           schema: { type: string, format: uuid }
@@ -1635,7 +1700,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [auto_publish_change, kill_switch_disable, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect, approval_revoke, correction_decision]
+            enum: [auto_publish_change, kill_switch_disable, run_stop, unpublish, bulk_retry, retention_execute, registry_decision, profile_decision, validation_decision, credential_disconnect, approval_revoke, correction_decision]
     ReauthenticationProof:
       type: object
       additionalProperties: false
@@ -1995,6 +2060,82 @@ components:
             properties:
               autoPublishValidationRefs: { maxItems: 0 }
               autoPublishActivationRefs: { maxItems: 0 }
+    RunStopRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedState, requestKey, reauthProofId, reason]
+      properties:
+        expectedState: { $ref: '#/components/schemas/RunState' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    RunRetryScope:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [sourceAttemptId]
+          properties:
+            sourceAttemptId: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [documentExtractionId]
+          properties:
+            documentExtractionId: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [publicationAttemptId]
+          properties:
+            publicationAttemptId: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [targetId]
+          properties:
+            targetId: { type: string, format: uuid }
+    RunRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, requestKey, reauthProofId, reason]
+      properties:
+        scope: { $ref: '#/components/schemas/RunRetryScope' }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reauthProofId: { type: string, format: uuid }
+        reason: { type: string, minLength: 3, maxLength: 500 }
+    RunControlDecision:
+      type: object
+      additionalProperties: false
+      required: [id, runId, action, scope, requestKey, reauthProofId, decidedBy, decidedAt]
+      properties:
+        id: { type: string, format: uuid }
+        runId: { type: string, format: uuid }
+        action: { type: string, enum: [stop, retry] }
+        scope:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              maxProperties: 0
+            - $ref: '#/components/schemas/RunRetryScope'
+        requestKey: { type: string, minLength: 1, maxLength: 200 }
+        reauthProofId: { type: [string, 'null'], format: uuid }
+        decidedBy: { type: string, format: uuid }
+        decidedAt: { type: string, format: date-time }
+    RunControlResult:
+      type: object
+      additionalProperties: false
+      required: [decision, created, run, retryTarget]
+      properties:
+        decision: { $ref: '#/components/schemas/RunControlDecision' }
+        created: { type: boolean }
+        run: { $ref: '#/components/schemas/CollectionRun' }
+        retryTarget:
+          oneOf:
+            - type: 'null'
+            - type: object
+              additionalProperties: false
+              required: [kind, id, state]
+              properties:
+                kind: { type: string, enum: [source_attempt, document_extraction, publication_attempt] }
+                id: { type: string, format: uuid }
+                state: { type: string }
     RunState:
       type: string
       enum: [queued, collecting, extracting, validating, drafting, awaiting_approval, publishing, stopping, stopped, completed, failed]
@@ -2045,7 +2186,7 @@ components:
       description: >-
         Server-computed immutable run snapshot. In validated_auto mode, requested target,
         target-snapshot, validation and activation target sets are equal and one-to-one.
-      required: [id, displayId, topic, trigger, sourceRegistrySnapshotId, registryVersion, registryManifestHash, topicPolicyId, policyVersion, policyHash, freshnessMinutes, allowedAuthorityTiers, freshnessCutoff, requestedTargetIds, requestedTargetSnapshots, targetSnapshotManifestHash, approvalMode, autoPublishValidationRefs, autoPublishActivationRefs, autoActivationManifestHash, scheduleSnapshotHash, autoValidationSnapshotHash, requestFingerprint, state, createdAt]
+      required: [id, displayId, topic, trigger, sourceRegistrySnapshotId, registryVersion, registryManifestHash, topicPolicyId, policyVersion, policyHash, freshnessMinutes, allowedAuthorityTiers, freshnessCutoff, requestedTargetIds, approvalMode, requestFingerprint, state, windowStart, windowEnd, counters, errorSummary, correlationId, durationMs, retryCount, terminalImpact, recoveryState, nextRecoveryAt, stopRequestedAt, createdAt, startedAt, completedAt]
       properties:
         id: { type: string, format: uuid }
         displayId: { type: string }
@@ -2072,31 +2213,7 @@ components:
           type: array
           items: { type: string, format: uuid }
           uniqueItems: true
-        requestedTargetSnapshots:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/TargetSnapshotRef' }
-        targetSnapshotManifestHash:
-          type: string
-          pattern: '^[a-f0-9]{64}$'
         approvalMode: { type: string, enum: [manual, validated_auto] }
-        autoPublishValidationRefs:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/AutoPublishValidationRef' }
-        autoPublishActivationRefs:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
-        autoActivationManifestHash:
-          type: [string, 'null']
-          pattern: '^[a-f0-9]{64}$'
-        scheduleSnapshotHash:
-          type: [string, 'null']
-          pattern: '^[a-f0-9]{64}$'
-        autoValidationSnapshotHash:
-          type: [string, 'null']
-          pattern: '^[a-f0-9]{64}$'
         requestFingerprint:
           type: string
           pattern: '^[a-f0-9]{64}$'
@@ -2115,36 +2232,6 @@ components:
         createdAt: { type: string, format: date-time }
         startedAt: { type: [string, 'null'], format: date-time }
         completedAt: { type: [string, 'null'], format: date-time }
-      allOf:
-        - if:
-            required: [approvalMode]
-            properties:
-              approvalMode: { const: validated_auto }
-          then:
-            properties:
-              autoValidationSnapshotHash:
-                type: string
-                pattern: '^[a-f0-9]{64}$'
-              autoPublishValidationRefs: { minItems: 1 }
-              autoPublishActivationRefs: { minItems: 1 }
-              autoActivationManifestHash:
-                type: string
-                pattern: '^[a-f0-9]{64}$'
-          else:
-            properties:
-              autoValidationSnapshotHash: { type: 'null' }
-              autoPublishValidationRefs: { maxItems: 0 }
-              autoPublishActivationRefs: { maxItems: 0 }
-              autoActivationManifestHash: { type: 'null' }
-        - if:
-            required: [trigger]
-            properties:
-              trigger: { const: schedule }
-          then:
-            properties:
-              scheduleSnapshotHash:
-                type: string
-                pattern: '^[a-f0-9]{64}$'
     RunStep:
       type: object
       required: [name, attemptNo, state, inputCount, outputCount, errorCode, errorDetail, startedAt, fanoutCompletedAt, finishedAt, durationMs, retryCount, retryAt, terminalImpact, recoveryState]
@@ -4558,24 +4645,47 @@ components:
           items: { $ref: '#/components/schemas/AutoPublishActivationRef' }
         overlapPolicy: { type: string, enum: [skip, queue_one] }
         enabled: { type: boolean }
+    ScheduleDisableRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, requestKey, reason]
+      properties:
+        expectedVersion: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        requestKey: { type: string, minLength: 8, maxLength: 200 }
+        reason: { type: string, minLength: 3, maxLength: 500 }
     Schedule:
       allOf:
         - $ref: '#/components/schemas/ScheduleConfiguration'
         - type: object
-          required: [id, version, autoValidationManifestHash, autoActivationManifestHash]
+          required: [id, version, nextRunAt, lastDispatchedAt, updatedAt]
           properties:
             id: { type: string, format: uuid }
             version: { type: integer, minimum: 1 }
-            autoValidationManifestHash:
-              type: [string, 'null']
-              pattern: '^[a-f0-9]{64}$'
-            autoActivationManifestHash:
-              type: [string, 'null']
-              pattern: '^[a-f0-9]{64}$'
             nextRunAt: { type: [string, 'null'], format: date-time }
             lastDispatchedAt: { type: [string, 'null'], format: date-time }
-            validatedPolicyVersion: { type: [integer, 'null'] }
+            updatedAt: { type: string, format: date-time }
       unevaluatedProperties: false
+    SchedulePage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/Schedule' }
+    KillSwitchState:
+      type: object
+      additionalProperties: false
+      required: [decisionId, enabled, version, reason, changedAt]
+      properties:
+        decisionId: { type: [string, 'null'], format: uuid }
+        enabled:
+          type: boolean
+          description: true blocks new external writes; false allows them after reauthentication.
+        version: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        reason: { type: string, maxLength: 500 }
+        changedAt: { type: [string, 'null'], format: date-time }
 
     PublicationTargetInput:
       allOf:
@@ -4924,6 +5034,16 @@ components:
       properties:
         decision: { $ref: '#/components/schemas/CorrectionDecision' }
         correctionCase: { $ref: '#/components/schemas/CorrectionCase' }
+    CorrectionCasePage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/CorrectionCase' }
+        nextCursor: { type: [string, 'null'] }
 
     AuditEvent:
       type: object
@@ -4982,24 +5102,20 @@ components:
     RetentionBatch:
       type: object
       additionalProperties: false
-      required: [id, scope, cutoffAt, previewReason, authorizationReason, previewHash, impactManifestObjectKey, impactManifestObjectVersion, impactManifestHash, holdManifestObjectKey, holdManifestObjectVersion, holdManifestHash, expectedItemCount, expectedByteCount, state, phase, version, processedCount, skippedHoldCount, failedCount, failureCursor, errorCode, errorDetailRedacted, remediation, requestedBy, authorizedBy, authorizationRequestKey, createdAt, authorizedAt, completedAt]
+      required: [id, policyVersion, policyHash, scope, cutoffAt, previewReason, authorizationReason, previewHash, counters, expectedItemCount, expectedByteCount, state, version, processedCount, skippedHoldCount, failedCount, failureCursor, errorCode, errorDetailRedacted, remediation, requestedBy, authorizedBy, reauthProofId, authorizationRequestKey, createdAt, authorizedAt, startedAt, completedAt]
       properties:
         id: { type: string, format: uuid }
+        policyVersion: { type: integer, minimum: 1 }
+        policyHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         scope: { type: string, enum: [raw_evidence, unpublished_drafts, wordpress_media, public_delivery_assets, audit_expiry] }
         cutoffAt: { type: string, format: date-time }
         previewReason: { type: string, minLength: 3, maxLength: 500 }
         authorizationReason: { type: [string, 'null'], maxLength: 500 }
         previewHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        impactManifestObjectKey: { type: string, minLength: 1 }
-        impactManifestObjectVersion: { type: string, minLength: 1 }
-        impactManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        holdManifestObjectKey: { type: string, minLength: 1 }
-        holdManifestObjectVersion: { type: string, minLength: 1 }
-        holdManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        counters: { type: object, additionalProperties: { type: integer, minimum: 0 } }
         expectedItemCount: { type: integer, minimum: 0 }
         expectedByteCount: { type: integer, minimum: 0 }
-        state: { type: string, enum: [previewed, authorized, running, completed, failed, cancelled] }
-        phase: { type: string, enum: [not_started, snapshotting, nulling, deleting, tombstoning, done] }
+        state: { type: string, enum: [preview, approved, running, completed, failed] }
         version: { type: integer, minimum: 1 }
         processedCount: { type: integer, minimum: 0 }
         skippedHoldCount: { type: integer, minimum: 0 }
@@ -5010,33 +5126,51 @@ components:
         remediation: { type: [string, 'null'] }
         requestedBy: { type: string, format: uuid }
         authorizedBy: { type: [string, 'null'], format: uuid }
+        reauthProofId: { type: [string, 'null'], format: uuid }
         authorizationRequestKey: { type: [string, 'null'], minLength: 8, maxLength: 200 }
         createdAt: { type: string, format: date-time }
         authorizedAt: { type: [string, 'null'], format: date-time }
+        startedAt: { type: [string, 'null'], format: date-time }
         completedAt: { type: [string, 'null'], format: date-time }
     RetentionBatchItem:
       type: object
       additionalProperties: false
-      required: [entityType, entityId, objectVersion, preconditionHash, holdReason, state, resultHash, errorCode, errorDetailRedacted, remediation]
+      required: [id, entityType, entityId, policyCode, objectKeyRedacted, objectVersion, objectChecksum, byteSize, preconditionHash, dependencyManifest, leaseGeneration, state, reasonCode, holdReason, resultHash, errorCode, errorDetailRedacted, remediation, processedAt, tombstoneAt]
       properties:
+        id: { type: string, format: uuid }
         entityType: { type: string }
         entityId: { type: string, format: uuid }
+        policyCode: { type: string }
+        objectKeyRedacted:
+          type: [string, 'null']
+          pattern: '^sha256:[a-f0-9]{16}$'
         objectVersion: { type: [string, 'null'] }
+        objectChecksum: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        byteSize: { type: integer, minimum: 0 }
         preconditionHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        dependencyManifest:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: true
+        leaseGeneration: { type: integer, minimum: 1 }
         holdReason: { type: [string, 'null'] }
-        state: { type: string, enum: [pending, snapshotted, unlinked, deleted, tombstoned, skipped, failed] }
+        state: { type: string, enum: [candidate, held, deletion_pending, purged, skipped, failed] }
+        reasonCode: { type: [string, 'null'] }
         resultHash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
         errorCode: { type: [string, 'null'] }
         errorDetailRedacted: { type: [string, 'null'] }
         remediation: { type: [string, 'null'] }
+        processedAt: { type: [string, 'null'], format: date-time }
+        tombstoneAt: { type: [string, 'null'], format: date-time }
     RetentionBatchItemPage:
       type: object
       additionalProperties: false
-      required: [batchId, impactManifestHash, holdManifestHash, items, nextCursor]
+      required: [batchId, previewHash, items, nextCursor]
       properties:
         batchId: { type: string, format: uuid }
-        impactManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
-        holdManifestHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        previewHash: { type: string, pattern: '^[a-f0-9]{64}$' }
         items:
           type: array
           items: { $ref: '#/components/schemas/RetentionBatchItem' }
