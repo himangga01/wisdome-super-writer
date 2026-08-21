@@ -8,7 +8,10 @@
 > 출처별 수집기 고도화, PaddleOCR 모델 checksum 확정, 자동발행 안전 게이트 및 Phase 7 테스트를
 > 완료해야 합니다. 세부 진행 상태는
 > [`specs/001-automated-content-publishing/tasks.md`](specs/001-automated-content-publishing/tasks.md)를
-> 기준으로 확인합니다.
+> 기준으로 확인합니다. 다른 PC에서 작업을 이어갈 때는
+> [`REMAINING_WORK.md`](REMAINING_WORK.md)와
+> [`T031_WORK_IN_PROGRESS.md`](specs/001-automated-content-publishing/T031_WORK_IN_PROGRESS.md)를
+> 먼저 확인합니다.
 
 ## 지원 범위
 

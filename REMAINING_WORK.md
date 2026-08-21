@@ -1,68 +1,53 @@
-# Wisdome Super Writer 남은 작업 현황
+# Wisdome Super Writer 현재 인수인계
 
-## 한국어 — 현재 상태
+기준일: 2026-08-21  
+기준 브랜치: `main`  
+저장소: `https://github.com/himangga01/wisdome-super-writer.git`
 
-- 기준일: 2026-08-08
-- 작업 브랜치: `main`
-- T012 리뷰 기준선: `7d04126`
-- 현재 단계: T012 구현, 3개 관점 병렬 비판 리뷰 2회, 승인 검증 완료
-- 검증 상태: Django check issue 0건, migration drift 0건, compileall exit 0
-- 완료 판정: T012 `[X]`; T012 구현·계약·검증 문서를 하나의 changeset으로 커밋
+## 한국어 — 먼저 읽을 내용
 
-### T012에 반영한 핵심 내용
+현재 작업은 T031 `운영 API와 관리자 콘솔` 구현 중간 상태다. 가장 상세한 활성 목표, 구현 내역, 검증 증거, 남은 작업과 다른 PC 재개 명령은 아래 문서가 정본이다.
 
-1. frozen access/rights policy와 hash, traffic scope, origin purpose, robots, redirect, MIME,
-   HTTP status, rate/retry/Retry-After 경계를 실제 source 및 attachment 요청에 연결했다.
-2. source별 durable attempt와 실제 outbox consumer 전달 번호 기반 append-only observation,
-   재시도·소진 callback·부분 성공 finalizer를 연결했다.
-3. attachment 접근 오류를 evidence 실패 계약으로 변환하면서 retry 가능 여부와
-   `retry_after_seconds`를 보존했다.
-4. schema/policy/authentication/security 오류의 영구 실패 분류와
-   transient/infrastructure 오류의 outbox 재시도 예산을 분리했다.
-5. 마지막 retryable 전달은 worker 성공으로 종료하지 않고 outbox 소진 callback이
-   receipt dead-letter와 source attempt terminal 관측을 함께 남기도록 수정했다.
-6. 예상 밖 source worker 예외도 실제 전달 번호의 retry 관측으로 남긴다. worker 종료로
-   정산되지 않은 앞선 전달 번호는 다음 전달 또는 소진 callback이
-   `source_delivery_interrupted` 관측으로 보충하고, 마지막 전달은 terminal callback이 종결한다.
-7. `SourceCollectionObservation`의 instance/queryset/base manager 변경을 차단하고
-   PostgreSQL UPDATE/DELETE 거부 trigger를 추가했다.
-8. freshness는 `modified_at` 우선, `published_at` fallback으로 판정하며 신규 evidence 대상인
-   corrected record에도 적용한다. 제외 수는 attempt/observation/run summary에 보존한다.
+- [T031 작업 현황·목표·남은 작업](specs/001-automated-content-publishing/T031_WORK_IN_PROGRESS.md)
+- [정본 작업 체크리스트](specs/001-automated-content-publishing/tasks.md)
+- [상세 구현 계획](docs/superpowers/plans/2026-08-07-remaining-implementation.md)
 
-### 다음 작업
+### 현재 체크 상태
 
-1. 승인된 순서대로 T013 사건 clustering, T014~T017 extraction, T018 editorial,
-   T019~T026 publishing, T027~T031 operations, T032 검증, T033 문서 정합성을 진행한다.
+- 완료 표시: T001~T014, T023, T029, T030
+- 구현 커밋은 존재하지만 선행 dependency·외부 acceptance·검증 gate 때문에 미완료 표시 유지: T015~T022, T024~T028
+- 현재 진행: T031
+- 이후: T032 자동 검증/release evidence, T033 최종 문서·운영 runbook
 
-## English — AI Handoff
+커밋이 존재한다는 사실만으로 task를 완료 처리하지 않는다. `tasks.md`의 현재 체크 상태와 각 task의 명시적 dependency/acceptance 조건을 우선한다.
 
-```yaml
-as_of: 2026-08-08
-branch: main
-review_baseline: 7d04126
-current_task: T013
-T012_status: complete_committed
-implementation_status: implementation_two_review_rounds_and_approved_validation_complete
-validation_status:
-  compileall: passed_exit_0
-  django_check: passed_zero_issues
-  migration_drift_check: passed_no_changes_detected
-resolved_validation_root_cause:
-  contract_format: hostname
-  contract_path: components.schemas.SourceAccessOriginPolicy.properties.host
-  resolution: added_hostname_to_validator_allowlist
-  dependency_support: jsonschema_format_nongpl_with_fqdn
-  evidence:
-    - specs/001-automated-content-publishing/contracts/admin-api.openapi.yaml:1460
-    - src/wisdome_writer/api/openapi.py:43
-    - pyproject.toml:22
-task_checkbox: T012_checked
-review_rounds:
-  count: 2
-  parallel_perspectives:
-    - http_security_runtime
-    - state_concurrency_database
-    - policy_rights_contracts
-next_actions:
-  - continue_T013_through_T033_in_plan_order
+### 새 PC에서 시작
+
+```powershell
+git clone https://github.com/himangga01/wisdome-super-writer.git
+Set-Location wisdome-super-writer
+git switch main
+git pull --ff-only origin main
+git status --short
+Get-Content -Encoding UTF8 specs\001-automated-content-publishing\T031_WORK_IN_PROGRESS.md
+git switch -c codex/t031-operations-continue
 ```
+
+Python 3.12와 Docker Desktop/Compose를 사용한다. `.env.example`에서 새 PC 전용 `.env`를 만들고 이전 PC의 비밀, token, cookie, Application Password를 복사하거나 커밋하지 않는다. 자세한 환경 준비와 첫 focused test는 T031 문서의 ‘다른 PC에서 이어서 작업하는 절차’를 따른다.
+
+### 안전 상태
+
+- T031은 WIP이며 배포 가능 선언이 아니다.
+- 최신 failed-retention-resume 감사 assertion은 실행 직후 중단되어 아직 결과가 없다.
+- 전체 suite/E2E는 T032 범위다.
+- 외부 게시를 포함한 전체 환경을 처음 올릴 때는 global kill switch 차단 상태를 유지한다.
+
+---
+
+# English — AI handoff
+
+The active task is the in-progress T031 Operations APIs and administration console. Use `specs/001-automated-content-publishing/T031_WORK_IN_PROGRESS.md` as the detailed continuation authority, `tasks.md` as the checkbox/dependency authority, and the dated implementation plan for sequencing.
+
+Checked tasks are T001-T014, T023, T029, and T030. T015-T022 and T024-T028 have substantial implementation commits but intentionally remain unchecked because dependency, external acceptance, or verification gates remain open. T031 is active; T032 and T033 follow.
+
+On another machine, clone `origin/main`, confirm a clean tree, read the T031 handoff, and create a new continuation branch. Use Python 3.12. Recreate `.env` from `.env.example`; do not transfer secrets through Git. The current T031 material is WIP and not a deployability claim.

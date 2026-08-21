@@ -24,6 +24,8 @@ T031 이후의 상위 목표는 T032 자동 검증/release evidence와 T033 최�
 
 - 기준 커밋은 `e5e8cf1 feat: enforce dependency-aware retention deletion`이다.
 - T023~T030 결과는 이미 기준 브랜치에 포함되어 있다.
+- WIP 구현 커밋은 `67a1747 wip: preserve T031 operations console progress`다.
+- 해당 WIP 브랜치는 `2f6650b merge: preserve T031 operations progress`로 `main`에 머지됐다.
 - 현재 변경은 T031 구현 중간 상태다.
 - `tasks.md`의 T031 체크박스는 의도적으로 `[ ]`로 유지한다.
 - 이번 커밋·푸시는 작업 유실을 막기 위한 WIP 체크포인트이며 T031 완료 또는 배포 가능 선언이 아니다.
@@ -158,8 +160,107 @@ $env:DJANGO_SETTINGS_MODULE='wisdome_writer.settings'
 
 - 대상 저장소: `https://github.com/himangga01/wisdome-super-writer.git`
 - 원격 이름: `origin`
-- 현재 기본 브랜치에서 직접 게시하지 않고 WIP feature branch를 생성해 푸시한다.
+- WIP 보존 브랜치: `codex/t031-operations-wip-20260821`
+- 이어서 작업할 정본은 이 문서 갱신 커밋이 포함된 `origin/main`이다.
 - 이 기록을 포함한 게시 커밋은 완료 커밋이 아니라 진행 보존용이다.
+
+## 다른 PC에서 이어서 작업하는 절차
+
+### 1. 저장소 받기
+
+새 PC에서는 기존 폴더를 복사하지 말고 원격 `main`을 새로 clone한다.
+
+```powershell
+git clone https://github.com/himangga01/wisdome-super-writer.git
+Set-Location wisdome-super-writer
+git switch main
+git pull --ff-only origin main
+git log -1 --oneline
+git status --short
+```
+
+`git status --short`가 비어 있어야 한다. 이어지는 작업을 기본 브랜치에서 직접 만들지 않으려면 새 continuation branch를 만든다.
+
+```powershell
+git switch -c codex/t031-operations-continue
+```
+
+WIP merge 전 상태를 별도로 확인해야 할 때만 `origin/codex/t031-operations-wip-20260821` 또는 커밋 `67a1747`을 사용한다. 실제 후속 작업의 기준은 `origin/main`이다.
+
+### 2. 로컬 개발 환경 준비
+
+필수 버전은 Python 3.12다. Python 3.13 이상은 현재 지원 범위가 아니다. Docker 기반 전체 환경에는 Docker Desktop과 Docker Compose가 필요하다.
+
+권장 `uv` 절차:
+
+```powershell
+uv sync --all-groups
+Copy-Item .env.example .env
+```
+
+`uv`를 사용하지 않는 경우:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+```
+
+`.env`에는 새 PC 전용 개발 값을 입력한다. 이전 PC의 `.env`, OAuth token, session cookie, WordPress Application Password, Blogger token을 Git이나 이 문서로 옮기지 않는다. 최소한 `DJANGO_SECRET_KEY`, `AUDIT_CURSOR_SIGNING_KEY`, PostgreSQL/Redis/MinIO 값과 허용 host/origin을 채워야 한다.
+
+다음 자료는 Git에 포함되지 않으므로 전체 pipeline/Compose 실행이 필요할 때 별도로 안전하게 준비한다.
+
+- PaddleOCR 모델 bytes와 승인된 checksum/manifest
+- Legacy HWP converter release attestation과 로컬 모델/manifest
+- WordPress/Blogger 자격 증명 및 외부 secret provider 설정
+- 실제 운영용 PostgreSQL, Redis, MinIO 데이터와 비밀 값
+
+T031 focused test만 이어갈 때는 운영 자격 증명이나 외부 게시 target을 사용하지 않는다.
+
+### 3. 문서와 현재 상태 확인
+
+```powershell
+Get-Content -Encoding UTF8 specs\001-automated-content-publishing\T031_WORK_IN_PROGRESS.md
+Select-String -Path specs\001-automated-content-publishing\tasks.md -Pattern "T031"
+Select-String -Path docs\superpowers\plans\2026-08-07-remaining-implementation.md -Pattern "Task 20"
+```
+
+T031은 미완료이므로 `tasks.md`의 체크박스를 먼저 변경하지 않는다.
+
+### 4. 첫 재개 명령
+
+가장 최신 변경에서 중단된 failed-retention-resume 감사 test부터 실행한다.
+
+`uv` 환경:
+
+```powershell
+$env:WISDOME_ENVIRONMENT='development'
+$env:PYTHONPATH='src'
+$env:DJANGO_SETTINGS_MODULE='wisdome_writer.settings'
+uv run python -m django test tests.unit.test_retention_dependency_graph.RetentionServiceTests.test_failed_batch_resume_revalidates_only_failed_items -v 1
+```
+
+`.venv` 환경:
+
+```powershell
+$env:WISDOME_ENVIRONMENT='development'
+$env:PYTHONPATH='src'
+$env:DJANGO_SETTINGS_MODULE='wisdome_writer.settings'
+.\.venv\Scripts\python.exe -m django test tests.unit.test_retention_dependency_graph.RetentionServiceTests.test_failed_batch_resume_revalidates_only_failed_items -v 1
+```
+
+이 test 결과를 확인한 뒤 이 문서의 ‘앞으로 작업해야 하는 내용’ 순서대로 진행한다. 실패 시 T031 완료나 배포 가능 상태를 주장하지 않는다.
+
+### 5. 전체 Compose가 필요한 경우
+
+운영과 겹치지 않는 개발용 `.env`를 준비한 후 README의 안전한 배포 절차를 따른다. worker가 실행 중인 데이터베이스에 임의 migration을 실행하지 않는다.
+
+```powershell
+.\deploy\compose-deploy.ps1
+```
+
+외부 발행 위험을 막기 위해 최초 부팅은 global kill switch가 차단 상태인 구성을 유지한다.
 
 ---
 
@@ -175,7 +276,7 @@ After T031, continue with T032 automated release evidence and T033 final documen
 
 ## Checkpoint status
 
-Baseline is `e5e8cf1`. The current tree is a T031 work in progress. T031 remains unchecked. This publication is a preservation checkpoint, not a completion or deployability claim.
+Baseline is `e5e8cf1`. WIP implementation commit `67a1747` was merged into `main` by merge commit `2f6650b`. The current tree remains a T031 work in progress and T031 remains unchecked. This publication is a preservation checkpoint, not a completion or deployability claim.
 
 ## Implemented material
 
@@ -200,4 +301,12 @@ Run the interrupted focused test first. Then run the direct T031 regression modu
 
 ## Publication
 
-Push this checkpoint to `origin` (`https://github.com/himangga01/wisdome-super-writer.git`) on a feature branch. Do not represent this WIP commit as the final T031 completion commit.
+The preservation branch is `codex/t031-operations-wip-20260821`, but the authoritative continuation point after this update is `origin/main` at `https://github.com/himangga01/wisdome-super-writer.git`. Do not represent this WIP material as the final T031 completion commit.
+
+## Cross-PC continuation
+
+Clone the repository, switch to `main`, and fast-forward from `origin/main`. Confirm a clean status, then create a new continuation branch. Use Python 3.12 and either `uv sync --all-groups` or a local `.venv` with `pip install -e ".[dev]"`. Create `.env` from `.env.example`; never copy or commit the previous machine's secrets, tokens, cookies, or application passwords.
+
+OCR model bytes, HWP release attestations, publisher credentials, secret-provider configuration, and runtime database/object-store data are not Git artifacts and must be provisioned independently. They are not needed for the first T031 focused test.
+
+Read this file, keep T031 unchecked, and run the interrupted failed-retention-resume audit test shown in the Korean section. Continue through the listed direct regressions and contract/document synchronization. Use the safe Compose deployment script only when the full environment is required and keep the global kill switch blocking external writes during initial setup.
