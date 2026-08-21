@@ -1,6 +1,6 @@
-import json
 from datetime import timedelta
 
+from django.apps import apps
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
 from django.http import JsonResponse
@@ -9,7 +9,14 @@ from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
 from .models import CollectionRun, RecoveryState, RunState
-from .services import create_run, project_run_terminal_observation
+from .services import (
+    create_run,
+    request_run_stop,
+    request_selective_retry,
+)
+from apps.audit.services import AuditContext
+from wisdome_writer.api.openapi import openapi_operation, openapi_operations
+from wisdome_writer.domain.errors import InvalidInput, StateConflict
 from wisdome_writer.infrastructure.outbox import enqueue_event
 
 
@@ -19,6 +26,7 @@ def _run_payload(run):
         "displayId": run.display_id,
         "topic": run.topic_code,
         "trigger": run.trigger,
+        "approvalMode": run.approval_mode,
         "state": run.state,
         "windowStart": run.window_start.isoformat(),
         "windowEnd": run.window_end.isoformat(),
@@ -31,6 +39,8 @@ def _run_payload(run):
         "freshnessMinutes": run.freshness_minutes,
         "allowedAuthorityTiers": run.allowed_authority_tiers,
         "freshnessCutoff": run.freshness_cutoff.isoformat(),
+        "requestedTargetIds": run.requested_target_ids,
+        "requestFingerprint": run.request_fingerprint,
         "counters": run.counters,
         "errorSummary": run.error_summary,
         "correlationId": str(run.correlation_id),
@@ -43,6 +53,7 @@ def _run_payload(run):
             if run.next_recovery_at
             else None
         ),
+        "stopRequestedAt": _timestamp(run.stop_requested_at),
         "createdAt": run.created_at.isoformat(),
         "startedAt": (
             run.started_at.isoformat()
@@ -146,16 +157,111 @@ def _step_payload(step):
     }
 
 
+def _run_control_payload(decision):
+    return {
+        "id": str(decision.id),
+        "runId": str(decision.run_id),
+        "action": decision.action,
+        "scope": decision.scope,
+        "requestKey": decision.request_key,
+        "reauthProofId": (
+            str(decision.reauth_proof_id)
+            if decision.reauth_proof_id
+            else None
+        ),
+        "decidedBy": str(decision.decided_by_id),
+        "decidedAt": decision.decided_at.isoformat(),
+    }
+
+
+def _retry_target_payload(target):
+    if target is None:
+        return None
+    model_name = type(target).__name__
+    kind = {
+        "SourceCollectionAttempt": "source_attempt",
+        "DocumentExtraction": "document_extraction",
+        "PublicationAttempt": "publication_attempt",
+    }.get(model_name)
+    if kind is None:
+        kind = "publication_attempt" if hasattr(target, "publication") else "source_attempt"
+    return {
+        "kind": kind,
+        "id": str(target.id),
+        "state": str(target.state),
+    }
+
+
+def _run_recovery_payload(run, *, document_rows, publication_rows):
+    scopes = []
+    if run.stop_requested_at is None:
+        scopes.extend(
+            {"sourceAttemptId": str(row.id)}
+            for row in run.collection_attempts.all()
+            if row.state == "failed"
+        )
+        scopes.extend(
+            {"documentExtractionId": str(row.id)}
+            for row in document_rows
+            if row.state == "failed"
+        )
+        retryable_publication_states = {
+            "retryable_failed",
+            "unknown_outcome",
+            "reconciling",
+            "permanent_failed",
+            "manual_required",
+            "stale",
+        }
+        for row in publication_rows:
+            if row.state not in retryable_publication_states:
+                continue
+            scopes.append({"publicationAttemptId": str(row.id)})
+            scopes.append({"targetId": str(row.publication.target_id)})
+    return {
+        "state": getattr(run, "recovery_state", RecoveryState.IN_PROGRESS),
+        "terminalImpact": getattr(run, "terminal_impact", {}),
+        "nextRecoveryAt": _timestamp(getattr(run, "next_recovery_at", None)),
+        "stopRequestedAt": _timestamp(run.stop_requested_at),
+        "allowedRetryScopes": scopes,
+        "canStop": (
+            run.stop_requested_at is None
+            and getattr(run, "state", None)
+            not in {RunState.COMPLETED, RunState.FAILED, RunState.STOPPED}
+        ),
+    }
+
+
+def _locked_run_for_api(run_id):
+    return get_object_or_404(
+        CollectionRun.objects.select_related(
+            "source_registry",
+            "topic_policy",
+        ),
+        id=run_id,
+    )
+
+
 @login_required
+@openapi_operations({"GET": "listRuns", "POST": "createRun"})
 @require_http_methods(["GET", "POST"])
 def runs(request):
     if request.method == "GET":
+        query = request.openapi_query
         queryset = CollectionRun.objects.select_related(
             "source_registry",
             "topic_policy",
-        )[:100]
-        return JsonResponse({"items": [_run_payload(run) for run in queryset]})
-    body = json.loads(request.body or b"{}")
+        )
+        if query.get("topic"):
+            queryset = queryset.filter(topic_code=query["topic"])
+        if query.get("state"):
+            queryset = queryset.filter(state=query["state"])
+        limit = int(query.get("limit") or 50)
+        rows = list(queryset[:limit])
+        return JsonResponse(
+            {"items": [_run_payload(run) for run in rows], "nextCursor": None}
+        )
+    body = request.openapi_body
     now = timezone.now()
     window_end = timezone.datetime.fromisoformat(body["windowEnd"]) if body.get("windowEnd") else now
     if timezone.is_naive(window_end):
@@ -174,6 +280,8 @@ def runs(request):
             window_end=window_end,
             user=request.user,
             correlation_id=getattr(request, "correlation_id", None),
+            requested_target_ids=body["targetIds"],
+            approval_mode=body["approvalMode"],
         )
         if created:
             enqueue_event(
@@ -189,6 +297,8 @@ def runs(request):
 
 
 @login_required
+@openapi_operation("getRun")
+@require_http_methods(["GET"])
 def run_detail(request, run_id):
     run = get_object_or_404(
         CollectionRun.objects.select_related(
@@ -230,107 +340,96 @@ def run_detail(request, run_id):
             "source_snapshot_id"
         )
     ]
+    DocumentExtraction = apps.get_model("evidence", "DocumentExtraction")
+    document_rows = list(
+        DocumentExtraction.objects.filter(
+            run_source_item__run_id=run.id
+        ).order_by("id")[:200]
+    )
+    PublicationAttempt = apps.get_model("publishing", "PublicationAttempt")
+    publication_rows = list(
+        PublicationAttempt.objects.filter(
+            publication_intent__origin_collection_run_id=run.id
+        )
+        .select_related("publication")
+        .order_by("id")[:200]
+    )
+    payload["recovery"] = _run_recovery_payload(
+        run,
+        document_rows=document_rows,
+        publication_rows=publication_rows,
+    )
     return JsonResponse(payload)
 
 
 @login_required
+@openapi_operation("stopRun")
 @require_http_methods(["POST"])
 def stop_run(request, run_id):
-    response_status = 200
-    with transaction.atomic():
-        run = get_object_or_404(
-            CollectionRun.objects.select_for_update(),
-            id=run_id,
+    body = request.openapi_body
+    audit_context = AuditContext.for_admin(
+        request=request,
+        reason_code=body["reason"],
+        request_key=body["requestKey"],
+    )
+    try:
+        decision, created = request_run_stop(
+            run_id=run_id,
+            expected_state=body["expectedState"],
+            request_key=body["requestKey"],
+            reason=body["reason"],
+            user=request.user,
+            request=request,
+            reauth_proof_id=body["reauthProofId"],
+            audit_context=audit_context,
         )
-        if run.state not in {
-            RunState.COMPLETED,
-            RunState.FAILED,
-            RunState.STOPPED,
-        }:
-            previous_state = run.state
-            if previous_state in {
-                RunState.QUEUED,
-                RunState.AWAITING_APPROVAL,
-            }:
-                now = timezone.now()
-                run.stop_requested_at = (
-                    run.stop_requested_at or now
-                )
-                run.state = RunState.STOPPED
-                project_run_terminal_observation(
-                    run,
-                    finished_at=now,
-                    stage=previous_state,
-                    final_state=run.state,
-                    error_code="stop_requested",
-                    recovery_state=RecoveryState.STOPPED,
-                )
-                run.save(
-                    update_fields=[
-                        "state",
-                        "stop_requested_at",
-                        "completed_at",
-                        "duration_ms",
-                        "terminal_impact",
-                        "recovery_state",
-                        "next_recovery_at",
-                    ]
-                )
-            elif previous_state == RunState.COLLECTING:
-                run.stop_requested_at = (
-                    run.stop_requested_at or timezone.now()
-                )
-                run.state = RunState.STOPPING
-                run.save(update_fields=["state", "stop_requested_at"])
-            elif previous_state == RunState.EXTRACTING:
-                run.stop_requested_at = (
-                    run.stop_requested_at or timezone.now()
-                )
-                run.state = RunState.STOPPING
-                run.save(update_fields=["state", "stop_requested_at"])
-                enqueue_event(
-                    event_type="evidence.finalize_requested",
-                    aggregate_type="collection_run",
-                    aggregate_id=run.id,
-                    job_id=run.id,
-                    dedupe_key=(
-                        f"evidence.finalize_requested:stop:{run.id}"
-                    ),
-                    payload={"run_id": str(run.id)},
-                    correlation_id=run.correlation_id,
-                )
-            elif previous_state == RunState.STOPPING:
-                pass
-            else:
-                response_status = 409
-    payload = _run_payload(run)
-    if response_status == 409:
-        payload["error"] = "stop_not_supported_for_active_phase"
-    return JsonResponse(payload, status=response_status)
+    except ValueError as exc:
+        raise StateConflict(str(exc)) from exc
+    run = _locked_run_for_api(run_id)
+    return JsonResponse(
+        {
+            "decision": _run_control_payload(decision),
+            "created": created,
+            "run": _run_payload(run),
+            "retryTarget": None,
+        },
+        status=202 if created else 200,
+    )
 
 
 @login_required
+@openapi_operation("retryRun")
 @require_http_methods(["POST"])
 def retry_run(request, run_id):
-    old = get_object_or_404(CollectionRun, id=run_id)
-    with transaction.atomic():
-        run, created = create_run(
-            topic_code=old.topic_code,
-            window_start=old.window_start,
-            window_end=old.window_end,
+    body = request.openapi_body
+    audit_context = AuditContext.for_admin(
+        request=request,
+        reason_code=body["reason"],
+        request_key=body["requestKey"],
+    )
+    try:
+        decision, target, created = request_selective_retry(
+            run_id=run_id,
+            scope=body["scope"],
+            request_key=body["requestKey"],
+            reason=body["reason"],
             user=request.user,
-            trigger="retry",
-            correlation_id=old.correlation_id,
-            retry_count=old.retry_count + 1,
+            reauth_proof_id=body["reauthProofId"],
+            request=request,
+            audit_context=audit_context,
         )
-        if created:
-            enqueue_event(
-                event_type="run.requested",
-                aggregate_type="collection_run",
-                aggregate_id=run.id,
-                job_id=run.id,
-                dedupe_key=f"run.requested:{run.id}",
-                payload={"run_id": str(run.id)},
-                correlation_id=run.correlation_id,
-            )
-    return JsonResponse(_run_payload(run), status=202)
+    except ValueError as exc:
+        message = str(exc)
+        if "conflict" in message or "cannot" in message or "requires" in message:
+            raise StateConflict(message) from exc
+        raise InvalidInput(message) from exc
+    run = _locked_run_for_api(run_id)
+    return JsonResponse(
+        {
+            "decision": _run_control_payload(decision),
+            "created": created,
+            "run": _run_payload(run),
+            "retryTarget": _retry_target_payload(target),
+        },
+        status=202 if created else 200,
+    )

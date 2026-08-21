@@ -475,6 +475,28 @@ ACTION_METADATA_POLICIES: dict[tuple[str, str], AuditMetadataPolicy] = {
             "kill_switch.decided",
         )
     },
+    ("collection_run.control_decided", "1"): _policy(
+        "collection_run_id",
+        "decision",
+        "decision_id",
+        "reauth_proof_id",
+        "request_hash",
+        "result",
+    ),
+    **{
+        (action, "1"): _policy(
+            "count",
+            "reauth_proof_id",
+            "request_hash",
+            "result",
+            "state",
+            "version",
+        )
+        for action in (
+            "retention_batch.previewed",
+            "retention_batch.authorized",
+        )
+    },
     **{
         (action, "1"): _policy(*_ARTICLE_KEYS)
         for action in (

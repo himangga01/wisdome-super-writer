@@ -7,11 +7,12 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, connection, transaction
-from django.test import SimpleTestCase, TestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase
 from django.utils import timezone
 
 from apps.collection import models as collection_models
 from apps.collection import services as collection_services
+from apps.audit.models import AuditEvent
 from apps.audit.services import AuditContext
 from apps.topics.models import SourceRegistrySnapshot, TopicPolicy
 from apps.topics.services import registry_manifest_hash_for_memberships
@@ -277,6 +278,40 @@ class RunControlServiceTests(TestCase):
         self.assertIsNotNone(self.run.stop_requested_at)
         self.assertEqual(event.status, OutboxMessage.Status.DEAD_LETTER)
         self.assertEqual(event.last_error_code, "run_stop_requested")
+
+    def test_admin_stop_records_reauthenticated_audit_decision(self):
+        request = RequestFactory().post("/api/v1/runs/stop")
+        request.user = self.user
+        request.correlation_id = self.run.correlation_id
+        proof_id = uuid.uuid4()
+        audit_context = AuditContext.for_admin(
+            request=request,
+            reason_code="operator_stop",
+            request_key="stop-audited",
+        )
+
+        with patch(
+            "apps.accounts.services.consume_reauthentication_proof"
+        ) as consume:
+            decision, created = collection_services.request_run_stop(
+                run_id=self.run.id,
+                expected_state=self.run.state,
+                request_key="stop-audited",
+                reason="operator_stop",
+                user=self.user,
+                request=request,
+                reauth_proof_id=proof_id,
+                audit_context=audit_context,
+            )
+
+        self.assertTrue(created)
+        consume.assert_called_once()
+        event = AuditEvent.objects.get(
+            action="collection_run.control_decided",
+            entity_id=decision.id,
+        )
+        self.assertEqual(event.actor_id, self.user.id)
+        self.assertEqual(event.metadata_redacted["request_hash"], decision.request_hash)
 
     def test_terminal_projection_releases_queue_one_after_commit(self):
         collection_models.RunStep.objects.create(

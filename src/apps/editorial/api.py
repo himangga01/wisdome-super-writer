@@ -748,6 +748,33 @@ def revise_article(request, article_id):
 
 
 @login_required
+@openapi_operation("listCorrections")
+def corrections(request):
+    if not request.user.is_active or not request.user.is_staff:
+        return JsonResponse(
+            {"type": "about:blank", "title": "forbidden", "status": 403},
+            status=403,
+        )
+    query = request.openapi_query
+    rows = CorrectionCase.objects.select_related(
+        "article",
+        "source_item",
+        "prior_source_item",
+        "latest_decision",
+    ).prefetch_related("decisions")
+    if query.get("state"):
+        rows = rows.filter(state=query["state"])
+    limit = int(query.get("limit") or 50)
+    rows = rows.order_by("-detected_at", "-id")[:limit]
+    return JsonResponse(
+        {
+            "items": [_correction_case_payload(row) for row in rows],
+            "nextCursor": None,
+        }
+    )
+
+
+@login_required
 @openapi_operation("listArticleCorrections")
 def article_corrections(request, article_id):
     if not request.user.is_active or not request.user.is_staff:
