@@ -55,7 +55,7 @@ _REFERENCE_START_PATTERN = re.compile(
 _REFERENCE_TITLE_PATTERNS = (
     re.compile(r'^"(?:\\.|[^"\\])*"$'),
     re.compile(r"^'(?:\\.|[^'\\])*'$"),
-    re.compile(r"^\((?:\\.|[^)\\])*\)$"),
+    re.compile(r"^\((?:\\.|[^()\\])*\)$"),
 )
 _SENSITIVE_PATTERNS = (_DIGIT_TOKEN_PATTERN,)
 _EVENT_PHASES = frozenset({"sanitize", "chunk", "transform", "verify", "assemble"})
@@ -774,15 +774,17 @@ def _indented_reference_content(line: str) -> str | None:
 
 
 def _parse_reference_destination(value: str) -> tuple[bool, bool]:
-    material = value.strip()
+    material = value.strip(" \t")
     if not material or material.startswith(("\"", "'")):
         return False, False
-    destination_end = _angle_destination_end(material)
-    if destination_end is None:
-        destination_end = _bare_destination_end(material)
+    destination_end = (
+        _angle_destination_end(material)
+        if material.startswith("<")
+        else _bare_destination_end(material)
+    )
     if destination_end is None:
         return False, False
-    remainder = material[destination_end:].strip()
+    remainder = material[destination_end:].strip(" \t")
     if remainder and not _is_reference_title(remainder):
         return False, False
     return True, bool(remainder)
@@ -808,13 +810,16 @@ def _bare_destination_end(value: str) -> int | None:
     depth = 0
     escaped = False
     for index, character in enumerate(value):
+        codepoint = ord(character)
+        if codepoint <= 0x20 or codepoint == 0x7F:
+            if character in " \t" and depth == 0:
+                return index
+            return None
         if escaped:
             escaped = False
             continue
         if character == "\\":
             escaped = True
-        elif character.isspace() and depth == 0:
-            return index
         elif character == "(":
             depth += 1
         elif character == ")":

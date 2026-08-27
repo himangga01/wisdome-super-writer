@@ -4,7 +4,8 @@ import gzip
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 
 import httpx
@@ -46,6 +47,24 @@ def _transport(
         )
 
     return httpx.MockTransport(handler)
+
+
+@contextmanager
+def _acquire_semaphore_slots_for_evidence(
+    semaphore: threading.BoundedSemaphore,
+    *,
+    count: int,
+    timeout: float,
+) -> Iterator[list[bool]]:
+    acquired_slots: list[bool] = []
+    try:
+        for _ in range(count):
+            acquired_slots.append(semaphore.acquire(timeout=timeout))
+        yield acquired_slots
+    finally:
+        for acquired in acquired_slots:
+            if acquired:
+                semaphore.release()
 
 
 class _ChunkStream(httpx.SyncByteStream):
@@ -234,19 +253,38 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
             release.set()
         for exited in exits[:-1]:
             assert exited.wait(1.0)
-        reacquired_slots = [
-            humanizer_module._WATCHDOG_SLOTS.acquire(timeout=1.0)
-            for _ in range(humanizer_module.MAX_LINGERING_HUMANIZATIONS)
-        ]
-        assert reacquired_slots == [True, True]
-        for reacquired in reacquired_slots:
-            if reacquired:
-                humanizer_module._WATCHDOG_SLOTS.release()
+        with _acquire_semaphore_slots_for_evidence(
+            humanizer_module._WATCHDOG_SLOTS,
+            count=humanizer_module.MAX_LINGERING_HUMANIZATIONS,
+            timeout=1.0,
+        ) as reacquired_slots:
+            assert reacquired_slots == [True, True]
 
     success_client = HumanizerClient(
         "http://127.0.0.1:3210", transport=_transport(_event_bytes(COMPLETE_EVENTS))
     )
     assert success_client.transform("원문") == "자연스러운 문장"
+
+
+def test_semaphore_evidence_cleanup_survives_a_failed_assertion() -> None:
+    slots = threading.BoundedSemaphore(2)
+
+    with pytest.raises(AssertionError):
+        with _acquire_semaphore_slots_for_evidence(
+            slots,
+            count=2,
+            timeout=0.0,
+        ) as acquired_slots:
+            assert acquired_slots == [True, False]
+
+    reacquired_slots: list[bool] = []
+    try:
+        reacquired_slots = [slots.acquire(blocking=False) for _ in range(2)]
+        assert reacquired_slots == [True, True]
+    finally:
+        for reacquired in reacquired_slots:
+            if reacquired:
+                slots.release()
 
 
 def test_watchdog_recomputes_remaining_budget_after_thread_setup(
@@ -1002,6 +1040,52 @@ def test_reference_definition_uses_bounded_valid_continuation_grammar(
     assert protected_value in {value for _token, value in protected.token_values}
     for mutable in mutable_values:
         assert mutable in protected.document
+
+
+@pytest.mark.parametrize(
+    ("source", "protected_value", "invalid_continuation"),
+    [
+        (
+            "[공식]:\n  <https://example.test/a<b>\n본문입니다.",
+            "[공식]:\n",
+            "<https://example.test/a<b>",
+        ),
+        (
+            "[공식]:\n  <https://example.test/a\n본문입니다.",
+            "[공식]:\n",
+            "<https://example.test/a",
+        ),
+        (
+            "[공식]:\n  https://example.test/a(b c)\n본문입니다.",
+            "[공식]:\n",
+            "https://example.test/a(b c)",
+        ),
+        (
+            "[공식]:\n"
+            "  https://example.test/a\n"
+            "  (bad (title)\n"
+            "본문입니다.",
+            "[공식]:\n  https://example.test/a\n",
+            "(bad (title)",
+        ),
+    ],
+    ids=[
+        "nested-angle-destination",
+        "unterminated-angle-destination",
+        "bare-destination-whitespace-in-parentheses",
+        "parenthesized-title-with-inner-parenthesis",
+    ],
+)
+def test_invalid_reference_continuation_is_not_whole_line_protected(
+    source: str,
+    protected_value: str,
+    invalid_continuation: str,
+) -> None:
+    protected = protect_article_prose({"intro": source}, anchors=())
+    protected_values = {value for _token, value in protected.token_values}
+
+    assert protected_value in protected_values
+    assert all(invalid_continuation not in value for value in protected_values)
 
 
 @pytest.mark.parametrize(
