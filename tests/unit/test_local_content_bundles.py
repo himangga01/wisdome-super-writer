@@ -400,6 +400,207 @@ def test_bound_file_close_preserves_primary_for_all_reader_entrypoints(
                 pass
 
 
+def test_bound_file_final_path_substitution_precedes_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "bound-file.txt"
+    target.write_bytes(b"owned payload")
+    expected_fingerprint = bundle_module._path_fingerprint(
+        target,
+        "test bound file",
+        BundlePublishError,
+    )
+    backup = tmp_path / "bound-file-original.txt"
+    replacement = tmp_path / "bound-file-replacement.txt"
+    replacement.write_bytes(b"substituted payload")
+    real_close = bundle_module.os.close
+    real_replace = bundle_module.os.replace
+    close_calls = 0
+
+    def substitute_then_fail_close(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        real_close(descriptor)
+        real_replace(target, backup)
+        real_replace(replacement, target)
+        raise OSError(errno.EIO, "sensitive close body")
+
+    monkeypatch.setattr(bundle_module.os, "close", substitute_then_fail_close)
+
+    with pytest.raises(BundlePublishError, match="identity changed during replay") as raised:
+        bundle_module._read_bound_file(
+            target,
+            expected_fingerprint,
+            max_bytes=64,
+            label="test bound file",
+        )
+
+    assert close_calls == 1
+    assert "sensitive close body" not in str(raised.value)
+    assert backup.read_bytes() == b"owned payload"
+    assert target.read_bytes() == b"substituted payload"
+
+
+def test_bound_file_read_failure_precedes_final_substitution_and_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "bound-file.txt"
+    target.write_bytes(b"owned payload")
+    expected_fingerprint = bundle_module._path_fingerprint(
+        target,
+        "test bound file",
+        BundlePublishError,
+    )
+    backup = tmp_path / "bound-file-original.txt"
+    replacement = tmp_path / "bound-file-replacement.txt"
+    replacement.write_bytes(b"substituted payload")
+    real_lstat = bundle_module.os.lstat
+    real_close = bundle_module.os.close
+    real_replace = bundle_module.os.replace
+    read_error = OSError(errno.EIO, "sensitive read body")
+    close_calls = 0
+    target_lstat_calls = 0
+
+    def count_target_lstat(path: os.PathLike[str] | str):
+        nonlocal target_lstat_calls
+        if Path(path) == target:
+            target_lstat_calls += 1
+        return real_lstat(path)
+
+    def fail_read(_descriptor: int, _size: int) -> bytes:
+        raise read_error
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        real_close(descriptor)
+        real_replace(target, backup)
+        real_replace(replacement, target)
+        raise OSError(errno.EIO, "sensitive close body")
+
+    monkeypatch.setattr(bundle_module.os, "lstat", count_target_lstat)
+    monkeypatch.setattr(bundle_module.os, "read", fail_read)
+    monkeypatch.setattr(bundle_module.os, "close", close_then_fail)
+
+    with pytest.raises(BundlePublishError, match="handle read failed") as raised:
+        bundle_module._read_bound_file(
+            target,
+            expected_fingerprint,
+            max_bytes=64,
+            label="test bound file",
+        )
+
+    assert raised.value.__cause__ is read_error
+    assert close_calls == 1
+    assert target_lstat_calls >= 2
+    assert "sensitive read body" not in str(raised.value)
+    assert "sensitive close body" not in str(raised.value)
+    assert backup.read_bytes() == b"owned payload"
+    assert target.read_bytes() == b"substituted payload"
+
+
+def test_bound_file_close_only_error_is_stable_after_final_path_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "bound-file.txt"
+    target.write_bytes(b"owned payload")
+    expected_fingerprint = bundle_module._path_fingerprint(
+        target,
+        "test bound file",
+        BundlePublishError,
+    )
+    real_lstat = bundle_module.os.lstat
+    real_close = bundle_module.os.close
+    close_calls = 0
+    target_lstat_calls = 0
+
+    def count_target_lstat(path: os.PathLike[str] | str):
+        nonlocal target_lstat_calls
+        if Path(path) == target:
+            target_lstat_calls += 1
+        return real_lstat(path)
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        real_close(descriptor)
+        raise OSError(errno.EIO, "sensitive close body")
+
+    monkeypatch.setattr(bundle_module.os, "lstat", count_target_lstat)
+    monkeypatch.setattr(bundle_module.os, "close", close_then_fail)
+
+    with pytest.raises(BundlePublishError, match="handle close failed") as raised:
+        bundle_module._read_bound_file(
+            target,
+            expected_fingerprint,
+            max_bytes=64,
+            label="test bound file",
+        )
+
+    assert close_calls == 1
+    assert target_lstat_calls >= 2
+    assert "sensitive close body" not in str(raised.value)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, MemoryError, KeyboardInterrupt])
+def test_bound_file_unexpected_primary_closes_once_and_remains_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+) -> None:
+    target = tmp_path / "bound-file.txt"
+    target.write_bytes(b"owned payload")
+    expected_fingerprint = bundle_module._path_fingerprint(
+        target,
+        "test bound file",
+        BundlePublishError,
+    )
+    real_open = bundle_module.os.open
+    real_close = bundle_module.os.close
+    primary_error = error_type("unexpected primary body")
+    tracked_descriptors: set[int] = set()
+    close_calls = 0
+
+    def track_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == target:
+            tracked_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_read(_descriptor: int, _size: int) -> bytes:
+        raise primary_error
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        real_close(descriptor)
+        raise OSError(errno.EIO, "sensitive close body")
+
+    monkeypatch.setattr(bundle_module.os, "open", track_open)
+    monkeypatch.setattr(bundle_module.os, "read", fail_read)
+    monkeypatch.setattr(bundle_module.os, "close", close_then_fail)
+    try:
+        with pytest.raises(error_type) as raised:
+            bundle_module._read_bound_file(
+                target,
+                expected_fingerprint,
+                max_bytes=64,
+                label="test bound file",
+            )
+
+        assert raised.value is primary_error
+        assert close_calls == 1
+    finally:
+        for descriptor in tracked_descriptors:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
+
+
 def test_completed_run_directory_lease_cannot_be_reused(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     writer = ArticleBundleWriter(tmp_path / "output")

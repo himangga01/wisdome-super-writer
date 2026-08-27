@@ -1910,47 +1910,64 @@ def _read_bound_file(
 ) -> bytes:
     _require_unchanged_fingerprint(path, expected_fingerprint, BundlePublishError)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    primary_error: BaseException | None = None
+    primary_traceback = None
+    close_error: BaseException | None = None
+    close_traceback = None
+    final_path_error: BaseException | None = None
+    final_path_traceback = None
+    chunks: list[bytes] = []
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
         raise BundlePublishError(f"{label} could not be opened safely: {path}") from exc
-    failure: BundlePublishError | None = None
-    failure_traceback = None
-    chunks: list[bytes] = []
     try:
-        before = _opened_handle_fingerprint(os.fstat(descriptor))
-        expected_handle = _opened_handle_fingerprint_from_path(expected_fingerprint)
-        if before != expected_handle or before[0] != stat.S_IFREG:
-            raise BundlePublishError(
-                f"{label} opened identity differs from lstat: {path}; "
-                f"expected={expected_handle!r}; opened={before!r}"
-            )
-        observed = 0
-        while True:
-            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max_bytes + 1 - observed))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            observed += len(chunk)
-            if observed > max_bytes:
-                raise BundlePublishError(f"{label} exceeds bounded read limit: {path}")
-        after = _opened_handle_fingerprint(os.fstat(descriptor))
-        if after != before:
-            raise BundlePublishError(f"{label} opened identity changed during read: {path}")
-    except BundlePublishError as exc:
-        failure = exc
-        failure_traceback = exc.__traceback__
-    except OSError as exc:
-        failure = BundlePublishError(f"{label} handle read failed: {path}")
-        failure.__cause__ = exc
-    try:
-        os.close(descriptor)
-    except OSError as exc:
-        if failure is None:
-            raise BundlePublishError(f"{label} handle close failed: {path}") from exc
-    if failure is not None:
-        raise failure.with_traceback(failure_traceback)
-    _require_unchanged_fingerprint(path, expected_fingerprint, BundlePublishError)
+        try:
+            before = _opened_handle_fingerprint(os.fstat(descriptor))
+            expected_handle = _opened_handle_fingerprint_from_path(expected_fingerprint)
+            if before != expected_handle or before[0] != stat.S_IFREG:
+                raise BundlePublishError(
+                    f"{label} opened identity differs from lstat: {path}; "
+                    f"expected={expected_handle!r}; opened={before!r}"
+                )
+            observed = 0
+            while True:
+                chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max_bytes + 1 - observed))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                observed += len(chunk)
+                if observed > max_bytes:
+                    raise BundlePublishError(f"{label} exceeds bounded read limit: {path}")
+            after = _opened_handle_fingerprint(os.fstat(descriptor))
+            if after != before:
+                raise BundlePublishError(f"{label} opened identity changed during read: {path}")
+        except OSError as exc:
+            primary_error = BundlePublishError(f"{label} handle read failed: {path}")
+            primary_error.__cause__ = exc
+        except BaseException as exc:
+            primary_error = exc
+            primary_traceback = exc.__traceback__
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            close_error = BundlePublishError(f"{label} handle close failed: {path}")
+            close_error.__cause__ = exc
+        except BaseException as exc:
+            close_error = exc
+            close_traceback = exc.__traceback__
+        try:
+            _require_unchanged_fingerprint(path, expected_fingerprint, BundlePublishError)
+        except BaseException as exc:
+            final_path_error = exc
+            final_path_traceback = exc.__traceback__
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_traceback)
+    if final_path_error is not None:
+        raise final_path_error.with_traceback(final_path_traceback)
+    if close_error is not None:
+        raise close_error.with_traceback(close_traceback)
     return b"".join(chunks)
 
 
