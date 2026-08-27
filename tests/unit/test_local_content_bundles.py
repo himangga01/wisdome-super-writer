@@ -58,6 +58,14 @@ def _bundle(tmp_path: Path, **notice_overrides: object) -> ArticleBundle:
     return build_article_bundle(date(2026, 8, 28), rendered, images)
 
 
+def _snapshot_tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def _encoded_image(format_name: str, size: tuple[int, int]) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", size, "white").save(output, format=format_name, quality=82, method=6)
@@ -148,6 +156,62 @@ def test_run_directory_write_requires_writer_issued_lease(tmp_path: Path) -> Non
         )
 
 
+def test_new_writer_default_write_gets_revision_without_reopening_primary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "output"
+    bundle = _bundle(tmp_path)
+    first = ArticleBundleWriter(root).write(bundle)
+    before = _snapshot_tree_bytes(first.parent)
+
+    second = ArticleBundleWriter(root).write(bundle)
+
+    assert first.parent.name == "2026-08-28"
+    assert second.parent.name.startswith("2026-08-28--run-")
+    assert second.parent != first.parent
+    assert _snapshot_tree_bytes(first.parent) == before
+
+
+def test_completed_implicit_lease_rolls_same_writer_to_revision(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(root)
+    first_run = writer.write_run(date(2026, 8, 28), "# weekly\n", (bundle,))
+    before = _snapshot_tree_bytes(first_run)
+
+    revised_article = writer.write(bundle)
+
+    assert revised_article.parent.name.startswith("2026-08-28--run-")
+    assert revised_article.parent != first_run
+    assert _snapshot_tree_bytes(first_run) == before
+
+
+def test_post_replace_failed_owned_article_cannot_be_reopened(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "output"
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(root)
+    real_fsync_directory = bundle_module._fsync_directory
+    injected = False
+
+    def fail_after_replace(path: Path) -> None:
+        nonlocal injected
+        if (path / bundle.slug).is_dir() and not injected:
+            injected = True
+            raise BundlePublishError("injected post-replace failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(bundle_module, "_fsync_directory", fail_after_replace)
+    with pytest.raises(BundlePublishError, match="injected post-replace"):
+        writer.write(bundle)
+    monkeypatch.setattr(bundle_module, "_fsync_directory", real_fsync_directory)
+
+    with pytest.raises(BundlePublishError, match="failed-owned|reopen|lease"):
+        writer.write(bundle)
+
+
 def test_run_directory_lease_rejects_substituted_partial_directory(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     root = tmp_path / "output"
@@ -163,6 +227,80 @@ def test_run_directory_lease_rejects_substituted_partial_directory(tmp_path: Pat
 
     with pytest.raises(BundlePublishError, match="lease|identity|substitut"):
         writer.write(bundle, run_directory=lease)
+
+
+def test_bundle_directory_fsync_primary_failure_survives_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "bundle-dual-failure-probe"
+    probe.write_bytes(b"probe")
+    real_open = bundle_module.os.open
+    real_close = bundle_module.os.close
+    source_descriptor = real_open(probe, os.O_RDONLY)
+    opened: list[int] = []
+
+    def duplicate_probe(_path, _flags):
+        descriptor = os.dup(source_descriptor)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError(errno.EIO, "sensitive fsync body")
+
+    def fail_close(descriptor: int) -> None:
+        if descriptor in opened:
+            raise OSError(errno.EIO, "sensitive close body")
+        real_close(descriptor)
+
+    monkeypatch.setattr(bundle_module.os, "open", duplicate_probe)
+    monkeypatch.setattr(bundle_module.os, "fsync", fail_fsync)
+    monkeypatch.setattr(bundle_module.os, "close", fail_close)
+    try:
+        with pytest.raises(BundlePublishError, match="directory fsync failed"):
+            bundle_module._fsync_directory(tmp_path)
+    finally:
+        monkeypatch.setattr(bundle_module.os, "close", real_close)
+        for descriptor in opened:
+            real_close(descriptor)
+        real_close(source_descriptor)
+
+
+def test_run_reservation_wraps_directory_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "bundle-close-probe"
+    probe.write_bytes(b"probe")
+    real_open = bundle_module.os.open
+    real_close = bundle_module.os.close
+    source_descriptor = real_open(probe, os.O_RDONLY)
+    opened: list[int] = []
+
+    def duplicate_probe(_path, _flags):
+        descriptor = os.dup(source_descriptor)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_close(descriptor: int) -> None:
+        if descriptor in opened:
+            raise OSError(errno.EIO, "sensitive reservation close body")
+        real_close(descriptor)
+
+    monkeypatch.setattr(bundle_module.os, "open", duplicate_probe)
+    monkeypatch.setattr(bundle_module.os, "fsync", lambda _descriptor: None)
+    monkeypatch.setattr(bundle_module.os, "close", fail_close)
+    try:
+        with pytest.raises(BundlePublishError, match="directory close failed"):
+            ArticleBundleWriter(tmp_path / "output").reserve_run_directory(
+                date(2026, 8, 28),
+                workflow_id="reservation-close",
+            )
+    finally:
+        monkeypatch.setattr(bundle_module.os, "close", real_close)
+        for descriptor in opened:
+            real_close(descriptor)
+        real_close(source_descriptor)
 
 
 def test_completed_run_directory_lease_cannot_be_reused(tmp_path: Path) -> None:
@@ -1168,9 +1306,9 @@ def test_concurrent_identical_publish_retains_losing_stage_and_injected_material
 
     monkeypatch.setattr(bundle_module.os, "replace", publish_competing_copy_then_fail)
 
-    published = writer.write(bundle)
+    with pytest.raises(BundlePublishError, match="lease|concurrent"):
+        writer.write(bundle)
 
-    assert published.name == bundle.slug
     stages = list((tmp_path / "output").rglob("*.tmp-*"))
     assert len(stages) == 1
     assert (stages[0] / "foreign-injected.txt").read_bytes() == b"must remain untouched"
@@ -1220,7 +1358,10 @@ def test_concurrent_winner_rechecks_root_identity_after_existing_hash_validation
     monkeypatch.setattr(bundle_module.os, "replace", publish_competing_copy_then_fail)
     monkeypatch.setattr(writer, "_existing_hash", substitute_after_existing_hash)
 
-    with pytest.raises(BundlePublishError, match="identity|substitut|reparse|changed"):
+    with pytest.raises(
+        BundlePublishError,
+        match="identity|substitut|reparse|changed|lease|concurrent",
+    ):
         writer.write(bundle)
     assert substituted is True
     assert backup.is_dir()
@@ -1336,8 +1477,13 @@ def test_run_manifest_is_a_required_verified_commit_marker(tmp_path: Path) -> No
     (run_path / "index.md").write_text("tampered", encoding="utf-8")
     with pytest.raises(BundlePublishError, match="index checksum"):
         writer.validate_run(date(2026, 8, 28))
-    writer.write_run(date(2026, 8, 28), index, (bundle,))
-    assert writer.validate_run(date(2026, 8, 28)) == run_path
+    repaired = writer.write_run(date(2026, 8, 28), index, (bundle,))
+    assert repaired != run_path
+    assert repaired.name.startswith("2026-08-28--run-")
+    assert writer.validate_run(
+        date(2026, 8, 28),
+        run_directory=repaired.name,
+    ) == repaired
     (run_path / "manifest.json").unlink()
     with pytest.raises(BundlePublishError, match="commit marker"):
         writer.validate_run(date(2026, 8, 28))
@@ -1425,9 +1571,13 @@ def test_run_retry_repairs_interruption_between_index_and_commit_marker(
         writer.validate_run(date(2026, 8, 28))
     monkeypatch.setattr(bundle_module.os, "replace", original_replace)
 
-    writer.write_run(date(2026, 8, 28), index, (bundle,))
+    repaired = writer.write_run(date(2026, 8, 28), index, (bundle,))
 
-    assert writer.validate_run(date(2026, 8, 28)).is_dir()
+    assert repaired.name.startswith("2026-08-28--run-")
+    assert writer.validate_run(
+        date(2026, 8, 28),
+        run_directory=repaired.name,
+    ).is_dir()
     assert tuple((tmp_path / "output" / "2026-08-28").glob(".manifest.json.tmp-*")) == abandoned
 
 
@@ -1465,7 +1615,9 @@ def test_each_failed_run_invocation_leaves_a_unique_owned_temp(
         with pytest.raises(BundlePublishError, match="run publish"):
             writer.write_run(date(2026, 8, 28), index, (bundle,))
 
-    abandoned = tuple((tmp_path / "output" / "2026-08-28").glob(".manifest.json.tmp-*"))
+    abandoned = tuple(
+        (tmp_path / "output").glob("2026-08-28*/.manifest.json.tmp-*")
+    )
     assert len(abandoned) == 2
     assert len({path.name for path in abandoned}) == 2
 
@@ -1594,8 +1746,12 @@ def test_run_publish_rechecks_owned_targets_after_complete_run_validation(
     real_validate_run = writer.validate_run
     real_replace = bundle_module.os.replace
 
-    def validate_then_substitute(run_date: date) -> Path:
-        run_root = real_validate_run(run_date)
+    def validate_then_substitute(
+        run_date: date,
+        *,
+        run_directory: str | None = None,
+    ) -> Path:
+        run_root = real_validate_run(run_date, run_directory=run_directory)
         target = run_root / "manifest.json"
         shutil.copy2(target, replacement)
         real_replace(target, backup)

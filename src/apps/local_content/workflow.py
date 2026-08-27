@@ -903,24 +903,29 @@ def _validated_prior_detailed_ids(
     pattern = re.compile(
         r"(?P<date>\d{4}-\d{2}-\d{2})(?:--run-[0-9a-f]{12})?"
     )
+    candidates: list[tuple[str, date]] = []
     try:
-        candidates = tuple(
-            sorted(
-                (path.name, match.group("date"))
-                for path in output_root.iterdir()
-                if path.name != current_run
-                and (match := pattern.fullmatch(path.name)) is not None
-            )
-        )
+        with os.scandir(output_root) as entries:
+            for entry in entries:
+                if entry.name == current_run:
+                    continue
+                match = pattern.fullmatch(entry.name)
+                if match is None:
+                    continue
+                try:
+                    run_date = date.fromisoformat(match.group("date"))
+                except ValueError:
+                    continue
+                if len(candidates) >= 512:
+                    raise WorkflowError("PRIOR_RUN_SCAN_LIMIT")
+                candidates.append((entry.name, run_date))
     except OSError:
         raise WorkflowError("PRIOR_RUN_SCAN_FAILED") from None
-    if len(candidates) > 512:
-        raise WorkflowError("PRIOR_RUN_SCAN_LIMIT")
+    candidates.sort(key=lambda item: item[0])
     writer = ArticleBundleWriter(output_root)
     result: set[str] = set()
-    for run_name, run_date_text in candidates:
+    for run_name, run_date in candidates:
         try:
-            run_date = date.fromisoformat(run_date_text)
             metadata_rows = writer.validated_run_article_metadata(
                 run_date,
                 run_directory=run_name,
@@ -1643,16 +1648,19 @@ def _fsync_directory(path: Path) -> None:
         if _directory_fsync_is_unsupported(exc):
             return
         raise WorkflowError("REPORT_DIRECTORY_FSYNC_OPEN_FAILED") from None
+    failure: WorkflowError | None = None
     try:
         os.fsync(descriptor)
     except OSError as exc:
         if not _directory_fsync_is_unsupported(exc):
-            raise WorkflowError("REPORT_DIRECTORY_FSYNC_FAILED") from None
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            raise WorkflowError("REPORT_DIRECTORY_CLOSE_FAILED") from None
+            failure = WorkflowError("REPORT_DIRECTORY_FSYNC_FAILED")
+    try:
+        os.close(descriptor)
+    except OSError:
+        if failure is None:
+            failure = WorkflowError("REPORT_DIRECTORY_CLOSE_FAILED")
+    if failure is not None:
+        raise failure
 
 
 def _directory_fsync_is_unsupported(exc: OSError) -> bool:

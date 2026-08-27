@@ -11,6 +11,7 @@ import stat
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit
 
 from django.conf import settings
@@ -145,7 +146,7 @@ def _verify_fixture_manifest(
     root: Path,
     *,
     approved_root: Path,
-) -> dict[str, bytes]:
+) -> Mapping[str, bytes]:
     root = Path(root)
     approved_root = Path(approved_root)
     if root.resolve(strict=True) != approved_root.resolve(strict=True):
@@ -163,15 +164,30 @@ def _verify_fixture_manifest(
             if relative.startswith("lh/")
         },
     }
+    fixture_parent_path = root.parent
+    fingerprint_paths = (fixture_parent_path, *expected_sets)
+    directory_fingerprints = {
+        path: _fixture_directory_fingerprint(path) for path in fingerprint_paths
+    }
+
+    def verify_directories() -> None:
+        for path, expected in directory_fingerprints.items():
+            if _fixture_directory_fingerprint(path) != expected:
+                raise WorkflowError("FIXTURE_DIRECTORY_CHANGED")
+
+    verify_directories()
     for directory, expected_names in expected_sets.items():
         if _closed_fixture_names(directory) != expected_names:
             raise WorkflowError("FIXTURE_EXTRA_FILE")
+    verify_directories()
     manifest_path = root / "manifest.json"
     try:
+        verify_directories()
         manifest = json.loads(
             _read_fixture_file(manifest_path).decode("utf-8", errors="strict"),
             object_pairs_hook=_strict_fixture_pairs,
         )
+        verify_directories()
     except (OSError, UnicodeError, ValueError):
         raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
     if (
@@ -190,9 +206,11 @@ def _verify_fixture_manifest(
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
         path = root.parent / relative
         try:
+            verify_directories()
             resolved = path.resolve(strict=True)
             confined = resolved.is_relative_to(fixture_parent)
             payload = _read_fixture_file(path)
+            verify_directories()
             observed = hashlib.sha256(payload).hexdigest()
         except OSError:
             raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
@@ -204,7 +222,30 @@ def _verify_fixture_manifest(
     for directory, expected_names in expected_sets.items():
         if _closed_fixture_names(directory) != expected_names:
             raise WorkflowError("FIXTURE_EXTRA_FILE")
-    return verified
+    verify_directories()
+    return MappingProxyType(dict(verified))
+
+
+def _fixture_directory_fingerprint(path: Path) -> tuple[object, ...]:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise WorkflowError("FIXTURE_DIRECTORY_CHANGED") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    ):
+        raise WorkflowError("FIXTURE_DIRECTORY_CHANGED")
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        getattr(metadata, "st_file_attributes", 0),
+    )
 
 
 def _closed_fixture_names(directory: Path) -> set[str]:
@@ -241,6 +282,9 @@ def _read_fixture_file(path: Path) -> bytes:
         descriptor = os.open(path, flags)
     except OSError:
         raise WorkflowError("FIXTURE_OPEN_FAILED") from None
+    failure: WorkflowError | None = None
+    chunks: list[bytes] = []
+    before: os.stat_result | None = None
     try:
         before = os.fstat(descriptor)
         if (
@@ -252,7 +296,6 @@ def _read_fixture_file(path: Path) -> bytes:
             )
         ):
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
-        chunks: list[bytes] = []
         observed = 0
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -265,15 +308,18 @@ def _read_fixture_file(path: Path) -> bytes:
         after = os.fstat(descriptor)
         if _fixture_fingerprint(before) != _fixture_fingerprint(after):
             raise WorkflowError("FIXTURE_MANIFEST_CHANGED")
-    except WorkflowError:
-        raise
+    except WorkflowError as exc:
+        failure = exc
     except OSError:
-        raise WorkflowError("FIXTURE_READ_FAILED") from None
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            raise WorkflowError("FIXTURE_READ_CLOSE_FAILED") from None
+        failure = WorkflowError("FIXTURE_READ_FAILED")
+    try:
+        os.close(descriptor)
+    except OSError:
+        if failure is None:
+            failure = WorkflowError("FIXTURE_READ_CLOSE_FAILED")
+    if failure is not None:
+        raise failure
+    assert before is not None
     try:
         path_metadata = path.lstat()
     except OSError:
@@ -324,7 +370,7 @@ class _FixtureFetcher:
             raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
         if set(files) != set(_FIXTURE_FILES):
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
-        self.files = dict(files)
+        self.files = MappingProxyType(dict(files))
 
     def get(self, url: str) -> HtmlResponse:
         split = urlsplit(url)

@@ -12,7 +12,7 @@ import secrets
 import stat
 import unicodedata
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path, PurePosixPath
 
@@ -215,7 +215,12 @@ class RunDirectoryLease:
 @dataclass
 class _RunLeaseState:
     lease: RunDirectoryLease
-    article_names: set[str]
+    article_names: set[str] = field(default_factory=set)
+    pending_names: set[str] = field(default_factory=set)
+    failed_owned_names: set[str] = field(default_factory=set)
+    run_temp_names: set[str] = field(default_factory=set)
+    partial_names: set[str] = field(default_factory=set)
+    commit_started: bool = False
     completed: bool = False
 
 
@@ -259,6 +264,7 @@ class ArticleBundleWriter:
         self.root = Path(root)
         self._writer_token = secrets.token_hex(8)
         self._run_leases: dict[str, _RunLeaseState] = {}
+        self._implicit_leases: dict[date, RunDirectoryLease] = {}
 
     def reserve_run_directory(
         self,
@@ -312,7 +318,7 @@ class ArticleBundleWriter:
             _root_identity=root_identity,
             _run_identity=run_identity,
         )
-        self._run_leases[lease._lease_token] = _RunLeaseState(lease, set())
+        self._run_leases[lease._lease_token] = _RunLeaseState(lease)
         _fsync_directory(root)
         return lease
 
@@ -342,19 +348,20 @@ class ArticleBundleWriter:
 
         root = self._safe_root()
         validated = self._validate(bundle)
-        lease_state: _RunLeaseState | None = None
         if run_directory is None:
-            run_name = bundle.run_date.isoformat()
-            date_root = root / run_name
-        else:
-            date_root, lease_state = self._lease_run_root(
-                root,
-                bundle.run_date,
-                run_directory,
-            )
+            run_directory = self._implicit_run_lease(bundle.run_date)
+        date_root, lease_state = self._lease_run_root(
+            root,
+            bundle.run_date,
+            run_directory,
+        )
         self._ensure_directory(date_root)
         primary = self._safe_child(date_root, bundle.slug)
         target, existing = self._publication_target(primary, bundle.bundle_hash)
+        if lease_state is not None and target.name in (
+            lease_state.pending_names | lease_state.failed_owned_names
+        ):
+            raise BundlePublishError("run lease cannot reopen a failed-owned article")
         if existing is not None:
             _require_validated_existing_root(target, existing, "exact existing bundle")
             if lease_state is not None:
@@ -405,6 +412,8 @@ class ArticleBundleWriter:
                         )
                         return target
                 raise BundlePublishError(f"atomic bundle publish failed: {target}") from exc
+            if lease_state is not None:
+                lease_state.pending_names.add(target.name)
             _require_owned_identity(
                 target,
                 owned_stage_fingerprint,
@@ -420,12 +429,19 @@ class ArticleBundleWriter:
                 "fully validated published bundle",
             )
             if lease_state is not None:
+                lease_state.pending_names.discard(target.name)
                 lease_state.article_names.add(target.name)
                 self._verify_run_lease(root, lease_state)
             return target
         except BundlePublishError:
+            if lease_state is not None and target.name in lease_state.pending_names:
+                lease_state.pending_names.discard(target.name)
+                lease_state.failed_owned_names.add(target.name)
             raise
         except OSError as exc:
+            if lease_state is not None and target.name in lease_state.pending_names:
+                lease_state.pending_names.discard(target.name)
+                lease_state.failed_owned_names.add(target.name)
             raise BundlePublishError(f"bundle write or publish failed: {target}") from exc
 
     def write_run(
@@ -439,17 +455,14 @@ class ArticleBundleWriter:
         """Publish article bundles, then atomically replace the run index and manifest."""
 
         root = self._safe_root()
-        lease_state: _RunLeaseState | None = None
         if run_directory is None:
-            run_name = run_date.isoformat()
-            run_root = root / run_name
-        else:
-            run_root, lease_state = self._lease_run_root(
-                root,
-                run_date,
-                run_directory,
-            )
-            run_name = run_directory.name
+            run_directory = self._implicit_run_lease(run_date)
+        run_root, lease_state = self._lease_run_root(
+            root,
+            run_date,
+            run_directory,
+        )
+        run_name = run_directory.name
         self._ensure_directory(run_root)
         index_markdown = (
             weekly_index.to_markdown()
@@ -481,6 +494,8 @@ class ArticleBundleWriter:
             "articles": dict(sorted(published.items())),
         }
         manifest_payload = _json_bytes(run_manifest)
+        if lease_state is not None:
+            lease_state.commit_started = True
         try:
             index_tmp, index_fingerprint = self._write_owned_run_temp(
                 run_root,
@@ -488,12 +503,16 @@ class ArticleBundleWriter:
                 index_hash,
                 index_payload,
             )
+            if lease_state is not None:
+                lease_state.run_temp_names.add(index_tmp.name)
             manifest_tmp, manifest_fingerprint = self._write_owned_run_temp(
                 run_root,
                 "manifest.json",
                 hashlib.sha256(manifest_payload).hexdigest(),
                 manifest_payload,
             )
+            if lease_state is not None:
+                lease_state.run_temp_names.add(manifest_tmp.name)
             _fsync_directory(run_root)
             self._validate_owned_run_temp(
                 index_tmp,
@@ -504,6 +523,9 @@ class ArticleBundleWriter:
             index_target = run_root / "index.md"
             manifest_target = run_root / "manifest.json"
             os.replace(index_tmp, index_target)
+            if lease_state is not None:
+                lease_state.run_temp_names.discard(index_tmp.name)
+                lease_state.partial_names.add(index_target.name)
             self._validate_owned_run_temp(
                 index_target,
                 index_fingerprint,
@@ -518,6 +540,9 @@ class ArticleBundleWriter:
                 "run manifest temp",
             )
             os.replace(manifest_tmp, manifest_target)
+            if lease_state is not None:
+                lease_state.run_temp_names.discard(manifest_tmp.name)
+                lease_state.partial_names.add(manifest_target.name)
             self._validate_owned_run_temp(
                 manifest_target,
                 manifest_fingerprint,
@@ -530,11 +555,7 @@ class ArticleBundleWriter:
             raise
         except OSError as exc:
             raise BundlePublishError(f"run publish failed: {run_root}") from exc
-        validated_run = (
-            self.validate_run(run_date)
-            if run_directory is None
-            else self.validate_run(run_date, run_directory=run_name)
-        )
+        validated_run = self.validate_run(run_date, run_directory=run_name)
         _require_owned_identity(
             index_target,
             index_fingerprint,
@@ -550,6 +571,19 @@ class ArticleBundleWriter:
             lease_state.completed = True
         return validated_run
 
+    def _implicit_run_lease(self, run_date: date) -> RunDirectoryLease:
+        existing = self._implicit_leases.get(run_date)
+        if existing is not None:
+            state = self._run_leases.get(existing._lease_token)
+            if state is not None and not state.completed and not state.commit_started:
+                return existing
+        lease = self.reserve_run_directory(
+            run_date,
+            workflow_id=f"implicit:{self._writer_token}:{secrets.token_hex(16)}",
+        )
+        self._implicit_leases[run_date] = lease
+        return lease
+
     def _lease_run_root(
         self,
         root: Path,
@@ -559,6 +593,8 @@ class ArticleBundleWriter:
         state = self._validated_lease_state(run_date, lease)
         if state.completed:
             raise BundlePublishError("completed run directory lease cannot be reused")
+        if state.commit_started:
+            raise BundlePublishError("partial run directory lease cannot be reused")
         self._verify_run_lease(root, state)
         return self._safe_child(root, lease.name), state
 
@@ -611,17 +647,31 @@ class ArticleBundleWriter:
         except OSError as exc:
             raise BundlePublishError("cannot inspect run lease directory") from exc
         allowed_files = {"acceptance-report.json", "notices.json"}
-        if allow_completed:
-            allowed_files.update({"index.md", "manifest.json"})
+        if allow_completed and not {"index.md", "manifest.json"}.issubset(
+            state.partial_names
+        ):
+            raise BundlePublishError("run lease completed markers are not owned")
         for entry in entries:
             name = entry.name
             if name in allowed_files:
                 if not entry.is_file(follow_symlinks=False):
                     raise BundlePublishError("run lease controller file is unsafe")
                 continue
-            if name in state.article_names:
+            if name in (
+                state.article_names
+                | state.pending_names
+                | state.failed_owned_names
+            ):
                 if not entry.is_dir(follow_symlinks=False):
                     raise BundlePublishError("run lease article entry is unsafe")
+                continue
+            if name in state.partial_names:
+                if not entry.is_file(follow_symlinks=False):
+                    raise BundlePublishError("run lease partial commit file is unsafe")
+                continue
+            if name in state.run_temp_names:
+                if not entry.is_file(follow_symlinks=False):
+                    raise BundlePublishError("run lease temp file is unsafe")
                 continue
             owned_stage = (
                 name.startswith(".")
@@ -629,6 +679,14 @@ class ArticleBundleWriter:
                 and f"-{self._writer_token}-" in name
             )
             if owned_stage and entry.is_dir(follow_symlinks=False):
+                continue
+            owned_run_temp = (
+                state.commit_started
+                and name.startswith(".")
+                and ".tmp-" in name
+                and f"-{self._writer_token}-" in name
+            )
+            if owned_run_temp and entry.is_file(follow_symlinks=False):
                 continue
             raise BundlePublishError("run lease contains unowned or completed material")
 
@@ -1604,13 +1662,19 @@ def _fsync_directory(path: Path) -> None:
         if _directory_fsync_is_unsupported(exc):
             return
         raise BundlePublishError(f"directory fsync open failed: {path}") from exc
+    failure: BundlePublishError | None = None
     try:
         os.fsync(descriptor)
     except OSError as exc:
         if not _directory_fsync_is_unsupported(exc):
-            raise BundlePublishError(f"directory fsync failed: {path}") from exc
-    finally:
+            failure = BundlePublishError(f"directory fsync failed: {path}")
+    try:
         os.close(descriptor)
+    except OSError:
+        if failure is None:
+            failure = BundlePublishError(f"directory close failed: {path}")
+    if failure is not None:
+        raise failure
 
 
 def _file_sha256(path: Path) -> str:

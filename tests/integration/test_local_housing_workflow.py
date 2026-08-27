@@ -334,6 +334,49 @@ def test_crash_between_run_files_never_changes_prior_generation(
     assert "sensitive crash body" not in json.dumps(second.as_dict())
 
 
+def test_partial_run_commit_keeps_primary_error_and_persists_failed_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import apps.local_content.bundles as bundle_module
+
+    real_replace = bundle_module.os.replace
+    injected = False
+
+    def fail_manifest_replace(source, destination):
+        nonlocal injected
+        if Path(destination).name == "manifest.json" and not injected:
+            injected = True
+            raise OSError(errno.EIO, "sensitive manifest path body")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(bundle_module.os, "replace", fail_manifest_replace)
+    workflow = LocalHousingWorkflow(
+        collectors=(
+            _collector("applyhome", _notice("partial-run", checksum_digit="3")),
+            _collector("lh"),
+        ),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        state_root=tmp_path / "state",
+        mode="fixture",
+    )
+
+    report = _run(workflow)
+
+    assert injected is True
+    assert report.complete is False
+    assert "RUN_COMMIT_FAILED" in report.error_codes
+    assert "RUN_LEASE_CHANGED" not in report.error_codes
+    run_root = tmp_path / report.run_path
+    assert (run_root / "index.md").is_file()
+    assert not (run_root / "manifest.json").exists()
+    acceptance = json.loads((run_root / "acceptance-report.json").read_text("utf-8"))
+    assert acceptance["phases"][-1]["status"] == "failed"
+    assert "RUN_COMMIT_FAILED" in acceptance["error_codes"]
+    assert "sensitive manifest path body" not in json.dumps(acceptance)
+
+
 def test_validated_prior_manual_detail_promotes_explicit_correction(
     tmp_path: Path,
 ) -> None:
@@ -495,6 +538,36 @@ def test_validated_draft_only_bundle_cannot_promote_correction(tmp_path: Path) -
     report = _run(workflow)
 
     assert report.articles == ()
+
+
+def test_invalid_date_like_prior_generation_never_leaks_value_error(tmp_path: Path) -> None:
+    (tmp_path / "2026-99-99").mkdir()
+    workflow = LocalHousingWorkflow(
+        collectors=(_collector("applyhome"), _collector("lh")),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        state_root=tmp_path / "state",
+        mode="fixture",
+    )
+
+    report = _run(workflow, humanize=False, write_articles=False)
+
+    assert report.complete is True
+
+
+def test_prior_generation_scan_stops_at_hard_bound(tmp_path: Path) -> None:
+    for index in range(513):
+        (tmp_path / f"2025-01-01--run-{index:012x}").mkdir()
+    workflow = LocalHousingWorkflow(
+        collectors=(_collector("applyhome"), _collector("lh")),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        state_root=tmp_path / "state",
+        mode="fixture",
+    )
+
+    with pytest.raises(WorkflowError, match="PRIOR_RUN_SCAN_LIMIT"):
+        _run(workflow, humanize=False, write_articles=False)
 
 
 def test_advisory_guard_is_held_before_collect_and_persists_after_release(
@@ -962,6 +1035,46 @@ def test_directory_fsync_propagates_io_and_allows_exact_unsupported_errno(
         os.close(probe_descriptor)
 
 
+def test_workflow_directory_fsync_primary_failure_survives_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.local_content import workflow as workflow_module
+
+    probe = tmp_path / "workflow-dual-failure-probe"
+    probe.write_bytes(b"probe")
+    real_open = workflow_module.os.open
+    real_close = workflow_module.os.close
+    source_descriptor = real_open(probe, os.O_RDONLY)
+    opened: list[int] = []
+
+    def duplicate_probe(_path, _flags):
+        descriptor = os.dup(source_descriptor)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError(errno.EIO, "sensitive fsync body")
+
+    def fail_close(descriptor: int) -> None:
+        if descriptor in opened:
+            raise OSError(errno.EIO, "sensitive close body")
+        real_close(descriptor)
+
+    monkeypatch.setattr(workflow_module.os, "open", duplicate_probe)
+    monkeypatch.setattr(workflow_module.os, "fsync", fail_fsync)
+    monkeypatch.setattr(workflow_module.os, "close", fail_close)
+    try:
+        with pytest.raises(WorkflowError, match="REPORT_DIRECTORY_FSYNC_FAILED") as raised:
+            workflow_module._fsync_directory(tmp_path)
+        assert "sensitive" not in str(raised.value)
+    finally:
+        monkeypatch.setattr(workflow_module.os, "close", real_close)
+        for descriptor in opened:
+            real_close(descriptor)
+        real_close(source_descriptor)
+
+
 def test_both_source_failures_block_final_index_and_expose_codes_only(tmp_path: Path) -> None:
     workflow = LocalHousingWorkflow(
         collectors=(_failed_collector("applyhome"), _failed_collector("lh")),
@@ -1376,6 +1489,66 @@ def test_article_storage_failure_does_not_stop_healthy_peer(
     assert "sensitive storage path body" not in json.dumps(report.as_dict())
 
 
+@pytest.mark.parametrize("failure_point", ["post_replace_replay", "post_replace_fsync"])
+def test_real_post_replace_article_failure_keeps_lease_and_healthy_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    import apps.local_content.bundles as bundle_module
+
+    failed_notice = _notice("post-replace-bad", checksum_digit="a")
+    healthy_notice = _notice("post-replace-good", checksum_digit="b")
+    failed_slug = notice_slug(failed_notice)
+    injected = False
+
+    if failure_point == "post_replace_replay":
+        real_existing_hash = ArticleBundleWriter._existing_hash
+
+        def fail_replay(self, path, **kwargs):
+            nonlocal injected
+            if path.name == failed_slug and path.is_dir() and not injected:
+                injected = True
+                raise BundlePublishError("sensitive replay body")
+            return real_existing_hash(self, path, **kwargs)
+
+        monkeypatch.setattr(ArticleBundleWriter, "_existing_hash", fail_replay)
+    else:
+        real_fsync_directory = bundle_module._fsync_directory
+
+        def fail_fsync(path: Path) -> None:
+            nonlocal injected
+            if (path / failed_slug).is_dir() and not injected:
+                injected = True
+                raise BundlePublishError("sensitive fsync body")
+            real_fsync_directory(path)
+
+        monkeypatch.setattr(bundle_module, "_fsync_directory", fail_fsync)
+
+    workflow = LocalHousingWorkflow(
+        collectors=(
+            _collector("applyhome", failed_notice, healthy_notice),
+            _collector("lh"),
+        ),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        mode="fixture",
+    )
+
+    report = _run(workflow)
+
+    assert injected is True
+    failed, healthy = report.articles
+    assert "BUNDLE_WRITE_FAILED" in failed.error_codes
+    assert failed.article_path is None
+    assert healthy.status == "written"
+    assert (tmp_path / healthy.article_path / "article.md").is_file()
+    index = (tmp_path / report.run_path / "index.md").read_text("utf-8")
+    assert f"./{failed_slug}/article.md" not in index
+    assert f"./{notice_slug(healthy_notice)}/article.md" in index
+    assert report.blocked is True
+
+
 def test_dry_run_leaves_no_files_and_cannot_report_live_success(tmp_path: Path) -> None:
     output_root = tmp_path / "not-created"
     humanizer = EchoHumanizer()
@@ -1565,6 +1738,40 @@ def test_fixture_fetcher_serves_one_verified_in_memory_snapshot(tmp_path: Path) 
     source.write_text("tampered after verification", encoding="utf-8")
 
     assert fetcher.get(url).body == before
+    with pytest.raises(TypeError):
+        snapshot["applyhome/apt-list.html"] = b"mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        fetcher.files["applyhome/apt-list.html"] = b"mutated"  # type: ignore[index]
+
+
+def test_fixture_capture_rejects_source_directory_identity_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = _isolated_fixture_assembly(tmp_path)
+    real_read = command_module._read_fixture_file
+    swapped = False
+
+    def swap_after_read(path: Path) -> bytes:
+        nonlocal swapped
+        payload = real_read(path)
+        if path.name == "apt-list.html" and not swapped:
+            swapped = True
+            source = tmp_path / "applyhome"
+            backup = tmp_path / "applyhome-before-swap"
+            source.rename(backup)
+            shutil.copytree(backup, source)
+        return payload
+
+    monkeypatch.setattr(command_module, "_read_fixture_file", swap_after_read)
+
+    with pytest.raises(WorkflowError, match="FIXTURE_DIRECTORY_CHANGED"):
+        command_module._verify_fixture_manifest(
+            fixture_root,
+            approved_root=fixture_root,
+        )
+
+    assert swapped is True
 
 
 def test_fixture_read_oserror_is_stable_and_body_free(
@@ -1584,3 +1791,41 @@ def test_fixture_read_oserror_is_stable_and_body_free(
         )
 
     assert "sensitive fixture path body" not in str(raised.value)
+
+
+def test_fixture_read_failure_is_not_masked_by_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = _isolated_fixture_assembly(tmp_path)
+    real_open = command_module.os.open
+    real_close = command_module.os.close
+    opened: list[int] = []
+
+    def tracking_open(path, flags):
+        descriptor = real_open(path, flags)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_read(_descriptor: int, _size: int) -> bytes:
+        raise OSError(errno.EIO, "sensitive fixture read body")
+
+    def fail_close(descriptor: int) -> None:
+        if descriptor in opened:
+            raise OSError(errno.EIO, "sensitive fixture close body")
+        real_close(descriptor)
+
+    monkeypatch.setattr(command_module.os, "open", tracking_open)
+    monkeypatch.setattr(command_module.os, "read", fail_read)
+    monkeypatch.setattr(command_module.os, "close", fail_close)
+    try:
+        with pytest.raises(WorkflowError, match="FIXTURE_READ_FAILED") as raised:
+            command_module._verify_fixture_manifest(
+                fixture_root,
+                approved_root=fixture_root,
+            )
+        assert "sensitive" not in str(raised.value)
+    finally:
+        monkeypatch.setattr(command_module.os, "close", real_close)
+        for descriptor in opened:
+            real_close(descriptor)
