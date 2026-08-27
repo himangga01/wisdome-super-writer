@@ -140,3 +140,55 @@ Results: `126 passed, 4 subtests passed in 0.84s`; `All checks passed!`.
 
 - Full legacy-suite execution remains intentionally omitted because it is
   known-red; all Task 3--5 related regression suites above are green.
+
+---
+
+# Task 6 Fix Round 2/5
+
+## RED
+
+Added parametrized regressions for `data-empty-results="true"` combined with
+actual rows and both a normal declared total (`51`) and contradictory zero total
+(`0`).
+
+```powershell
+$env:WISDOME_ENVIRONMENT='development'
+.venv\\Scripts\\python.exe -m pytest tests/unit/test_lh_public_html.py -q
+```
+
+Result before the parser change: `2 failed, 25 passed in 0.84s`. The normal-total
+case admitted 51 notices; the zero-total case reported the less-specific
+`invalid list pagination material` error.
+
+## GREEN
+
+`_parse_list()` now reads the explicit-empty marker before pagination admission
+and fail-closes with `contradictory explicit empty result page` whenever rows are
+present, irrespective of the declared total.
+
+## Tests
+
+```powershell
+$env:WISDOME_ENVIRONMENT='development'
+.venv\\Scripts\\python.exe -m pytest tests/unit/test_lh_public_html.py tests/unit/test_applyhome_public_html.py tests/unit/test_local_content_dates.py tests/unit/test_local_content_http.py tests/unit/test_extraction_safety_boundaries.py -q
+.venv\\Scripts\\python.exe -m ruff check src/apps/local_content/sources/lh.py tests/unit/test_lh_public_html.py
+```
+
+Results: `128 passed, 4 subtests passed in 0.76s`; `All checks passed!`.
+
+## Files
+
+- `src/apps/local_content/sources/lh.py`
+- `tests/unit/test_lh_public_html.py`
+- `.superpowers/sdd/2026-08-28-dockerless-local-housing-writer/task-6-report.md`
+
+## Self-review
+
+- The contradiction is rejected before any row parsing, identity creation,
+  pagination validation, or detail fetches.
+- Proper explicit-empty zero results continue to be admitted.
+
+## Concerns
+
+- Full legacy-suite execution remains intentionally omitted because it is
+  known-red; Task 3--5 related focused suites are green.

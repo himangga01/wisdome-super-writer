@@ -193,6 +193,9 @@ class LhPublicCollector:
         if root is None:
             raise _ParseFailure("list parser drift")
         rows = tuple(root.css("[data-id1][data-id2][data-id3][data-id4]"))
+        explicit_empty = _normalize(root.attributes.get("data-empty-results")) == "true"
+        if explicit_empty and rows:
+            raise _ParseFailure("contradictory explicit empty result page")
         current_page = _required_int(root, "data-current-page", minimum=1)
         last_page = _required_int(root, "data-last-page", minimum=1)
         total_count = _required_int(root, "data-total-count", minimum=0)
@@ -204,7 +207,7 @@ class LhPublicCollector:
                 current_page,
                 last_page,
                 total_count,
-                _normalize(root.attributes.get("data-empty-results")) == "true",
+                explicit_empty,
             )
         if total_count == 0:
             raise _ParseFailure("invalid list pagination material")

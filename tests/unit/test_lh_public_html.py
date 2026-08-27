@@ -305,6 +305,20 @@ def test_lh_collector_rejects_malformed_explicit_empty_result(
     assert report.errors == ("invalid explicit empty result page",)
 
 
+@pytest.mark.parametrize("total_count", ["51", "0"])
+def test_lh_collector_rejects_empty_marker_with_actual_rows(
+    fetcher: FixtureFetcher, window: CollectionWindow, total_count: str
+) -> None:
+    fetcher.list_pages["1"] = fetcher.list_pages["1"].replace(
+        'data-lh-notice-list="true"', 'data-lh-notice-list="true" data-empty-results="true"', 1
+    ).replace('data-total-count="51"', f'data-total-count="{total_count}"', 1)
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("contradictory explicit empty result page",)
+
+
 def test_lh_collector_rejects_an_old_corrected_notice(
     fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:
