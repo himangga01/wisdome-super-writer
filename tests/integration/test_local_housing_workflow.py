@@ -1549,6 +1549,70 @@ def test_real_post_replace_article_failure_keeps_lease_and_healthy_peer(
     assert report.blocked is True
 
 
+@pytest.mark.parametrize("failure_point", ["post_replace_replay", "post_replace_fsync"])
+def test_post_replace_article_substitution_remains_run_lease_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    import apps.local_content.bundles as bundle_module
+
+    failed_notice = _notice("post-replace-substituted", checksum_digit="c")
+    healthy_notice = _notice("post-replace-unreached", checksum_digit="d")
+    failed_slug = notice_slug(failed_notice)
+    real_replace = bundle_module.os.replace
+    backup = tmp_path / "published-owned-backup"
+    replacement = tmp_path / "published-substitution"
+    injected = False
+
+    def substitute_published(path: Path) -> None:
+        shutil.copytree(path, replacement)
+        real_replace(path, backup)
+        real_replace(replacement, path)
+
+    if failure_point == "post_replace_replay":
+        real_existing_hash = ArticleBundleWriter._existing_hash
+
+        def substitute_during_replay(self, path, **kwargs):
+            nonlocal injected
+            if path.name == failed_slug and path.is_dir() and not injected:
+                substitute_published(path)
+                injected = True
+                raise BundlePublishError("sensitive replay body")
+            return real_existing_hash(self, path, **kwargs)
+
+        monkeypatch.setattr(ArticleBundleWriter, "_existing_hash", substitute_during_replay)
+    else:
+        real_fsync_directory = bundle_module._fsync_directory
+
+        def substitute_during_fsync(path: Path) -> None:
+            nonlocal injected
+            published = path / failed_slug
+            if published.is_dir() and not injected:
+                substitute_published(published)
+                injected = True
+                raise BundlePublishError("sensitive fsync body")
+            real_fsync_directory(path)
+
+        monkeypatch.setattr(bundle_module, "_fsync_directory", substitute_during_fsync)
+
+    workflow = LocalHousingWorkflow(
+        collectors=(
+            _collector("applyhome", failed_notice, healthy_notice),
+            _collector("lh"),
+        ),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        mode="fixture",
+    )
+
+    with pytest.raises(WorkflowError, match="RUN_LEASE_CHANGED"):
+        _run(workflow)
+
+    assert injected is True
+    assert backup.is_dir()
+
+
 def test_dry_run_leaves_no_files_and_cannot_report_live_success(tmp_path: Path) -> None:
     output_root = tmp_path / "not-created"
     humanizer = EchoHumanizer()

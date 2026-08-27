@@ -212,6 +212,24 @@ def test_post_replace_failed_owned_article_cannot_be_reopened(
         writer.write(bundle)
 
 
+def test_run_lease_rejects_unregistered_writer_token_shaped_stage(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    writer = ArticleBundleWriter(root)
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-forged-stage",
+    )
+    forged = (
+        root
+        / lease.name
+        / f".forged.tmp-deadbeefcafe-{lease._writer_token}-0123456789abcdef"
+    )
+    forged.mkdir()
+
+    with pytest.raises(BundlePublishError, match="unowned|identity|lease"):
+        writer.verify_run_directory_lease(lease)
+
+
 def test_run_directory_lease_rejects_substituted_partial_directory(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     root = tmp_path / "output"
@@ -301,6 +319,85 @@ def test_run_reservation_wraps_directory_close_failure(
         for descriptor in opened:
             real_close(descriptor)
         real_close(source_descriptor)
+
+
+@pytest.mark.parametrize("entrypoint", ["replay", "validate_run", "history"])
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_message"),
+    [
+        ("close_only", "handle close failed"),
+        ("read_and_close", "handle read failed"),
+        ("identity_and_close", "opened identity differs"),
+    ],
+)
+def test_bound_file_close_preserves_primary_for_all_reader_entrypoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    failure_kind: str,
+    expected_message: str,
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    if entrypoint == "replay":
+        bundle = _bundle(tmp_path)
+        published = writer.write(bundle)
+        target = published / "manifest.json"
+
+        def invoke() -> object:
+            return writer.write(bundle)
+
+    else:
+        run_path = writer.write_run(date(2026, 8, 28), "# weekly\n")
+        target = run_path / "manifest.json"
+
+        def invoke() -> object:
+            if entrypoint == "validate_run":
+                return writer.validate_run(date(2026, 8, 28))
+            return writer.validated_run_article_metadata(date(2026, 8, 28))
+
+    real_open = bundle_module.os.open
+    real_read = bundle_module.os.read
+    real_fstat = bundle_module.os.fstat
+    real_close = bundle_module.os.close
+    tracked_descriptors: set[int] = set()
+
+    def track_target_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == target:
+            tracked_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_target_read(descriptor: int, size: int) -> bytes:
+        if descriptor in tracked_descriptors and failure_kind == "read_and_close":
+            raise OSError(errno.EIO, "sensitive bound read body")
+        return real_read(descriptor, size)
+
+    def change_target_identity(descriptor: int):
+        metadata = real_fstat(descriptor)
+        if descriptor in tracked_descriptors and failure_kind == "identity_and_close":
+            return _changed_identity(metadata)
+        return metadata
+
+    def fail_target_close(descriptor: int) -> None:
+        if descriptor in tracked_descriptors:
+            raise OSError(errno.EIO, "sensitive bound close body")
+        real_close(descriptor)
+
+    monkeypatch.setattr(bundle_module.os, "open", track_target_open)
+    monkeypatch.setattr(bundle_module.os, "read", fail_target_read)
+    monkeypatch.setattr(bundle_module.os, "fstat", change_target_identity)
+    monkeypatch.setattr(bundle_module.os, "close", fail_target_close)
+    try:
+        with pytest.raises(BundlePublishError, match=expected_message) as raised:
+            invoke()
+        assert "sensitive bound close body" not in str(raised.value)
+    finally:
+        monkeypatch.setattr(bundle_module.os, "close", real_close)
+        for descriptor in tracked_descriptors:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
 
 
 def test_completed_run_directory_lease_cannot_be_reused(tmp_path: Path) -> None:
@@ -1620,6 +1717,86 @@ def test_each_failed_run_invocation_leaves_a_unique_owned_temp(
     )
     assert len(abandoned) == 2
     assert len({path.name for path in abandoned}) == 2
+
+
+@pytest.mark.parametrize("entry_kind", ["run_temp", "partial_target"])
+def test_partial_run_lease_rejects_owned_entry_identity_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_kind: str,
+) -> None:
+    root = tmp_path / "output"
+    writer = ArticleBundleWriter(root)
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id=f"workflow-substituted-{entry_kind}",
+    )
+    real_replace = bundle_module.os.replace
+
+    def fail_manifest_replace(source, target) -> None:
+        if Path(target).name == "manifest.json":
+            raise OSError(errno.EIO, "injected commit-marker interruption")
+        real_replace(source, target)
+
+    monkeypatch.setattr(bundle_module.os, "replace", fail_manifest_replace)
+    with pytest.raises(BundlePublishError, match="run publish"):
+        writer.write_run(
+            date(2026, 8, 28),
+            "# weekly\n",
+            run_directory=lease,
+        )
+    monkeypatch.setattr(bundle_module.os, "replace", real_replace)
+
+    run_root = root / lease.name
+    owned = (
+        next(run_root.glob(".manifest.json.tmp-*"))
+        if entry_kind == "run_temp"
+        else run_root / "index.md"
+    )
+    backup = tmp_path / f"owned-{entry_kind}-backup"
+    replacement = tmp_path / f"substituted-{entry_kind}"
+    shutil.copy2(owned, replacement)
+    real_replace(owned, backup)
+    real_replace(replacement, owned)
+
+    with pytest.raises(BundlePublishError, match="owned|substitut|identity|changed"):
+        writer.verify_run_directory_lease(lease)
+
+
+def test_partial_run_lease_rejects_unregistered_writer_token_shaped_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "output"
+    writer = ArticleBundleWriter(root)
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-forged-run-temp",
+    )
+    real_replace = bundle_module.os.replace
+
+    def fail_manifest_replace(source, target) -> None:
+        if Path(target).name == "manifest.json":
+            raise OSError(errno.EIO, "injected commit-marker interruption")
+        real_replace(source, target)
+
+    monkeypatch.setattr(bundle_module.os, "replace", fail_manifest_replace)
+    with pytest.raises(BundlePublishError, match="run publish"):
+        writer.write_run(
+            date(2026, 8, 28),
+            "# weekly\n",
+            run_directory=lease,
+        )
+
+    forged = (
+        root
+        / lease.name
+        / f".forged.tmp-deadbeefcafe-{lease._writer_token}-0123456789abcdef"
+    )
+    forged.write_bytes(b"foreign")
+
+    with pytest.raises(BundlePublishError, match="unowned|identity|lease"):
+        writer.verify_run_directory_lease(lease)
 
 
 @pytest.mark.parametrize("target_name", ["index.md", "manifest.json"])

@@ -215,11 +215,12 @@ class RunDirectoryLease:
 @dataclass
 class _RunLeaseState:
     lease: RunDirectoryLease
-    article_names: set[str] = field(default_factory=set)
-    pending_names: set[str] = field(default_factory=set)
-    failed_owned_names: set[str] = field(default_factory=set)
-    run_temp_names: set[str] = field(default_factory=set)
-    partial_names: set[str] = field(default_factory=set)
+    article_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    article_temp_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    pending_article_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    failed_owned_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    run_temp_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    partial_identities: dict[str, tuple[object, ...]] = field(default_factory=dict)
     commit_started: bool = False
     completed: bool = False
 
@@ -358,21 +359,24 @@ class ArticleBundleWriter:
         self._ensure_directory(date_root)
         primary = self._safe_child(date_root, bundle.slug)
         target, existing = self._publication_target(primary, bundle.bundle_hash)
-        if lease_state is not None and target.name in (
-            lease_state.pending_names | lease_state.failed_owned_names
+        if target.name in (
+            lease_state.pending_article_identities
+            | lease_state.failed_owned_identities
         ):
             raise BundlePublishError("run lease cannot reopen a failed-owned article")
         if existing is not None:
             _require_validated_existing_root(target, existing, "exact existing bundle")
-            if lease_state is not None:
-                lease_state.article_names.add(target.name)
-                self._verify_run_lease(root, lease_state)
+            lease_state.article_identities[target.name] = _identity_from_fingerprint(
+                existing.root_fingerprint
+            )
+            self._verify_run_lease(root, lease_state)
             return target
 
         staging, owned_stage_fingerprint = self._create_owned_staging(
             root,
             target,
             bundle.bundle_hash,
+            lease_state,
         )
         try:
             for item, payload in validated:
@@ -412,8 +416,8 @@ class ArticleBundleWriter:
                         )
                         return target
                 raise BundlePublishError(f"atomic bundle publish failed: {target}") from exc
-            if lease_state is not None:
-                lease_state.pending_names.add(target.name)
+            lease_state.article_temp_identities.pop(staging.name, None)
+            lease_state.pending_article_identities[target.name] = owned_stage_fingerprint
             _require_owned_identity(
                 target,
                 owned_stage_fingerprint,
@@ -428,20 +432,15 @@ class ArticleBundleWriter:
                 owned_stage_fingerprint,
                 "fully validated published bundle",
             )
-            if lease_state is not None:
-                lease_state.pending_names.discard(target.name)
-                lease_state.article_names.add(target.name)
-                self._verify_run_lease(root, lease_state)
+            lease_state.pending_article_identities.pop(target.name, None)
+            lease_state.article_identities[target.name] = owned_stage_fingerprint
+            self._verify_run_lease(root, lease_state)
             return target
         except BundlePublishError:
-            if lease_state is not None and target.name in lease_state.pending_names:
-                lease_state.pending_names.discard(target.name)
-                lease_state.failed_owned_names.add(target.name)
+            self._retain_failed_owned_article(lease_state, target)
             raise
         except OSError as exc:
-            if lease_state is not None and target.name in lease_state.pending_names:
-                lease_state.pending_names.discard(target.name)
-                lease_state.failed_owned_names.add(target.name)
+            self._retain_failed_owned_article(lease_state, target)
             raise BundlePublishError(f"bundle write or publish failed: {target}") from exc
 
     def write_run(
@@ -502,17 +501,15 @@ class ArticleBundleWriter:
                 "index.md",
                 index_hash,
                 index_payload,
+                lease_state,
             )
-            if lease_state is not None:
-                lease_state.run_temp_names.add(index_tmp.name)
             manifest_tmp, manifest_fingerprint = self._write_owned_run_temp(
                 run_root,
                 "manifest.json",
                 hashlib.sha256(manifest_payload).hexdigest(),
                 manifest_payload,
+                lease_state,
             )
-            if lease_state is not None:
-                lease_state.run_temp_names.add(manifest_tmp.name)
             _fsync_directory(run_root)
             self._validate_owned_run_temp(
                 index_tmp,
@@ -523,9 +520,8 @@ class ArticleBundleWriter:
             index_target = run_root / "index.md"
             manifest_target = run_root / "manifest.json"
             os.replace(index_tmp, index_target)
-            if lease_state is not None:
-                lease_state.run_temp_names.discard(index_tmp.name)
-                lease_state.partial_names.add(index_target.name)
+            lease_state.run_temp_identities.pop(index_tmp.name, None)
+            lease_state.partial_identities[index_target.name] = index_fingerprint
             self._validate_owned_run_temp(
                 index_target,
                 index_fingerprint,
@@ -540,9 +536,8 @@ class ArticleBundleWriter:
                 "run manifest temp",
             )
             os.replace(manifest_tmp, manifest_target)
-            if lease_state is not None:
-                lease_state.run_temp_names.discard(manifest_tmp.name)
-                lease_state.partial_names.add(manifest_target.name)
+            lease_state.run_temp_identities.pop(manifest_tmp.name, None)
+            lease_state.partial_identities[manifest_target.name] = manifest_fingerprint
             self._validate_owned_run_temp(
                 manifest_target,
                 manifest_fingerprint,
@@ -648,45 +643,49 @@ class ArticleBundleWriter:
             raise BundlePublishError("cannot inspect run lease directory") from exc
         allowed_files = {"acceptance-report.json", "notices.json"}
         if allow_completed and not {"index.md", "manifest.json"}.issubset(
-            state.partial_names
+            state.partial_identities
         ):
             raise BundlePublishError("run lease completed markers are not owned")
+        owned_directories = (
+            ("run lease article", state.article_identities),
+            ("run lease article temp", state.article_temp_identities),
+            ("run lease pending article", state.pending_article_identities),
+            ("run lease failed article", state.failed_owned_identities),
+        )
+        owned_files = (
+            ("run lease temp file", state.run_temp_identities),
+            ("run lease partial commit file", state.partial_identities),
+        )
+        for label, identities in (*owned_directories, *owned_files):
+            for name, expected in identities.items():
+                _require_owned_identity(
+                    self._safe_child(run_root, name),
+                    expected,
+                    label,
+                )
+        owned_directory_names = {
+            name
+            for _label, identities in owned_directories
+            for name in identities
+        }
+        owned_file_names = {
+            name
+            for _label, identities in owned_files
+            for name in identities
+        }
         for entry in entries:
             name = entry.name
             if name in allowed_files:
                 if not entry.is_file(follow_symlinks=False):
                     raise BundlePublishError("run lease controller file is unsafe")
                 continue
-            if name in (
-                state.article_names
-                | state.pending_names
-                | state.failed_owned_names
-            ):
+            if name in owned_directory_names:
                 if not entry.is_dir(follow_symlinks=False):
                     raise BundlePublishError("run lease article entry is unsafe")
                 continue
-            if name in state.partial_names:
+            if name in owned_file_names:
                 if not entry.is_file(follow_symlinks=False):
-                    raise BundlePublishError("run lease partial commit file is unsafe")
-                continue
-            if name in state.run_temp_names:
-                if not entry.is_file(follow_symlinks=False):
-                    raise BundlePublishError("run lease temp file is unsafe")
-                continue
-            owned_stage = (
-                name.startswith(".")
-                and ".tmp-" in name
-                and f"-{self._writer_token}-" in name
-            )
-            if owned_stage and entry.is_dir(follow_symlinks=False):
-                continue
-            owned_run_temp = (
-                state.commit_started
-                and name.startswith(".")
-                and ".tmp-" in name
-                and f"-{self._writer_token}-" in name
-            )
-            if owned_run_temp and entry.is_file(follow_symlinks=False):
+                    raise BundlePublishError("run lease file entry is unsafe")
                 continue
             raise BundlePublishError("run lease contains unowned or completed material")
 
@@ -1166,6 +1165,7 @@ class ArticleBundleWriter:
         root: Path,
         target: Path,
         bundle_hash: str,
+        lease_state: _RunLeaseState,
     ) -> tuple[Path, tuple[object, ...]]:
         for _attempt in range(10):
             nonce = secrets.token_hex(8)
@@ -1182,6 +1182,7 @@ class ArticleBundleWriter:
                 "owned staging",
                 BundlePublishError,
             )
+            lease_state.article_temp_identities[staging.name] = fingerprint
             _fsync_directory(staging.parent)
             return staging, fingerprint
         raise BundlePublishError("could not allocate a unique writer-owned staging directory")
@@ -1212,6 +1213,7 @@ class ArticleBundleWriter:
         label: str,
         content_hash: str,
         payload: bytes,
+        lease_state: _RunLeaseState,
     ) -> tuple[Path, tuple[object, ...]]:
         for _attempt in range(10):
             nonce = secrets.token_hex(8)
@@ -1220,16 +1222,36 @@ class ArticleBundleWriter:
                 f".{label}.tmp-{content_hash[:12]}-{self._writer_token}-{nonce}",
             )
             try:
-                _write_bytes_fsynced(path, payload)
+                handle = path.open("xb")
             except FileExistsError:
                 continue
-            fingerprint = _path_identity_fingerprint(
-                path,
-                "owned run temp",
-                BundlePublishError,
-            )
+            with handle:
+                fingerprint = _path_identity_fingerprint(
+                    path,
+                    "owned run temp",
+                    BundlePublishError,
+                )
+                opened_identity = _identity_fingerprint_metadata(os.fstat(handle.fileno()))
+                if opened_identity != fingerprint or opened_identity[0] != stat.S_IFREG:
+                    raise BundlePublishError("owned run temp handle identity is unsafe")
+                lease_state.run_temp_identities[path.name] = fingerprint
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
             return path, fingerprint
         raise BundlePublishError("could not allocate a unique writer-owned run temp file")
+
+    @staticmethod
+    def _retain_failed_owned_article(
+        lease_state: _RunLeaseState,
+        target: Path,
+    ) -> None:
+        expected = lease_state.pending_article_identities.get(target.name)
+        if expected is None:
+            return
+        _require_owned_identity(target, expected, "post-replace failed article")
+        lease_state.pending_article_identities.pop(target.name)
+        lease_state.failed_owned_identities[target.name] = expected
 
     @staticmethod
     def _validate_owned_run_temp(
@@ -1797,6 +1819,22 @@ def _fingerprint_metadata(metadata: os.stat_result) -> tuple[object, ...]:
     )
 
 
+def _identity_fingerprint_metadata(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        getattr(metadata, "st_file_attributes", 0),
+    )
+
+
+def _identity_from_fingerprint(
+    fingerprint: tuple[object, ...],
+) -> tuple[object, ...]:
+    file_type, device, inode, _size, _mtime, _ctime, attributes = fingerprint
+    return (file_type, device, inode, attributes)
+
+
 def _path_fingerprint(
     path: Path,
     label: str,
@@ -1810,9 +1848,7 @@ def _path_identity_fingerprint(
     label: str,
     error_type: type[BundleValidationError],
 ) -> tuple[object, ...]:
-    fingerprint = _path_fingerprint(path, label, error_type)
-    file_type, device, inode, _size, _mtime, _ctime, attributes = fingerprint
-    return (file_type, device, inode, attributes)
+    return _identity_from_fingerprint(_path_fingerprint(path, label, error_type))
 
 
 def _require_owned_identity(
@@ -1878,6 +1914,9 @@ def _read_bound_file(
         descriptor = os.open(path, flags)
     except OSError as exc:
         raise BundlePublishError(f"{label} could not be opened safely: {path}") from exc
+    failure: BundlePublishError | None = None
+    failure_traceback = None
+    chunks: list[bytes] = []
     try:
         before = _opened_handle_fingerprint(os.fstat(descriptor))
         expected_handle = _opened_handle_fingerprint_from_path(expected_fingerprint)
@@ -1886,7 +1925,6 @@ def _read_bound_file(
                 f"{label} opened identity differs from lstat: {path}; "
                 f"expected={expected_handle!r}; opened={before!r}"
             )
-        chunks: list[bytes] = []
         observed = 0
         while True:
             chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max_bytes + 1 - observed))
@@ -1899,10 +1937,19 @@ def _read_bound_file(
         after = _opened_handle_fingerprint(os.fstat(descriptor))
         if after != before:
             raise BundlePublishError(f"{label} opened identity changed during read: {path}")
+    except BundlePublishError as exc:
+        failure = exc
+        failure_traceback = exc.__traceback__
     except OSError as exc:
-        raise BundlePublishError(f"{label} handle read failed: {path}") from exc
-    finally:
+        failure = BundlePublishError(f"{label} handle read failed: {path}")
+        failure.__cause__ = exc
+    try:
         os.close(descriptor)
+    except OSError as exc:
+        if failure is None:
+            raise BundlePublishError(f"{label} handle close failed: {path}") from exc
+    if failure is not None:
+        raise failure.with_traceback(failure_traceback)
     _require_unchanged_fingerprint(path, expected_fingerprint, BundlePublishError)
     return b"".join(chunks)
 
