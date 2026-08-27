@@ -234,10 +234,14 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
             release.set()
         for exited in exits[:-1]:
             assert exited.wait(1.0)
-        reacquired = humanizer_module._WATCHDOG_SLOTS.acquire(timeout=1.0)
-        assert reacquired
-        if reacquired:
-            humanizer_module._WATCHDOG_SLOTS.release()
+        reacquired_slots = [
+            humanizer_module._WATCHDOG_SLOTS.acquire(timeout=1.0)
+            for _ in range(humanizer_module.MAX_LINGERING_HUMANIZATIONS)
+        ]
+        assert reacquired_slots == [True, True]
+        for reacquired in reacquired_slots:
+            if reacquired:
+                humanizer_module._WATCHDOG_SLOTS.release()
 
     success_client = HumanizerClient(
         "http://127.0.0.1:3210", transport=_transport(_event_bytes(COMPLETE_EVENTS))
@@ -245,10 +249,21 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
     assert success_client.transform("원문") == "자연스러운 문장"
 
 
-def test_watchdog_recomputes_remaining_budget_after_thread_setup() -> None:
+def test_watchdog_recomputes_remaining_budget_after_thread_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     release = threading.Event()
     started = threading.Event()
+    thread_start_called = threading.Event()
     observed_waits: list[float] = []
+    real_thread = threading.Thread
+
+    class TrackingThread(real_thread):
+        def start(self) -> None:
+            super().start()
+            thread_start_called.set()
+
+    monkeypatch.setattr(humanizer_module.threading, "Thread", TrackingThread)
 
     def operation(_cancelled: threading.Event) -> str:
         started.set()
@@ -260,12 +275,16 @@ def test_watchdog_recomputes_remaining_budget_after_thread_setup() -> None:
         observed_waits.append(timeout)
         return event.is_set()
 
+    def post_setup_clock() -> float:
+        assert thread_start_called.is_set()
+        return 9.75
+
     try:
         with pytest.raises(HumanizationError, match="total deadline"):
             humanizer_module._run_with_watchdog(
                 operation,
                 deadline=10.0,
-                clock=lambda: 9.75,
+                clock=post_setup_clock,
                 wait_for_completion=wait_for_completion,
             )
         assert observed_waits == [0.25]
@@ -930,6 +949,62 @@ def test_multiline_reference_definition_is_one_protected_logical_block() -> None
 
 
 @pytest.mark.parametrize(
+    ("source", "protected_value", "mutable_values"),
+    [
+        (
+            "[공식]:\n"
+            "  <https://example.test/a_(b)c>\n"
+            '  "유효 제목"\n'
+            "  추가 들여쓰기 문장\n"
+            "본문입니다.",
+            '[공식]:\n  <https://example.test/a_(b)c>\n  "유효 제목"\n',
+            ("추가 들여쓰기 문장", "본문입니다."),
+        ),
+        (
+            "[공식]:\n"
+            "  목적지가 아닌 여러 단어 문장\n"
+            '  "제목처럼 보이는 다음 줄"\n'
+            "본문입니다.",
+            "[공식]:\n",
+            ("목적지가 아닌 여러 단어 문장", "제목처럼 보이는 다음 줄"),
+        ),
+        (
+            "[공식]: https://example.test/a\n"
+            "  제목 문법이 아닌 일반 문장\n"
+            '  "두 번째 줄도 흡수 금지"\n'
+            "본문입니다.",
+            "[공식]: https://example.test/a\n",
+            ("제목 문법이 아닌 일반 문장", "두 번째 줄도 흡수 금지"),
+        ),
+        (
+            "[공식]:\n"
+            "  <https://example.test/a>\n"
+            "  (유효 괄호 제목)\n"
+            "본문입니다.",
+            "[공식]:\n  <https://example.test/a>\n  (유효 괄호 제목)\n",
+            ("본문입니다.",),
+        ),
+    ],
+    ids=[
+        "excess-indented-prose",
+        "invalid-destination",
+        "invalid-title",
+        "valid-parenthesized-title",
+    ],
+)
+def test_reference_definition_uses_bounded_valid_continuation_grammar(
+    source: str,
+    protected_value: str,
+    mutable_values: tuple[str, ...],
+) -> None:
+    protected = protect_article_prose({"intro": source}, anchors=())
+
+    assert protected_value in {value for _token, value in protected.token_values}
+    for mutable in mutable_values:
+        assert mutable in protected.document
+
+
+@pytest.mark.parametrize(
     ("source", "protected_value", "mutable_text"),
     [
         (
@@ -971,6 +1046,40 @@ def test_incremental_ndjson_scanner_does_linear_work_for_one_byte_chunks() -> No
 
     assert parser.scan_work == size
     assert len(parser.pending) == size
+
+
+def test_ndjson_parser_compacts_large_many_line_chunk_only_once() -> None:
+    parser = humanizer_module._NdjsonBuffer()
+    state = humanizer_module._StreamState()
+    blank_lines = 10_000
+    payload = (
+        _event_bytes([COMPLETE_EVENTS[0]])
+        + (b"\n" * blank_lines)
+        + _event_bytes(
+            [
+                {"type": "result-start"},
+                {"type": "result-delta", "text": "결과"},
+                COMPLETE_EVENTS[-1],
+            ]
+        )
+    )
+
+    parser.feed(payload, state)
+
+    assert state.done is True
+    assert parser.scan_work == len(payload)
+    assert parser.compactions == 1
+    assert parser.compaction_work == 0
+    assert parser.pending == b""
+
+
+def test_client_accepts_final_unterminated_valid_done_record() -> None:
+    client = HumanizerClient(
+        "http://127.0.0.1:3210",
+        transport=_transport(_event_bytes(COMPLETE_EVENTS, trailing_newline=False)),
+    )
+
+    assert client.transform("원문") == "자연스러운 문장"
 
 
 def test_candidate_preserves_inline_markdown_and_citation_markers() -> None:

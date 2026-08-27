@@ -49,6 +49,14 @@ _MARKDOWN_PATTERN = re.compile(
 )
 _URL_PATTERN = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
 _DIGIT_TOKEN_PATTERN = re.compile(r"(?<!\S)\S*\d\S*(?!\S)")
+_REFERENCE_START_PATTERN = re.compile(
+    r"^ {0,3}\[[^\]\r\n]+\]:[ \t]*(?P<rest>[^\r\n]*)$"
+)
+_REFERENCE_TITLE_PATTERNS = (
+    re.compile(r'^"(?:\\.|[^"\\])*"$'),
+    re.compile(r"^'(?:\\.|[^'\\])*'$"),
+    re.compile(r"^\((?:\\.|[^)\\])*\)$"),
+)
 _SENSITIVE_PATTERNS = (_DIGIT_TOKEN_PATTERN,)
 _EVENT_PHASES = frozenset({"sanitize", "chunk", "transform", "verify", "assemble"})
 _ERROR_CODES = frozenset(
@@ -407,23 +415,32 @@ class _NdjsonBuffer:
     pending: bytearray = field(default_factory=bytearray)
     scan_offset: int = 0
     scan_work: int = 0
+    compactions: int = 0
+    compaction_work: int = 0
 
     def feed(self, chunk: bytes, state: _StreamState) -> None:
         self.pending.extend(chunk)
+        consumed = 0
         while True:
             line_end = self.pending.find(b"\n", self.scan_offset)
             if line_end < 0:
                 self.scan_work += len(self.pending) - self.scan_offset
                 self.scan_offset = len(self.pending)
-                return
+                break
             self.scan_work += line_end + 1 - self.scan_offset
-            line = bytes(self.pending[:line_end])
-            del self.pending[: line_end + 1]
-            self.scan_offset = 0
+            line = bytes(self.pending[consumed:line_end])
+            consumed = line_end + 1
+            self.scan_offset = consumed
             if line.endswith(b"\r"):
                 line = line[:-1]
             if line:
                 _consume_event_bytes(line, state)
+        if consumed:
+            remaining = len(self.pending) - consumed
+            self.compaction_work += remaining
+            self.compactions += 1
+            del self.pending[:consumed]
+            self.scan_offset -= consumed
 
     def finish(self, state: _StreamState) -> None:
         if self.pending:
@@ -717,18 +734,30 @@ def _markdown_protected_lines(document: str) -> tuple[str, ...]:
     index = 0
     while index < len(lines):
         line = lines[index]
-        stripped = line.lstrip(" ")
-        is_reference = (
-            len(line) - len(stripped) <= 3
-            and stripped.startswith("[")
-            and "]:" in stripped
-        )
-        if is_reference:
+        first_line = line.rstrip("\r\n")
+        reference = _REFERENCE_START_PATTERN.fullmatch(first_line)
+        if reference is not None:
             block = [line]
             index += 1
-            while index < len(lines) and _is_reference_continuation(lines[index]):
-                block.append(lines[index])
-                index += 1
+            rest = reference.group("rest")
+            destination_valid = False
+            title_present = False
+            if rest:
+                destination_valid, title_present = _parse_reference_destination(rest)
+            elif index < len(lines):
+                destination = _indented_reference_content(lines[index])
+                if destination is not None:
+                    destination_valid, title_present = _parse_reference_destination(
+                        destination
+                    )
+                    if destination_valid:
+                        block.append(lines[index])
+                        index += 1
+            if destination_valid and not title_present and index < len(lines):
+                title = _indented_reference_content(lines[index])
+                if title is not None and _is_reference_title(title):
+                    block.append(lines[index])
+                    index += 1
             protected.append("".join(block))
             continue
         if "](" in line:
@@ -737,9 +766,66 @@ def _markdown_protected_lines(document: str) -> tuple[str, ...]:
     return tuple(protected)
 
 
-def _is_reference_continuation(line: str) -> bool:
+def _indented_reference_content(line: str) -> str | None:
     content = line.rstrip("\r\n")
-    return bool(content.strip()) and content.startswith((" ", "\t"))
+    if not content.strip() or not content.startswith((" ", "\t")):
+        return None
+    return content.lstrip(" \t")
+
+
+def _parse_reference_destination(value: str) -> tuple[bool, bool]:
+    material = value.strip()
+    if not material or material.startswith(("\"", "'")):
+        return False, False
+    destination_end = _angle_destination_end(material)
+    if destination_end is None:
+        destination_end = _bare_destination_end(material)
+    if destination_end is None:
+        return False, False
+    remainder = material[destination_end:].strip()
+    if remainder and not _is_reference_title(remainder):
+        return False, False
+    return True, bool(remainder)
+
+
+def _angle_destination_end(value: str) -> int | None:
+    if not value.startswith("<"):
+        return None
+    escaped = False
+    for index, character in enumerate(value[1:], start=1):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "<":
+            return None
+        elif character == ">":
+            return index + 1
+    return None
+
+
+def _bare_destination_end(value: str) -> int | None:
+    depth = 0
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+        elif character.isspace() and depth == 0:
+            return index
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return None
+            depth -= 1
+    return len(value) if depth == 0 and not escaped else None
+
+
+def _is_reference_title(value: str) -> bool:
+    return any(pattern.fullmatch(value) is not None for pattern in _REFERENCE_TITLE_PATTERNS)
 
 
 def _validate_markdown_text(document: str) -> None:
