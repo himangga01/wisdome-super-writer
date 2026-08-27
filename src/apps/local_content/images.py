@@ -6,8 +6,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -39,6 +41,16 @@ _TIMELINE_INPUT_KEYS = (
     "deadline",
     "announcement_date",
 )
+_CARD_TEXT_LIMITS = {
+    "title": (200, 800),
+    "region": (100, 400),
+    "price_summary": (240, 960),
+}
+_MAX_RENDERER_INPUT_CODEPOINTS = 400
+_MAX_RENDERER_INPUT_BYTES = 1400
+_MAX_SUPPLY_COUNT = 999_999_999
+_SUPPLY_VALUE = re.compile(r"(?:0|[1-9][0-9]{0,2}(?:,[0-9]{3}){0,2})세대")
+_DATE_VALUE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 GENERIC_HERO_PATH = (
     Path(__file__).resolve().parents[2] / "static" / "local_articles" / "generic-housing-hero.png"
 )
@@ -249,18 +261,50 @@ def canonical_card_renderer_input(
     if not isinstance(value, dict):
         raise ImageRenderError("card renderer input must be an object")
     kind = value.get("kind")
-    keys = _SUMMARY_INPUT_KEYS if kind == "summary" else _TIMELINE_INPUT_KEYS
     if kind not in {"summary", "timeline"} or (expected_kind and kind != expected_kind):
         raise ImageRenderError("card renderer input kind is invalid")
-    if set(value) != set(keys) or any(not isinstance(value[key], str) for key in keys):
+    keys = _SUMMARY_INPUT_KEYS if kind == "summary" else _TIMELINE_INPUT_KEYS
+    if (
+        len(value) != len(keys)
+        or set(value) != set(keys)
+        or any(not isinstance(value[key], str) for key in keys)
+    ):
         raise ImageRenderError("card renderer input does not match its closed schema")
-    return tuple((key, value[key]) for key in keys)
+
+    canonical: list[tuple[str, str]] = []
+    for key in keys:
+        item = value[key]
+        if key in _CARD_TEXT_LIMITS:
+            item = _canonical_renderer_text(item, key)
+        elif key == "supply":
+            _validate_renderer_supply(item)
+        elif key != "kind":
+            _validate_renderer_date(item, key)
+        canonical.append((key, item))
+
+    total_codepoints = sum(len(item) for _key, item in canonical)
+    try:
+        total_bytes = sum(len(item.encode("utf-8")) for _key, item in canonical)
+    except UnicodeEncodeError as exc:
+        raise ImageRenderError("card renderer input contains invalid Unicode") from exc
+    if (
+        total_codepoints > _MAX_RENDERER_INPUT_CODEPOINTS
+        or total_bytes > _MAX_RENDERER_INPUT_BYTES
+    ):
+        raise ImageRenderError("card renderer input exceeds total resource limit")
+    return tuple(canonical)
 
 
 def rerender_card_bytes(renderer_input: tuple[tuple[str, str], ...]) -> bytes:
     """Deterministically recreate one card from persisted canonical input."""
 
-    return _rerender_card_bytes_cached(_renderer_fingerprint(), renderer_input)
+    canonical = _canonical_renderer_input_pairs(renderer_input)
+    try:
+        return _rerender_card_bytes_cached(_renderer_fingerprint(), canonical)
+    except ImageRenderError:
+        raise
+    except Exception as exc:
+        raise ImageRenderError("card renderer measurement or encoding failed") from exc
 
 
 def card_accessibility_material(
@@ -268,7 +312,7 @@ def card_accessibility_material(
 ) -> tuple[str, str]:
     """Derive exact alt/caption text from canonical renderer input."""
 
-    canonical = canonical_card_renderer_input(dict(renderer_input))
+    canonical = _canonical_renderer_input_pairs(renderer_input)
     values = dict(canonical)
     if values["kind"] == "summary":
         return (
@@ -290,8 +334,7 @@ def _rerender_card_bytes_cached(
     _bound_renderer_fingerprint: str,
     renderer_input: tuple[tuple[str, str], ...],
 ) -> bytes:
-    canonical = canonical_card_renderer_input(dict(renderer_input))
-    values = dict(canonical)
+    values = dict(renderer_input)
     image = (
         _render_summary_image(values)
         if values["kind"] == "summary"
@@ -480,12 +523,17 @@ def _fit_text(
 
 
 def _summary_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ...]:
-    supply = (
-        f"{notice.supply_count:,}세대"
-        if notice.supply_count is not None
-        else UNKNOWN_VALUE
-    )
-    return (
+    if notice.supply_count is None:
+        supply = UNKNOWN_VALUE
+    elif (
+        type(notice.supply_count) is not int
+        or notice.supply_count < 0
+        or notice.supply_count > _MAX_SUPPLY_COUNT
+    ):
+        raise ImageRenderError("card renderer input supply is outside the supported range")
+    else:
+        supply = f"{notice.supply_count:,}세대"
+    material = (
         ("kind", "summary"),
         ("title", _known(notice.title)),
         ("region", _known(notice.region)),
@@ -493,10 +541,11 @@ def _summary_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ...
         ("application_start", _date(notice.application_start)),
         ("price_summary", _known(notice.price_summary)),
     )
+    return canonical_card_renderer_input(dict(material), expected_kind="summary")
 
 
 def _timeline_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ...]:
-    return (
+    material = (
         ("kind", "timeline"),
         ("title", _known(notice.title)),
         ("application_start", _date(notice.application_start)),
@@ -504,6 +553,7 @@ def _timeline_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ..
         ("deadline", _date(notice.deadline)),
         ("announcement_date", _date(notice.announcement_date)),
     )
+    return canonical_card_renderer_input(dict(material), expected_kind="timeline")
 
 
 def _timeline_events(values: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -520,12 +570,79 @@ def _known(value: str | None) -> str:
         " " if unicodedata.category(character) in {"Cc", "Cf"} else character
         for character in value or ""
     )
-    normalized = " ".join(normalized.split())
+    normalized = unicodedata.normalize("NFC", " ".join(normalized.split()))
     return normalized or UNKNOWN_VALUE
 
 
 def _date(value: object | None) -> str:
-    return value.isoformat() if value is not None else UNKNOWN_VALUE  # type: ignore[union-attr]
+    if value is None:
+        return UNKNOWN_VALUE
+    if type(value) is not date:
+        raise ImageRenderError("card renderer input date must be an exact date")
+    return value.isoformat()
+
+
+def _canonical_renderer_input_pairs(
+    renderer_input: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    if (
+        not isinstance(renderer_input, tuple)
+        or len(renderer_input) not in {len(_SUMMARY_INPUT_KEYS), len(_TIMELINE_INPUT_KEYS)}
+    ):
+        raise ImageRenderError("card renderer input must be canonical key/value pairs")
+    if any(
+        not isinstance(pair, tuple)
+        or len(pair) != 2
+        or not isinstance(pair[0], str)
+        or not isinstance(pair[1], str)
+        for pair in renderer_input
+    ):
+        raise ImageRenderError("card renderer input must be canonical key/value pairs")
+    if len(renderer_input) != len({key for key, _item in renderer_input}):
+        raise ImageRenderError("card renderer input contains duplicate keys")
+    canonical = canonical_card_renderer_input(dict(renderer_input))
+    if renderer_input != canonical:
+        raise ImageRenderError("card renderer input key order is not canonical")
+    return canonical
+
+
+def _canonical_renderer_text(value: str, field: str) -> str:
+    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+        raise ImageRenderError(f"card renderer input {field} contains control characters")
+    normalized = unicodedata.normalize("NFC", " ".join(value.split()))
+    if not normalized or normalized != value:
+        raise ImageRenderError(f"card renderer input {field} is not canonical")
+    max_codepoints, max_bytes = _CARD_TEXT_LIMITS[field]
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ImageRenderError(f"card renderer input {field} contains invalid Unicode") from exc
+    if len(value) > max_codepoints or len(encoded) > max_bytes:
+        raise ImageRenderError(f"card renderer input {field} exceeds resource limit")
+    return normalized
+
+
+def _validate_renderer_date(value: str, field: str) -> None:
+    if value == UNKNOWN_VALUE:
+        return
+    if _DATE_VALUE.fullmatch(value) is None:
+        raise ImageRenderError(f"card renderer input {field} is not an exact YYYY-MM-DD date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ImageRenderError(f"card renderer input {field} is not a calendar date") from exc
+    if parsed.isoformat() != value:
+        raise ImageRenderError(f"card renderer input {field} is not canonical")
+
+
+def _validate_renderer_supply(value: str) -> None:
+    if value == UNKNOWN_VALUE:
+        return
+    if _SUPPLY_VALUE.fullmatch(value) is None:
+        raise ImageRenderError("card renderer input supply is not a canonical bounded decimal")
+    count = int(value.removesuffix("세대").replace(",", ""))
+    if count > _MAX_SUPPLY_COUNT or value != f"{count:,}세대":
+        raise ImageRenderError("card renderer input supply exceeds its decimal limit")
 
 
 def _timeline_value_lines(value: str) -> tuple[str, ...]:

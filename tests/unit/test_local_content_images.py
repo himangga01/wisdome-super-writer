@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from PIL import Image
 
+import apps.local_content.images as image_module
 from apps.local_content.contracts import HousingNotice
 from apps.local_content.images import (
     GENERIC_HERO_CAPTION,
@@ -16,10 +17,12 @@ from apps.local_content.images import (
     ImageRenderError,
     _timeline_value_lines,
     build_image_set,
+    canonical_card_renderer_input,
     card_renderer_material,
     fingerprint_renderer_material,
     render_summary_card,
     render_timeline,
+    rerender_card_bytes,
 )
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -187,3 +190,87 @@ def test_whitespace_title_is_unknown_in_card_pixels_and_alt(tmp_path: Path) -> N
 
     assert summary.alt.startswith("공고문에서 직접 확인 필요")
     assert timeline.alt.startswith("공고문에서 직접 확인 필요")
+
+
+def test_card_renderer_input_requires_exact_canonical_summary_values() -> None:
+    canonical = {
+        "kind": "summary",
+        "title": "서울 해오름 A단지 주택공급",
+        "region": "서울특별시",
+        "supply": "1,147세대",
+        "application_start": "2026-09-07",
+        "price_summary": "공고문 기준",
+    }
+
+    assert canonical_card_renderer_input(canonical) == tuple(canonical.items())
+
+    invalid_values = (
+        {**canonical, "extra": "attacker-controlled"},
+        {**canonical, "title": 123},
+        {**canonical, "title": ""},
+        {**canonical, "title": "서울\n주택"},
+        {**canonical, "region": " 서울특별시 "},
+        {**canonical, "price_summary": "공고문\u200b 기준"},
+        {**canonical, "supply": "1147세대"},
+        {**canonical, "supply": "-1세대"},
+        {**canonical, "supply": "999,999,999,999세대"},
+        {**canonical, "application_start": "2026-9-7"},
+        {**canonical, "application_start": "2026-02-30"},
+    )
+    for invalid in invalid_values:
+        with pytest.raises(ImageRenderError, match="renderer input"):
+            canonical_card_renderer_input(invalid)
+
+
+def test_card_renderer_input_enforces_field_and_total_resource_limits() -> None:
+    base = {
+        "kind": "summary",
+        "title": "서울 주택공급",
+        "region": "서울특별시",
+        "supply": "1세대",
+        "application_start": "2026-09-07",
+        "price_summary": "공고문 기준",
+    }
+
+    for field in ("title", "region", "price_summary"):
+        with pytest.raises(ImageRenderError, match="limit"):
+            canonical_card_renderer_input({**base, field: "가" * 10_000})
+
+    byte_heavy = {**base, "title": "😀" * 2_000}
+    with pytest.raises(ImageRenderError, match="limit"):
+        canonical_card_renderer_input(byte_heavy)
+
+    aggregate_codepoint_heavy = {
+        **base,
+        "title": "가" * 180,
+        "region": "나" * 90,
+        "price_summary": "다" * 180,
+    }
+    with pytest.raises(ImageRenderError, match="total resource limit"):
+        canonical_card_renderer_input(aggregate_codepoint_heavy)
+
+    aggregate_byte_heavy = {
+        **base,
+        "title": "😀" * 150,
+        "region": "😀" * 75,
+        "price_summary": "😀" * 150,
+    }
+    with pytest.raises(ImageRenderError, match="total resource limit"):
+        canonical_card_renderer_input(aggregate_byte_heavy)
+
+
+def test_invalid_renderer_input_is_rejected_before_entering_rerender_cache() -> None:
+    image_module._rerender_card_bytes_cached.cache_clear()
+    malformed = (
+        ("kind", "timeline"),
+        ("title", "서울 주택공급"),
+        ("application_start", "not-a-date"),
+        ("application_end", "2026-09-09"),
+        ("deadline", "공고문에서 직접 확인 필요"),
+        ("announcement_date", "2026-09-16"),
+    )
+
+    with pytest.raises(ImageRenderError, match="renderer input"):
+        rerender_card_bytes(malformed)
+
+    assert image_module._rerender_card_bytes_cached.cache_info().currsize == 0

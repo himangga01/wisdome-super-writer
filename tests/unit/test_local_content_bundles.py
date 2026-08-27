@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 
 import apps.local_content.bundles as bundle_module
+import apps.local_content.images as image_module
 from apps.local_content.bundles import (
     ArticleBundle,
     ArticleBundleWriter,
@@ -112,6 +113,10 @@ def _manifest_bundle_hash(manifest: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _nested_json_document(depth: int) -> str:
+    return '{"value":' * depth + '"safe"' + "}" * depth
+
+
 def test_bundle_write_is_atomic_and_repeatable(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     root = tmp_path / "output"
@@ -170,7 +175,17 @@ def test_repeat_rejects_tampered_manifest_identity_fields(tmp_path: Path) -> Non
         writer.write(bundle)
 
 
-@pytest.mark.parametrize("raw_manifest", ["[1]", "42", "NaN", '{"schema_version": NaN}'])
+@pytest.mark.parametrize(
+    "raw_manifest",
+    [
+        "[1]",
+        "42",
+        "NaN",
+        '{"schema_version": NaN}',
+        _nested_json_document(80),
+        _nested_json_document(2_000),
+    ],
+)
 def test_article_manifest_requires_strict_json_object(
     tmp_path: Path, raw_manifest: str
 ) -> None:
@@ -180,6 +195,21 @@ def test_article_manifest_requires_strict_json_object(
     (published / "manifest.json").write_text(raw_manifest, encoding="utf-8")
 
     with pytest.raises(BundlePublishError, match="JSON object|JSON manifest"):
+        writer._existing_hash(published)
+
+
+def test_article_manifest_rejects_duplicate_keys(tmp_path: Path) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(_bundle(tmp_path))
+    manifest_path = published / "manifest.json"
+    raw = manifest_path.read_text("utf-8").replace(
+        '"schema_version": 1',
+        '"schema_version": 1,\n  "schema_version": 1',
+        1,
+    )
+    manifest_path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="duplicate|JSON manifest"):
         writer._existing_hash(published)
 
 
@@ -557,6 +587,27 @@ def test_bundle_allows_only_utf8_markdown_or_valid_json_and_png_webp(
 
 
 @pytest.mark.parametrize(
+    "document",
+    [
+        '{"safe": 1, "safe": 2}',
+        _nested_json_document(80),
+        _nested_json_document(2_000),
+        json.dumps({"values": [0] * 10_100}),
+    ],
+    ids=["duplicate-key", "depth-limit", "parser-recursion", "node-limit"],
+)
+def test_bundle_json_rejects_duplicate_or_resource_exhausting_documents(
+    tmp_path: Path, document: str
+) -> None:
+    file = BundleFile.text("sources.json", document, "application/json")
+
+    with pytest.raises(BundlePublishError, match="JSON|depth|node|resource"):
+        ArticleBundleWriter(tmp_path / "output").write(
+            ArticleBundle(date(2026, 8, 28), "safe", (file,))
+        )
+
+
+@pytest.mark.parametrize(
     ("path", "mime_type", "payload"),
     [
         (
@@ -767,6 +818,22 @@ def test_bundle_rejects_arbitrary_webp_with_copied_card_labels_and_fingerprint(
         )
 
 
+def test_bundle_converts_card_measurement_failure_to_publish_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+
+    def fail_measurement(*_args: object, **_kwargs: object) -> float:
+        raise OverflowError("synthetic Pillow measurement overflow")
+
+    image_module._rerender_card_bytes_cached.cache_clear()
+    monkeypatch.setattr(image_module.ImageDraw.ImageDraw, "textlength", fail_measurement)
+
+    with pytest.raises(BundlePublishError, match="renderer|rerender|measurement"):
+        ArticleBundleWriter(tmp_path / "output").write(bundle)
+
+
 def test_exact_replay_reapplies_image_rights_and_provenance_semantics(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     writer = ArticleBundleWriter(tmp_path / "output")
@@ -879,7 +946,7 @@ def test_article_retry_uses_new_stage_without_deleting_abandoned_replace_stage(
     assert tuple((tmp_path / "output").rglob("*.tmp-*")) == abandoned
 
 
-def test_concurrent_identical_publish_cleans_its_validated_losing_stage(
+def test_concurrent_identical_publish_retains_losing_stage_and_injected_material(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle = _bundle(tmp_path)
@@ -891,6 +958,7 @@ def test_concurrent_identical_publish_cleans_its_validated_losing_stage(
     ) -> None:
         if Path(target).name == bundle.slug:
             shutil.copytree(source, target)
+            (Path(source) / "foreign-injected.txt").write_bytes(b"must remain untouched")
             raise OSError(errno.EEXIST, "injected concurrent winner")
         original_replace(source, target)
 
@@ -899,7 +967,9 @@ def test_concurrent_identical_publish_cleans_its_validated_losing_stage(
     published = writer.write(bundle)
 
     assert published.name == bundle.slug
-    assert not list((tmp_path / "output").rglob("*.tmp-*"))
+    stages = list((tmp_path / "output").rglob("*.tmp-*"))
+    assert len(stages) == 1
+    assert (stages[0] / "foreign-injected.txt").read_bytes() == b"must remain untouched"
 
 
 def test_article_publish_rejects_owned_stage_substitution_during_replace(
@@ -926,6 +996,44 @@ def test_article_publish_rejects_owned_stage_substitution_during_replace(
 
     with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
         writer.write(bundle)
+    assert backup.is_dir()
+
+
+def test_article_publish_rechecks_owned_target_after_complete_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    target = tmp_path / "output" / "2026-08-28" / bundle.slug
+    backup = tmp_path / "validated-owned-target"
+    replacement = tmp_path / "substituted-owned-target"
+    real_existing_hash = writer._existing_hash
+    real_replace = bundle_module.os.replace
+    substituted = False
+
+    def substitute_after_identity_before_validation(
+        path: Path,
+        *,
+        expected_slug: str | None = None,
+        allow_staging_name: bool = False,
+    ) -> str:
+        nonlocal substituted
+        if path == target and not substituted:
+            substituted = True
+            shutil.copytree(path, replacement)
+            real_replace(path, backup)
+            real_replace(replacement, path)
+        return real_existing_hash(
+            path,
+            expected_slug=expected_slug,
+            allow_staging_name=allow_staging_name,
+        )
+
+    monkeypatch.setattr(writer, "_existing_hash", substitute_after_identity_before_validation)
+
+    with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
+        writer.write(bundle)
+    assert substituted is True
     assert backup.is_dir()
 
 
@@ -981,7 +1089,17 @@ def test_run_manifest_is_a_required_verified_commit_marker(tmp_path: Path) -> No
         writer.validate_run(date(2026, 8, 28))
 
 
-@pytest.mark.parametrize("raw_manifest", ["[]", "null", "Infinity", '{"run_date": NaN}'])
+@pytest.mark.parametrize(
+    "raw_manifest",
+    [
+        "[]",
+        "null",
+        "Infinity",
+        '{"run_date": NaN}',
+        _nested_json_document(80),
+        _nested_json_document(2_000),
+    ],
+)
 def test_run_manifest_requires_strict_json_object(
     tmp_path: Path, raw_manifest: str
 ) -> None:
@@ -992,6 +1110,21 @@ def test_run_manifest_requires_strict_json_object(
     (run_path / "manifest.json").write_text(raw_manifest, encoding="utf-8")
 
     with pytest.raises(BundlePublishError, match="JSON object|JSON manifest"):
+        writer.validate_run(date(2026, 8, 28))
+
+
+def test_run_manifest_rejects_duplicate_keys(tmp_path: Path) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    run_path = writer.write_run(date(2026, 8, 28), "# 주간 주거 공고\n")
+    manifest_path = run_path / "manifest.json"
+    raw = manifest_path.read_text("utf-8").replace(
+        '"schema_version": 1',
+        '"schema_version": 1,\n  "schema_version": 1',
+        1,
+    )
+    manifest_path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="duplicate|JSON manifest"):
         writer.validate_run(date(2026, 8, 28))
 
 
@@ -1109,6 +1242,116 @@ def test_run_publish_rejects_owned_temp_substitution_during_replace(
 
     with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
         writer.write_run(date(2026, 8, 28), index, (bundle,))
+    assert backup.is_file()
+
+
+def test_run_temp_substitution_after_handle_read_is_rejected_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    run_root = tmp_path / "output" / "2026-08-28"
+    backup = tmp_path / "read-owned-index-temp"
+    replacement = tmp_path / "substituted-index-temp"
+    real_read_bound_file = bundle_module._read_bound_file
+    real_replace = bundle_module.os.replace
+    substituted = False
+
+    def substitute_after_handle_read(
+        path: Path,
+        expected_fingerprint: tuple[object, ...],
+        *,
+        max_bytes: int,
+        label: str,
+    ) -> bytes:
+        nonlocal substituted
+        observed = real_read_bound_file(
+            path,
+            expected_fingerprint,
+            max_bytes=max_bytes,
+            label=label,
+        )
+        if label == "run index temp" and not substituted:
+            substituted = True
+            shutil.copy2(path, replacement)
+            real_replace(path, backup)
+            real_replace(replacement, path)
+        return observed
+
+    monkeypatch.setattr(bundle_module, "_read_bound_file", substitute_after_handle_read)
+
+    with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
+        writer.write_run(date(2026, 8, 28), "# 주간 주거 공고\n")
+    assert substituted is True
+    assert backup.is_file()
+    assert not (run_root / "index.md").exists()
+
+
+@pytest.mark.parametrize("target_name", ["index.md", "manifest.json"])
+def test_run_target_rechecks_identity_after_handle_bound_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    backup = tmp_path / f"validated-{target_name}"
+    replacement = tmp_path / f"substituted-{target_name}"
+    real_read_bound_file = bundle_module._read_bound_file
+    real_replace = bundle_module.os.replace
+    substituted = False
+
+    def substitute_after_handle_read(
+        path: Path,
+        expected_fingerprint: tuple[object, ...],
+        *,
+        max_bytes: int,
+        label: str,
+    ) -> bytes:
+        nonlocal substituted
+        observed = real_read_bound_file(
+            path,
+            expected_fingerprint,
+            max_bytes=max_bytes,
+            label=label,
+        )
+        expected_label = (
+            f"published run {target_name.removesuffix('.md').removesuffix('.json')}"
+        )
+        if label == expected_label and not substituted:
+            substituted = True
+            shutil.copy2(path, replacement)
+            real_replace(path, backup)
+            real_replace(replacement, path)
+        return observed
+
+    monkeypatch.setattr(bundle_module, "_read_bound_file", substitute_after_handle_read)
+
+    with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
+        writer.write_run(date(2026, 8, 28), "# 주간 주거 공고\n")
+    assert substituted is True
+    assert backup.is_file()
+
+
+def test_run_publish_rechecks_owned_targets_after_complete_run_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    backup = tmp_path / "fully-validated-run-manifest"
+    replacement = tmp_path / "substituted-run-manifest"
+    real_validate_run = writer.validate_run
+    real_replace = bundle_module.os.replace
+
+    def validate_then_substitute(run_date: date) -> Path:
+        run_root = real_validate_run(run_date)
+        target = run_root / "manifest.json"
+        shutil.copy2(target, replacement)
+        real_replace(target, backup)
+        real_replace(replacement, target)
+        return run_root
+
+    monkeypatch.setattr(writer, "validate_run", validate_then_substitute)
+
+    with pytest.raises(BundlePublishError, match="owned|substitut|identity"):
+        writer.write_run(date(2026, 8, 28), "# 주간 주거 공고\n")
     assert backup.is_file()
 
 

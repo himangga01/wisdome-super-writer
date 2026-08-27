@@ -76,6 +76,8 @@ _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 _MAX_IMAGE_EDGE = 4096
 _MAX_IMAGE_PIXELS = 16_000_000
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 10_000
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _ALLOWED_WSW_COMMENT = re.compile(
     r"<!-- WSW:(?:block|endblock|slot):[a-z0-9_-]+ -->"
@@ -273,18 +275,22 @@ class ArticleBundleWriter:
                 os.replace(staging, target)
             except OSError as exc:
                 if target.is_dir() and self._existing_hash(target) == bundle.bundle_hash:
-                    self._cleanup_owned_staging(staging, owned_stage_fingerprint)
                     return target
                 raise BundlePublishError(f"atomic bundle publish failed: {target}") from exc
-            if (
-                _path_identity_fingerprint(target, "published bundle", BundlePublishError)
-                != owned_stage_fingerprint
-            ):
-                raise BundlePublishError(f"owned stage identity was substituted: {target}")
+            _require_owned_identity(
+                target,
+                owned_stage_fingerprint,
+                "published bundle",
+            )
             if self._existing_hash(target) != bundle.bundle_hash:
                 raise BundlePublishError(f"published bundle does not match owned stage: {target}")
             _fsync_directory(date_root)
             _fsync_directory(root)
+            _require_owned_identity(
+                target,
+                owned_stage_fingerprint,
+                "fully validated published bundle",
+            )
             return target
         except BundlePublishError:
             raise
@@ -352,9 +358,11 @@ class ArticleBundleWriter:
                 index_payload,
                 "run index temp",
             )
-            os.replace(index_tmp, run_root / "index.md")
+            index_target = run_root / "index.md"
+            manifest_target = run_root / "manifest.json"
+            os.replace(index_tmp, index_target)
             self._validate_owned_run_temp(
-                run_root / "index.md",
+                index_target,
                 index_fingerprint,
                 index_payload,
                 "published run index",
@@ -366,9 +374,9 @@ class ArticleBundleWriter:
                 manifest_payload,
                 "run manifest temp",
             )
-            os.replace(manifest_tmp, run_root / "manifest.json")
+            os.replace(manifest_tmp, manifest_target)
             self._validate_owned_run_temp(
-                run_root / "manifest.json",
+                manifest_target,
                 manifest_fingerprint,
                 manifest_payload,
                 "published run manifest",
@@ -379,7 +387,18 @@ class ArticleBundleWriter:
             raise
         except OSError as exc:
             raise BundlePublishError(f"run publish failed: {run_root}") from exc
-        return self.validate_run(run_date)
+        validated_run = self.validate_run(run_date)
+        _require_owned_identity(
+            index_target,
+            index_fingerprint,
+            "fully validated published run index",
+        )
+        _require_owned_identity(
+            manifest_target,
+            manifest_fingerprint,
+            "fully validated published run manifest",
+        )
+        return validated_run
 
     def validate_run(self, run_date: date) -> Path:
         """Validate the run manifest commit marker before any reader uses the index."""
@@ -535,31 +554,19 @@ class ArticleBundleWriter:
             return
         if extension == ".json" and item.mime_type == "application/json":
             document = _decode_utf8(payload, item.path)
-            _reject_raw_html(document, item.path)
-            try:
-                parsed = json.loads(
-                    document,
-                    parse_constant=_reject_json_constant,
-                    object_pairs_hook=_strict_json_object_pairs,
-                )
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise BundleValidationError(f"JSON file is invalid: {item.path}") from exc
-            _reject_html_in_json_values(parsed, item.path)
+            _parse_strict_json_document(document, f"JSON file {item.path}")
             return
         if extension == ".ndjson" and item.mime_type == "application/x-ndjson":
             document = _decode_utf8(payload, item.path)
-            _reject_raw_html(document, item.path)
-            try:
-                for line in document.splitlines():
-                    if line.strip():
-                        parsed = json.loads(
-                            line,
-                            parse_constant=_reject_json_constant,
-                            object_pairs_hook=_strict_json_object_pairs,
-                        )
-                        _reject_html_in_json_values(parsed, item.path)
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise BundleValidationError(f"JSON file is invalid: {item.path}") from exc
+            remaining_nodes = _MAX_JSON_NODES
+            for line in document.splitlines():
+                if line.strip():
+                    _parsed, observed_nodes = _parse_strict_json_document(
+                        line,
+                        f"NDJSON file {item.path}",
+                        max_nodes=remaining_nodes,
+                    )
+                    remaining_nodes -= observed_nodes
             return
         raise BundleValidationError(f"bundle file type is not allowed: {item.path}")
 
@@ -652,8 +659,8 @@ class ArticleBundleWriter:
                 rerendered = rerender_card_bytes(canonical_input)
                 expected_alt, expected_caption = card_accessibility_material(canonical_input)
             except ImageRenderError as exc:
-                raise BundleValidationError(
-                    f"derived card renderer input is invalid: {item.path}"
+                raise BundlePublishError(
+                    f"derived card renderer or rerender failed: {item.path}"
                 ) from exc
             if rerendered != payload:
                 raise BundleValidationError(
@@ -810,28 +817,13 @@ class ArticleBundleWriter:
             return staging, fingerprint
         raise BundlePublishError("could not allocate a unique writer-owned staging directory")
 
-    def _cleanup_owned_staging(
-        self,
-        staging: Path,
-        owned_fingerprint: tuple[object, ...],
-    ) -> None:
-        current = _path_identity_fingerprint(staging, "owned staging", BundlePublishError)
-        if current != owned_fingerprint:
-            raise BundlePublishError(f"owned staging identity changed before cleanup: {staging}")
-        _remove_tree_no_follow(staging)
-        _fsync_directory(staging.parent)
-
     def _validate_owned_article_stage(
         self,
         staging: Path,
         owned_fingerprint: tuple[object, ...],
         bundle: ArticleBundle,
     ) -> None:
-        if (
-            _path_identity_fingerprint(staging, "owned staging", BundlePublishError)
-            != owned_fingerprint
-        ):
-            raise BundlePublishError(f"owned staging identity changed: {staging}")
+        _require_owned_identity(staging, owned_fingerprint, "owned staging")
         observed_hash = self._existing_hash(
             staging,
             expected_slug=bundle.slug,
@@ -839,6 +831,11 @@ class ArticleBundleWriter:
         )
         if observed_hash != bundle.bundle_hash:
             raise BundlePublishError(f"owned staging manifest does not match bundle: {staging}")
+        _require_owned_identity(
+            staging,
+            owned_fingerprint,
+            "fully validated owned staging",
+        )
 
     def _write_owned_run_temp(
         self,
@@ -872,9 +869,7 @@ class ArticleBundleWriter:
         expected_payload: bytes,
         label: str,
     ) -> None:
-        current_identity = _path_identity_fingerprint(path, label, BundlePublishError)
-        if current_identity != owned_fingerprint:
-            raise BundlePublishError(f"{label} owned identity was substituted: {path}")
+        _require_owned_identity(path, owned_fingerprint, label)
         current_fingerprint = _path_fingerprint(path, label, BundlePublishError)
         observed = _read_bound_file(
             path,
@@ -884,6 +879,7 @@ class ArticleBundleWriter:
         )
         if observed != expected_payload:
             raise BundlePublishError(f"{label} bytes were substituted: {path}")
+        _require_owned_identity(path, owned_fingerprint, f"handle-validated {label}")
 
     def _publication_target(self, primary: Path, bundle_hash: str) -> Path:
         self._assert_no_symlink(primary)
@@ -1087,16 +1083,34 @@ def _reject_raw_html(
         raise BundleValidationError(f"raw HTML or SVG is not allowed: {path}")
 
 
-def _reject_html_in_json_values(value: object, path: str) -> None:
-    if isinstance(value, str):
-        _reject_raw_html(value, path)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _reject_html_in_json_values(key, path)
-            _reject_html_in_json_values(item, path)
-    elif isinstance(value, list):
-        for item in value:
-            _reject_html_in_json_values(item, path)
+def _reject_html_in_json_values(
+    value: object,
+    path: str,
+    *,
+    max_nodes: int = _MAX_JSON_NODES,
+) -> int:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    observed_nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        observed_nodes += 1
+        if depth > _MAX_JSON_DEPTH:
+            raise BundlePublishError(f"JSON depth resource limit exceeded: {path}")
+        if observed_nodes > max_nodes:
+            raise BundlePublishError(f"JSON node resource limit exceeded: {path}")
+        if isinstance(current, str):
+            _reject_raw_html(current, path)
+        elif isinstance(current, dict):
+            if observed_nodes + (len(current) * 2) > max_nodes:
+                raise BundlePublishError(f"JSON node resource limit exceeded: {path}")
+            for key, item in current.items():
+                stack.append((item, depth + 1))
+                stack.append((key, depth + 1))
+        elif isinstance(current, list):
+            if observed_nodes + len(current) > max_nodes:
+                raise BundlePublishError(f"JSON node resource limit exceeded: {path}")
+            stack.extend((item, depth + 1) for item in current)
+    return observed_nodes
 
 
 def _reject_json_constant(value: str) -> None:
@@ -1112,17 +1126,43 @@ def _strict_json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, obje
     return result
 
 
-def _parse_strict_json_object(payload: bytes, label: str) -> dict[str, object]:
+def _parse_strict_json_document(
+    document: str,
+    label: str,
+    *,
+    max_nodes: int = _MAX_JSON_NODES,
+) -> tuple[object, int]:
     try:
-        document = payload.decode("utf-8", errors="strict")
         _reject_raw_html(document, label)
         value = json.loads(
             document,
             parse_constant=_reject_json_constant,
             object_pairs_hook=_strict_json_object_pairs,
         )
-        _reject_html_in_json_values(value, label)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        observed_nodes = _reject_html_in_json_values(
+            value,
+            label,
+            max_nodes=max_nodes,
+        )
+    except BundlePublishError:
+        raise
+    except BundleValidationError as exc:
+        raise BundlePublishError(str(exc)) from exc
+    except (RecursionError, ValueError) as exc:
+        raise BundlePublishError(f"{label} is invalid") from exc
+    return value, observed_nodes
+
+
+def _parse_strict_json_object(payload: bytes, label: str) -> dict[str, object]:
+    try:
+        document = payload.decode("utf-8", errors="strict")
+        value, _observed_nodes = _parse_strict_json_document(
+            document,
+            f"{label} JSON manifest",
+        )
+    except BundlePublishError:
+        raise
+    except UnicodeDecodeError as exc:
         raise BundlePublishError(f"{label} JSON manifest is invalid") from exc
     if not isinstance(value, dict):
         raise BundlePublishError(f"{label} JSON manifest must be an object")
@@ -1346,6 +1386,18 @@ def _path_identity_fingerprint(
     return (file_type, device, inode, attributes)
 
 
+def _require_owned_identity(
+    path: Path,
+    expected: tuple[object, ...],
+    label: str,
+) -> None:
+    observed = _path_identity_fingerprint(path, label, BundlePublishError)
+    if observed != expected:
+        raise BundlePublishError(
+            f"{label} owned identity, type, or reparse state was substituted: {path}"
+        )
+
+
 def _require_unchanged_fingerprint(
     path: Path,
     expected: tuple[object, ...],
@@ -1514,17 +1566,3 @@ def _parent_directories(paths: set[str] | frozenset[str]) -> set[str]:
             result.add(parent.as_posix())
             parent = parent.parent
     return result
-
-
-def _remove_tree_no_follow(root: Path) -> None:
-    files, directories = _scan_tree(root, BundlePublishError)
-    for relative in sorted(files, key=lambda value: value.count("/"), reverse=True):
-        target = root.joinpath(*PurePosixPath(relative).parts)
-        _lstat_no_links(target, "stale staging", BundlePublishError)
-        target.unlink()
-    for relative in sorted(directories, key=lambda value: value.count("/"), reverse=True):
-        target = root.joinpath(*PurePosixPath(relative).parts)
-        _require_regular_directory(target, "stale staging", BundlePublishError)
-        target.rmdir()
-    _require_regular_directory(root, "stale staging", BundlePublishError)
-    root.rmdir()
