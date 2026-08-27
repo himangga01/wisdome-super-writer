@@ -184,14 +184,18 @@ class OfficialHtmlFetcher:
         if normalized_host not in self._allowed_hosts:
             raise OfficialSourceError("Official source URL host is not approved")
         path = parsed.path or "/"
-        decoded_path = unquote(path)
+        try:
+            decoded_path = unquote(path, errors="strict")
+        except UnicodeDecodeError:
+            raise OfficialSourceError("Official source URL path encoding is invalid") from None
         if (
             "\\" in decoded_path
+            or re.search(r"%[0-9a-f]{2}", decoded_path, re.IGNORECASE)
             or re.search(r"%(?:2f|5c)", path, re.IGNORECASE)
             or any(segment in {".", ".."} for segment in decoded_path.split("/"))
         ):
             raise OfficialSourceError("Official source URL path is ambiguous or traversing")
-        if not any(_path_has_prefix(path, prefix) for prefix in self._path_prefixes):
+        if not any(_path_has_prefix(decoded_path, prefix) for prefix in self._path_prefixes):
             raise OfficialSourceError("Official source URL path is not approved")
 
 
@@ -240,13 +244,19 @@ def _status_error(status_code: int, url: str) -> OfficialSourceError:
 def _retry_after_seconds(value: str | None) -> float:
     if not value:
         return 0.0
-    try:
-        return max(0.0, float(int(value.strip())))
-    except ValueError:
+    stripped = value.strip()
+    if stripped.isascii() and stripped.isdigit():
+        significant = stripped.lstrip("0") or "0"
+        if len(significant) > 9:
+            return float("inf")
         try:
-            parsed = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return max(0.0, (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds())
+            return float(int(significant))
+        except (ValueError, OverflowError):
+            return float("inf")
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max(0.0, (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds())

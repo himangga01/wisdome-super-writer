@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import threading
+import time
 from datetime import UTC, datetime
 
 import httpx
@@ -9,6 +11,7 @@ import pytest
 from apps.local_content import http as official_http
 from apps.local_content.http import OfficialHtmlFetcher, OfficialSourceError
 from wisdome_writer.infrastructure import http_safety
+from wisdome_writer.infrastructure.http_safety import HttpSafetyError, safe_get
 
 
 @pytest.fixture
@@ -314,3 +317,94 @@ def test_fetcher_rejects_ambiguous_or_traversing_paths(path: str) -> None:
 
     with pytest.raises(OfficialSourceError, match="path"):
         fetcher.get(f"https://example.go.kr{path}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/notices/%252e%252e/private",
+        "/notices/%252Fprivate",
+        "/notices/%255cprivate",
+    ),
+)
+def test_fetcher_rejects_nested_percent_encoded_path_delimiters(path: str) -> None:
+    fetcher = OfficialHtmlFetcher(
+        allowed_hosts={"example.go.kr"},
+        path_prefixes=("/notices/",),
+    )
+
+    with pytest.raises(OfficialSourceError, match="path"):
+        fetcher.get(f"https://example.go.kr{path}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/notices/announcement%202026",
+        "/notices/%ED%95%9C%EA%B8%80",
+        "/notices/100%25",
+    ),
+)
+def test_fetcher_accepts_stable_single_encoded_path_characters(
+    public_dns: None,
+    path: str,
+) -> None:
+    fetcher = OfficialHtmlFetcher(
+        allowed_hosts={"example.go.kr"},
+        path_prefixes=("/notices/",),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html>ok</html>",
+            )
+        ),
+    )
+
+    assert fetcher.get(f"https://example.go.kr{path}").body == "<html>ok</html>"
+
+
+def test_fetcher_bounds_arbitrarily_large_numeric_retry_after(public_dns: None) -> None:
+    fetcher = OfficialHtmlFetcher(
+        allowed_hosts={"example.go.kr"},
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                429,
+                headers={"Retry-After": "9" * 4000},
+                content=b"busy",
+            )
+        ),
+    )
+
+    with pytest.raises(OfficialSourceError, match="time limit"):
+        fetcher.get("https://example.go.kr/list")
+
+
+def test_safe_get_bounds_blocking_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = threading.Event()
+    resolver_finished = threading.Event()
+
+    def blocked_resolution(host: str, port: int, **kwargs: object) -> list[object]:
+        release.wait()
+        resolver_finished.set()
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))
+        ]
+
+    monkeypatch.setattr(http_safety.socket, "getaddrinfo", blocked_resolution)
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(HttpSafetyError, match="time limit"):
+            safe_get(
+                "https://example.go.kr/list",
+                max_bytes=1024,
+                timeout=1,
+                allowed_hosts={"example.go.kr"},
+                max_elapsed_seconds=0.02,
+                https_only=True,
+            )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started_at < 0.5
+    assert resolver_finished.wait(1)

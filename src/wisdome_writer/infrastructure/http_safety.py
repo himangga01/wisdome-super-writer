@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ipaddress
+import queue
 import re
 import socket
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
@@ -13,9 +15,11 @@ import httpx
 
 DEFAULT_MAX_REDIRECTS = 5
 DEFAULT_MAX_ELAPSED_SECONDS = 60.0
+DNS_RESOLVER_CAPACITY = 4
 STREAM_CHUNK_BYTES = 64 * 1024
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+_DNS_RESOLUTION_SLOTS = threading.BoundedSemaphore(DNS_RESOLVER_CAPACITY)
 
 
 class HttpSafetyError(Exception):
@@ -203,6 +207,7 @@ def _safe_request(
             current_url,
             normalized_allowed_hosts,
             https_only=https_only,
+            deadline=deadline,
         )
         response = _request_pinned(
             target,
@@ -247,6 +252,7 @@ def _validate_target(
     allowed_hosts: frozenset[str] | None,
     *,
     https_only: bool = False,
+    deadline: float,
 ) -> _ValidatedTarget:
     try:
         parsed = urlsplit(url)
@@ -278,7 +284,12 @@ def _validate_target(
         )
 
     target_port = port or (443 if scheme == "https" else 80)
-    addresses = _resolve_public_addresses(normalized_hostname, target_port, url)
+    addresses = _resolve_public_addresses(
+        normalized_hostname,
+        target_port,
+        url,
+        deadline=deadline,
+    )
     return _ValidatedTarget(
         logical_url=url,
         parsed=parsed,
@@ -299,22 +310,14 @@ def _resolve_public_addresses(
     hostname: str,
     port: int,
     logical_url: str,
+    *,
+    deadline: float,
 ) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
     try:
         literal = ipaddress.ip_address(hostname)
         raw_addresses = (literal,)
     except ValueError:
-        try:
-            resolved = socket.getaddrinfo(
-                hostname,
-                port,
-                type=socket.SOCK_STREAM,
-                proto=socket.IPPROTO_TCP,
-            )
-        except OSError:
-            raise OutboundResolutionFailed(
-                f"Outbound host resolution failed for {redact_url(logical_url)}"
-            ) from None
+        resolved = _getaddrinfo_with_deadline(hostname, port, logical_url, deadline)
         raw_addresses = tuple(
             ipaddress.ip_address(address[4][0].split("%", 1)[0])
             for address in resolved
@@ -330,6 +333,79 @@ def _resolve_public_addresses(
             f"Outbound host resolved to a non-public address: {redact_url(logical_url)}"
         )
     return addresses
+
+
+def _getaddrinfo_with_deadline(
+    hostname: str,
+    port: int,
+    logical_url: str,
+    deadline: float,
+) -> list[tuple[Any, ...]]:
+    remaining = _resolution_remaining_seconds(deadline, logical_url)
+    if not _DNS_RESOLUTION_SLOTS.acquire(timeout=remaining):
+        raise _resolution_timeout(logical_url)
+
+    outcomes: queue.Queue[tuple[list[tuple[Any, ...]] | None, Exception | None]] = queue.Queue(
+        maxsize=1
+    )
+
+    def resolve() -> None:
+        try:
+            try:
+                resolved = socket.getaddrinfo(
+                    hostname,
+                    port,
+                    type=socket.SOCK_STREAM,
+                    proto=socket.IPPROTO_TCP,
+                )
+                outcome = (resolved, None)
+            except Exception as exc:
+                outcome = (None, exc)
+            outcomes.put_nowait(outcome)
+        finally:
+            _DNS_RESOLUTION_SLOTS.release()
+
+    worker = threading.Thread(
+        target=resolve,
+        name="bounded-dns-resolver",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        _DNS_RESOLUTION_SLOTS.release()
+        raise OutboundResolutionFailed(
+            f"Outbound host resolution failed for {redact_url(logical_url)}"
+        ) from None
+
+    try:
+        resolved, failure = outcomes.get(
+            timeout=_resolution_remaining_seconds(deadline, logical_url)
+        )
+    except queue.Empty:
+        raise _resolution_timeout(logical_url) from None
+    if failure is not None:
+        raise OutboundResolutionFailed(
+            f"Outbound host resolution failed for {redact_url(logical_url)}"
+        ) from None
+    if resolved is None:
+        raise OutboundResolutionFailed(
+            f"Outbound host resolution failed for {redact_url(logical_url)}"
+        )
+    return resolved
+
+
+def _resolution_remaining_seconds(deadline: float, logical_url: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _resolution_timeout(logical_url)
+    return remaining
+
+
+def _resolution_timeout(logical_url: str) -> OutboundResolutionFailed:
+    return OutboundResolutionFailed(
+        f"Outbound host resolution time limit exceeded for {redact_url(logical_url)}"
+    )
 
 
 def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
