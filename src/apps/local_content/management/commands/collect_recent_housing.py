@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import stat
 from collections.abc import Mapping
@@ -135,20 +136,40 @@ def _fixture_collectors(root: Path):
         raise WorkflowError("FIXTURE_ROOT_UNAPPROVED") from None
     if resolved != approved:
         raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
-    _verify_fixture_manifest(resolved, approved_root=approved)
-    fixture = _FixtureFetcher(resolved)
+    fixture_bytes = _verify_fixture_manifest(resolved, approved_root=approved)
+    fixture = _FixtureFetcher(resolved, fixture_bytes)
     return (ApplyHomePublicCollector(fixture), LhPublicCollector(fixture))
 
 
-def _verify_fixture_manifest(root: Path, *, approved_root: Path) -> None:
+def _verify_fixture_manifest(
+    root: Path,
+    *,
+    approved_root: Path,
+) -> dict[str, bytes]:
     root = Path(root)
     approved_root = Path(approved_root)
     if root.resolve(strict=True) != approved_root.resolve(strict=True):
         raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
+    expected_sets = {
+        root: {"README.md", "manifest.json"},
+        root.parent / "applyhome": {
+            Path(relative).name
+            for relative in _FIXTURE_FILES
+            if relative.startswith("applyhome/")
+        },
+        root.parent / "lh": {
+            Path(relative).name
+            for relative in _FIXTURE_FILES
+            if relative.startswith("lh/")
+        },
+    }
+    for directory, expected_names in expected_sets.items():
+        if _closed_fixture_names(directory) != expected_names:
+            raise WorkflowError("FIXTURE_EXTRA_FILE")
     manifest_path = root / "manifest.json"
     try:
         manifest = json.loads(
-            manifest_path.read_text(encoding="utf-8"),
+            _read_fixture_file(manifest_path).decode("utf-8", errors="strict"),
             object_pairs_hook=_strict_fixture_pairs,
         )
     except (OSError, UnicodeError, ValueError):
@@ -162,6 +183,7 @@ def _verify_fixture_manifest(root: Path, *, approved_root: Path) -> None:
     ):
         raise WorkflowError("FIXTURE_MANIFEST_INVALID")
     fixture_parent = root.parent.resolve(strict=True)
+    verified: dict[str, bytes] = {}
     for relative in _FIXTURE_FILES:
         expected = manifest["files"].get(relative)
         if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
@@ -169,23 +191,116 @@ def _verify_fixture_manifest(root: Path, *, approved_root: Path) -> None:
         path = root.parent / relative
         try:
             resolved = path.resolve(strict=True)
-            metadata = path.lstat()
             confined = resolved.is_relative_to(fixture_parent)
-            unsafe = (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or bool(
-                    getattr(metadata, "st_file_attributes", 0)
-                    & _FILE_ATTRIBUTE_REPARSE_POINT
-                )
-            )
-            observed = hashlib.sha256(path.read_bytes()).hexdigest()
+            payload = _read_fixture_file(path)
+            observed = hashlib.sha256(payload).hexdigest()
         except OSError:
             raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
-        if not confined or unsafe:
+        if not confined:
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
         if observed != expected:
             raise WorkflowError("FIXTURE_CHECKSUM_MISMATCH")
+        verified[relative] = payload
+    for directory, expected_names in expected_sets.items():
+        if _closed_fixture_names(directory) != expected_names:
+            raise WorkflowError("FIXTURE_EXTRA_FILE")
+    return verified
+
+
+def _closed_fixture_names(directory: Path) -> set[str]:
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError:
+        raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
+    result: set[str] = set()
+    for entry in entries:
+        try:
+            metadata = entry.lstat()
+        except OSError:
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        ):
+            raise WorkflowError("FIXTURE_EXTRA_FILE")
+        result.add(entry.name)
+    return result
+
+
+def _read_fixture_file(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise WorkflowError("FIXTURE_OPEN_FAILED") from None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or bool(
+                getattr(before, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        ):
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > 16 * 1024 * 1024:
+                raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _fixture_fingerprint(before) != _fixture_fingerprint(after):
+            raise WorkflowError("FIXTURE_MANIFEST_CHANGED")
+    except WorkflowError:
+        raise
+    except OSError:
+        raise WorkflowError("FIXTURE_READ_FAILED") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise WorkflowError("FIXTURE_READ_CLOSE_FAILED") from None
+    try:
+        path_metadata = path.lstat()
+    except OSError:
+        raise WorkflowError("FIXTURE_MANIFEST_CHANGED") from None
+    if _fixture_identity(path_metadata) != _fixture_identity(before):
+        raise WorkflowError("FIXTURE_MANIFEST_CHANGED")
+    return b"".join(chunks)
+
+
+def _fixture_fingerprint(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        getattr(metadata, "st_file_attributes", 0),
+    )
+
+
+def _fixture_identity(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        getattr(metadata, "st_file_attributes", 0),
+    )
 
 
 def _strict_fixture_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -203,52 +318,43 @@ class _FixtureHumanizer:
 
 
 class _FixtureFetcher:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, files: Mapping[str, bytes]) -> None:
         self.root = Path(root)
-        if not self.root.is_dir() or self.root.name != "local-content":
+        if self.root.name != "local-content":
             raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
-        fixture_root = self.root.parent
-        self.applyhome = fixture_root / "applyhome"
-        self.lh = fixture_root / "lh"
-        required = (
-            self.applyhome / "apt-list.html",
-            self.applyhome / "apt-list-page-2.html",
-            self.applyhome / "remaining-list.html",
-            self.applyhome / "apt-detail.html",
-            self.lh / "notice-list-page-1.html",
-            self.lh / "notice-list-page-2.html",
-            self.lh / "notice-detail.html",
-        )
-        if any(not path.is_file() for path in required):
+        if set(files) != set(_FIXTURE_FILES):
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+        self.files = dict(files)
 
     def get(self, url: str) -> HtmlResponse:
         split = urlsplit(url)
         query = parse_qs(split.query)
         if url.startswith(APT_LIST):
             page = query.get("pageIndex", ["1"])[0]
-            path = self.applyhome / (
-                "apt-list.html" if page == "1" else "apt-list-page-2.html"
+            relative = (
+                "applyhome/apt-list.html"
+                if page == "1"
+                else "applyhome/apt-list-page-2.html"
             )
         elif url.startswith(REMAINING_LIST):
-            path = self.applyhome / "remaining-list.html"
+            relative = "applyhome/remaining-list.html"
         elif split.hostname == "www.applyhome.co.kr":
-            path = (
-                self.applyhome / "apt-detail.html"
+            relative = (
+                "applyhome/apt-detail.html"
                 if query.get("houseManageNo") == ["2026000001"]
                 else None
             )
         elif split.hostname == "apply.lh.or.kr":
-            path = (
-                self.lh / "notice-detail.html"
+            relative = (
+                "lh/notice-detail.html"
                 if query.get("panId") == ["0000061158"]
                 else None
             )
         else:
             raise KeyError(url)
         body = (
-            path.read_text(encoding="utf-8")
-            if path is not None
+            self._text(relative)
+            if relative is not None
             else '<main data-notice-detail="apt" data-lh-notice-detail="true"></main>'
         )
         return _fixture_response(url, body)
@@ -259,9 +365,14 @@ class _FixtureFetcher:
         page = data.get("currPage")
         if page not in {"1", "2"}:
             raise KeyError(page)
-        path = self.lh / f"notice-list-page-{page}.html"
-        body = path.read_text(encoding="utf-8")
+        body = self._text(f"lh/notice-list-page-{page}.html")
         return _fixture_response(url, _assembled_lh_page(body, page))
+
+    def _text(self, relative: str) -> str:
+        try:
+            return self.files[relative].decode("utf-8", errors="strict")
+        except (KeyError, UnicodeError):
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
 
 
 def _fixture_response(url: str, body: str) -> HtmlResponse:

@@ -200,6 +200,25 @@ class ArticleBundle:
         return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True)
+class RunDirectoryLease:
+    """One writer-issued capability for a newly reserved run directory."""
+
+    run_date: date
+    name: str
+    _writer_token: str
+    _lease_token: str
+    _root_identity: tuple[object, ...]
+    _run_identity: tuple[object, ...]
+
+
+@dataclass
+class _RunLeaseState:
+    lease: RunDirectoryLease
+    article_names: set[str]
+    completed: bool = False
+
+
 def build_article_bundle(
     run_date: date,
     article: RenderedArticle,
@@ -239,24 +258,108 @@ class ArticleBundleWriter:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self._writer_token = secrets.token_hex(8)
+        self._run_leases: dict[str, _RunLeaseState] = {}
+
+    def reserve_run_directory(
+        self,
+        run_date: date,
+        *,
+        workflow_id: str,
+    ) -> RunDirectoryLease:
+        """Exclusively reserve a never-before-used generation directory."""
+
+        if not isinstance(workflow_id, str) or not workflow_id:
+            raise BundlePublishError("workflow identity is required for run lease")
+        root = self._safe_root()
+        date_name = run_date.isoformat()
+        generation_pattern = re.compile(
+            rf"{re.escape(date_name)}(?:--run-[0-9a-f]{{12}})?"
+        )
+        try:
+            has_generation = any(
+                generation_pattern.fullmatch(path.name)
+                for path in root.iterdir()
+            )
+        except OSError as exc:
+            raise BundlePublishError("cannot scan run generations") from exc
+        if has_generation:
+            suffix = hashlib.sha256(workflow_id.encode("utf-8")).hexdigest()[:12]
+            run_name = f"{date_name}--run-{suffix}"
+        else:
+            run_name = date_name
+        run_root = self._safe_child(root, run_name)
+        if _path_exists_no_follow(run_root):
+            raise BundlePublishError("run lease path already exists")
+        try:
+            run_root.mkdir()
+        except OSError as exc:
+            raise BundlePublishError("run lease reservation failed") from exc
+        root_identity = _path_identity_fingerprint(
+            root,
+            "run lease root",
+            BundlePublishError,
+        )
+        run_identity = _path_identity_fingerprint(
+            run_root,
+            "run lease directory",
+            BundlePublishError,
+        )
+        lease = RunDirectoryLease(
+            run_date=run_date,
+            name=run_name,
+            _writer_token=self._writer_token,
+            _lease_token=secrets.token_hex(16),
+            _root_identity=root_identity,
+            _run_identity=run_identity,
+        )
+        self._run_leases[lease._lease_token] = _RunLeaseState(lease, set())
+        _fsync_directory(root)
+        return lease
+
+    def verify_run_directory_lease(
+        self,
+        lease: RunDirectoryLease,
+        *,
+        allow_completed: bool = False,
+    ) -> Path:
+        """Revalidate one active writer-issued lease without reopening it."""
+
+        root = self._safe_root()
+        state = self._validated_lease_state(lease.run_date, lease)
+        if state.completed and not allow_completed:
+            raise BundlePublishError("completed run directory lease cannot be reused")
+        self._verify_run_lease(root, state, allow_completed=allow_completed)
+        run_root = self._safe_child(root, lease.name)
+        return run_root
 
     def write(
         self,
         bundle: ArticleBundle,
         *,
-        run_directory: str | None = None,
+        run_directory: RunDirectoryLease | None = None,
     ) -> Path:
         """Validate and atomically publish one immutable article bundle."""
 
         root = self._safe_root()
         validated = self._validate(bundle)
-        run_name = _validated_run_directory(bundle.run_date, run_directory)
-        date_root = root / run_name
+        lease_state: _RunLeaseState | None = None
+        if run_directory is None:
+            run_name = bundle.run_date.isoformat()
+            date_root = root / run_name
+        else:
+            date_root, lease_state = self._lease_run_root(
+                root,
+                bundle.run_date,
+                run_directory,
+            )
         self._ensure_directory(date_root)
         primary = self._safe_child(date_root, bundle.slug)
         target, existing = self._publication_target(primary, bundle.bundle_hash)
         if existing is not None:
             _require_validated_existing_root(target, existing, "exact existing bundle")
+            if lease_state is not None:
+                lease_state.article_names.add(target.name)
+                self._verify_run_lease(root, lease_state)
             return target
 
         staging, owned_stage_fingerprint = self._create_owned_staging(
@@ -291,6 +394,10 @@ class ArticleBundleWriter:
                 if target.is_dir():
                     winner = self._existing_hash(target)
                     if winner.bundle_hash == bundle.bundle_hash:
+                        if lease_state is not None:
+                            raise BundlePublishError(
+                                "run lease rejected a concurrent article winner"
+                            ) from exc
                         _require_validated_existing_root(
                             target,
                             winner,
@@ -312,6 +419,9 @@ class ArticleBundleWriter:
                 owned_stage_fingerprint,
                 "fully validated published bundle",
             )
+            if lease_state is not None:
+                lease_state.article_names.add(target.name)
+                self._verify_run_lease(root, lease_state)
             return target
         except BundlePublishError:
             raise
@@ -324,13 +434,22 @@ class ArticleBundleWriter:
         weekly_index: RenderedArticle | str,
         bundles: tuple[ArticleBundle, ...] | list[ArticleBundle] = (),
         *,
-        run_directory: str | None = None,
+        run_directory: RunDirectoryLease | None = None,
     ) -> Path:
         """Publish article bundles, then atomically replace the run index and manifest."""
 
         root = self._safe_root()
-        run_name = _validated_run_directory(run_date, run_directory)
-        run_root = root / run_name
+        lease_state: _RunLeaseState | None = None
+        if run_directory is None:
+            run_name = run_date.isoformat()
+            run_root = root / run_name
+        else:
+            run_root, lease_state = self._lease_run_root(
+                root,
+                run_date,
+                run_directory,
+            )
+            run_name = run_directory.name
         self._ensure_directory(run_root)
         index_markdown = (
             weekly_index.to_markdown()
@@ -344,7 +463,7 @@ class ArticleBundleWriter:
         for bundle in bundles:
             if bundle.run_date != run_date:
                 raise BundleValidationError("article bundle run date does not match run index")
-            path = self.write(bundle, run_directory=run_name)
+            path = self.write(bundle, run_directory=run_directory)
             published[path.name] = bundle.bundle_hash
             if path.name != bundle.slug:
                 index_markdown = index_markdown.replace(
@@ -426,7 +545,92 @@ class ArticleBundleWriter:
             manifest_fingerprint,
             "fully validated published run manifest",
         )
+        if lease_state is not None:
+            self._verify_run_lease(root, lease_state, allow_completed=True)
+            lease_state.completed = True
         return validated_run
+
+    def _lease_run_root(
+        self,
+        root: Path,
+        run_date: date,
+        lease: object,
+    ) -> tuple[Path, _RunLeaseState]:
+        state = self._validated_lease_state(run_date, lease)
+        if state.completed:
+            raise BundlePublishError("completed run directory lease cannot be reused")
+        self._verify_run_lease(root, state)
+        return self._safe_child(root, lease.name), state
+
+    def _validated_lease_state(
+        self,
+        run_date: date,
+        lease: object,
+    ) -> _RunLeaseState:
+        if not isinstance(lease, RunDirectoryLease):
+            raise BundlePublishError("writer-issued run directory lease is required")
+        state = self._run_leases.get(lease._lease_token)
+        if (
+            lease._writer_token != self._writer_token
+            or state is None
+            or state.lease != lease
+            or lease.run_date != run_date
+        ):
+            raise BundlePublishError("run directory lease authority is invalid")
+        return state
+
+    def _verify_run_lease(
+        self,
+        root: Path,
+        state: _RunLeaseState,
+        *,
+        allow_completed: bool = False,
+    ) -> None:
+        lease = state.lease
+        if (
+            _path_identity_fingerprint(
+                root,
+                "run lease root",
+                BundlePublishError,
+            )
+            != lease._root_identity
+        ):
+            raise BundlePublishError("run lease root identity was substituted")
+        run_root = self._safe_child(root, lease.name)
+        if (
+            _path_identity_fingerprint(
+                run_root,
+                "run lease directory",
+                BundlePublishError,
+            )
+            != lease._run_identity
+        ):
+            raise BundlePublishError("run lease directory identity was substituted")
+        try:
+            entries = tuple(os.scandir(run_root))
+        except OSError as exc:
+            raise BundlePublishError("cannot inspect run lease directory") from exc
+        allowed_files = {"acceptance-report.json", "notices.json"}
+        if allow_completed:
+            allowed_files.update({"index.md", "manifest.json"})
+        for entry in entries:
+            name = entry.name
+            if name in allowed_files:
+                if not entry.is_file(follow_symlinks=False):
+                    raise BundlePublishError("run lease controller file is unsafe")
+                continue
+            if name in state.article_names:
+                if not entry.is_dir(follow_symlinks=False):
+                    raise BundlePublishError("run lease article entry is unsafe")
+                continue
+            owned_stage = (
+                name.startswith(".")
+                and ".tmp-" in name
+                and f"-{self._writer_token}-" in name
+            )
+            if owned_stage and entry.is_dir(follow_symlinks=False):
+                continue
+            raise BundlePublishError("run lease contains unowned or completed material")
 
     def validate_run(
         self,
@@ -568,6 +772,7 @@ class ArticleBundleWriter:
             declared_hashes = dict(validation.file_hashes)
             if (
                 validation.bundle_hash != expected_bundle_hash
+                or "article.md" not in declared_hashes
                 or declared_hashes.get("verification.json")
                 != hashlib.sha256(verification_payload).hexdigest()
             ):

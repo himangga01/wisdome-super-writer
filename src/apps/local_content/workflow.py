@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import uuid
 from collections.abc import Collection, Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -26,6 +28,8 @@ from apps.local_content.bundles import (
     ArticleBundleWriter,
     BundleFile,
     BundlePublishError,
+    BundleValidationError,
+    RunDirectoryLease,
 )
 from apps.local_content.contracts import (
     CollectionWindow,
@@ -293,6 +297,8 @@ class LocalHousingWorkflow:
         run_relative: str | None = None
         report_relative: str | None = None
         run_root: Path | None = None
+        run_lease: RunDirectoryLease | None = None
+        writer: ArticleBundleWriter | None = None
         phases = [PhaseReport(name) for name in PHASE_NAMES]
         source_reports: tuple[SourceRunReport, ...] = ()
         source_summaries: tuple[SourceWorkflowReport, ...] = ()
@@ -300,8 +306,10 @@ class LocalHousingWorkflow:
         article_work: list[_ArticleWork] = []
         errors: list[str] = []
         detail_failure_ids: tuple[str, ...] = ()
+        detail_failure_records: tuple[tuple[str, str], ...] = ()
         all_sources_failed = False
         final_state = False
+        run_committed = False
 
         lock = _WorkflowGuard(
             self.output_root,
@@ -329,8 +337,7 @@ class LocalHousingWorkflow:
                 final_state
                 and not incomplete_sources
                 and not blocked
-                and "SELECTED_ID_NOT_FOUND" not in errors
-                and "BUNDLE_WRITE_FAILED" not in errors
+                and not errors
             )
             return WorkflowReport(
                 workflow_id=workflow_id,
@@ -356,32 +363,52 @@ class LocalHousingWorkflow:
                 error_codes=report_errors,
             )
 
+        def verify_generation(*, allow_completed: bool = False) -> None:
+            lock.verify()
+            if writer is not None and run_lease is not None:
+                try:
+                    writer.verify_run_directory_lease(
+                        run_lease,
+                        allow_completed=allow_completed,
+                    )
+                except BundleValidationError:
+                    raise WorkflowError("RUN_LEASE_CHANGED") from None
+
         def persist() -> None:
             if not self.dry_run:
-                if run_root is None:
+                if run_root is None or writer is None or run_lease is None:
                     raise WorkflowError("RUN_PATH_UNAVAILABLE")
+                verify_generation()
                 _atomic_write_json(
                     run_root / ACCEPTANCE_FILENAME,
                     snapshot().as_dict(),
                 )
+                verify_generation()
 
         try:
             lock.acquire()
             if self.dry_run:
                 lock.bind_output_root(create=False)
             else:
-                run_root, run_relative = _allocate_run_directory(
-                    lock.output_root,
-                    observed,
-                    workflow_id,
-                )
-                report_relative = f"{run_relative}/{ACCEPTANCE_FILENAME}"
                 lock.bind_output_root(create=True)
-            lock.verify()
+                lock.verify()
+                writer = ArticleBundleWriter(lock.output_root)
+                try:
+                    run_lease = writer.reserve_run_directory(
+                        observed.date(),
+                        workflow_id=workflow_id,
+                    )
+                except BundlePublishError:
+                    raise WorkflowError("RUN_LEASE_RESERVATION_FAILED") from None
+                run_relative = run_lease.name
+                run_root = lock.output_root / run_relative
+                report_relative = f"{run_relative}/{ACCEPTANCE_FILENAME}"
+                verify_generation()
+            verify_generation()
             with temporary_context as temporary_root:
                 collected: list[SourceRunReport] = []
                 for collector in self.collectors:
-                    lock.verify()
+                    verify_generation()
                     try:
                         report = collector.collect(window)
                         if not isinstance(report, SourceRunReport):
@@ -391,13 +418,17 @@ class LocalHousingWorkflow:
                             source_key=_collector_source_key(collector),
                             errors=("collector raised an exception",),
                         )
+                    verify_generation()
                     collected.append(report)
                 source_reports = tuple(collected)
-                detail_failure_ids = tuple(
-                    notice.external_id
+                detail_failure_records = tuple(
+                    (report.source_key, notice.external_id)
                     for report in source_reports
                     for notice in report.notices
                     if _has_detail_failure(notice)
+                )
+                detail_failure_ids = tuple(
+                    external_id for _source_key, external_id in detail_failure_records
                 )
                 source_summaries = tuple(
                     SourceWorkflowReport(
@@ -473,11 +504,12 @@ class LocalHousingWorkflow:
                 notice_ids = {notice.external_id for notice in collection.notices}
                 if any(value not in notice_ids for value in selected):
                     errors.append("SELECTED_ID_NOT_FOUND")
+                verify_generation()
                 prior_detailed_ids = _validated_prior_detailed_ids(
                     lock.output_root,
-                    observed,
                     current_run=run_relative,
                 )
+                verify_generation()
                 selected_notices = tuple(
                     notice
                     for notice in collection.notices
@@ -538,10 +570,14 @@ class LocalHousingWorkflow:
                         if article.blocked:
                             continue
                         try:
-                            article.images = build_image_set(
-                                article.notice,
-                                image_root / article.slug,
-                            )
+                            verify_generation()
+                            try:
+                                article.images = build_image_set(
+                                    article.notice,
+                                    image_root / article.slug,
+                                )
+                            finally:
+                                verify_generation()
                             article.status = "images_ready"
                         except Exception:
                             article.fail("IMAGE_FAILED")
@@ -574,9 +610,15 @@ class LocalHousingWorkflow:
                             )
                             continue
                         try:
+                            verify_generation()
                             if self.humanizer is None:
                                 raise RuntimeError
-                            article.candidate_output = self.humanizer.transform(protected.document)
+                            try:
+                                article.candidate_output = self.humanizer.transform(
+                                    protected.document
+                                )
+                            finally:
+                                verify_generation()
                             article.humanization_status = "candidate"
                             article.status = "humanized"
                         except Exception:
@@ -673,16 +715,35 @@ class LocalHousingWorkflow:
                     final_state = True
                     persist()
                 else:
-                    try:
-                        assert run_relative is not None
-                        assert run_root is not None
-                        writer = ArticleBundleWriter(lock.output_root)
-                        final_bundles: list[ArticleBundle] = []
-                        for article in article_work:
-                            if article.final_bundle is not None:
+                    assert run_relative is not None
+                    assert run_root is not None
+                    assert writer is not None
+                    assert run_lease is not None
+                    final_bundles: list[ArticleBundle] = []
+
+                    def publish_diagnostic(article: _ArticleWork) -> None:
+                        try:
+                            verify_generation()
+                            diagnostic = _diagnostic_bundle(article, observed.date())
+                            published = writer.write(
+                                diagnostic,
+                                run_directory=run_lease,
+                            )
+                            article.draft_path = _relative_path(
+                                lock.output_root,
+                                published,
+                            )
+                            verify_generation()
+                        except (BundleValidationError, OSError, ValueError):
+                            article.fail("BUNDLE_DIAGNOSTIC_WRITE_FAILED")
+
+                    for article in article_work:
+                        if article.final_bundle is not None:
+                            try:
+                                verify_generation()
                                 published = writer.write(
                                     article.final_bundle,
-                                    run_directory=run_relative,
+                                    run_directory=run_lease,
                                 )
                                 article.article_path = _relative_path(
                                     lock.output_root,
@@ -690,49 +751,77 @@ class LocalHousingWorkflow:
                                 )
                                 article.status = "written"
                                 final_bundles.append(article.final_bundle)
-                            elif article.blocked:
-                                diagnostic = _diagnostic_bundle(article, observed.date())
-                                published = writer.write(
-                                    diagnostic,
-                                    run_directory=run_relative,
-                                )
-                                article.draft_path = _relative_path(
-                                    lock.output_root,
-                                    published,
-                                )
-                        index = _workflow_index(collection, article_work)
-                        _atomic_write_json(
-                            run_root / "notices.json",
-                            _notices_document(collection),
+                                verify_generation()
+                            except (BundleValidationError, OSError):
+                                article.fail("BUNDLE_WRITE_FAILED")
+                                publish_diagnostic(article)
+                        elif article.blocked:
+                            publish_diagnostic(article)
+                    index = _workflow_index(
+                        collection,
+                        article_work,
+                        detail_failures=detail_failure_records,
+                    )
+                    verify_generation()
+                    _atomic_write_json(
+                        run_root / "notices.json",
+                        _notices_document(
+                            collection,
+                            detail_failures=detail_failure_records,
+                        ),
+                    )
+                    verify_generation()
+                    storage_codes = tuple(
+                        code
+                        for code in (
+                            "BUNDLE_WRITE_FAILED",
+                            "BUNDLE_DIAGNOSTIC_WRITE_FAILED",
                         )
+                        if any(code in article.errors for article in article_work)
+                    )
+                    phases[7] = PhaseReport(
+                        "write",
+                        "completed_with_errors" if storage_codes else "completed",
+                        count=sum(article.status == "written" for article in article_work),
+                        paths=(run_relative,),
+                        error_codes=storage_codes,
+                    )
+                    final_state = True
+                    persist()
+                    try:
+                        verify_generation()
                         run_path = writer.write_run(
                             observed.date(),
                             index,
                             tuple(final_bundles),
-                            run_directory=run_relative,
+                            run_directory=run_lease,
                         )
-                        phases[7] = PhaseReport(
-                            "write",
-                            "completed",
-                            count=sum(article.status == "written" for article in article_work),
-                            paths=(_relative_path(lock.output_root, run_path),),
-                        )
-                        final_state = True
-                    except Exception:
-                        errors.append("BUNDLE_WRITE_FAILED")
-                        for article in article_work:
-                            if article.status == "verified":
-                                article.fail("BUNDLE_WRITE_FAILED")
+                        if _relative_path(lock.output_root, run_path) != run_relative:
+                            raise BundlePublishError("run lease returned another path")
+                        run_committed = True
+                        verify_generation(allow_completed=True)
+                    except (BundleValidationError, OSError):
+                        errors.append("RUN_COMMIT_FAILED")
                         phases[7] = PhaseReport(
                             "write",
                             "failed",
                             count=sum(article.status == "written" for article in article_work),
-                            error_codes=("BUNDLE_WRITE_FAILED",),
+                            paths=(run_relative,),
+                            error_codes=(*storage_codes, "RUN_COMMIT_FAILED"),
                         )
                         final_state = True
-                    persist()
+                        try:
+                            persist()
+                        except (WorkflowError, BundleValidationError):
+                            pass
+                verify_generation(allow_completed=run_committed)
         finally:
-            lock.release()
+            primary_error = sys.exc_info()[0] is not None
+            try:
+                lock.release()
+            except WorkflowError:
+                if not primary_error:
+                    raise
         return snapshot()
 
 
@@ -805,31 +894,33 @@ def _has_detail_failure(notice: HousingNotice) -> bool:
 
 def _validated_prior_detailed_ids(
     output_root: Path,
-    observed: datetime,
     *,
     current_run: str | None,
 ) -> tuple[str, ...]:
-    if not os.path.lexists(output_root):
+    if not _workflow_path_exists(output_root):
         return ()
     _reject_link_ancestors(output_root)
-    run_date = observed.date()
-    prefix = re.compile(
-        rf"{re.escape(run_date.isoformat())}(?:--run-[0-9a-f]{{12}})?"
+    pattern = re.compile(
+        r"(?P<date>\d{4}-\d{2}-\d{2})(?:--run-[0-9a-f]{12})?"
     )
     try:
         candidates = tuple(
             sorted(
-                path.name
+                (path.name, match.group("date"))
                 for path in output_root.iterdir()
-                if path.name != current_run and prefix.fullmatch(path.name)
+                if path.name != current_run
+                and (match := pattern.fullmatch(path.name)) is not None
             )
         )
     except OSError:
         raise WorkflowError("PRIOR_RUN_SCAN_FAILED") from None
+    if len(candidates) > 512:
+        raise WorkflowError("PRIOR_RUN_SCAN_LIMIT")
     writer = ArticleBundleWriter(output_root)
     result: set[str] = set()
-    for run_name in candidates:
+    for run_name, run_date_text in candidates:
         try:
+            run_date = date.fromisoformat(run_date_text)
             metadata_rows = writer.validated_run_article_metadata(
                 run_date,
                 run_directory=run_name,
@@ -851,8 +942,9 @@ def _validated_prior_detailed_ids(
                 and metadata.get("humanization_status") == "verified"
                 and isinstance(metadata.get("source_key"), str)
                 and isinstance(external_id, str)
-                and external_id
+                and re.fullmatch(r"[A-Za-z0-9:._-]{1,512}", external_id) is not None
                 and isinstance(metadata.get("source_checksum"), str)
+                and _SHA256_CHECKSUM.fullmatch(metadata["source_checksum"]) is not None
             ):
                 result.add(external_id)
     return tuple(sorted(result))
@@ -1025,6 +1117,8 @@ def _diagnostic_bundle(article: _ArticleWork, run_date) -> ArticleBundle:
 def _workflow_index(
     collection: HousingCollectionResult,
     articles: Sequence[_ArticleWork],
+    *,
+    detail_failures: Sequence[tuple[str, str]] = (),
 ) -> str:
     selected_ids = tuple(article.notice.external_id for article in articles)
     markdown = render_weekly_index(
@@ -1041,16 +1135,13 @@ def _workflow_index(
         else:
             replacement = "[NOT WRITTEN: WRITE_DISABLED]"
         markdown = pattern.sub(lambda _match, value=replacement: value, markdown)
-    affected = tuple(
-        notice
-        for notice in (*collection.notices, *collection.conflicts)
-        if _has_detail_failure(notice)
-    )
+    affected = tuple(dict.fromkeys(detail_failures))
     if affected:
         lines = ["", "## Workflow notice status", ""]
         lines.extend(
-            f"- `{_safe_status_id(notice.external_id)}`: DETAIL_COLLECTION_FAILED"
-            for notice in affected
+            f"- `{_safe_status_id(source_key)}:{_safe_status_id(external_id)}`: "
+            "DETAIL_COLLECTION_FAILED"
+            for source_key, external_id in affected
         )
         markdown = markdown.rstrip() + "\n" + "\n".join(lines) + "\n"
     return markdown
@@ -1095,15 +1186,26 @@ def _safe_status_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9:._-]", "_", value)[:240]
 
 
-def _notices_document(collection: HousingCollectionResult) -> dict[str, object]:
+def _notices_document(
+    collection: HousingCollectionResult,
+    *,
+    detail_failures: Sequence[tuple[str, str]] = (),
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "window": {
             "start": collection.window.start.isoformat(),
             "end": collection.window.end.isoformat(),
         },
-        "complete": collection.complete
-        and not any(_has_detail_failure(notice) for notice in collection.notices),
+        "complete": collection.complete and not detail_failures,
+        "detail_failures": [
+            {
+                "source_key": source_key,
+                "external_id": external_id,
+                "error_codes": ["DETAIL_COLLECTION_FAILED"],
+            }
+            for source_key, external_id in dict.fromkeys(detail_failures)
+        ],
         "notices": [
             {
                 "source_key": notice.source_key,
@@ -1186,28 +1288,58 @@ def _relative_path(root: Path, path: Path) -> str:
 def _atomic_write_json(path: Path, payload: object) -> None:
     target = Path(path)
     _reject_link_ancestors(target.parent)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise WorkflowError("REPORT_DIRECTORY_PREPARE_FAILED") from None
     _reject_link_ancestors(target.parent)
-    encoded = _json_text(payload).encode("utf-8")
+    try:
+        encoded = _json_text(payload).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError):
+        raise WorkflowError("REPORT_SERIALIZE_FAILED") from None
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
     descriptor: int | None = None
     try:
-        descriptor = os.open(temporary, flags, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            descriptor = None
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            descriptor = os.open(temporary, flags, 0o600)
+        except OSError:
+            raise WorkflowError("REPORT_OPEN_FAILED") from None
+        offset = 0
+        try:
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError
+                offset += written
+        except OSError:
+            raise WorkflowError("REPORT_WRITE_FAILED") from None
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            raise WorkflowError("REPORT_FILE_FSYNC_FAILED") from None
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise WorkflowError("REPORT_CLOSE_FAILED") from None
+        descriptor = None
         _reject_link_ancestors(target.parent)
-        os.replace(temporary, target)
+        try:
+            os.replace(temporary, target)
+        except OSError:
+            raise WorkflowError("REPORT_REPLACE_FAILED") from None
         _reject_link_ancestors(target.parent)
         _fsync_directory(target.parent)
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
@@ -1254,7 +1386,7 @@ class _WorkflowGuard:
                 self.guard_root,
                 "guard root",
             )
-            if os.path.lexists(self.path):
+            if _workflow_path_exists(self.path):
                 _regular_file_identity(self.path, "workflow guard")
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
@@ -1278,10 +1410,16 @@ class _WorkflowGuard:
             self._write_metadata()
             self._verify_guard_paths()
         except WorkflowError:
-            self.release()
+            try:
+                self.release()
+            except WorkflowError:
+                pass
             raise
         except OSError:
-            self.release()
+            try:
+                self.release()
+            except WorkflowError:
+                pass
             raise WorkflowError("WORKFLOW_LOCK_UNAVAILABLE") from None
 
     def bind_output_root(self, *, create: bool) -> None:
@@ -1290,7 +1428,7 @@ class _WorkflowGuard:
             if create:
                 self.output_root.mkdir(parents=True, exist_ok=True)
                 _reject_link_ancestors(self.output_root)
-            if os.path.lexists(self.output_root):
+            if _workflow_path_exists(self.output_root):
                 self.output_identity = _directory_identity(
                     self.output_root,
                     "output root",
@@ -1315,7 +1453,7 @@ class _WorkflowGuard:
             if _directory_identity(self.output_root, "output root") != self.output_identity:
                 raise WorkflowError("OUTPUT_ROOT_CHANGED")
         elif self.output_absent_parent is not None:
-            if os.path.lexists(self.output_root):
+            if _workflow_path_exists(self.output_root):
                 raise WorkflowError("OUTPUT_ROOT_CHANGED")
             parent, identity = self.output_absent_parent
             if _directory_identity(parent, "output ancestor") != identity:
@@ -1347,8 +1485,19 @@ class _WorkflowGuard:
             else:
                 fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.locked = True
-        except OSError:
-            raise WorkflowLockedError("WORKFLOW_ALREADY_RUNNING") from None
+        except OSError as exc:
+            contention = {errno.EACCES, errno.EAGAIN}
+            if hasattr(errno, "EDEADLK"):
+                contention.add(errno.EDEADLK)
+            unsupported = {errno.ENOSYS}
+            for name in ("ENOTSUP", "EOPNOTSUPP"):
+                if hasattr(errno, name):
+                    unsupported.add(getattr(errno, name))
+            if exc.errno in contention:
+                raise WorkflowLockedError("WORKFLOW_ALREADY_RUNNING") from None
+            if exc.errno in unsupported:
+                raise WorkflowError("WORKFLOW_LOCK_UNSUPPORTED") from None
+            raise WorkflowError("WORKFLOW_LOCK_FAILED") from None
 
     def _write_metadata(self) -> None:
         if self.descriptor is None:
@@ -1378,6 +1527,8 @@ class _WorkflowGuard:
         descriptor = self.descriptor
         if descriptor is None:
             return
+        unlock_error = False
+        close_error = False
         try:
             if self.locked and os.name == "nt":
                 os.lseek(descriptor, 0, os.SEEK_SET)
@@ -1385,27 +1536,36 @@ class _WorkflowGuard:
             elif self.locked and os.name == "posix":
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError:
-            pass
-        finally:
+            unlock_error = True
+        try:
             os.close(descriptor)
+        except OSError:
+            close_error = True
+        else:
             self.descriptor = None
             self.locked = False
+        if unlock_error:
+            raise WorkflowError("WORKFLOW_UNLOCK_FAILED")
+        if close_error:
+            raise WorkflowError("WORKFLOW_GUARD_CLOSE_FAILED")
 
 
 def _reject_link_ancestors(path: Path) -> None:
     absolute = Path(os.path.abspath(path))
-    existing: list[Path] = []
     cursor = absolute
     while True:
-        if os.path.lexists(cursor):
-            existing.append(cursor)
+        try:
+            metadata = os.lstat(cursor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise WorkflowError("WORKFLOW_PATH_INSPECTION_FAILED") from None
+        else:
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+                raise WorkflowError("PATH_LINK_OR_REPARSE_UNSAFE")
         if cursor == cursor.parent:
             break
         cursor = cursor.parent
-    for candidate in reversed(existing):
-        metadata = os.lstat(candidate)
-        if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
-            raise WorkflowError("PATH_LINK_OR_REPARSE_UNSAFE")
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
@@ -1456,52 +1616,21 @@ def _regular_file_identity(path: Path, _label: str) -> tuple[object, ...]:
 
 def _nearest_existing_parent(path: Path) -> Path:
     cursor = path.parent
-    while not os.path.lexists(cursor):
+    while not _workflow_path_exists(cursor):
         if cursor == cursor.parent:
             raise WorkflowError("OUTPUT_ROOT_UNAVAILABLE")
         cursor = cursor.parent
     return cursor
 
 
-def _allocate_run_directory(
-    output_root: Path,
-    observed: datetime,
-    workflow_id: str,
-) -> tuple[Path, str]:
-    _reject_link_ancestors(output_root)
+def _workflow_path_exists(path: Path) -> bool:
     try:
-        output_root.mkdir(parents=True, exist_ok=True)
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
     except OSError:
-        raise WorkflowError("OUTPUT_ROOT_UNAVAILABLE") from None
-    _reject_link_ancestors(output_root)
-    _directory_identity(output_root, "output root")
-    date_name = observed.date().isoformat()
-    primary = output_root / date_name
-    generation_pattern = re.compile(
-        rf"{re.escape(date_name)}(?:--run-[0-9a-f]{{12}})?"
-    )
-    try:
-        has_generation = os.path.lexists(primary) or any(
-            generation_pattern.fullmatch(path.name)
-            for path in output_root.iterdir()
-        )
-    except OSError:
-        raise WorkflowError("RUN_PATH_UNAVAILABLE") from None
-    if not has_generation:
-        run_name = date_name
-    else:
-        suffix = hashlib.sha256(workflow_id.encode("ascii")).hexdigest()[:12]
-        run_name = f"{date_name}--run-{suffix}"
-    run_root = output_root / run_name
-    if os.path.lexists(run_root):
-        raise WorkflowError("RUN_PATH_CONFLICT")
-    try:
-        run_root.mkdir()
-    except OSError:
-        raise WorkflowError("RUN_PATH_UNAVAILABLE") from None
-    _reject_link_ancestors(run_root)
-    _directory_identity(run_root, "run root")
-    return run_root, run_name
+        raise WorkflowError("WORKFLOW_PATH_INSPECTION_FAILED") from None
+    return True
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1510,11 +1639,26 @@ def _fsync_directory(path: Path) -> None:
         flags |= os.O_DIRECTORY
     try:
         descriptor = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if _directory_fsync_is_unsupported(exc):
+            return
+        raise WorkflowError("REPORT_DIRECTORY_FSYNC_OPEN_FAILED") from None
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if not _directory_fsync_is_unsupported(exc):
+            raise WorkflowError("REPORT_DIRECTORY_FSYNC_FAILED") from None
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise WorkflowError("REPORT_DIRECTORY_CLOSE_FAILED") from None
+
+
+def _directory_fsync_is_unsupported(exc: OSError) -> bool:
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}
+    if hasattr(errno, "EOPNOTSUPP"):
+        unsupported.add(errno.EOPNOTSUPP)
+    if os.name == "nt":
+        unsupported.add(errno.EACCES)
+    return exc.errno in unsupported

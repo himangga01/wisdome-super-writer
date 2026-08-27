@@ -137,6 +137,88 @@ def test_bundle_write_is_atomic_and_repeatable(tmp_path: Path) -> None:
     assert list(manifest["files"])[-1] == "sources.json"
 
 
+def test_run_directory_write_requires_writer_issued_lease(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+
+    with pytest.raises(BundlePublishError, match="lease"):
+        writer.write(
+            bundle,
+            run_directory="2026-08-28--run-000000000000",
+        )
+
+
+def test_run_directory_lease_rejects_substituted_partial_directory(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    root = tmp_path / "output"
+    writer = ArticleBundleWriter(root)
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-substitution",
+    )
+    original = root / lease.name
+    backup = tmp_path / "owned-run-backup"
+    original.rename(backup)
+    original.mkdir()
+
+    with pytest.raises(BundlePublishError, match="lease|identity|substitut"):
+        writer.write(bundle, run_directory=lease)
+
+
+def test_completed_run_directory_lease_cannot_be_reused(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-complete",
+    )
+    writer.write_run(
+        date(2026, 8, 28),
+        "# weekly\n",
+        (bundle,),
+        run_directory=lease,
+    )
+
+    with pytest.raises(BundlePublishError, match="completed|reused|lease"):
+        writer.write(bundle, run_directory=lease)
+
+
+def test_completed_run_lease_rejects_directory_identity_substitution(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    root = tmp_path / "output"
+    writer = ArticleBundleWriter(root)
+    lease = writer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-completed-substitution",
+    )
+    writer.write_run(
+        date(2026, 8, 28),
+        "# weekly\n",
+        (bundle,),
+        run_directory=lease,
+    )
+    run_root = root / lease.name
+    backup = tmp_path / "completed-run-backup"
+    run_root.rename(backup)
+    shutil.copytree(backup, run_root)
+
+    with pytest.raises(BundlePublishError, match="identity|substitut"):
+        writer.verify_run_directory_lease(lease, allow_completed=True)
+
+
+def test_lease_from_another_writer_has_no_write_authority(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    root = tmp_path / "output"
+    issuer = ArticleBundleWriter(root)
+    lease = issuer.reserve_run_directory(
+        date(2026, 8, 28),
+        workflow_id="workflow-authority",
+    )
+
+    with pytest.raises(BundlePublishError, match="lease|authority"):
+        ArticleBundleWriter(root).write(bundle, run_directory=lease)
+
+
 def test_exact_replay_rechecks_root_identity_after_existing_hash_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
