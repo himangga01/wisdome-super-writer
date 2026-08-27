@@ -1,0 +1,606 @@
+"""Strict loopback adapter and protected-prose verification for the local humanizer."""
+
+from __future__ import annotations
+
+import codecs
+import ipaddress
+import json
+import re
+import unicodedata
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from time import monotonic
+from urllib.parse import urlsplit
+
+import httpx
+
+from apps.local_content.rendering import ProseBlock
+
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+HUMANIZATION_DEADLINE_SECONDS = 10 * 60.0
+_TRANSFORM_CONTENT_TYPE = "application/x-ndjson"
+_HEALTH_CONTENT_TYPE = "application/json"
+_TOKEN_PATTERN = re.compile(r"\[\[P\d{4,}\]\]")
+_BLOCK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_BLOCK_PATTERN = re.compile(
+    r"<!-- WSW:block:(?P<block_id>[A-Za-z0-9][A-Za-z0-9._-]{0,63}) -->\n"
+    r"(?P<body>.*?)\n"
+    r"<!-- WSW:endblock:(?P=block_id) -->",
+    re.DOTALL,
+)
+_LINK_PATTERN = re.compile(
+    r"!?\[[^\]\n]*\]\(\s*(?P<target><[^>\n]+>|[^\s)]+)"
+    r"(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?\s*\)"
+)
+_MARKDOWN_PATTERN = re.compile(
+    r"<!--\s*WSW:(?:end)?block:[^>\r\n]+-->"
+    r"|!?\[[^\]\n]*\]\(\s*(?:<[^>\n]+>|[^\s)]+)"
+    r"(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?\s*\)"
+    r"|\[\^[^\]\n]+\]|\[[^\]\n]+\]"
+    r"|`{1,3}[^`\n]*`{1,3}"
+    r"|\\[*_~`\[\]()]|\*{1,3}|_{1,3}|~~|\|"
+    r"|^(?: {0,3}(?:#{1,6}(?=\s)|>|[-+*](?=\s)|\d+[.)](?=\s)|`{3,}|~{3,}))",
+    re.MULTILINE,
+)
+_URL_PATTERN = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?82[- ]?)?0\d{1,2}[- ]?\d{3,4}[- ]?\d{4}(?!\d)")
+_DATE_PATTERN = re.compile(
+    r"(?<!\d)(?:\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"
+    r"|\d{4}[-./]\d{1,2}[-./]\d{1,2})(?!\d)"
+)
+_TIME_PATTERN = re.compile(r"(?<!\d)(?:(?:오전|오후)\s*)?\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
+_CURRENCY_PATTERN = re.compile(
+    r"(?<!\w)(?:(?:KRW|USD)\s*|[₩￦$€¥])\s*\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:원|만원|억원|조원))?"
+    r"|(?<!\d)\d[\d,]*(?:\.\d+)?\s*(?:원|만원|억원|조원)(?!\w)",
+    re.IGNORECASE,
+)
+_NUMBER_PATTERN = re.compile(
+    r"\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:%|퍼센트|세대|명|건|호|개|회|차|년|개월|일|시간|분|초|"
+    r"mm|cm|km|m²|㎡|m|kg|g|L|ml))?",
+    re.IGNORECASE,
+)
+_SENSITIVE_PATTERNS = (
+    _PHONE_PATTERN,
+    _DATE_PATTERN,
+    _TIME_PATTERN,
+    _CURRENCY_PATTERN,
+    _NUMBER_PATTERN,
+)
+_EVENT_PHASES = frozenset({"sanitize", "chunk", "transform", "verify", "assemble"})
+_ERROR_CODES = frozenset(
+    {
+        "EMPTY_INPUT",
+        "QUEUE_FULL",
+        "ENGINE_UNAVAILABLE",
+        "ENGINE_TIMEOUT",
+        "ENGINE_OUTPUT_INVALID",
+        "VALIDATION_FAILED",
+        "INSUFFICIENT_DISK",
+        "CLIENT_ABORTED",
+        "INTERNAL_ERROR",
+    }
+)
+
+
+class HumanizationError(Exception):
+    """A persistence-safe failure while calling the local humanizer."""
+
+
+class HumanizationVerificationError(HumanizationError):
+    """A candidate changed protected or structural article material."""
+
+
+@dataclass(frozen=True)
+class ProtectedArticleProse:
+    """The only document permitted to cross the humanizer boundary."""
+
+    document: str
+    original_blocks: tuple[ProseBlock, ...]
+    token_values: tuple[tuple[str, str], ...]
+    token_occurrences: tuple[str, ...]
+    link_targets: tuple[str, ...]
+
+
+class HumanizerClient:
+    """A bounded client for the sibling service's public loopback API."""
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:3210",
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._base_url = _validated_loopback_base_url(base_url)
+        self._transport = transport
+
+    def health(self) -> bool:
+        """Return whether the sibling service reports its public ready state."""
+
+        try:
+            with self._client(timeout=10.0) as client:
+                with client.stream("GET", f"{self._base_url}/api/health") as response:
+                    if response.status_code != 200:
+                        return False
+                    if _media_type(response.headers.get("content-type")) != _HEALTH_CONTENT_TYPE:
+                        return False
+                    content = _read_limited_response(response, deadline=monotonic() + 10.0)
+            payload = _strict_json_loads(content.decode("utf-8", errors="strict"))
+        except (httpx.HTTPError, UnicodeDecodeError, ValueError, HumanizationError):
+            return False
+        return _valid_health_payload(payload)
+
+    def transform(self, document: str) -> str:
+        """Stream one transform and return output only after a single valid terminal done."""
+
+        request_body = _utf8_bytes(document, boundary=HumanizationError)
+        if len(request_body) > MAX_RESPONSE_BYTES:
+            raise HumanizationError("Humanizer input exceeded the 5 MiB size limit")
+        deadline = monotonic() + HUMANIZATION_DEADLINE_SECONDS
+        try:
+            with self._client(timeout=HUMANIZATION_DEADLINE_SECONDS) as client:
+                with client.stream(
+                    "POST",
+                    f"{self._base_url}/api/transform",
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "Accept": _TRANSFORM_CONTENT_TYPE,
+                    },
+                    content=request_body,
+                ) as response:
+                    if response.status_code != 200:
+                        raise HumanizationError(
+                            f"Humanizer returned HTTP status {response.status_code}"
+                        )
+                    if (
+                        _media_type(response.headers.get("content-type"))
+                        != _TRANSFORM_CONTENT_TYPE
+                    ):
+                        raise HumanizationError("Humanizer response content type was not NDJSON")
+                    return _consume_transform_stream(response, deadline=deadline)
+        except HumanizationError:
+            raise
+        except httpx.TimeoutException:
+            raise HumanizationError("Humanizer request exceeded the 10-minute deadline") from None
+        except httpx.HTTPError as exc:
+            raise HumanizationError(
+                f"Humanizer request failed ({exc.__class__.__name__})"
+            ) from None
+
+    def _client(self, *, timeout: float) -> httpx.Client:
+        return httpx.Client(
+            transport=self._transport,
+            timeout=httpx.Timeout(timeout),
+            follow_redirects=False,
+            trust_env=False,
+        )
+
+
+def protect_article_prose(
+    blocks: Mapping[str, str] | Iterable[ProseBlock],
+    anchors: Iterable[str],
+) -> ProtectedArticleProse:
+    """Create a tokenized document containing prose blocks and no factual article slots."""
+
+    material = _coerce_blocks(blocks)
+    _validate_blocks(material)
+    document = "\n\n".join(
+        f"<!-- WSW:block:{block.block_id} -->\n{block.markdown}\n"
+        f"<!-- WSW:endblock:{block.block_id} -->"
+        for block in material
+    )
+    _utf8_bytes(document, boundary=ValueError)
+    if _TOKEN_PATTERN.search(document):
+        raise ValueError("prose contains a reserved protected token")
+    protected_values = _protected_values(document, anchors)
+    value_tokens = {
+        value: f"[[P{index:04d}]]" for index, value in enumerate(protected_values, start=1)
+    }
+    if protected_values:
+        alternation = re.compile("|".join(re.escape(value) for value in protected_values))
+        tokenized = alternation.sub(lambda match: value_tokens[match.group(0)], document)
+    else:
+        tokenized = document
+    token_values = tuple((value_tokens[value], value) for value in protected_values)
+    return ProtectedArticleProse(
+        document=tokenized,
+        original_blocks=material,
+        token_values=token_values,
+        token_occurrences=tuple(match.group(0) for match in _TOKEN_PATTERN.finditer(tokenized)),
+        link_targets=_link_targets(document),
+    )
+
+
+def verify_humanized_candidate(
+    protected: ProtectedArticleProse,
+    candidate: str,
+) -> tuple[ProseBlock, ...]:
+    """Verify, restore, and return prose blocks without constructing a final article."""
+
+    candidate_bytes = _utf8_bytes(candidate, boundary=HumanizationVerificationError)
+    if len(candidate_bytes) > MAX_RESPONSE_BYTES:
+        raise HumanizationVerificationError("candidate exceeded the 5 MiB size limit")
+    observed_tokens = tuple(match.group(0) for match in _TOKEN_PATTERN.finditer(candidate))
+    if observed_tokens != protected.token_occurrences:
+        raise HumanizationVerificationError("protected token multiset or order changed")
+    replacements = dict(protected.token_values)
+    if any(token not in replacements for token in observed_tokens):
+        raise HumanizationVerificationError("protected token was not recognized")
+    restored = _TOKEN_PATTERN.sub(lambda match: replacements[match.group(0)], candidate)
+    _utf8_bytes(restored, boundary=HumanizationVerificationError)
+    _validate_markdown_text(restored)
+    blocks = _extract_blocks(restored)
+    expected_ids = tuple(block.block_id for block in protected.original_blocks)
+    observed_ids = tuple(block.block_id for block in blocks)
+    if observed_ids != expected_ids:
+        raise HumanizationVerificationError("block IDs or order changed")
+    if _link_targets(restored) != protected.link_targets:
+        raise HumanizationVerificationError("Markdown link targets changed")
+    original_document = _restore_document(protected)
+    if Counter(_markdown_occurrences(restored)) != Counter(
+        _markdown_occurrences(original_document)
+    ):
+        raise HumanizationVerificationError("Markdown markers changed")
+    original_sensitive = Counter(_sensitive_occurrences(original_document))
+    candidate_sensitive = Counter(_sensitive_occurrences(restored))
+    if candidate_sensitive - original_sensitive:
+        raise HumanizationVerificationError(
+            "candidate introduced a numeric, date, or currency token"
+        )
+    return blocks
+
+
+def _validated_loopback_base_url(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
+    ):
+        raise ValueError("humanizer URL must be an unambiguous loopback HTTP URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        host = parsed.hostname
+    except (TypeError, ValueError):
+        raise ValueError("humanizer URL must be an unambiguous loopback HTTP URL") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("humanizer URL must be an unambiguous loopback HTTP URL")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise ValueError("humanizer URL must use a literal loopback IP address") from None
+    if not address.is_loopback:
+        raise ValueError("humanizer URL must use a loopback IP address")
+    display_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    display_port = f":{port}" if port is not None else ""
+    return f"{parsed.scheme.lower()}://{display_host}{display_port}"
+
+
+def _consume_transform_stream(response: httpx.Response, *, deadline: float) -> str:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    buffer = ""
+    received = 0
+    state = _StreamState()
+    try:
+        for chunk in response.iter_bytes():
+            if monotonic() > deadline:
+                raise HumanizationError("Humanizer request exceeded the 10-minute deadline")
+            received += len(chunk)
+            if received > MAX_RESPONSE_BYTES:
+                raise HumanizationError("Humanizer response exceeded the 5 MiB size limit")
+            buffer += decoder.decode(chunk, final=False)
+            buffer = _consume_complete_lines(buffer, state)
+        buffer += decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        raise HumanizationError("Humanizer response was not valid UTF-8") from None
+    if monotonic() > deadline:
+        raise HumanizationError("Humanizer request exceeded the 10-minute deadline")
+    if buffer:
+        _consume_event_line(buffer, state)
+    if not state.done:
+        raise HumanizationError("Humanizer NDJSON stream was truncated before done")
+    return "".join(state.deltas)
+
+
+@dataclass
+class _StreamState:
+    accepted: bool = False
+    result_started: bool = False
+    done: bool = False
+    event_count: int = 0
+    result_bytes: int = 0
+    deltas: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.deltas is None:
+            self.deltas = []
+
+
+def _consume_complete_lines(buffer: str, state: _StreamState) -> str:
+    while "\n" in buffer:
+        line, buffer = buffer.split("\n", 1)
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line:
+            _consume_event_line(line, state)
+    return buffer
+
+
+def _consume_event_line(line: str, state: _StreamState) -> None:
+    try:
+        event = _strict_json_loads(line)
+    except (ValueError, RecursionError):
+        raise HumanizationError("Humanizer returned invalid NDJSON") from None
+    if not isinstance(event, dict) or not all(isinstance(key, str) for key in event):
+        raise HumanizationError("Humanizer returned an invalid event schema")
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        raise HumanizationError("Humanizer returned an invalid event schema")
+    if state.done:
+        raise HumanizationError("Humanizer returned an event after terminal done")
+    if state.event_count == 0 and event_type != "accepted":
+        raise HumanizationError("Humanizer stream did not begin with accepted")
+    state.event_count += 1
+    _validate_event(event_type, event)
+    if event_type == "accepted":
+        if state.accepted:
+            raise HumanizationError("Humanizer returned duplicate accepted events")
+        state.accepted = True
+    elif event_type == "result-start":
+        if state.result_started:
+            raise HumanizationError("Humanizer returned duplicate result-start events")
+        state.result_started = True
+    elif event_type == "result-delta":
+        if not state.result_started:
+            raise HumanizationError("Humanizer returned a result delta before result-start")
+        assert state.deltas is not None
+        state.deltas.append(event["text"])
+        state.result_bytes += len(event["text"].encode("utf-8"))
+        if state.result_bytes > MAX_RESPONSE_BYTES:
+            raise HumanizationError("Humanizer result exceeded the 5 MiB size limit")
+    elif event_type == "done":
+        if not state.result_started:
+            raise HumanizationError("Humanizer returned done before result-start")
+        state.done = True
+    elif event_type == "error":
+        raise HumanizationError(f"Humanizer returned terminal error {event['code']}")
+
+
+def _validate_event(event_type: str, event: dict[str, object]) -> None:
+    if event_type == "accepted":
+        _exact_keys(event, {"type", "jobId", "position"})
+        _string(event, "jobId", nonempty=True)
+        _integer(event, "position")
+    elif event_type == "queued":
+        _exact_keys(event, {"type", "position"})
+        _integer(event, "position")
+    elif event_type == "progress":
+        required = {"type", "phase", "current", "total", "message"}
+        optional = {"completedUnits", "totalUnits"}
+        if not required.issubset(event) or not set(event).issubset(required | optional):
+            raise HumanizationError("Humanizer returned an invalid event schema")
+        if event["phase"] not in _EVENT_PHASES:
+            raise HumanizationError("Humanizer returned an invalid event schema")
+        _integer(event, "current")
+        _integer(event, "total")
+        _string(event, "message")
+        for key in optional & set(event):
+            _integer(event, key)
+    elif event_type == "warning":
+        _exact_keys(event, {"type", "code", "message"})
+        _string(event, "code", nonempty=True)
+        _string(event, "message")
+    elif event_type == "result-start":
+        _exact_keys(event, {"type"})
+    elif event_type == "result-delta":
+        _exact_keys(event, {"type", "text"})
+        _string(event, "text")
+    elif event_type == "done":
+        _exact_keys(event, {"type", "sourceChars", "outputChars", "chunks", "elapsedMs"})
+        for key in ("sourceChars", "outputChars", "chunks", "elapsedMs"):
+            _integer(event, key)
+    elif event_type == "error":
+        _exact_keys(event, {"type", "code", "message", "retryable"})
+        if event["code"] not in _ERROR_CODES or type(event["retryable"]) is not bool:
+            raise HumanizationError("Humanizer returned an invalid event schema")
+        _string(event, "message")
+    else:
+        raise HumanizationError("Humanizer returned an unknown event type")
+
+
+def _exact_keys(event: Mapping[str, object], expected: set[str]) -> None:
+    if set(event) != expected:
+        raise HumanizationError("Humanizer returned an invalid event schema")
+
+
+def _string(event: Mapping[str, object], key: str, *, nonempty: bool = False) -> None:
+    value = event.get(key)
+    if not isinstance(value, str) or (nonempty and not value):
+        raise HumanizationError("Humanizer returned an invalid event schema")
+
+
+def _integer(event: Mapping[str, object], key: str) -> None:
+    value = event.get(key)
+    if type(value) is not int or value < 0:
+        raise HumanizationError("Humanizer returned an invalid event schema")
+
+
+def _read_limited_response(response: httpx.Response, *, deadline: float) -> bytes:
+    chunks: list[bytes] = []
+    received = 0
+    for chunk in response.iter_bytes():
+        if monotonic() > deadline:
+            raise HumanizationError("Humanizer health request timed out")
+        received += len(chunk)
+        if received > MAX_RESPONSE_BYTES:
+            raise HumanizationError("Humanizer health response exceeded the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _valid_health_payload(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    required = {
+        "status",
+        "engine",
+        "engineVersion",
+        "humanizeVersion",
+        "activeJobs",
+        "queuedJobs",
+    }
+    if set(payload) != required or payload.get("status") != "ready":
+        return False
+    return (
+        payload.get("engine") == "codex-cli"
+        and isinstance(payload.get("engineVersion"), str)
+        and isinstance(payload.get("humanizeVersion"), str)
+        and type(payload.get("activeJobs")) is int
+        and payload["activeJobs"] >= 0
+        and type(payload.get("queuedJobs")) is int
+        and payload["queuedJobs"] >= 0
+    )
+
+
+def _coerce_blocks(
+    blocks: Mapping[str, str] | Iterable[ProseBlock],
+) -> tuple[ProseBlock, ...]:
+    if isinstance(blocks, Mapping):
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in blocks.items()
+        ):
+            raise ValueError("prose blocks must map string block IDs to string Markdown")
+        return tuple(ProseBlock(key, value) for key, value in blocks.items())
+    try:
+        material = tuple(blocks)
+    except TypeError:
+        raise ValueError("prose blocks must be a mapping or iterable of ProseBlock") from None
+    if not all(isinstance(block, ProseBlock) for block in material):
+        raise ValueError("prose blocks must contain ProseBlock values")
+    return material
+
+
+def _validate_blocks(blocks: tuple[ProseBlock, ...]) -> None:
+    if not blocks:
+        raise ValueError("at least one prose block is required")
+    ids = tuple(block.block_id for block in blocks)
+    invalid_id = any(_BLOCK_ID_PATTERN.fullmatch(value) is None for value in ids)
+    if len(set(ids)) != len(ids) or invalid_id:
+        raise ValueError("prose block id must be unique and safe")
+    for block in blocks:
+        if not isinstance(block.markdown, str):
+            raise ValueError("prose block Markdown must be text")
+
+
+def _protected_values(document: str, anchors: Iterable[str]) -> tuple[str, ...]:
+    values: set[str] = set()
+    try:
+        anchor_values = tuple(anchors)
+    except TypeError:
+        raise ValueError("protected anchors must be an iterable of strings") from None
+    for anchor in anchor_values:
+        if not isinstance(anchor, str):
+            raise ValueError("protected anchors must contain strings")
+        _utf8_bytes(anchor, boundary=ValueError)
+        if anchor and anchor in document:
+            values.add(anchor)
+    for pattern in (_MARKDOWN_PATTERN, _URL_PATTERN, *_SENSITIVE_PATTERNS):
+        values.update(match.group(0) for match in pattern.finditer(document) if match.group(0))
+    return tuple(sorted(values, key=lambda value: (-len(value), value)))
+
+
+def _restore_document(protected: ProtectedArticleProse) -> str:
+    replacements = dict(protected.token_values)
+    return _TOKEN_PATTERN.sub(lambda match: replacements[match.group(0)], protected.document)
+
+
+def _extract_blocks(document: str) -> tuple[ProseBlock, ...]:
+    blocks: list[ProseBlock] = []
+    cursor = 0
+    for match in _BLOCK_PATTERN.finditer(document):
+        if document[cursor : match.start()].strip():
+            raise HumanizationVerificationError("content appeared outside protected prose blocks")
+        blocks.append(ProseBlock(match.group("block_id"), match.group("body")))
+        cursor = match.end()
+    if document[cursor:].strip():
+        raise HumanizationVerificationError("content appeared outside protected prose blocks")
+    if not blocks:
+        raise HumanizationVerificationError("protected prose block markers were missing")
+    return tuple(blocks)
+
+
+def _link_targets(document: str) -> tuple[str, ...]:
+    return tuple(match.group("target") for match in _LINK_PATTERN.finditer(document))
+
+
+def _sensitive_occurrences(document: str) -> tuple[str, ...]:
+    matches: list[tuple[int, int, str]] = []
+    for pattern in _SENSITIVE_PATTERNS:
+        matches.extend(
+            (match.start(), match.end(), match.group(0))
+            for match in pattern.finditer(document)
+        )
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+    result: list[str] = []
+    end = -1
+    for start, stop, value in matches:
+        if start >= end:
+            result.append(value)
+            end = stop
+    return tuple(result)
+
+
+def _markdown_occurrences(document: str) -> tuple[str, ...]:
+    return tuple(match.group(0) for match in _MARKDOWN_PATTERN.finditer(document))
+
+
+def _validate_markdown_text(document: str) -> None:
+    for character in document:
+        category = unicodedata.category(character)
+        if category == "Cs" or (category == "Cc" and character not in "\n\r\t"):
+            raise HumanizationVerificationError("candidate is not valid UTF-8 Markdown text")
+    if "\x00" in document:
+        raise HumanizationVerificationError("candidate is not valid UTF-8 Markdown text")
+
+
+def _utf8_bytes(value: object, *, boundary: type[Exception]) -> bytes:
+    if not isinstance(value, str):
+        raise boundary("value must be UTF-8 text")
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise boundary("value is not valid UTF-8 text") from None
+
+
+def _media_type(value: str | None) -> str:
+    return (value or "").split(";", 1)[0].strip().lower()
+
+
+def _strict_json_loads(value: str) -> object:
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    def reject_constant(_value: str) -> object:
+        raise ValueError("non-standard JSON number")
+
+    return json.loads(
+        value,
+        object_pairs_hook=object_pairs,
+        parse_constant=reject_constant,
+    )
