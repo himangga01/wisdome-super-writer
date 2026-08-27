@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import codecs
 import ipaddress
 import json
+import math
 import re
+import threading
 import unicodedata
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from time import monotonic
 from urllib.parse import urlsplit
@@ -18,7 +19,10 @@ import httpx
 from apps.local_content.rendering import ProseBlock
 
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_INPUT_BYTES = 5 * 1024 * 1024
+MAX_RESULT_BYTES = 5 * 1024 * 1024
 HUMANIZATION_DEADLINE_SECONDS = 10 * 60.0
+MAX_LINGERING_HUMANIZATIONS = 2
 _TRANSFORM_CONTENT_TYPE = "application/x-ndjson"
 _HEALTH_CONTENT_TYPE = "application/json"
 _TOKEN_PATTERN = re.compile(r"\[\[P\d{4,}\]\]")
@@ -44,31 +48,8 @@ _MARKDOWN_PATTERN = re.compile(
     re.MULTILINE,
 )
 _URL_PATTERN = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
-_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?82[- ]?)?0\d{1,2}[- ]?\d{3,4}[- ]?\d{4}(?!\d)")
-_DATE_PATTERN = re.compile(
-    r"(?<!\d)(?:\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"
-    r"|\d{4}[-./]\d{1,2}[-./]\d{1,2})(?!\d)"
-)
-_TIME_PATTERN = re.compile(r"(?<!\d)(?:(?:오전|오후)\s*)?\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
-_CURRENCY_PATTERN = re.compile(
-    r"(?<!\w)(?:(?:KRW|USD)\s*|[₩￦$€¥])\s*\d[\d,]*(?:\.\d+)?"
-    r"(?:\s*(?:원|만원|억원|조원))?"
-    r"|(?<!\d)\d[\d,]*(?:\.\d+)?\s*(?:원|만원|억원|조원)(?!\w)",
-    re.IGNORECASE,
-)
-_NUMBER_PATTERN = re.compile(
-    r"\d[\d,]*(?:\.\d+)?"
-    r"(?:\s*(?:%|퍼센트|세대|명|건|호|개|회|차|년|개월|일|시간|분|초|"
-    r"mm|cm|km|m²|㎡|m|kg|g|L|ml))?",
-    re.IGNORECASE,
-)
-_SENSITIVE_PATTERNS = (
-    _PHONE_PATTERN,
-    _DATE_PATTERN,
-    _TIME_PATTERN,
-    _CURRENCY_PATTERN,
-    _NUMBER_PATTERN,
-)
+_DIGIT_TOKEN_PATTERN = re.compile(r"(?<!\S)\S*\d\S*(?!\S)")
+_SENSITIVE_PATTERNS = (_DIGIT_TOKEN_PATTERN,)
 _EVENT_PHASES = frozenset({"sanitize", "chunk", "transform", "verify", "assemble"})
 _ERROR_CODES = frozenset(
     {
@@ -83,6 +64,7 @@ _ERROR_CODES = frozenset(
         "INTERNAL_ERROR",
     }
 )
+_WATCHDOG_SLOTS = threading.BoundedSemaphore(MAX_LINGERING_HUMANIZATIONS)
 
 
 class HumanizationError(Exception):
@@ -112,9 +94,19 @@ class HumanizerClient:
         base_url: str = "http://127.0.0.1:3210",
         *,
         transport: httpx.BaseTransport | None = None,
+        deadline_seconds: float = HUMANIZATION_DEADLINE_SECONDS,
     ) -> None:
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, int | float)
+            or not math.isfinite(deadline_seconds)
+            or deadline_seconds <= 0
+            or deadline_seconds > HUMANIZATION_DEADLINE_SECONDS
+        ):
+            raise ValueError("humanizer deadline must be positive and at most 10 minutes")
         self._base_url = _validated_loopback_base_url(base_url)
         self._transport = transport
+        self._deadline_seconds = float(deadline_seconds)
 
     def health(self) -> bool:
         """Return whether the sibling service reports its public ready state."""
@@ -135,12 +127,35 @@ class HumanizerClient:
     def transform(self, document: str) -> str:
         """Stream one transform and return output only after a single valid terminal done."""
 
+        started = monotonic()
         request_body = _utf8_bytes(document, boundary=HumanizationError)
-        if len(request_body) > MAX_RESPONSE_BYTES:
+        if len(request_body) > MAX_INPUT_BYTES:
             raise HumanizationError("Humanizer input exceeded the 5 MiB size limit")
-        deadline = monotonic() + HUMANIZATION_DEADLINE_SECONDS
+        deadline = started + self._deadline_seconds
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise HumanizationError("Humanizer request exceeded the total deadline")
+        return _run_with_watchdog(
+            lambda cancelled: self._transform_request(
+                request_body,
+                deadline=deadline,
+                cancelled=cancelled,
+            ),
+            timeout=remaining,
+        )
+
+    def _transform_request(
+        self,
+        request_body: bytes,
+        *,
+        deadline: float,
+        cancelled: threading.Event,
+    ) -> str:
+        remaining = max(0.001, deadline - monotonic())
         try:
-            with self._client(timeout=HUMANIZATION_DEADLINE_SECONDS) as client:
+            with self._client(timeout=remaining) as client:
+                if cancelled.is_set():
+                    raise HumanizationError("Humanizer request exceeded the total deadline")
                 with client.stream(
                     "POST",
                     f"{self._base_url}/api/transform",
@@ -159,11 +174,15 @@ class HumanizerClient:
                         != _TRANSFORM_CONTENT_TYPE
                     ):
                         raise HumanizationError("Humanizer response content type was not NDJSON")
-                    return _consume_transform_stream(response, deadline=deadline)
+                    return _consume_transform_stream(
+                        response,
+                        deadline=deadline,
+                        cancelled=cancelled,
+                    )
         except HumanizationError:
             raise
         except httpx.TimeoutException:
-            raise HumanizationError("Humanizer request exceeded the 10-minute deadline") from None
+            raise HumanizationError("Humanizer request exceeded the total deadline") from None
         except httpx.HTTPError as exc:
             raise HumanizationError(
                 f"Humanizer request failed ({exc.__class__.__name__})"
@@ -256,6 +275,9 @@ def _validated_loopback_base_url(value: str) -> str:
     if (
         not isinstance(value, str)
         or value != value.strip()
+        or value.endswith("/")
+        or "?" in value
+        or "#" in value
         or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
     ):
         raise ValueError("humanizer URL must be an unambiguous loopback HTTP URL")
@@ -270,7 +292,7 @@ def _validated_loopback_base_url(value: str) -> str:
         or not host
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.path not in {"", "/"}
+        or parsed.path
         or parsed.query
         or parsed.fragment
     ):
@@ -283,30 +305,75 @@ def _validated_loopback_base_url(value: str) -> str:
         raise ValueError("humanizer URL must use a loopback IP address")
     display_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
     display_port = f":{port}" if port is not None else ""
-    return f"{parsed.scheme.lower()}://{display_host}{display_port}"
+    origin = f"{parsed.scheme.lower()}://{display_host}{display_port}"
+    if value != origin:
+        raise ValueError("humanizer URL must be an exact loopback HTTP origin")
+    return origin
 
 
-def _consume_transform_stream(response: httpx.Response, *, deadline: float) -> str:
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    buffer = ""
+def _run_with_watchdog(
+    operation: Callable[[threading.Event], str],
+    *,
+    timeout: float,
+) -> str:
+    if not _WATCHDOG_SLOTS.acquire(blocking=False):
+        raise HumanizationError("Humanizer watchdog capacity is exhausted")
+    cancelled = threading.Event()
+    completed = threading.Event()
+    outcome: dict[str, str | Exception] = {}
+
+    def worker() -> None:
+        try:
+            outcome["result"] = operation(cancelled)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            _WATCHDOG_SLOTS.release()
+            completed.set()
+
+    thread = threading.Thread(
+        target=worker,
+        name="local-humanizer-watchdog",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        _WATCHDOG_SLOTS.release()
+        raise HumanizationError("Humanizer watchdog could not start") from None
+    if not completed.wait(timeout):
+        cancelled.set()
+        raise HumanizationError("Humanizer request exceeded the total deadline")
+    error = outcome.get("error")
+    if isinstance(error, Exception):
+        raise error
+    result = outcome.get("result")
+    if not isinstance(result, str):
+        raise HumanizationError("Humanizer watchdog returned no result")
+    return result
+
+
+def _consume_transform_stream(
+    response: httpx.Response,
+    *,
+    deadline: float,
+    cancelled: threading.Event,
+) -> str:
+    buffer = bytearray()
     received = 0
     state = _StreamState()
-    try:
-        for chunk in response.iter_bytes():
-            if monotonic() > deadline:
-                raise HumanizationError("Humanizer request exceeded the 10-minute deadline")
-            received += len(chunk)
-            if received > MAX_RESPONSE_BYTES:
-                raise HumanizationError("Humanizer response exceeded the 5 MiB size limit")
-            buffer += decoder.decode(chunk, final=False)
-            buffer = _consume_complete_lines(buffer, state)
-        buffer += decoder.decode(b"", final=True)
-    except UnicodeDecodeError:
-        raise HumanizationError("Humanizer response was not valid UTF-8") from None
-    if monotonic() > deadline:
-        raise HumanizationError("Humanizer request exceeded the 10-minute deadline")
+    for chunk in response.iter_bytes():
+        if cancelled.is_set() or monotonic() > deadline:
+            raise HumanizationError("Humanizer request exceeded the total deadline")
+        received += len(chunk)
+        if received > MAX_RESPONSE_BYTES:
+            raise HumanizationError("Humanizer response exceeded the 5 MiB size limit")
+        buffer.extend(chunk)
+        _consume_complete_lines(buffer, state)
+    if cancelled.is_set() or monotonic() > deadline:
+        raise HumanizationError("Humanizer request exceeded the total deadline")
     if buffer:
-        _consume_event_line(buffer, state)
+        _consume_event_bytes(bytes(buffer), state)
     if not state.done:
         raise HumanizationError("Humanizer NDJSON stream was truncated before done")
     return "".join(state.deltas)
@@ -326,14 +393,25 @@ class _StreamState:
             self.deltas = []
 
 
-def _consume_complete_lines(buffer: str, state: _StreamState) -> str:
-    while "\n" in buffer:
-        line, buffer = buffer.split("\n", 1)
-        if line.endswith("\r"):
+def _consume_complete_lines(buffer: bytearray, state: _StreamState) -> None:
+    cursor = 0
+    while (line_end := buffer.find(b"\n", cursor)) >= 0:
+        line = bytes(buffer[cursor:line_end])
+        if line.endswith(b"\r"):
             line = line[:-1]
         if line:
-            _consume_event_line(line, state)
-    return buffer
+            _consume_event_bytes(line, state)
+        cursor = line_end + 1
+    if cursor:
+        del buffer[:cursor]
+
+
+def _consume_event_bytes(line: bytes, state: _StreamState) -> None:
+    try:
+        decoded = line.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise HumanizationError("Humanizer response was not valid UTF-8") from None
+    _consume_event_line(decoded, state)
 
 
 def _consume_event_line(line: str, state: _StreamState) -> None:
@@ -352,6 +430,8 @@ def _consume_event_line(line: str, state: _StreamState) -> None:
         raise HumanizationError("Humanizer stream did not begin with accepted")
     state.event_count += 1
     _validate_event(event_type, event)
+    if state.result_started and event_type not in {"result-delta", "done"}:
+        raise HumanizationError("Humanizer returned an event after result-start")
     if event_type == "accepted":
         if state.accepted:
             raise HumanizationError("Humanizer returned duplicate accepted events")
@@ -364,9 +444,10 @@ def _consume_event_line(line: str, state: _StreamState) -> None:
         if not state.result_started:
             raise HumanizationError("Humanizer returned a result delta before result-start")
         assert state.deltas is not None
+        delta_bytes = _utf8_bytes(event["text"], boundary=HumanizationError)
         state.deltas.append(event["text"])
-        state.result_bytes += len(event["text"].encode("utf-8"))
-        if state.result_bytes > MAX_RESPONSE_BYTES:
+        state.result_bytes += len(delta_bytes)
+        if state.result_bytes > MAX_RESULT_BYTES:
             raise HumanizationError("Humanizer result exceeded the 5 MiB size limit")
     elif event_type == "done":
         if not state.result_started:
@@ -501,6 +582,8 @@ def _validate_blocks(blocks: tuple[ProseBlock, ...]) -> None:
     for block in blocks:
         if not isinstance(block.markdown, str):
             raise ValueError("prose block Markdown must be text")
+        if "<!-- WSW:" in block.markdown:
+            raise ValueError("prose contains a reserved WSW marker")
 
 
 def _protected_values(document: str, anchors: Iterable[str]) -> tuple[str, ...]:
@@ -515,6 +598,7 @@ def _protected_values(document: str, anchors: Iterable[str]) -> tuple[str, ...]:
         _utf8_bytes(anchor, boundary=ValueError)
         if anchor and anchor in document:
             values.add(anchor)
+    values.update(_markdown_protected_lines(document))
     for pattern in (_MARKDOWN_PATTERN, _URL_PATTERN, *_SENSITIVE_PATTERNS):
         values.update(match.group(0) for match in pattern.finditer(document) if match.group(0))
     return tuple(sorted(values, key=lambda value: (-len(value), value)))
@@ -565,6 +649,20 @@ def _markdown_occurrences(document: str) -> tuple[str, ...]:
     return tuple(match.group(0) for match in _MARKDOWN_PATTERN.finditer(document))
 
 
+def _markdown_protected_lines(document: str) -> tuple[str, ...]:
+    protected: list[str] = []
+    for line in document.splitlines(keepends=True):
+        stripped = line.lstrip(" ")
+        is_reference = (
+            len(line) - len(stripped) <= 3
+            and stripped.startswith("[")
+            and "]:" in stripped
+        )
+        if "](" in line or is_reference:
+            protected.append(line)
+    return tuple(protected)
+
+
 def _validate_markdown_text(document: str) -> None:
     for character in document:
         category = unicodedata.category(character)
@@ -577,6 +675,8 @@ def _validate_markdown_text(document: str) -> None:
 def _utf8_bytes(value: object, *, boundary: type[Exception]) -> bytes:
     if not isinstance(value, str):
         raise boundary("value must be UTF-8 text")
+    if any(unicodedata.category(character) in {"Cf", "Cs"} for character in value):
+        raise boundary("value is not valid UTF-8 text")
     try:
         return value.encode("utf-8", errors="strict")
     except UnicodeEncodeError:

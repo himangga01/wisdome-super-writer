@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import gzip
 import json
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 
 import httpx
 import pytest
 
+import apps.local_content.humanizer as humanizer_module
 from apps.local_content.humanizer import (
     MAX_RESPONSE_BYTES,
     HumanizationError,
@@ -50,6 +54,45 @@ class _ChunkStream(httpx.SyncByteStream):
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         yield from self._chunks
+
+
+class _BlockingStream(httpx.SyncByteStream):
+    def __init__(self, release: threading.Event, exited: threading.Event) -> None:
+        self._release = release
+        self._exited = exited
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        try:
+            self._release.wait()
+            yield _event_bytes(COMPLETE_EVENTS)
+        finally:
+            self._exited.set()
+
+
+class _MidStreamBlock(httpx.SyncByteStream):
+    def __init__(
+        self,
+        blocked: threading.Event,
+        release: threading.Event,
+        exited: threading.Event,
+    ) -> None:
+        self._blocked = blocked
+        self._release = release
+        self._exited = exited
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        try:
+            yield _event_bytes([COMPLETE_EVENTS[0], {"type": "result-start"}])
+            self._blocked.set()
+            self._release.wait()
+            yield _event_bytes(
+                [
+                    {"type": "result-delta", "text": "늦은 결과"},
+                    COMPLETE_EVENTS[-1],
+                ]
+            )
+        finally:
+            self._exited.set()
 
 
 COMPLETE_EVENTS: list[dict[str, object]] = [
@@ -114,6 +157,74 @@ def test_client_decodes_utf8_and_ndjson_split_across_stream_chunks() -> None:
     assert client.transform("원문") == "자연스러운 문장"
 
 
+def test_client_total_deadline_returns_while_a_late_read_is_blocked() -> None:
+    blocked = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            stream=_MidStreamBlock(blocked, release, exited),
+        )
+
+    client = HumanizerClient(
+        "http://127.0.0.1:3210",
+        transport=httpx.MockTransport(handler),
+        deadline_seconds=0.05,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(HumanizationError, match="total deadline"):
+            client.transform("원문")
+        elapsed = time.monotonic() - started
+        assert blocked.is_set()
+        assert elapsed < 0.5
+    finally:
+        release.set()
+        assert exited.wait(1.0)
+
+
+def test_client_caps_lingering_blocked_watchdog_workers() -> None:
+    releases: list[threading.Event] = []
+    exits: list[threading.Event] = []
+
+    def blocking_client() -> HumanizerClient:
+        release = threading.Event()
+        exited = threading.Event()
+        releases.append(release)
+        exits.append(exited)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/x-ndjson"},
+                stream=_BlockingStream(release, exited),
+            )
+
+        return HumanizerClient(
+            "http://127.0.0.1:3210",
+            transport=httpx.MockTransport(handler),
+            deadline_seconds=0.02,
+        )
+
+    try:
+        for _ in range(humanizer_module.MAX_LINGERING_HUMANIZATIONS):
+            with pytest.raises(HumanizationError, match="total deadline"):
+                blocking_client().transform("원문")
+
+        started = time.monotonic()
+        with pytest.raises(HumanizationError, match="capacity"):
+            blocking_client().transform("원문")
+        assert time.monotonic() - started < 0.2
+    finally:
+        for release in releases:
+            release.set()
+        for exited in exits[:-1]:
+            assert exited.wait(1.0)
+
+
 @pytest.mark.parametrize(
     "events",
     [
@@ -161,6 +272,45 @@ def test_client_rejects_invalid_terminal_streams(events: list[dict[str, object]]
     )
 
     with pytest.raises(HumanizationError):
+        client.transform("원문")
+
+
+@pytest.mark.parametrize(
+    "late_event",
+    [
+        {"type": "queued", "position": 1},
+        {
+            "type": "progress",
+            "phase": "verify",
+            "current": 1,
+            "total": 1,
+            "message": "late progress",
+        },
+        {"type": "warning", "code": "LATE", "message": "late warning"},
+        {"type": "accepted", "jobId": "j2", "position": 0},
+        {
+            "type": "error",
+            "code": "ENGINE_TIMEOUT",
+            "message": "late error",
+            "retryable": True,
+        },
+    ],
+    ids=["queued", "progress", "warning", "accepted", "error"],
+)
+def test_client_rejects_non_result_event_after_result_start(
+    late_event: dict[str, object],
+) -> None:
+    events = [
+        COMPLETE_EVENTS[0],
+        {"type": "result-start"},
+        late_event,
+        COMPLETE_EVENTS[-1],
+    ]
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(events))
+    )
+
+    with pytest.raises(HumanizationError, match="after result-start"):
         client.transform("원문")
 
 
@@ -243,6 +393,55 @@ def test_client_rejects_response_larger_than_five_mib() -> None:
         client.transform("원문")
 
 
+def test_client_rejects_decompressed_response_larger_than_five_mib() -> None:
+    compressed = gzip.compress(b" " * (MAX_RESPONSE_BYTES + 1))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/x-ndjson",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkStream([compressed]),
+        )
+
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(HumanizationError, match="5 MiB"):
+        client.transform("원문")
+
+
+def test_client_rejects_input_larger_than_five_mib() -> None:
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(COMPLETE_EVENTS))
+    )
+
+    with pytest.raises(HumanizationError, match="input.*5 MiB"):
+        client.transform("x" * (MAX_RESPONSE_BYTES + 1))
+
+
+def test_client_enforces_result_limit_independently_of_response_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_limit = humanizer_module.MAX_RESULT_BYTES
+    monkeypatch.setattr(humanizer_module, "MAX_RESPONSE_BYTES", result_limit + 4096)
+    events = [
+        COMPLETE_EVENTS[0],
+        {"type": "result-start"},
+        {"type": "result-delta", "text": "x" * (result_limit + 1)},
+        COMPLETE_EVENTS[-1],
+    ]
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(events))
+    )
+
+    with pytest.raises(HumanizationError, match="result.*5 MiB"):
+        client.transform("원문")
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -252,6 +451,9 @@ def test_client_rejects_response_larger_than_five_mib() -> None:
         "http://user:secret@127.0.0.1:3210",
         "http://127.0.0.1:3210/unexpected",
         "http://127.0.0.1:3210?target=elsewhere",
+        "http://127.0.0.1:3210/",
+        "http://127.0.0.1:3210?",
+        "http://127.0.0.1:3210#",
         "\nhttp://127.0.0.1:3210",
         "http://127.0.0.1:3210\n",
         " http://127.0.0.1:3210",
@@ -279,6 +481,61 @@ def test_health_requires_ready_sibling_contract() -> None:
     )
 
     assert client.health() is True
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [{"type": "accepted", "jobId": "j1", "position": True}],
+        [
+            COMPLETE_EVENTS[0],
+            {"type": "result-start"},
+            {
+                "type": "done",
+                "sourceChars": 2,
+                "outputChars": 2,
+                "chunks": False,
+                "elapsedMs": 1,
+            },
+        ],
+    ],
+    ids=["accepted-position", "done-chunks"],
+)
+def test_client_rejects_boolean_integer_metrics(events: list[dict[str, object]]) -> None:
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(events))
+    )
+
+    with pytest.raises(HumanizationError, match="event schema"):
+        client.transform("원문")
+
+
+def test_client_disables_redirects_and_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.Client
+    options: dict[str, object] = {}
+    requests: list[httpx.Request] = []
+
+    def client_factory(**kwargs: object) -> httpx.Client:
+        options.update(kwargs)
+
+        def redirect(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(302, headers={"location": "http://127.0.0.1:9999/elsewhere"})
+
+        kwargs["transport"] = httpx.MockTransport(redirect)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(humanizer_module.httpx, "Client", client_factory)
+    client = HumanizerClient("http://127.0.0.1:3210")
+
+    with pytest.raises(HumanizationError, match="302"):
+        client.transform("원문")
+
+    assert options["follow_redirects"] is False
+    assert options["trust_env"] is False
+    assert len(requests) == 1
 
 
 def test_protection_hides_anchors_numbers_links_and_markdown_structure() -> None:
@@ -310,6 +567,51 @@ def test_protection_hides_anchors_numbers_links_and_markdown_structure() -> None
     ):
         assert value not in protected.document
     assert "[[P0001]]" in protected.document
+
+
+def test_protection_covers_entire_contiguous_token_containing_a_digit() -> None:
+    source = (
+        "변동률은 -12.5%이고 면적은 .5평, 공급은 10평이며 일정은 "
+        "2026년 8월 28일, 10층 A-26BL입니다."
+    )
+    protected = protect_article_prose({"intro": source}, anchors=())
+    protected_values = {value for _token, value in protected.token_values}
+
+    assert {
+        "-12.5%이고",
+        ".5평,",
+        "10평이며",
+        "2026년",
+        "8월",
+        "28일,",
+        "10층",
+        "A-26BL입니다.",
+    }.issubset(protected_values)
+    without_tokens = protected.document
+    for token in protected.token_occurrences:
+        without_tokens = without_tokens.replace(token, "")
+    assert not any(character.isdigit() for character in without_tokens)
+
+
+@pytest.mark.parametrize(
+    ("source_value", "mutated_value"),
+    [
+        ("-12.5%입니다.", "+12.5%입니다."),
+        ("10평입니다.", "10㎡입니다."),
+        ("2026년입니다.", "2027년입니다."),
+        ("8월입니다.", "9월입니다."),
+        ("10층입니다.", "11호입니다."),
+    ],
+)
+def test_candidate_cannot_change_sign_unit_date_or_floor_token(
+    source_value: str, mutated_value: str
+) -> None:
+    protected = protect_article_prose({"intro": f"값은 {source_value}"}, anchors=())
+    token = next(token for token, value in protected.token_values if value == source_value)
+    candidate = protected.document.replace(token, mutated_value)
+
+    with pytest.raises(HumanizationVerificationError, match="protected token"):
+        verify_humanized_candidate(protected, candidate)
 
 
 def test_protected_values_must_survive_exactly() -> None:
@@ -344,6 +646,15 @@ def test_protected_token_order_cannot_change() -> None:
 def test_candidate_cannot_introduce_new_numeric_date_or_currency_tokens(insertion: str) -> None:
     protected = protect_article_prose({"intro": "기존 안내 문장입니다."}, anchors=())
     candidate = protected.document.replace("기존 안내 문장입니다.", insertion)
+
+    with pytest.raises(HumanizationVerificationError, match="numeric, date, or currency"):
+        verify_humanized_candidate(protected, candidate)
+
+
+@pytest.mark.parametrize("insertion", ["값은 -12.5%입니다.", "면적은 .5평입니다."])
+def test_candidate_cannot_introduce_signed_or_leading_decimal_tokens(insertion: str) -> None:
+    protected = protect_article_prose({"intro": "기존 안내입니다."}, anchors=())
+    candidate = protected.document.replace("기존 안내입니다.", insertion)
 
     with pytest.raises(HumanizationVerificationError, match="numeric, date, or currency"):
         verify_humanized_candidate(protected, candidate)
@@ -416,15 +727,62 @@ def test_verified_candidate_restores_links_and_returns_only_prose_blocks() -> No
         ),
         anchors=(),
     )
-    candidate = protected.document.replace("확인하십시오.", "꼭 확인해 보세요.")
-    candidate = candidate.replace("비교하십시오.", "함께 살펴보세요.")
+    candidate = protected.document.replace("비교하십시오.", "함께 살펴보세요.")
 
     result = verify_humanized_candidate(protected, candidate)
 
     assert result == (
-        ProseBlock("intro", f"정확한 내용은 {original_link}에서 꼭 확인해 보세요."),
+        ProseBlock("intro", f"정확한 내용은 {original_link}에서 확인하십시오."),
         ProseBlock("context", "신청 전 원문을 함께 살펴보세요."),
     )
+
+
+def test_whole_lines_protect_nested_links_and_reference_definitions() -> None:
+    linked_line = (
+        "중첩 주소는 [공식 링크](https://example.test/a_(b\\)c)?q=(d))에서 확인합니다."
+    )
+    reference_line = '[공식]: https://example.test/a_(b\\)c) "공식 제목"'
+    protected = protect_article_prose(
+        {"intro": f"{linked_line}\n{reference_line}\n다른 문장입니다."}, anchors=()
+    )
+
+    assert linked_line not in protected.document
+    assert reference_line not in protected.document
+    result = verify_humanized_candidate(
+        protected,
+        protected.document.replace("다른 문장입니다.", "이 문장만 다듬었습니다."),
+    )
+    assert result == (
+        ProseBlock("intro", f"{linked_line}\n{reference_line}\n이 문장만 다듬었습니다."),
+    )
+
+    link_token = next(
+        token
+        for token, value in protected.token_values
+        if value.rstrip("\r\n") == linked_line
+    )
+    tampered = protected.document.replace(
+        link_token, linked_line.replace("example.test", "evil.test") + "\n"
+    )
+    with pytest.raises(HumanizationVerificationError, match="protected token"):
+        verify_humanized_candidate(protected, tampered)
+
+
+def test_reference_definition_protection_includes_its_line_ending() -> None:
+    reference_line = "[공식]: https://example.test/a_(b)c"
+    protected = protect_article_prose(
+        {"intro": f"{reference_line}\n다음 문장입니다."}, anchors=()
+    )
+    reference_token, reference_value = next(
+        (token, value)
+        for token, value in protected.token_values
+        if value.rstrip("\r\n") == reference_line
+    )
+    assert reference_value.endswith("\n")
+    candidate = protected.document.replace(reference_token, reference_line, 1)
+
+    with pytest.raises(HumanizationVerificationError, match="protected token|Markdown"):
+        verify_humanized_candidate(protected, candidate)
 
 
 def test_candidate_preserves_inline_markdown_and_citation_markers() -> None:
@@ -450,6 +808,52 @@ def test_candidate_rejects_invalid_utf8_scalar() -> None:
 
     with pytest.raises(HumanizationVerificationError, match="UTF-8"):
         verify_humanized_candidate(protected, candidate)
+
+
+def test_candidate_rejects_unicode_format_control() -> None:
+    protected = protect_article_prose({"intro": "원래 문장"}, anchors=())
+    candidate = protected.document.replace("원래 문장", "보이지 않는\u200b 문장")
+
+    with pytest.raises(HumanizationVerificationError, match="UTF-8"):
+        verify_humanized_candidate(protected, candidate)
+
+
+@pytest.mark.parametrize("value", ["원문\u200b", "원문\ud800"])
+def test_client_rejects_format_controls_and_surrogates_as_humanization_error(
+    value: str,
+) -> None:
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(COMPLETE_EVENTS))
+    )
+
+    with pytest.raises(HumanizationError, match="UTF-8"):
+        client.transform(value)
+
+
+def test_client_rejects_escaped_surrogate_result_without_raw_encode_error() -> None:
+    body = (
+        b'{"type":"accepted","jobId":"j1","position":0}\n'
+        b'{"type":"result-start"}\n'
+        b'{"type":"result-delta","text":"\\ud800"}\n'
+        b'{"type":"done","sourceChars":1,"outputChars":1,"chunks":1,"elapsedMs":1}\n'
+    )
+    client = HumanizerClient("http://127.0.0.1:3210", transport=_transport(body))
+
+    with pytest.raises(HumanizationError, match="UTF-8"):
+        client.transform("원문")
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "<!-- WSW:block:forged -->",
+        "<!-- WSW:endblock:forged -->",
+        "<!-- WSW:slot:facts -->",
+    ],
+)
+def test_source_prose_rejects_reserved_wsw_markers(marker: str) -> None:
+    with pytest.raises(ValueError, match="reserved WSW marker"):
+        protect_article_prose({"intro": f"원문 {marker}"}, anchors=())
 
 
 def test_block_ids_must_be_unique_and_safe() -> None:
