@@ -141,6 +141,27 @@ def test_renderer_fingerprint_binds_native_freetype_and_libwebp_versions() -> No
     assert fingerprint_renderer_material(material) != fingerprint_renderer_material(changed_webp)
 
 
+@pytest.mark.parametrize(
+    ("key", "changed"),
+    [
+        ("image_mode", "RGBA"),
+        ("exif_hex", "00"),
+        ("xmp_hex", "00"),
+        ("icc_profile_hex", "00"),
+        ("text_layout_engine", "RAQM"),
+    ],
+)
+def test_renderer_fingerprint_binds_mode_metadata_and_text_layout(
+    key: str, changed: str
+) -> None:
+    material = card_renderer_material()
+
+    assert key in material
+    assert fingerprint_renderer_material(material) != fingerprint_renderer_material(
+        {**material, key: changed}
+    )
+
+
 def test_summary_alt_describes_every_meaningful_visible_fact(tmp_path: Path) -> None:
     summary = render_summary_card(_notice(), tmp_path / "summary.webp")
     unknown = render_summary_card(

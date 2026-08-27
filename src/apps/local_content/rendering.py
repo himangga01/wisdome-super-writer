@@ -579,9 +579,9 @@ def _confirmation_items(notice: HousingNotice) -> tuple[str, ...]:
     items = [f"- 수집 경고: {_markdown_text(warning)}" for warning in notice.warnings]
     if notice.price_summary is None:
         items.append(f"- 가격·보증금·임대료: {UNKNOWN_VALUE}")
-    if not notice.eligibility_summary:
+    if not any(_safe_scalar(value) for value in notice.eligibility_summary):
         items.append(f"- 신청 자격: {UNKNOWN_VALUE}")
-    if not notice.restriction_summary:
+    if not any(_safe_scalar(value) for value in notice.restriction_summary):
         items.append(f"- 제한사항: {UNKNOWN_VALUE}")
     items.extend(
         (

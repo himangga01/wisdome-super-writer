@@ -271,3 +271,16 @@ def test_weekly_category_normalizes_format_only_value_to_exact_unknown() -> None
 
     assert f"- {UNKNOWN_VALUE}: 1건" in rendered.factual_markdown
     assert f"| {UNKNOWN_VALUE} |" in rendered.factual_markdown
+
+
+def test_confirmation_items_label_format_only_policy_tuples_as_unknown() -> None:
+    rendered = render_detailed_article(
+        _notice(
+            eligibility_summary=("\u200b", " \t"),
+            restriction_summary=("\u200b",),
+        )
+    )
+
+    confirmation = rendered.factual_markdown.split("## 반드시 다시 확인할 내용", 1)[1]
+    assert f"- 신청 자격: {UNKNOWN_VALUE}" in confirmation
+    assert f"- 제한사항: {UNKNOWN_VALUE}" in confirmation

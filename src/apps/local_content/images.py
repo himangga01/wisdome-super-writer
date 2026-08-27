@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import unicodedata
@@ -17,6 +18,27 @@ from apps.local_content.contracts import HousingNotice
 from apps.local_content.rendering import GENERIC_HERO_CAPTION, UNKNOWN_VALUE
 
 CARD_SIZE = (1200, 630)
+_CARD_MODE = "RGB"
+_EMPTY_EXIF = b""
+_EMPTY_XMP = b""
+_EMPTY_ICC_PROFILE = b""
+_TEXT_LAYOUT_ENGINE = ImageFont.Layout.BASIC
+_SUMMARY_INPUT_KEYS = (
+    "kind",
+    "title",
+    "region",
+    "supply",
+    "application_start",
+    "price_summary",
+)
+_TIMELINE_INPUT_KEYS = (
+    "kind",
+    "title",
+    "application_start",
+    "application_end",
+    "deadline",
+    "announcement_date",
+)
 GENERIC_HERO_PATH = (
     Path(__file__).resolve().parents[2] / "static" / "local_articles" / "generic-housing-hero.png"
 )
@@ -54,6 +76,7 @@ class ArticleImage:
     rights_basis: str
     attribution: str
     renderer_fingerprint: str
+    renderer_input: tuple[tuple[str, str], ...] = ()
 
     def as_manifest(self, *, path: str | None = None) -> dict[str, object]:
         return {
@@ -71,6 +94,7 @@ class ArticleImage:
             "rights_basis": self.rights_basis,
             "attribution": self.attribution,
             "renderer_fingerprint": self.renderer_fingerprint,
+            "renderer_input": dict(self.renderer_input),
         }
 
 
@@ -99,7 +123,22 @@ def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImag
     """Render a stable 1200x630 WebP overview from normalized facts only."""
 
     output_path = _card_path(output_path, "summary-card.webp")
-    image = Image.new("RGB", CARD_SIZE, "#F4F6F2")
+    renderer_input = _summary_renderer_input(notice)
+    values = dict(renderer_input)
+    image = _render_summary_image(values)
+    _save_webp(image, output_path)
+    alt, caption = card_accessibility_material(renderer_input)
+    return _card_manifest(
+        output_path,
+        bundle_path="assets/summary-card.webp",
+        alt=alt,
+        caption=caption,
+        renderer_input=renderer_input,
+    )
+
+
+def _render_summary_image(values: dict[str, str]) -> Image.Image:
+    image = Image.new(_CARD_MODE, CARD_SIZE, "#F4F6F2")
     draw = ImageDraw.Draw(image)
     regular = _font(31)
     small = _font(25)
@@ -108,21 +147,15 @@ def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImag
 
     draw.rounded_rectangle((58, 52, 1142, 578), radius=34, fill="#FFFFFF", outline="#DDE4DB")
     draw.text((92, 86), "주거 공고 한눈에 보기", font=label_font, fill="#24705B")
-    notice_title = _known(notice.title)
-    title = _fit_text(draw, notice_title, title_font, 990)
+    title = _fit_text(draw, values["title"], title_font, 990)
     draw.text((92, 132), title, font=title_font, fill="#15251F")
     draw.line((92, 216, 1108, 216), fill="#DDE4DB", width=3)
 
-    supply = (
-        f"{notice.supply_count:,}세대"
-        if notice.supply_count is not None
-        else UNKNOWN_VALUE
-    )
     facts = (
-        ("지역", _known(notice.region)),
-        ("공급 규모", supply),
-        ("신청 시작", _date(notice.application_start)),
-        ("가격·보증금·임대료", _known(notice.price_summary)),
+        ("지역", values["region"]),
+        ("공급 규모", values["supply"]),
+        ("신청 시작", values["application_start"]),
+        ("가격·보증금·임대료", values["price_summary"]),
     )
     for index, (label, value) in enumerate(facts):
         column = index % 2
@@ -138,24 +171,29 @@ def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImag
         font=small,
         fill="#60706A",
     )
-    _save_webp(image, output_path)
-    return _card_manifest(
-        output_path,
-        bundle_path="assets/summary-card.webp",
-        alt=(
-            f"{notice_title} 요약 카드. 지역 {_known(notice.region)}, "
-            f"공급 규모 {supply}, 신청 시작 {_date(notice.application_start)}, "
-            f"가격·보증금·임대료 {_known(notice.price_summary)}."
-        ),
-        caption="정규화된 공식 공고 사실로 만든 요약 이미지",
-    )
+    return image
 
 
 def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
     """Render a stable 1200x630 WebP timeline without filling unknown dates."""
 
     output_path = _card_path(output_path, "timeline.webp")
-    image = Image.new("RGB", CARD_SIZE, "#F4F6F2")
+    renderer_input = _timeline_renderer_input(notice)
+    values = dict(renderer_input)
+    image = _render_timeline_image(values)
+    _save_webp(image, output_path)
+    alt, caption = card_accessibility_material(renderer_input)
+    return _card_manifest(
+        output_path,
+        bundle_path="assets/timeline.webp",
+        alt=alt,
+        caption=caption,
+        renderer_input=renderer_input,
+    )
+
+
+def _render_timeline_image(values: dict[str, str]) -> Image.Image:
+    image = Image.new(_CARD_MODE, CARD_SIZE, "#F4F6F2")
     draw = ImageDraw.Draw(image)
     title_font = _font(45, bold=True)
     label_font = _font(23, bold=True)
@@ -166,17 +204,12 @@ def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
     draw.text((92, 86), "신청 일정", font=title_font, fill="#15251F")
     draw.text(
         (92, 151),
-        _fit_text(draw, _known(notice.title), note_font, 990),
+        _fit_text(draw, values["title"], note_font, 990),
         font=note_font,
         fill="#60706A",
     )
 
-    events = (
-        ("신청 시작", _date(notice.application_start)),
-        ("신청 종료", _date(notice.application_end)),
-        ("마감일", _date(notice.deadline)),
-        ("당첨자 발표", _date(notice.announcement_date)),
-    )
+    events = _timeline_events(values)
     centers = (155, 445, 735, 1025)
     draw.line((centers[0], 285, centers[-1], 285), fill="#AAC8BC", width=8)
     for center, (label, value) in zip(centers, events, strict=True):
@@ -197,20 +230,74 @@ def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
         font=note_font,
         fill="#60706A",
     )
-    _save_webp(image, output_path)
-    alt_events = ", ".join(f"{label} {value}" for label, value in events)
-    return _card_manifest(
-        output_path,
-        bundle_path="assets/timeline.webp",
-        alt=f"{_known(notice.title)} 신청 일정. {alt_events}.",
-        caption="정규화된 공식 공고 날짜로 만든 신청 일정 이미지",
-    )
+    return image
 
 
 def card_renderer_fingerprint() -> str:
     """Return the hash-bound Pillow/font/encoding material for derived cards."""
 
     return _renderer_fingerprint()
+
+
+def canonical_card_renderer_input(
+    value: object,
+    *,
+    expected_kind: str | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Validate and canonicalize the closed renderer-input schema."""
+
+    if not isinstance(value, dict):
+        raise ImageRenderError("card renderer input must be an object")
+    kind = value.get("kind")
+    keys = _SUMMARY_INPUT_KEYS if kind == "summary" else _TIMELINE_INPUT_KEYS
+    if kind not in {"summary", "timeline"} or (expected_kind and kind != expected_kind):
+        raise ImageRenderError("card renderer input kind is invalid")
+    if set(value) != set(keys) or any(not isinstance(value[key], str) for key in keys):
+        raise ImageRenderError("card renderer input does not match its closed schema")
+    return tuple((key, value[key]) for key in keys)
+
+
+def rerender_card_bytes(renderer_input: tuple[tuple[str, str], ...]) -> bytes:
+    """Deterministically recreate one card from persisted canonical input."""
+
+    return _rerender_card_bytes_cached(_renderer_fingerprint(), renderer_input)
+
+
+def card_accessibility_material(
+    renderer_input: tuple[tuple[str, str], ...],
+) -> tuple[str, str]:
+    """Derive exact alt/caption text from canonical renderer input."""
+
+    canonical = canonical_card_renderer_input(dict(renderer_input))
+    values = dict(canonical)
+    if values["kind"] == "summary":
+        return (
+            f"{values['title']} 요약 카드. 지역 {values['region']}, "
+            f"공급 규모 {values['supply']}, 신청 시작 {values['application_start']}, "
+            f"가격·보증금·임대료 {values['price_summary']}.",
+            "정규화된 공식 공고 사실로 만든 요약 이미지",
+        )
+    events = _timeline_events(values)
+    alt_events = ", ".join(f"{label} {value}" for label, value in events)
+    return (
+        f"{values['title']} 신청 일정. {alt_events}.",
+        "정규화된 공식 공고 날짜로 만든 신청 일정 이미지",
+    )
+
+
+@lru_cache(maxsize=256)
+def _rerender_card_bytes_cached(
+    _bound_renderer_fingerprint: str,
+    renderer_input: tuple[tuple[str, str], ...],
+) -> bytes:
+    canonical = canonical_card_renderer_input(dict(renderer_input))
+    values = dict(canonical)
+    image = (
+        _render_summary_image(values)
+        if values["kind"] == "summary"
+        else _render_timeline_image(values)
+    )
+    return _encode_webp(image)
 
 
 def card_renderer_material() -> dict[str, object]:
@@ -232,6 +319,11 @@ def card_renderer_material() -> dict[str, object]:
         "method": 6,
         "exact": True,
         "size": CARD_SIZE,
+        "image_mode": _CARD_MODE,
+        "exif_hex": _EMPTY_EXIF.hex(),
+        "xmp_hex": _EMPTY_XMP.hex(),
+        "icc_profile_hex": _EMPTY_ICC_PROFILE.hex(),
+        "text_layout_engine": _TEXT_LAYOUT_ENGINE.name,
     }
 
 
@@ -283,6 +375,7 @@ def _generic_hero(path: Path) -> ArticleImage:
         renderer_fingerprint=hashlib.sha256(
             f"openai-imagegen:{GENERIC_HERO_SHA256}".encode("ascii")
         ).hexdigest(),
+        renderer_input=(("kind", "hero"), ("sha256", GENERIC_HERO_SHA256)),
     )
 
 
@@ -292,6 +385,7 @@ def _card_manifest(
     bundle_path: str,
     alt: str,
     caption: str,
+    renderer_input: tuple[tuple[str, str], ...],
 ) -> ArticleImage:
     return ArticleImage(
         path=output_path,
@@ -309,21 +403,28 @@ def _card_manifest(
         rights_basis="저장소 코드가 정규화된 사실만으로 직접 렌더링함",
         attribution="Wisdome Super Writer",
         renderer_fingerprint=_renderer_fingerprint(),
+        renderer_input=renderer_input,
     )
 
 
 def _save_webp(image: Image.Image, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(_encode_webp(image))
+
+
+def _encode_webp(image: Image.Image) -> bytes:
+    output = io.BytesIO()
     image.save(
-        output_path,
+        output,
         format="WEBP",
         quality=82,
         method=6,
         exact=True,
-        exif=b"",
-        xmp=b"",
-        icc_profile=b"",
+        exif=_EMPTY_EXIF,
+        xmp=_EMPTY_XMP,
+        icc_profile=_EMPTY_ICC_PROFILE,
     )
+    return output.getvalue()
 
 
 def _card_path(path: Path, filename: str) -> Path:
@@ -348,7 +449,11 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
     regular, bold_path = _font_paths()
     path = bold_path if bold else regular
     try:
-        return ImageFont.truetype(str(path), size=size)
+        return ImageFont.truetype(
+            str(path),
+            size=size,
+            layout_engine=_TEXT_LAYOUT_ENGINE,
+        )
     except OSError as exc:
         raise ImageRenderError(f"Korean font could not be loaded: {path}") from exc
 
@@ -372,6 +477,42 @@ def _fit_text(
     while candidate and draw.textlength(candidate + suffix, font=font) > max_width:
         candidate = candidate[:-1]
     return candidate.rstrip() + suffix
+
+
+def _summary_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ...]:
+    supply = (
+        f"{notice.supply_count:,}세대"
+        if notice.supply_count is not None
+        else UNKNOWN_VALUE
+    )
+    return (
+        ("kind", "summary"),
+        ("title", _known(notice.title)),
+        ("region", _known(notice.region)),
+        ("supply", supply),
+        ("application_start", _date(notice.application_start)),
+        ("price_summary", _known(notice.price_summary)),
+    )
+
+
+def _timeline_renderer_input(notice: HousingNotice) -> tuple[tuple[str, str], ...]:
+    return (
+        ("kind", "timeline"),
+        ("title", _known(notice.title)),
+        ("application_start", _date(notice.application_start)),
+        ("application_end", _date(notice.application_end)),
+        ("deadline", _date(notice.deadline)),
+        ("announcement_date", _date(notice.announcement_date)),
+    )
+
+
+def _timeline_events(values: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    return (
+        ("신청 시작", values["application_start"]),
+        ("신청 종료", values["application_end"]),
+        ("마감일", values["deadline"]),
+        ("당첨자 발표", values["announcement_date"]),
+    )
 
 
 def _known(value: str | None) -> str:
