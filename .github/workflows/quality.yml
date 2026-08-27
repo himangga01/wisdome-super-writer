@@ -42,7 +42,13 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Ruff changed files and local content
-        run: uv run python scripts/ci_changed_python.py --base "${{ github.event.pull_request.base.sha || github.event.before }}"
+        run: >-
+          uv run python scripts/ci_changed_python.py
+          --event "${{ github.event_name }}"
+          --base "${{ github.event.pull_request.base.sha }}"
+          --before "${{ github.event.before }}"
+          --default-branch "${{ github.event.repository.default_branch }}"
+          --ref-name "${{ github.ref_name }}"
 
       - name: Django checks
         run: |
@@ -55,6 +61,7 @@ jobs:
           tests/unit/test_queue_configuration.py
           tests/unit/test_local_runtime.py
           tests/unit/test_local_content_dates.py
+          tests/unit/test_local_content_http.py
           tests/unit/test_applyhome_public_html.py
           tests/unit/test_lh_public_html.py
           tests/unit/test_local_content_selection.py

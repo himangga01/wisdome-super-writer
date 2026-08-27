@@ -3,6 +3,7 @@
 param(
     [string]$RepositoryRoot = '',
     [string]$HumanizerRoot = '',
+    [int]$HealthTimeoutSeconds = 45,
     [switch]$ValidateOnly
 )
 
@@ -11,16 +12,31 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $humanizerOrigin = 'http://127.0.0.1:3210'
 $djangoOrigin = 'http://127.0.0.1:8000'
+$scriptDirectory = Split-Path -Parent $PSCommandPath
+
+if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::Windows
+)) {
+    throw 'start-local.ps1 requires Windows.'
+}
+if ($HealthTimeoutSeconds -lt 1 -or $HealthTimeoutSeconds -gt 300) {
+    throw 'HealthTimeoutSeconds must be between 1 and 300.'
+}
+Import-Module (Join-Path $scriptDirectory 'local-process-guard.psm1') -Force
 
 function Resolve-SafeDirectory {
     param([string]$Path, [string]$Label)
 
-    $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
-    $root = [System.IO.Path]::GetPathRoot($resolved).TrimEnd('\')
-    if ($resolved.TrimEnd('\') -eq $root) {
-        throw "$Label cannot be a drive root."
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $driveRoot = [System.IO.Path]::GetPathRoot($full).TrimEnd('\')
+    if ($full.TrimEnd('\') -eq $driveRoot -or -not [System.IO.Directory]::Exists($full)) {
+        throw "$Label must be an existing non-root directory."
     }
-    return $resolved
+    $attributes = [System.IO.File]::GetAttributes($full)
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label cannot be a reparse point."
+    }
+    return $full.TrimEnd('\')
 }
 
 function Find-HumanizerDirectory {
@@ -29,7 +45,7 @@ function Find-HumanizerDirectory {
     $current = Get-Item -LiteralPath $Repository
     while ($null -ne $current.Parent) {
         $candidate = Join-Path $current.Parent.FullName 'ai-text-makes-likes-human'
-        if (Test-Path -LiteralPath $candidate -PathType Container) {
+        if ([System.IO.Directory]::Exists($candidate)) {
             return $candidate
         }
         $current = $current.Parent
@@ -37,19 +53,38 @@ function Find-HumanizerDirectory {
     throw 'The sibling humanizer project could not be found.'
 }
 
-function Assert-RequiredFile {
+function Assert-ExternalRegularFile {
     param([string]$Path, [string]$Label)
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (-not [System.IO.File]::Exists($full)) {
         throw "$Label is missing."
+    }
+    $attributes = [System.IO.File]::GetAttributes($full)
+    if (
+        ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    ) {
+        throw "$Label cannot be a symlink or reparse point."
+    }
+    return $full
+}
+
+function Assert-HumanizerLayout {
+    param([string]$Root)
+
+    $packagePath = Assert-ExternalRegularFile -Path (Join-Path $Root 'package.json') -Label 'Humanizer package.json'
+    $package = Get-Content -Raw -LiteralPath $packagePath -Encoding UTF8 | ConvertFrom-Json
+    if ('start' -notin @($package.scripts.PSObject.Properties.Name)) {
+        throw 'Humanizer package must define its start script.'
     }
 }
 
 function Import-LocalEnvironment {
-    param([string]$Path)
+    param([string]$Root, [string]$Path)
 
-    Assert-RequiredFile -Path $Path -Label '.env.local'
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+    $safePath = Assert-LocalRepositoryFile -RepositoryRoot $Root -Path $Path -Label '.env.local'
+    foreach ($line in Get-Content -LiteralPath $safePath -Encoding UTF8) {
         $trimmed = $line.Trim()
         if (-not $trimmed -or $trimmed.StartsWith('#')) {
             continue
@@ -70,18 +105,6 @@ function Import-LocalEnvironment {
     }
 }
 
-function Assert-HumanizerLayout {
-    param([string]$Root)
-
-    $packagePath = Join-Path $Root 'package.json'
-    Assert-RequiredFile -Path $packagePath -Label 'Humanizer package.json'
-    $package = Get-Content -Raw -LiteralPath $packagePath -Encoding UTF8 | ConvertFrom-Json
-    $scriptNames = @($package.scripts.PSObject.Properties.Name)
-    if ('start' -notin $scriptNames) {
-        throw 'Humanizer package must define its start script.'
-    }
-}
-
 function Test-Health {
     param([string]$Url, [string]$ExpectedStatus = '')
 
@@ -92,7 +115,7 @@ function Test-Health {
         }
         if ($ExpectedStatus) {
             $payload = $response.Content | ConvertFrom-Json
-            return $payload.status -eq $ExpectedStatus
+            return $payload -is [pscustomobject] -and $payload.status -eq $ExpectedStatus
         }
         return $true
     }
@@ -102,11 +125,7 @@ function Test-Health {
 }
 
 function Wait-Health {
-    param(
-        [string]$Url,
-        [string]$ExpectedStatus = '',
-        [int]$TimeoutSeconds = 45
-    )
+    param([string]$Url, [string]$ExpectedStatus = '', [int]$TimeoutSeconds)
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
@@ -127,84 +146,6 @@ function Assert-LoopbackListener {
     }
 }
 
-function New-OwnedRecord {
-    param(
-        [System.Diagnostics.Process]$Process,
-        [string]$Name,
-        [string]$StandardOutput,
-        [string]$StandardError
-    )
-
-    return [pscustomobject]@{
-        name = $Name
-        pid = $Process.Id
-        startedAt = $Process.StartTime.ToUniversalTime().ToString('o')
-        stdout = $StandardOutput
-        stderr = $StandardError
-    }
-}
-
-function Save-OwnedState {
-    param(
-        [string]$Path,
-        [string]$Repository,
-        [System.Collections.ArrayList]$Records,
-        [bool]$Active
-    )
-
-    $state = [ordered]@{
-        schemaVersion = 1
-        repositoryRoot = $Repository
-        active = $Active
-        updatedAt = [DateTimeOffset]::UtcNow.ToString('o')
-        processes = @($Records)
-    }
-    $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
-}
-
-function Add-OwnedDescendants {
-    param([System.Collections.ArrayList]$Records)
-
-    $known = @{}
-    foreach ($record in $Records) {
-        $known[[int]$record.pid] = $true
-    }
-    $changed = $true
-    while ($changed) {
-        $changed = $false
-        foreach ($candidate in Get-CimInstance Win32_Process) {
-            if ($known.ContainsKey([int]$candidate.ProcessId) -or -not $known.ContainsKey([int]$candidate.ParentProcessId)) {
-                continue
-            }
-            $process = Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue
-            if ($null -eq $process) {
-                continue
-            }
-            [void]$Records.Add((New-OwnedRecord -Process $process -Name 'owned-child' -StandardOutput '' -StandardError ''))
-            $known[[int]$candidate.ProcessId] = $true
-            $changed = $true
-        }
-    }
-}
-
-function Stop-OwnedProcesses {
-    param([System.Collections.ArrayList]$Records)
-
-    $ordered = @($Records) | Sort-Object -Property pid -Descending
-    foreach ($record in $ordered) {
-        $process = Get-Process -Id $record.pid -ErrorAction SilentlyContinue
-        if ($null -eq $process) {
-            continue
-        }
-        $actualStart = $process.StartTime.ToUniversalTime().ToString('o')
-        if ($actualStart -cne $record.startedAt) {
-            continue
-        }
-        Stop-Process -Id $record.pid -ErrorAction SilentlyContinue
-    }
-}
-
-$scriptDirectory = Split-Path -Parent $PSCommandPath
 if (-not $RepositoryRoot) {
     $RepositoryRoot = Split-Path -Parent $scriptDirectory
 }
@@ -213,17 +154,16 @@ if (-not $HumanizerRoot) {
 }
 $repository = Resolve-SafeDirectory -Path $RepositoryRoot -Label 'Repository root'
 $humanizer = Resolve-SafeDirectory -Path $HumanizerRoot -Label 'Humanizer root'
-Assert-RequiredFile -Path (Join-Path $repository 'src\manage.py') -Label 'Django manage.py'
+[void](Assert-LocalRepositoryFile -RepositoryRoot $repository -Path (Join-Path $repository 'src\manage.py') -Label 'Django manage.py')
 Assert-HumanizerLayout -Root $humanizer
-Import-LocalEnvironment -Path (Join-Path $repository '.env.local')
+Import-LocalEnvironment -Root $repository -Path (Join-Path $repository '.env.local')
 if ($env:WISDOME_ENVIRONMENT -eq 'production') {
     throw 'start-local.ps1 refuses production mode.'
 }
 if ($env:WISDOME_ENVIRONMENT -ne 'development' -or $env:WISDOME_RUNTIME_MODE -ne 'local') {
     throw 'start-local.ps1 requires development environment and local runtime mode.'
 }
-$python = Join-Path $repository '.venv\Scripts\python.exe'
-Assert-RequiredFile -Path $python -Label 'Project Python environment'
+$python = Assert-LocalRepositoryFile -RepositoryRoot $repository -Path (Join-Path $repository '.venv\Scripts\python.exe') -Label 'Project Python environment'
 
 if ($ValidateOnly) {
     [pscustomobject]@{
@@ -235,13 +175,15 @@ if ($ValidateOnly) {
 }
 
 $npm = Get-Command 'npm.cmd' -ErrorAction Stop
-$stateRoot = Join-Path $repository '.local\state'
-$logRoot = Join-Path $stateRoot 'logs'
-[void](New-Item -ItemType Directory -Force -Path $logRoot)
-$statePath = Join-Path $stateRoot 'start-local-owned.json'
-$owned = New-Object System.Collections.ArrayList
-
+$context = $null
+$caughtFailure = $false
+$stopSignalEnabled = $false
 try {
+    $context = Enter-LocalSupervisor -RepositoryRoot $repository
+    Enable-LocalStopSignal
+    $stopSignalEnabled = $true
+    Update-LocalStopSignalContext -Context $context
+
     if (Test-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready') {
         Assert-LoopbackListener -Port 3210
     }
@@ -249,54 +191,64 @@ try {
         $env:HOST = '127.0.0.1'
         $env:PORT = '3210'
         $env:CODEX_CHUNK_CONCURRENCY = '1'
-        $humanizerOut = Join-Path $logRoot 'humanizer.stdout.log'
-        $humanizerErr = Join-Path $logRoot 'humanizer.stderr.log'
-        $humanizerProcess = Start-Process -FilePath $npm.Source -ArgumentList @('start') -WorkingDirectory $humanizer -PassThru -WindowStyle Hidden -RedirectStandardOutput $humanizerOut -RedirectStandardError $humanizerErr
-        [void]$owned.Add((New-OwnedRecord -Process $humanizerProcess -Name 'humanizer' -StandardOutput $humanizerOut -StandardError $humanizerErr))
-        Save-OwnedState -Path $statePath -Repository $repository -Records $owned -Active $true
-        Wait-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready'
+        [void](Start-LocalOwnedProcess -Context $context -Name 'humanizer' -FilePath $npm.Source -Arguments @('start') -WorkingDirectory $humanizer)
+        Update-LocalStopSignalContext -Context $context
+        Wait-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready' -TimeoutSeconds $HealthTimeoutSeconds
         Assert-LoopbackListener -Port 3210
-        Add-OwnedDescendants -Records $owned
-        Save-OwnedState -Path $statePath -Repository $repository -Records $owned -Active $true
     }
 
     if (Test-Health -Url "$djangoOrigin/health/live") {
         Assert-LoopbackListener -Port 8000
     }
     else {
-        $djangoOut = Join-Path $logRoot 'django.stdout.log'
-        $djangoErr = Join-Path $logRoot 'django.stderr.log'
-        $djangoProcess = Start-Process -FilePath $python -ArgumentList @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository -PassThru -WindowStyle Hidden -RedirectStandardOutput $djangoOut -RedirectStandardError $djangoErr
-        [void]$owned.Add((New-OwnedRecord -Process $djangoProcess -Name 'django' -StandardOutput $djangoOut -StandardError $djangoErr))
-        Save-OwnedState -Path $statePath -Repository $repository -Records $owned -Active $true
-        Wait-Health -Url "$djangoOrigin/health/live"
-        Wait-Health -Url "$djangoOrigin/health/ready"
+        [void](Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository)
+        Update-LocalStopSignalContext -Context $context
+        Wait-Health -Url "$djangoOrigin/health/live" -TimeoutSeconds $HealthTimeoutSeconds
         Assert-LoopbackListener -Port 8000
-        Add-OwnedDescendants -Records $owned
-        Save-OwnedState -Path $statePath -Repository $repository -Records $owned -Active $true
     }
+    Wait-Health -Url "$djangoOrigin/health/ready" -TimeoutSeconds $HealthTimeoutSeconds
+    Set-LocalSupervisorRunning -Context $context
 
     Write-Output "Preview: $djangoOrigin/local-articles/"
     Write-Output 'Collect: .\.venv\Scripts\python.exe src\manage.py collect_recent_housing --days 7 --humanize --write-articles'
-    Write-Output 'Press Ctrl+C to stop only the processes started by this script.'
-    while ($true) {
-        Start-Sleep -Seconds 1
-        foreach ($record in $owned) {
-            if ($record.name -ne 'owned-child' -and $null -eq (Get-Process -Id $record.pid -ErrorAction SilentlyContinue)) {
-                throw "$($record.name) exited; inspect its recorded log paths."
+    Write-Output "State: $($context.StatePath)"
+    Write-Output 'Press Ctrl+C to close this instance job and stop only its owned process tree.'
+    while (-not (Wait-LocalStopSignal -Milliseconds 1000)) {
+        foreach ($record in $context.Processes) {
+            $process = Get-Process -Id $record.pid -ErrorAction SilentlyContinue
+            if (
+                $null -eq $process -or
+                $process.StartTime.ToUniversalTime().ToString('o') -cne $record.creationTime
+            ) {
+                throw "$($record.name) exited; inspect its instance log paths."
             }
         }
     }
 }
+catch {
+    $caughtFailure = $true
+    if ($null -ne $context) {
+        Set-LocalSupervisorTerminalStatus -Context $context -Status 'error' -ErrorCode 'START_FAILED'
+    }
+    throw
+}
 finally {
     try {
-        Add-OwnedDescendants -Records $owned
+        if ($null -ne $context) {
+            $closed = if ([WisdomeConsoleStopSignal]::WasHandled) {
+                Complete-LocalSupervisorAfterSignal -Context $context
+            }
+            else {
+                Exit-LocalSupervisor -Context $context
+            }
+            if (-not $closed -and -not $caughtFailure) {
+                throw 'The owned Windows job could not be closed cleanly.'
+            }
+        }
     }
-    catch {
-        # Continue with the exact owned PIDs already recorded.
-    }
-    Stop-OwnedProcesses -Records $owned
-    if (Test-Path -LiteralPath $statePath) {
-        Save-OwnedState -Path $statePath -Repository $repository -Records $owned -Active $false
+    finally {
+        if ($stopSignalEnabled) {
+            Disable-LocalStopSignal
+        }
     }
 }

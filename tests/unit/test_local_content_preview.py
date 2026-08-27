@@ -211,3 +211,43 @@ def test_markdown_renderer_escapes_raw_html() -> None:
 
     assert "<script>" not in rendered
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in rendered
+
+
+@pytest.mark.parametrize("payload", [None, [], "ready", 1])
+def test_humanizer_status_treats_non_object_json_as_unavailable(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+) -> None:
+    from apps.local_content import views
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    settings.HUMANIZER_BASE_URL = "http://127.0.0.1:3210"
+    monkeypatch.setattr(views.httpx, "get", lambda *_args, **_kwargs: Response())
+
+    assert views._humanizer_status()["status"] == "unavailable"
+
+
+def test_humanizer_status_treats_malformed_json_as_unavailable(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apps.local_content import views
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            raise ValueError("malformed")
+
+    settings.HUMANIZER_BASE_URL = "http://127.0.0.1:3210"
+    monkeypatch.setattr(views.httpx, "get", lambda *_args, **_kwargs: Response())
+
+    assert views._humanizer_status()["status"] == "unavailable"

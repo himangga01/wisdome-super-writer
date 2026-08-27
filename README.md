@@ -55,8 +55,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local.ps
 시작 스크립트는 `.env.local`을 현재 프로세스에 읽고 production 설정을 거부합니다. 이미 정상인
 서비스는 재시작하지 않으며, 필요한 경우 humanizer를 `127.0.0.1:3210`, Django를
 `127.0.0.1:8000`에 숨김 프로세스로 시작합니다. 정확한 PID와 로그 경로는
-`.local/state/start-local-owned.json`과 `.local/state/logs/`에 기록됩니다. `Ctrl+C`로 끝내면 이
-스크립트가 시작하고 신원을 다시 확인한 프로세스만 종료합니다.
+`.local/state/start-local/<instance-id>/state.json`과 같은 instance의 `logs/`에 기록됩니다.
+저장소별 mutex는 두 번째 supervisor를 거부하고, `Ctrl+C`로 끝내면 Windows Job Object를 닫아
+이 instance가 시작한 프로세스 트리만 종료합니다.
 
 ### 3. 최근 7일 수집·글 생성
 

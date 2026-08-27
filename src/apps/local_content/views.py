@@ -605,7 +605,11 @@ def _humanizer_status() -> dict[str, str]:
     try:
         response = httpx.get(f"{endpoint}/api/health", timeout=0.5)
         payload = response.json()
-        ready = response.status_code == 200 and payload.get("status") == "ready"
+        ready = (
+            response.status_code == 200
+            and isinstance(payload, dict)
+            and payload.get("status") == "ready"
+        )
     except (httpx.HTTPError, ValueError, TypeError):
         ready = False
     return {"status": "ready" if ready else "unavailable", "endpoint": endpoint}
