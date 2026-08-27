@@ -248,3 +248,26 @@ def test_untrusted_scalar_newlines_cannot_inject_markdown_headings() -> None:
     assert "## 악성 기관" not in headings
     assert "## 악성 상태" not in headings
     assert rendered.title == "정상 공고 ## 악성 제목"
+
+
+def test_whitespace_and_format_only_fact_and_policy_values_use_exact_unknown() -> None:
+    rendered = render_detailed_article(
+        _notice(
+            facts=(("\u200b", " \t"), ("주택형", "\u200b")),
+            eligibility_summary=(" \t", "\u200b"),
+            restriction_summary=("\u200b",),
+        )
+    )
+
+    assert f"- {UNKNOWN_VALUE}: {UNKNOWN_VALUE}" in rendered.factual_markdown
+    assert f"- 주택형: {UNKNOWN_VALUE}" in rendered.factual_markdown
+    assert rendered.factual_markdown.count(f"- {UNKNOWN_VALUE}") >= 4
+
+
+def test_weekly_category_normalizes_format_only_value_to_exact_unknown() -> None:
+    notice = _notice(category="\u200b")
+
+    rendered = render_weekly_index(_result(notice))
+
+    assert f"- {UNKNOWN_VALUE}: 1건" in rendered.factual_markdown
+    assert f"| {UNKNOWN_VALUE} |" in rendered.factual_markdown

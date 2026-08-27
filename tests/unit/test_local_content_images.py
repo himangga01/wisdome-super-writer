@@ -16,6 +16,8 @@ from apps.local_content.images import (
     ImageRenderError,
     _timeline_value_lines,
     build_image_set,
+    card_renderer_material,
+    fingerprint_renderer_material,
     render_summary_card,
     render_timeline,
 )
@@ -122,6 +124,21 @@ def test_card_manifest_binds_the_exact_font_and_renderer_material(tmp_path: Path
     assert first.renderer_fingerprint == second.renderer_fingerprint
     assert timeline.renderer_fingerprint == first.renderer_fingerprint
     assert re.fullmatch(r"[0-9a-f]{64}", first.renderer_fingerprint)
+
+
+def test_renderer_fingerprint_binds_native_freetype_and_libwebp_versions() -> None:
+    material = card_renderer_material()
+    identical = dict(material)
+    changed_freetype = {**material, "freetype_version": "changed-freetype"}
+    changed_webp = {**material, "libwebp_version": "changed-libwebp"}
+
+    assert material["freetype_version"]
+    assert material["libwebp_version"]
+    assert fingerprint_renderer_material(material) == fingerprint_renderer_material(identical)
+    assert fingerprint_renderer_material(material) != fingerprint_renderer_material(
+        changed_freetype
+    )
+    assert fingerprint_renderer_material(material) != fingerprint_renderer_material(changed_webp)
 
 
 def test_summary_alt_describes_every_meaningful_visible_fact(tmp_path: Path) -> None:

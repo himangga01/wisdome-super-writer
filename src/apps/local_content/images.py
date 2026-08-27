@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 from PIL import __version__ as PILLOW_VERSION
 
 from apps.local_content.contracts import HousingNotice
@@ -213,6 +213,35 @@ def card_renderer_fingerprint() -> str:
     return _renderer_fingerprint()
 
 
+def card_renderer_material() -> dict[str, object]:
+    """Return auditable native-library, font, and encoder material for card bytes."""
+
+    regular, bold = _font_paths()
+    freetype_version = features.version("freetype2")
+    libwebp_version = features.version("webp")
+    if not freetype_version or not libwebp_version:
+        raise ImageRenderError("native FreeType and libwebp versions must be available")
+    return {
+        "pillow_version": PILLOW_VERSION,
+        "freetype_version": freetype_version,
+        "libwebp_version": libwebp_version,
+        "regular_font_sha256": _sha256(regular),
+        "bold_font_sha256": _sha256(bold),
+        "format": "WEBP",
+        "quality": 82,
+        "method": 6,
+        "exact": True,
+        "size": CARD_SIZE,
+    }
+
+
+def fingerprint_renderer_material(material: dict[str, object]) -> str:
+    """Hash one complete renderer-material mapping deterministically."""
+
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _generic_hero(path: Path) -> ArticleImage:
     approved = Path(os.path.abspath(GENERIC_HERO_PATH))
     candidate = Path(os.path.abspath(path))
@@ -326,19 +355,7 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 @lru_cache(maxsize=1)
 def _renderer_fingerprint() -> str:
-    regular, bold = _font_paths()
-    material = {
-        "pillow_version": PILLOW_VERSION,
-        "regular_font_sha256": _sha256(regular),
-        "bold_font_sha256": _sha256(bold),
-        "format": "WEBP",
-        "quality": 82,
-        "method": 6,
-        "exact": True,
-        "size": CARD_SIZE,
-    }
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return fingerprint_renderer_material(card_renderer_material())
 
 
 def _fit_text(

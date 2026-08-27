@@ -91,6 +91,27 @@ def _declared_image_file(
     )
 
 
+def _manifest_bundle_hash(manifest: dict[str, object]) -> str:
+    files = manifest["files"]
+    assert isinstance(files, dict)
+    material = [
+        {
+            "path": path,
+            "sha256": entry["sha256"],
+            "mime_type": entry["mime_type"],
+            "image": entry.get("image"),
+        }
+        for path, entry in sorted(files.items())
+    ]
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def test_bundle_write_is_atomic_and_repeatable(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     root = tmp_path / "output"
@@ -226,6 +247,68 @@ def test_repeat_lstat_rejects_simulated_unmanifested_symlink(
         writer.write(bundle)
 
 
+def _changed_identity(metadata: os.stat_result) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino + 1,
+        st_size=metadata.st_size,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_ctime_ns=metadata.st_ctime_ns,
+        st_file_attributes=getattr(metadata, "st_file_attributes", 0),
+    )
+
+
+def test_replay_rejects_entry_identity_change_between_lstat_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(bundle)
+    target = published / "article.draft.md"
+    real_lstat = bundle_module.os.lstat
+    calls = 0
+
+    def changing_lstat(path: os.PathLike[str] | str):
+        nonlocal calls
+        metadata = real_lstat(path)
+        if Path(path) == target:
+            calls += 1
+            if calls > 1:
+                return _changed_identity(metadata)
+        return metadata
+
+    monkeypatch.setattr(bundle_module.os, "lstat", changing_lstat)
+
+    with pytest.raises(BundlePublishError, match="changed|TOCTOU|identity"):
+        writer._existing_hash(published)
+
+
+def test_replay_rejects_ancestor_identity_change_between_lstat_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(bundle)
+    ancestor = published.parent
+    real_lstat = bundle_module.os.lstat
+    calls = 0
+
+    def changing_lstat(path: os.PathLike[str] | str):
+        nonlocal calls
+        metadata = real_lstat(path)
+        if Path(path) == ancestor:
+            calls += 1
+            if calls > 1:
+                return _changed_identity(metadata)
+        return metadata
+
+    monkeypatch.setattr(bundle_module.os, "lstat", changing_lstat)
+
+    with pytest.raises(BundlePublishError, match="ancestor|changed|TOCTOU|identity"):
+        writer._existing_hash(published)
+
+
 @pytest.mark.parametrize(
     "bad_path",
     ["../escape.md", "/absolute.md", "assets/../../escape.md", "assets\\escape.md"],
@@ -265,6 +348,10 @@ def test_bundle_rejects_duplicate_paths_case_insensitively(tmp_path: Path) -> No
         "trailing-dot.",
         "trailing-space ",
         "CON",
+        "CONIN$",
+        "CONOUT$",
+        "COM¹",
+        "LPT².txt",
         "dir/NUL.txt",
         "manifest.json.",
         "MANIFEST.JSON",
@@ -293,6 +380,23 @@ def test_bundle_rejects_unicode_normalization_path_alias(tmp_path: Path) -> None
 
     with pytest.raises(BundleValidationError, match="canonical|duplicate"):
         ArticleBundleWriter(tmp_path / "output").write(bundle)
+
+
+@pytest.mark.parametrize("alias", ["ARTICLE.DRAFT.MD", "e\u0301.md", "MANIFEST.JSON"])
+def test_replay_manifest_rejects_case_unicode_and_reserved_path_aliases(
+    tmp_path: Path, alias: str
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(bundle)
+    manifest_path = published / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["files"][alias] = dict(manifest["files"]["article.draft.md"])
+    manifest["bundle_hash"] = _manifest_bundle_hash(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="alias|canonical|reserved"):
+        writer._existing_hash(published)
 
 
 def test_bundle_rejects_windows_device_slug(tmp_path: Path) -> None:
@@ -341,6 +445,59 @@ def test_bundle_rejects_non_utf8_text(tmp_path: Path) -> None:
 
     with pytest.raises(BundleValidationError, match="UTF-8"):
         ArticleBundleWriter(tmp_path / "output").write(bundle)
+
+
+@pytest.mark.parametrize(
+    ("path", "mime_type", "payload"),
+    [
+        ("payload.bin", "application/octet-stream", b"generic-binary"),
+        ("notes.txt", "text/plain", b"plain text"),
+        ("sources.json", "application/json", b"not-json"),
+    ],
+)
+def test_bundle_allows_only_utf8_markdown_or_valid_json_and_png_webp(
+    tmp_path: Path, path: str, mime_type: str, payload: bytes
+) -> None:
+    file = BundleFile(
+        path=path,
+        content=payload,
+        mime_type=mime_type,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    with pytest.raises(BundleValidationError, match="file type|JSON"):
+        ArticleBundleWriter(tmp_path / "output").write(
+            ArticleBundle(date(2026, 8, 28), "safe", (file,))
+        )
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "payload"),
+    [
+        ("image/jpeg", b"\xff\xd8\xff\xe0"),
+        ("image/gif", b"GIF89a"),
+        ("image/bmp", b"BM"),
+        ("image/tiff", b"II*\x00"),
+        ("image/x-icon", b"\x00\x00\x01\x00"),
+        ("image/avif", b"\x00\x00\x00\x18ftypavif"),
+        ("image/heic", b"\x00\x00\x00\x18ftypheic"),
+        ("image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+    ],
+)
+def test_bundle_rejects_every_non_png_webp_image_format(
+    tmp_path: Path, mime_type: str, payload: bytes
+) -> None:
+    file = BundleFile(
+        path="payload.bin",
+        content=payload,
+        mime_type=mime_type,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    with pytest.raises(BundleValidationError, match="image metadata|allowed|MIME"):
+        ArticleBundleWriter(tmp_path / "output").write(
+            ArticleBundle(date(2026, 8, 28), "safe", (file,))
+        )
 
 
 def test_bundle_rejects_images_without_complete_manifest_metadata(tmp_path: Path) -> None:
@@ -470,6 +627,22 @@ def test_bundle_rejects_derived_card_with_unbound_font_material(tmp_path: Path) 
         )
 
 
+def test_exact_replay_reapplies_image_rights_and_provenance_semantics(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(bundle)
+    manifest_path = published / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    hero = manifest["files"]["assets/hero.png"]["image"]
+    hero["rights_status"] = "owned"
+    hero["creator"] = "forged creator"
+    manifest["bundle_hash"] = _manifest_bundle_hash(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="rights|provenance"):
+        writer._existing_hash(published)
+
+
 def test_bundle_rejects_symlink_source(tmp_path: Path) -> None:
     source = tmp_path / "source.md"
     source.write_text("source", encoding="utf-8")
@@ -515,7 +688,7 @@ def test_write_run_links_a_changed_article_to_its_immutable_revision(tmp_path: P
     assert f"./{revision_name}/article.md" in (run_path / "index.md").read_text("utf-8")
 
 
-def test_article_retry_recovers_validated_staging_after_interrupted_write(
+def test_article_retry_uses_new_stage_without_deleting_abandoned_write_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle = _bundle(tmp_path)
@@ -533,15 +706,17 @@ def test_article_retry_recovers_validated_staging_after_interrupted_write(
     monkeypatch.setattr(bundle_module, "_write_bytes_fsynced", fail_second_write)
     with pytest.raises(BundlePublishError, match="write|publish"):
         writer.write(bundle)
+    abandoned = tuple((tmp_path / "output").rglob("*.tmp-*"))
+    assert len(abandoned) == 1
     monkeypatch.setattr(bundle_module, "_write_bytes_fsynced", original_write)
 
     published = writer.write(bundle)
 
     assert (published / "manifest.json").is_file()
-    assert not list((tmp_path / "output").rglob("*.tmp-*"))
+    assert tuple((tmp_path / "output").rglob("*.tmp-*")) == abandoned
 
 
-def test_article_retry_recovers_validated_staging_after_interrupted_replace(
+def test_article_retry_uses_new_stage_without_deleting_abandoned_replace_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle = _bundle(tmp_path)
@@ -556,9 +731,12 @@ def test_article_retry_recovers_validated_staging_after_interrupted_replace(
     monkeypatch.setattr(bundle_module.os, "replace", fail_bundle_replace)
     with pytest.raises(BundlePublishError, match="atomic bundle publish"):
         writer.write(bundle)
+    abandoned = tuple((tmp_path / "output").rglob("*.tmp-*"))
+    assert len(abandoned) == 1
     monkeypatch.setattr(bundle_module.os, "replace", original_replace)
 
     assert writer.write(bundle).name == bundle.slug
+    assert tuple((tmp_path / "output").rglob("*.tmp-*")) == abandoned
 
 
 def test_concurrent_identical_publish_cleans_its_validated_losing_stage(
@@ -584,7 +762,7 @@ def test_concurrent_identical_publish_cleans_its_validated_losing_stage(
     assert not list((tmp_path / "output").rglob("*.tmp-*"))
 
 
-def test_invalid_stale_staging_material_is_never_deleted(tmp_path: Path) -> None:
+def test_foreign_staging_material_is_never_deleted_and_cannot_block_retry(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     root = tmp_path / "output"
     date_root = root / "2026-08-28"
@@ -594,10 +772,29 @@ def test_invalid_stale_staging_material_is_never_deleted(tmp_path: Path) -> None
     unexpected = staging / "attacker-controlled.txt"
     unexpected.write_text("do not delete", encoding="utf-8")
 
-    with pytest.raises(BundlePublishError, match="stale staging"):
-        ArticleBundleWriter(root).write(bundle)
+    published = ArticleBundleWriter(root).write(bundle)
 
+    assert published.name == bundle.slug
     assert unexpected.read_text("utf-8") == "do not delete"
+
+
+def test_each_failed_invocation_uses_a_unique_writer_owned_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+
+    def always_fail(_path: Path, _payload: bytes) -> None:
+        raise OSError(errno.EIO, "injected interruption")
+
+    monkeypatch.setattr(bundle_module, "_write_bytes_fsynced", always_fail)
+    for _attempt in range(2):
+        with pytest.raises(BundlePublishError, match="write|publish"):
+            writer.write(bundle)
+
+    stages = tuple((tmp_path / "output").rglob("*.tmp-*"))
+    assert len(stages) == 2
+    assert len({stage.name for stage in stages}) == 2
 
 
 def test_run_manifest_is_a_required_verified_commit_marker(tmp_path: Path) -> None:
@@ -614,6 +811,25 @@ def test_run_manifest_is_a_required_verified_commit_marker(tmp_path: Path) -> No
     assert writer.validate_run(date(2026, 8, 28)) == run_path
     (run_path / "manifest.json").unlink()
     with pytest.raises(BundlePublishError, match="commit marker"):
+        writer.validate_run(date(2026, 8, 28))
+
+
+def test_run_reader_reapplies_article_image_semantics(tmp_path: Path) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    bundle = _bundle(tmp_path)
+    index = f"# 주간 주거 공고\n\n- [상세](./{bundle.slug}/article.md)\n"
+    run_path = writer.write_run(date(2026, 8, 28), index, (bundle,))
+    article_manifest_path = run_path / bundle.slug / "manifest.json"
+    article_manifest = json.loads(article_manifest_path.read_text("utf-8"))
+    article_manifest["files"]["assets/hero.png"]["image"]["rights_status"] = "owned"
+    article_manifest["bundle_hash"] = _manifest_bundle_hash(article_manifest)
+    article_manifest_path.write_text(json.dumps(article_manifest), encoding="utf-8")
+    run_manifest_path = run_path / "manifest.json"
+    run_manifest = json.loads(run_manifest_path.read_text("utf-8"))
+    run_manifest["articles"][bundle.slug] = article_manifest["bundle_hash"]
+    run_manifest_path.write_text(json.dumps(run_manifest), encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="rights|provenance"):
         writer.validate_run(date(2026, 8, 28))
 
 
@@ -635,6 +851,8 @@ def test_run_retry_repairs_interruption_between_index_and_commit_marker(
     monkeypatch.setattr(bundle_module.os, "replace", fail_manifest_replace)
     with pytest.raises(BundlePublishError, match="run publish"):
         writer.write_run(date(2026, 8, 28), index, (bundle,))
+    abandoned = tuple((tmp_path / "output" / "2026-08-28").glob(".manifest.json.tmp-*"))
+    assert len(abandoned) == 1
     with pytest.raises(BundlePublishError, match="commit marker"):
         writer.validate_run(date(2026, 8, 28))
     monkeypatch.setattr(bundle_module.os, "replace", original_replace)
@@ -642,6 +860,46 @@ def test_run_retry_repairs_interruption_between_index_and_commit_marker(
     writer.write_run(date(2026, 8, 28), index, (bundle,))
 
     assert writer.validate_run(date(2026, 8, 28)).is_dir()
+    assert tuple((tmp_path / "output" / "2026-08-28").glob(".manifest.json.tmp-*")) == abandoned
+
+
+def test_foreign_run_temp_files_are_never_deleted_or_reused(tmp_path: Path) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    bundle = _bundle(tmp_path)
+    run_root = tmp_path / "output" / "2026-08-28"
+    run_root.mkdir(parents=True)
+    foreign = run_root / ".manifest.json.tmp-deadbeefcafe"
+    foreign.write_text("foreign", encoding="utf-8")
+    index = f"# 주간 주거 공고\n\n- [상세](./{bundle.slug}/article.md)\n"
+
+    writer.write_run(date(2026, 8, 28), index, (bundle,))
+
+    assert foreign.read_text("utf-8") == "foreign"
+
+
+def test_each_failed_run_invocation_leaves_a_unique_owned_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    bundle = _bundle(tmp_path)
+    index = f"# 주간 주거 공고\n\n- [상세](./{bundle.slug}/article.md)\n"
+    original_replace = bundle_module.os.replace
+
+    def fail_manifest_replace(
+        source: os.PathLike[str] | str, target: os.PathLike[str] | str
+    ) -> None:
+        if Path(source).name.startswith(".manifest.json.tmp-"):
+            raise OSError(errno.EIO, "injected commit-marker interruption")
+        original_replace(source, target)
+
+    monkeypatch.setattr(bundle_module.os, "replace", fail_manifest_replace)
+    for _attempt in range(2):
+        with pytest.raises(BundlePublishError, match="run publish"):
+            writer.write_run(date(2026, 8, 28), index, (bundle,))
+
+    abandoned = tuple((tmp_path / "output" / "2026-08-28").glob(".manifest.json.tmp-*"))
+    assert len(abandoned) == 2
+    assert len({path.name for path in abandoned}) == 2
 
 
 def test_directory_fsync_propagates_real_io_failure(monkeypatch: pytest.MonkeyPatch) -> None:

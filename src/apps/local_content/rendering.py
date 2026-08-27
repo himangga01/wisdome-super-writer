@@ -312,7 +312,7 @@ def _weekly_facts(
     selected_ids: Collection[str],
     prior_detailed_ids: Collection[str],
 ) -> str:
-    category_counts = Counter(notice.category for notice in result.notices)
+    category_counts = Counter(_display_value(notice.category) for notice in result.notices)
     publication_counts = Counter(
         notice.published_at.date().isoformat() for notice in result.notices
     )
@@ -376,7 +376,7 @@ def _weekly_facts(
                     notice.published_at.date().isoformat(),
                     _table_text(_display_value(notice.publisher)),
                     _table_text(_known(notice.region)),
-                    _table_text(notice.category),
+                    _table_text(_display_value(notice.category)),
                     official,
                     detail,
                 )
@@ -558,7 +558,7 @@ def _supply(value: int | None) -> str:
 
 
 def _fact_list(values: Iterable[str]) -> tuple[str, ...]:
-    material = tuple(value for value in values if value.strip())
+    material = tuple(_display_value(value) for value in values)
     if not material:
         return (f"- {UNKNOWN_VALUE}",)
     return tuple(f"- {_markdown_text(value)}" for value in material)
@@ -567,10 +567,11 @@ def _fact_list(values: Iterable[str]) -> tuple[str, ...]:
 def _publishable_facts(facts: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     result: list[tuple[str, str]] = []
     for key, value in facts:
-        normalized = key.strip().casefold()
-        if normalized == "attachment" or "internal_analysis_only" in value.casefold():
+        normalized_key = _safe_scalar(key).casefold()
+        normalized_value = _safe_scalar(value).casefold()
+        if normalized_key == "attachment" or "internal_analysis_only" in normalized_value:
             continue
-        result.append((key, value))
+        result.append((_display_value(key), _display_value(value)))
     return tuple(result)
 
 
