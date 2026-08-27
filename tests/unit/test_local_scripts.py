@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import warnings
 import zipfile
@@ -16,7 +19,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_ONLY = pytest.mark.skipif(
     sys.platform != "win32",
@@ -24,7 +26,9 @@ WINDOWS_ONLY = pytest.mark.skipif(
 )
 
 
-def _powershell(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _powershell(
+    *arguments: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", *arguments],
         cwd=REPOSITORY_ROOT,
@@ -123,6 +127,7 @@ def test_powershell_scripts_parse_and_contain_no_container_cli_invocation() -> N
     files = (
         REPOSITORY_ROOT / "scripts" / "setup-local.ps1",
         REPOSITORY_ROOT / "scripts" / "start-local.ps1",
+        REPOSITORY_ROOT / "scripts" / "local-toolchain.psm1",
         REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1",
     )
     for script in files:
@@ -364,6 +369,132 @@ def test_setup_initializes_env_atomically_and_preserves_existing_file(tmp_path: 
 
 
 @WINDOWS_ONLY
+@pytest.mark.parametrize("phase", ["write", "flush", "close"])
+def test_setup_env_post_create_fault_fails_and_removes_only_owned_partial(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    repository, humanizer = _script_fixture(tmp_path)
+    env_path = repository / ".env.local"
+    env_path.unlink()
+    arguments = (
+        "-File",
+        str(REPOSITORY_ROOT / "scripts" / "setup-local.ps1"),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        "-InitializeEnvironmentOnly",
+        "-EnvironmentFaultPhase",
+        phase,
+    )
+
+    failed = _powershell(*arguments)
+
+    assert failed.returncode != 0
+    assert phase in (failed.stdout + failed.stderr).casefold()
+    assert not env_path.exists()
+    env_path.write_text("SENTINEL=preexisting\n", encoding="utf-8")
+
+    collision = _powershell(*arguments)
+
+    assert collision.returncode == 0, collision.stdout + collision.stderr
+    assert env_path.read_text("utf-8") == "SENTINEL=preexisting\n"
+
+
+@WINDOWS_ONLY
+def test_verified_uv_handle_denies_concurrent_write_until_exact_process_exits(
+    tmp_path: Path,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    executable_root = repository / ".tools" / "verified"
+    executable_root.mkdir(parents=True)
+    executable = executable_root / "uv.exe"
+    shutil.copy2(os.environ["COMSPEC"], executable)
+    expected = hashlib.sha256(executable.read_bytes()).hexdigest()
+    module = REPOSITORY_ROOT / "scripts" / "local-toolchain.psm1"
+    probe = tmp_path / "verified-uv.ps1"
+    probe.write_text(
+        f"Import-Module '{module}' -Force\n"
+        f"$result=Invoke-VerifiedUv -RepositoryRoot '{repository}' -Path '{executable}' "
+        f"-ExpectedSha256 '{expected}' -Arguments @('/d','/c','ping 127.0.0.1 -n 3 > nul') "
+        f"-WorkingDirectory '{repository}'\n"
+        "$result | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(probe)],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.4)
+    assert process.poll() is None
+
+    with pytest.raises(PermissionError):
+        executable.write_bytes(b"replacement")
+
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stdout + stderr
+    payload = json.loads(stdout.strip().splitlines()[-1])
+    assert payload["ExitCode"] == 0
+    assert hashlib.sha256(executable.read_bytes()).hexdigest() == expected
+
+
+@WINDOWS_ONLY
+def test_setup_rejects_archive_larger_than_compressed_bound(tmp_path: Path) -> None:
+    repository, humanizer = _script_fixture(tmp_path)
+    archive = tmp_path / "oversized.zip"
+    _write_uv_archive(
+        archive,
+        [("uv.exe", b"uv"), ("uvw.exe", b"uvw"), ("uvx.exe", b"uvx")],
+    )
+    with archive.open("ab") as stream:
+        stream.truncate(33 * 1024 * 1024)
+    lock = tmp_path / "toolchain-lock.json"
+    _write_uv_lock(lock, archive, executable_sha256=hashlib.sha256(b"uv").hexdigest())
+
+    result = _provision_uv(repository, humanizer, archive, lock)
+
+    assert result.returncode != 0
+    assert "compressed archive" in (result.stdout + result.stderr).casefold()
+
+
+@WINDOWS_ONLY
+def test_setup_rejects_entry_with_oversized_expanded_metadata(tmp_path: Path) -> None:
+    repository, humanizer = _script_fixture(tmp_path)
+    archive = tmp_path / "expanded.zip"
+    oversized = b"0" * (49 * 1024 * 1024)
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("uv.exe", oversized)
+        bundle.writestr("uvw.exe", b"uvw")
+        bundle.writestr("uvx.exe", b"uvx")
+    lock = tmp_path / "toolchain-lock.json"
+    _write_uv_lock(lock, archive, executable_sha256=hashlib.sha256(oversized).hexdigest())
+
+    result = _provision_uv(repository, humanizer, archive, lock)
+
+    assert result.returncode != 0
+    assert "expanded" in (result.stdout + result.stderr).casefold()
+
+
+@WINDOWS_ONLY
+def test_bounded_stream_copy_fails_when_source_exceeds_counter_limit(tmp_path: Path) -> None:
+    module = REPOSITORY_ROOT / "scripts" / "local-toolchain.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; "
+        "$source=[IO.MemoryStream]::new([byte[]](0..255) * 8); "
+        "$target=[IO.MemoryStream]::new(); "
+        "Copy-BoundedStream -Source $source -Destination $target -MaximumBytes 1024",
+    )
+
+    assert result.returncode != 0
+    assert "limit" in (result.stdout + result.stderr).casefold()
+
+
+@WINDOWS_ONLY
 def test_start_preflight_rejects_reparse_virtual_environment(tmp_path: Path) -> None:
     repository, humanizer = _script_fixture(tmp_path)
     shutil.rmtree(repository / ".venv")
@@ -425,6 +556,7 @@ def test_job_object_closure_kills_direct_process_and_descendant(tmp_path: Path) 
         "[pscustomobject]@{closed=$closed;rootPid=$rootPid;childPid=$childPid;"
         "rootAlive=[bool](Get-Process -Id $rootPid -ErrorAction SilentlyContinue);"
         "childAlive=[bool](Get-Process -Id $childPid -ErrorAction SilentlyContinue);"
+        "nativeClosed=$context.NativeProcesses[0].Closed;"
         "state=$state} | ConvertTo-Json -Depth 8 -Compress\n",
         encoding="utf-8",
     )
@@ -436,10 +568,155 @@ def test_job_object_closure_kills_direct_process_and_descendant(tmp_path: Path) 
     assert payload["closed"] is True
     assert payload["rootAlive"] is False
     assert payload["childAlive"] is False
+    assert payload["nativeClosed"] is True
     assert payload["state"]["active"] is False
     assert payload["state"]["status"] == "stopped"
     assert len(payload["state"]["processes"]) == 1
     assert payload["state"]["processes"][0]["pid"] == payload["rootPid"]
+
+
+@WINDOWS_ONLY
+def test_suspended_assignment_failure_terminates_by_handle_before_child_executes(
+    tmp_path: Path,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    marker = tmp_path / "must-not-run.txt"
+    child = tmp_path / "child.ps1"
+    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8")
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        "$ErrorActionPreference='Stop'; "
+        f"Import-Module '{module}' -Force; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "try { Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        f"-Arguments @('-NoProfile','-File','{child}') -SimulateAssignmentFailure }} "
+        "finally { [void](Exit-LocalSupervisor -Context $c) }",
+    )
+
+    assert result.returncode != 0
+    normalized_error = re.sub(r"\s+", " ", result.stdout + result.stderr).casefold()
+    assert "injected assignment" in normalized_error
+    assert "invalidoperationexception" in normalized_error
+    assert not marker.exists()
+
+
+@WINDOWS_ONLY
+def test_owned_process_redirects_are_confined_and_created_new(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    outside = tmp_path / "outside.log"
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    escaped = _powershell(
+        "-Command",
+        "$ErrorActionPreference='Stop'; "
+        f"Import-Module '{module}' -Force; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "try { Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'cmd.exe' "
+        f"-Arguments @('/d','/c','echo no') -StandardOutput '{outside}' }} "
+        "finally { [void](Exit-LocalSupervisor -Context $c) }",
+    )
+    assert escaped.returncode != 0
+    assert "log root" in (escaped.stdout + escaped.stderr).casefold()
+    assert not outside.exists()
+
+    collision_probe = tmp_path / "collision.ps1"
+    collision_probe.write_text(
+        f"Import-Module '{module}' -Force\n"
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'\n"
+        "$log=Join-Path $c.LogRoot 'probe.stdout.log'\n"
+        "Set-Content -LiteralPath $log -Value SENTINEL\n"
+        "try {\n"
+        "  Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'cmd.exe' "
+        "-Arguments @('/d','/c','echo replace') -StandardOutput $log\n"
+        "}\nfinally {\n"
+        "  $value=Get-Content -Raw -LiteralPath $log\n"
+        "  [void](Exit-LocalSupervisor -Context $c)\n"
+        "  Write-Output $value\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    collision = _powershell("-File", str(collision_probe))
+    assert collision.returncode != 0
+    assert "sentinel" in (collision.stdout + collision.stderr).casefold()
+
+
+@WINDOWS_ONLY
+def test_physical_repository_alias_uses_same_global_mutex(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    holder = tmp_path / "physical-holder.ps1"
+    holder.write_text(
+        f"Import-Module '{module}' -Force\n"
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'\n"
+        "Write-Output ($c.MutexName + '|' + $c.PhysicalRepositoryRoot)\n"
+        "Start-Sleep -Seconds 3\n"
+        "[void](Exit-LocalSupervisor -Context $c)\n",
+        encoding="utf-8",
+    )
+    holder_process = subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(holder)],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder_process.stdout is not None
+    identity = holder_process.stdout.readline().strip()
+    assert identity.startswith("Global\\WisdomeWriter-")
+    alias = "\\\\?\\" + str(repository)
+
+    contender = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; Enter-LocalSupervisor -RepositoryRoot '{alias}'",
+    )
+
+    assert contender.returncode != 0
+    assert "already active" in (contender.stdout + contender.stderr).casefold()
+    stdout, stderr = holder_process.communicate(timeout=10)
+    assert holder_process.returncode == 0, stdout + stderr
+
+
+@WINDOWS_ONLY
+def test_stop_signal_latched_before_job_association_closes_later_job(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        "$ErrorActionPreference='Stop'; "
+        f"Import-Module '{module}' -Force; Enable-LocalStopSignal; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}' -DeferJob; "
+        "Initialize-LocalStopSignalContext -Context $c; "
+        "[WisdomeConsoleStopSignal]::TriggerForTest(); "
+        "Initialize-LocalSupervisorJob -Context $c; "
+        "$done=Complete-LocalSupervisorAfterSignal -Context $c; "
+        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; Disable-LocalStopSignal; "
+        "[pscustomobject]@{done=$done;state=$state} | ConvertTo-Json -Depth 5 -Compress",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["done"] is True
+    assert payload["state"]["active"] is False
+
+
+@WINDOWS_ONLY
+def test_initial_state_publish_failure_releases_mutex_for_next_supervisor(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; "
+        f"try {{ Enter-LocalSupervisor -RepositoryRoot '{repository}' "
+        "-SimulateInitialStateFailure } catch { $first=$_.Exception.Message }; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "$id=$c.InstanceId; [void](Exit-LocalSupervisor -Context $c); "
+        "Write-Output ($first + '|' + $id)",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    first, instance_id = result.stdout.strip().splitlines()[-1].split("|", 1)
+    assert "injected initial state failure" in first.casefold()
+    assert len(instance_id) == 32
 
 
 @WINDOWS_ONLY
@@ -678,9 +955,12 @@ def test_ci_configuration_has_portable_locked_local_gates() -> None:
     steps = job["steps"]
     checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout["with"]["fetch-depth"] == 0
-    python_step = next(step for step in steps if step.get("uses", "").startswith("actions/setup-python@"))
+    python_step = next(
+        step for step in steps if step.get("uses", "").startswith("actions/setup-python@")
+    )
     assert str(python_step["with"]["python-version"]) == "3.12"
     commands = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "${{" not in commands
     assert "uv sync --frozen --extra dev" in commands
     assert "scripts/ci_changed_python.py" in commands
     assert "makemigrations --check --dry-run" in commands
@@ -706,6 +986,16 @@ def test_ci_configuration_has_portable_locked_local_gates() -> None:
         token for token in commands.split() if token.startswith("tests/") and token.endswith(".py")
     }
     assert configured_tests == expected_tests
+    ruff_step = next(
+        step for step in steps if step.get("name") == "Ruff changed files and local content"
+    )
+    assert set(ruff_step["env"]) == {
+        "GITHUB_BASE_SHA",
+        "GITHUB_DEFAULT_BRANCH",
+        "GITHUB_EVENT_BEFORE",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REF_NAME",
+    }
 
 
 def _initialize_git_repository(repository: Path) -> None:
@@ -715,7 +1005,11 @@ def _initialize_git_repository(repository: Path) -> None:
     subprocess.run(["git", "config", "user.name", "CI"], cwd=repository, check=True)
 
 
-def _ci_selector(repository: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _ci_selector(
+    repository: Path,
+    *arguments: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -724,11 +1018,21 @@ def _ci_selector(repository: Path, *arguments: str) -> subprocess.CompletedProce
             "--list",
         ],
         cwd=repository,
+        env=env,
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
+
+
+def _ci_selector_module():
+    path = REPOSITORY_ROOT / "scripts" / "ci_changed_python.py"
+    spec = importlib.util.spec_from_file_location("ci_changed_python_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_ci_changed_python_gate_selects_multi_commit_diff_and_type_changes(
@@ -875,6 +1179,91 @@ def test_ci_changed_python_gate_uses_empty_tree_for_first_default_branch_push(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["first.py"]
+
+
+def test_ci_changed_python_nul_decoder_preserves_unicode_and_embedded_newline() -> None:
+    module = _ci_selector_module()
+    names = ("한글 공고 '자료'.py", "line\nbreak.py")
+    payload = b"\0".join(os.fsencode(name) for name in names) + b"\0"
+
+    assert module._decode_git_paths(payload) == names
+
+
+def test_ci_changed_python_gate_selects_korean_space_and_quote_filename(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _initialize_git_repository(repository)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repository, check=True)
+    unusual = "한국 공고 '검증'.py"
+    (repository / unusual).write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "unusual"], cwd=repository, check=True)
+
+    result = _ci_selector(repository, "--event", "push", "--before", "HEAD~1")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == unusual
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows filenames cannot contain newlines")
+def test_ci_changed_python_gate_does_not_omit_valid_newline_filename(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _initialize_git_repository(repository)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repository, check=True)
+    unusual = "line\nbreak.py"
+    (repository / unusual).write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "newline"], cwd=repository, check=True)
+    module = _ci_selector_module()
+
+    selected = module.selected_python_files(
+        event="push",
+        base=None,
+        before="HEAD~1",
+        default_branch=None,
+        ref_name=None,
+    )
+
+    assert selected == (unusual,)
+
+
+def test_ci_selector_reads_malicious_but_valid_ref_only_from_environment(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _initialize_git_repository(repository)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repository, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", base], cwd=repository, check=True
+    )
+    malicious_ref = "feature/$(echo-owned)"
+    subprocess.run(["git", "switch", "-qc", malicious_ref], cwd=repository, check=True)
+    (repository / "safe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "feature"], cwd=repository, check=True)
+    marker = repository / "echo-owned"
+    env = dict(os.environ)
+    env.update(
+        {
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_EVENT_BEFORE": "0" * 40,
+            "GITHUB_DEFAULT_BRANCH": "main",
+            "GITHUB_REF_NAME": malicious_ref,
+            "GITHUB_BASE_SHA": "",
+        }
+    )
+
+    result = _ci_selector(repository, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "safe.py"
+    assert not marker.exists()
 
 
 def test_ci_changed_python_gate_fails_closed_for_unresolved_pr_base(tmp_path: Path) -> None:

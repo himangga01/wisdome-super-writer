@@ -24,6 +24,23 @@ def _git(*arguments: str, check: bool = True) -> str:
     return result.stdout
 
 
+def _git_bytes(*arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", *arguments],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(os.fsdecode(result.stderr).strip() or "git command failed")
+    return result.stdout
+
+
+def _decode_git_paths(payload: bytes) -> tuple[str, ...]:
+    if payload and not payload.endswith(b"\0"):
+        raise RuntimeError("Git returned a non-NUL-terminated path stream.")
+    return tuple(os.fsdecode(value) for value in payload.split(b"\0") if value)
+
+
 def _commit(reference: str | None) -> str | None:
     if not reference or set(reference) == {"0"}:
         return None
@@ -101,22 +118,28 @@ def selected_python_files(
     )
     if not diff_base:
         raise RuntimeError("No trustworthy merge base could be computed.")
-    changed = _git(
-        "diff",
-        "--name-only",
-        "--diff-filter=ACMRT",
-        diff_base,
-        "HEAD",
-        "--",
-    ).splitlines()
-    local_content = _git(
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "--",
-        "src/apps/local_content",
-    ).splitlines()
+    changed = _decode_git_paths(
+        _git_bytes(
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMRT",
+            diff_base,
+            "HEAD",
+            "--",
+        )
+    )
+    local_content = _decode_git_paths(
+        _git_bytes(
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "src/apps/local_content",
+        )
+    )
     selected = {
         value.replace("\\", "/")
         for value in (*changed, *local_content)

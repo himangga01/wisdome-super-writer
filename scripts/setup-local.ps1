@@ -5,6 +5,8 @@ param(
     [string]$HumanizerRoot = '',
     [string]$ToolchainLockPath = '',
     [string]$UvArchivePath = '',
+    [ValidateSet('', 'write', 'flush', 'close')]
+    [string]$EnvironmentFaultPhase = '',
     [switch]$ValidateOnly,
     [switch]$ProvisionUvOnly,
     [switch]$InitializeEnvironmentOnly
@@ -16,9 +18,14 @@ $ProgressPreference = 'SilentlyContinue'
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
 $allowedUvEntries = @('uv.exe', 'uvw.exe', 'uvx.exe')
+$maximumArchiveBytes = 32 * 1024 * 1024
+$maximumEntryCompressedBytes = 32 * 1024 * 1024
+$maximumEntryExpandedBytes = 48 * 1024 * 1024
+$maximumAggregateExpandedBytes = 48 * 1024 * 1024
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.Net.Http
+Import-Module (Join-Path $scriptDirectory 'local-toolchain.psm1') -Force
 
 function Resolve-SafeDirectory {
     param([string]$Path, [string]$Label)
@@ -299,7 +306,12 @@ function Install-PinnedUv {
                 [System.IO.FileShare]::Read
             )
             try {
-                $source.CopyTo($archiveStream)
+                try {
+                    [void](Copy-BoundedStream -Source $source -Destination $archiveStream -MaximumBytes $maximumArchiveBytes)
+                }
+                catch {
+                    throw 'uv compressed archive exceeds its byte limit or could not be read.'
+                }
             }
             finally {
                 $source.Dispose()
@@ -311,7 +323,12 @@ function Install-PinnedUv {
             try {
                 $download = $client.GetStreamAsync($Toolchain.Url).GetAwaiter().GetResult()
                 try {
-                    $download.CopyTo($archiveStream)
+                    try {
+                        [void](Copy-BoundedStream -Source $download -Destination $archiveStream -MaximumBytes $maximumArchiveBytes)
+                    }
+                    catch {
+                        throw 'uv compressed archive exceeds its byte limit or could not be read.'
+                    }
                 }
                 finally {
                     $download.Dispose()
@@ -322,6 +339,9 @@ function Install-PinnedUv {
             }
         }
         $archiveStream.Flush($true)
+        if ($archiveStream.Length -gt $maximumArchiveBytes) {
+            throw 'uv compressed archive exceeds its byte limit.'
+        }
         if ((Get-StreamSha256 -Stream $archiveStream) -cne $Toolchain.ArchiveSha256) {
             throw 'uv archive checksum does not match the pinned toolchain lock.'
         }
@@ -332,6 +352,7 @@ function Install-PinnedUv {
             $true
         )
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        [long]$aggregateExpanded = 0
         foreach ($entry in $zip.Entries) {
             $name = [string]$entry.FullName
             $hasControl = @($name.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -gt 0
@@ -344,6 +365,16 @@ function Install-PinnedUv {
             }
             if (-not $seen.Add($name)) {
                 throw 'uv archive contains a duplicate or case-aliased entry.'
+            }
+            if ($entry.CompressedLength -gt $maximumEntryCompressedBytes) {
+                throw 'uv archive entry compressed size exceeds its byte limit.'
+            }
+            if ($entry.Length -gt $maximumEntryExpandedBytes) {
+                throw 'uv archive entry expanded size exceeds its byte limit.'
+            }
+            $aggregateExpanded += $entry.Length
+            if ($aggregateExpanded -gt $maximumAggregateExpandedBytes) {
+                throw 'uv archive aggregate expanded size exceeds its byte limit.'
             }
         }
         if ($seen.Count -ne $script:allowedUvEntries.Count) {
@@ -362,7 +393,10 @@ function Install-PinnedUv {
             try {
                 $entryStream = $entry.Open()
                 try {
-                    $entryStream.CopyTo($destination)
+                    $copied = Copy-BoundedStream -Source $entryStream -Destination $destination -MaximumBytes $maximumEntryExpandedBytes
+                    if ($copied -ne $entry.Length) {
+                        throw 'uv archive entry stream length differs from its metadata.'
+                    }
                 }
                 finally {
                     $entryStream.Dispose()
@@ -415,11 +449,12 @@ function Install-PinnedUv {
 }
 
 function Initialize-LocalEnvironment {
-    param([string]$Root)
+    param([string]$Root, [string]$FaultPhase = '')
 
     $source = Assert-SafeRepositoryFile -Root $Root -Path (Join-Path $Root '.env.local.example') -Label 'Local environment template'
     $target = Assert-RepositoryPathChain -Root $Root -Path (Join-Path $Root '.env.local') -Label 'Local environment file'
     $payload = [System.IO.File]::ReadAllBytes($source)
+    $stream = $null
     try {
         $stream = New-Object System.IO.FileStream(
             $target,
@@ -427,16 +462,40 @@ function Initialize-LocalEnvironment {
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::None
         )
-        try {
-            $stream.Write($payload, 0, $payload.Length)
-            $stream.Flush($true)
-        }
-        finally {
-            $stream.Dispose()
-        }
     }
     catch [System.IO.IOException] {
         [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Existing local environment file')
+        return $target
+    }
+
+    $ownedIdentity = Get-HeldStreamIdentity -Stream $stream
+    try {
+        if ($FaultPhase -eq 'write') {
+            throw 'Injected environment write failure.'
+        }
+        $stream.Write($payload, 0, $payload.Length)
+        if ($FaultPhase -eq 'flush') {
+            throw 'Injected environment flush failure.'
+        }
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        if ($FaultPhase -eq 'close') {
+            throw 'Injected environment close failure.'
+        }
+    }
+    catch {
+        $failure = $_
+        if ($null -ne $stream) {
+            try { $stream.Dispose() } catch { }
+            $stream = $null
+        }
+        $currentIdentity = Get-PathFileIdentity -RepositoryRoot $Root -Path $target -Label 'Owned partial environment file'
+        if ($currentIdentity -cne $ownedIdentity) {
+            throw 'Owned partial environment file identity changed; cleanup refused.'
+        }
+        [System.IO.File]::Delete($target)
+        throw $failure
     }
     return $target
 }
@@ -481,6 +540,22 @@ function Invoke-Checked {
     }
 }
 
+function Invoke-CheckedUv {
+    param([string[]]$Arguments, [string]$WorkingDirectory)
+
+    $result = Invoke-VerifiedUv -RepositoryRoot $repository -Path $uv -ExpectedSha256 $toolchain.ExecutableSha256 -Arguments $Arguments -WorkingDirectory $WorkingDirectory
+    if ($result.Stdout) {
+        [Console]::Out.Write($result.Stdout)
+    }
+    if ($result.Stderr) {
+        [Console]::Error.Write($result.Stderr)
+    }
+    if ($result.ExitCode -ne 0) {
+        throw "A required verified uv command failed with exit code $($result.ExitCode)."
+    }
+    return $result
+}
+
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {
@@ -514,7 +589,7 @@ if ($ValidateOnly) {
     exit 0
 }
 if ($InitializeEnvironmentOnly) {
-    [void](Initialize-LocalEnvironment -Root $repository)
+    [void](Initialize-LocalEnvironment -Root $repository -FaultPhase $EnvironmentFaultPhase)
     Write-Output 'Local environment initialization completed.'
     exit 0
 }
@@ -555,9 +630,10 @@ if ($LASTEXITCODE -ne 0) {
 [void](Assert-ExternalRegularFile -Path (Join-Path $humanizer 'dist\server.js') -Label 'Built humanizer server')
 
 [void](Assert-PublishedUvDirectory -Root $repository -Path (Split-Path -Parent $uv) -ExecutableSha256 $toolchain.ExecutableSha256)
-$uvVersion = [string](& $uv --version)
+$uvVersionResult = Invoke-CheckedUv -Arguments @('--version') -WorkingDirectory $repository
+$uvVersion = $uvVersionResult.Stdout.Trim()
 $uvVersionPattern = '^uv ' + [regex]::Escape($toolchain.Version) + '(?:\s|$)'
-if ($LASTEXITCODE -ne 0 -or $uvVersion -notmatch $uvVersionPattern) {
+if ($uvVersion -notmatch $uvVersionPattern) {
     throw 'Extracted uv executable does not match the pinned version.'
 }
 
@@ -575,15 +651,15 @@ if ($null -ne $launcher) {
 }
 if ($null -eq $python) {
     [void](Assert-PublishedUvDirectory -Root $repository -Path (Split-Path -Parent $uv) -ExecutableSha256 $toolchain.ExecutableSha256)
-    Invoke-Checked -FilePath $uv -Arguments @('python', 'install', '3.12') -WorkingDirectory $repository
+    [void](Invoke-CheckedUv -Arguments @('python', 'install', '3.12') -WorkingDirectory $repository)
     $python = '3.12'
 }
 
 [void](Assert-PublishedUvDirectory -Root $repository -Path (Split-Path -Parent $uv) -ExecutableSha256 $toolchain.ExecutableSha256)
-Invoke-Checked -FilePath $uv -Arguments @('sync', '--frozen', '--extra', 'dev', '--python', $python) -WorkingDirectory $repository
+[void](Invoke-CheckedUv -Arguments @('sync', '--frozen', '--extra', 'dev', '--python', $python) -WorkingDirectory $repository)
 $venvPython = Assert-SafeRepositoryFile -Root $repository -Path (Join-Path $repository '.venv\Scripts\python.exe') -Label 'Project Python environment'
 
-$envPath = Initialize-LocalEnvironment -Root $repository
+$envPath = Initialize-LocalEnvironment -Root $repository -FaultPhase $EnvironmentFaultPhase
 Import-LocalEnvironment -Root $repository -Path $envPath
 if ($env:WISDOME_ENVIRONMENT -ne 'development' -or $env:WISDOME_RUNTIME_MODE -ne 'local') {
     throw 'Local setup requires development environment and local runtime mode.'

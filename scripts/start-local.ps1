@@ -129,6 +129,9 @@ function Wait-Health {
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        if ([WisdomeConsoleStopSignal]::Wait(0)) {
+            throw 'Local supervisor stop was requested.'
+        }
         if (Test-Health -Url $Url -ExpectedStatus $ExpectedStatus) {
             return
         }
@@ -174,15 +177,16 @@ if ($ValidateOnly) {
     exit 0
 }
 
-$npm = Get-Command 'npm.cmd' -ErrorAction Stop
+$node = Get-Command 'node.exe' -ErrorAction Stop
 $context = $null
 $caughtFailure = $false
 $stopSignalEnabled = $false
 try {
-    $context = Enter-LocalSupervisor -RepositoryRoot $repository
     Enable-LocalStopSignal
     $stopSignalEnabled = $true
-    Update-LocalStopSignalContext -Context $context
+    $context = Enter-LocalSupervisor -RepositoryRoot $repository -DeferJob
+    Initialize-LocalStopSignalContext -Context $context
+    Initialize-LocalSupervisorJob -Context $context
 
     if (Test-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready') {
         Assert-LoopbackListener -Port 3210
@@ -191,8 +195,7 @@ try {
         $env:HOST = '127.0.0.1'
         $env:PORT = '3210'
         $env:CODEX_CHUNK_CONCURRENCY = '1'
-        [void](Start-LocalOwnedProcess -Context $context -Name 'humanizer' -FilePath $npm.Source -Arguments @('start') -WorkingDirectory $humanizer)
-        Update-LocalStopSignalContext -Context $context
+        [void](Start-LocalOwnedProcess -Context $context -Name 'humanizer' -FilePath $node.Source -Arguments @('dist\server.js') -WorkingDirectory $humanizer)
         Wait-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready' -TimeoutSeconds $HealthTimeoutSeconds
         Assert-LoopbackListener -Port 3210
     }
@@ -202,7 +205,6 @@ try {
     }
     else {
         [void](Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository)
-        Update-LocalStopSignalContext -Context $context
         Wait-Health -Url "$djangoOrigin/health/live" -TimeoutSeconds $HealthTimeoutSeconds
         Assert-LoopbackListener -Port 8000
     }
@@ -214,20 +216,16 @@ try {
     Write-Output "State: $($context.StatePath)"
     Write-Output 'Press Ctrl+C to close this instance job and stop only its owned process tree.'
     while (-not (Wait-LocalStopSignal -Milliseconds 1000)) {
-        foreach ($record in $context.Processes) {
-            $process = Get-Process -Id $record.pid -ErrorAction SilentlyContinue
-            if (
-                $null -eq $process -or
-                $process.StartTime.ToUniversalTime().ToString('o') -cne $record.creationTime
-            ) {
-                throw "$($record.name) exited; inspect its instance log paths."
+        for ($index = 0; $index -lt $context.NativeProcesses.Count; $index += 1) {
+            if ($context.NativeProcesses[$index].HasExited()) {
+                throw "$($context.Processes[$index].name) exited; inspect its instance log paths."
             }
         }
     }
 }
 catch {
     $caughtFailure = $true
-    if ($null -ne $context) {
+    if ($null -ne $context -and -not [WisdomeConsoleStopSignal]::WasHandled) {
         Set-LocalSupervisorTerminalStatus -Context $context -Status 'error' -ErrorCode 'START_FAILED'
     }
     throw
@@ -235,13 +233,15 @@ catch {
 finally {
     try {
         if ($null -ne $context) {
-            $closed = if ([WisdomeConsoleStopSignal]::WasHandled) {
-                Complete-LocalSupervisorAfterSignal -Context $context
+            $signalHandled = [WisdomeConsoleStopSignal]::WasHandled
+            $closed = if ($signalHandled) {
+                [void](Complete-LocalSupervisorAfterSignal -Context $context)
+                $true
             }
             else {
                 Exit-LocalSupervisor -Context $context
             }
-            if (-not $closed -and -not $caughtFailure) {
+            if (-not $signalHandled -and -not $closed -and -not $caughtFailure) {
                 throw 'The owned Windows job could not be closed cleanly.'
             }
         }
