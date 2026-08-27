@@ -10,6 +10,8 @@ from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 from kombu import Queue
 
+from wisdome_writer.infrastructure.queues import CELERY_QUEUE_NAMES
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPOSITORY_ROOT / "src"
 BASE_DIR = SRC_ROOT
@@ -359,22 +361,7 @@ CELERY_TASK_DEFAULT_QUEUE = "maintenance"
 CELERY_TASK_CREATE_MISSING_QUEUES = False
 CELERY_TASK_QUEUES = tuple(
     Queue(name)
-    for name in (
-        "outbox.dispatch",
-        "source.check",
-        "collect.housing",
-        "collect.semiconductor",
-        "extract.fanout",
-        "extract.document",
-        "extract.generic",
-        "extract.ocr.paddle",
-        "editorial",
-        "publish.media.wordpress",
-        "publish.wordpress",
-        "publish.blogger",
-        "reconcile",
-        "maintenance",
-    )
+    for name in CELERY_QUEUE_NAMES
 )
 CELERY_BEAT_SCHEDULE = {
     "dispatch-outbox": {

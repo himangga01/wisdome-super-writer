@@ -242,7 +242,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ),
     ("evidence.profile_decided", 1): EventRoute(
         "auto-publish-profile-invalidation",
-        "publishing",
+        "maintenance",
         "apps.publishing.tasks.invalidate_auto_publish_for_profile",
         (
             "profile_snapshot_id",
@@ -253,7 +253,7 @@ EVENT_ROUTES: dict[EventKey, EventRoute] = {
     ),
     ("topics.registry_decided", 1): EventRoute(
         "auto-publish-registry-invalidation",
-        "publishing",
+        "maintenance",
         "apps.publishing.tasks.invalidate_auto_publish_for_registry",
         (
             "topic_code",
