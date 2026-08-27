@@ -35,7 +35,6 @@ from .common import (
     response_metadata,
 )
 
-
 _CANONICAL_QUERY_KEYS = frozenset(
     {
         "houseManageNo",
@@ -101,7 +100,7 @@ _CANCELLATION_FLAGS = frozenset(
     }
 )
 _ENDPOINT_CATEGORIES = (
-    ("urbtyoftcllttotpblanc", "urban_officetel"),
+    ("urbtyofctllttotpblanc", "urban_officetel"),
     ("pblpvtrentlttotpblanc", "public_private_rental"),
     ("remndrlttotpblanc", "remaining"),
     ("optlttotpblanc", "optional_supply"),

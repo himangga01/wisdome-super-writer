@@ -266,6 +266,7 @@ INSTALLED_APPS = [
     "apps.editorial.apps.EditorialConfig",
     "apps.publishing.apps.PublishingConfig",
     "apps.scheduling.apps.SchedulingConfig",
+    "apps.local_content.apps.LocalContentConfig",
 ]
 
 MIDDLEWARE = [
