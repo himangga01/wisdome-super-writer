@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from apps.local_content.contracts import (
@@ -12,6 +13,8 @@ from apps.local_content.contracts import (
 )
 from apps.local_content.selection import is_residential
 
+_SHA256_CHECKSUM = re.compile(r"[0-9a-f]{64}")
+
 
 def merge_source_reports(
     reports: Iterable[SourceRunReport], window: CollectionWindow
@@ -21,18 +24,24 @@ def merge_source_reports(
     A source identity is the pair of source key and official external ID. Exact
     replays (the same identity and checksum) collapse to one item. Multiple
     material checksums for an identity are all retained in ``conflicts`` and
-    omitted from the weekly notice set.
+    omitted from the weekly notice set. Blank or malformed checksums are also
+    quarantined individually, never deduplicated.
     """
 
-    source_reports = tuple(sorted(reports, key=lambda report: report.source_key.casefold()))
+    source_reports = tuple(
+        sorted(reports, key=lambda report: (report.source_key.casefold(), report.source_key))
+    )
     grouped: dict[tuple[str, str], dict[str, HousingNotice]] = {}
+    conflicts: list[HousingNotice] = []
     for report in source_reports:
         for notice in report.notices:
+            if _SHA256_CHECKSUM.fullmatch(notice.source_checksum) is None:
+                conflicts.append(notice)
+                continue
             key = (notice.source_key, notice.external_id)
             grouped.setdefault(key, {}).setdefault(notice.source_checksum, notice)
 
     accepted: list[HousingNotice] = []
-    conflicts: list[HousingNotice] = []
     excluded_count = 0
     for variants in grouped.values():
         if len(variants) > 1:

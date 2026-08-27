@@ -25,7 +25,15 @@ _CATEGORY_ALIASES = {
     "공공분양주택": "public_sale",
     "remaining": "remaining",
     "remaining_supply": "remaining",
+    "unsold": "remaining",
+    "unsold_supply": "remaining",
     "잔여세대": "remaining",
+    "미분양": "remaining",
+    "미분양주택": "remaining",
+    "미분양 아파트": "remaining",
+    "미계약": "remaining",
+    "미계약분": "remaining",
+    "미계약 잔여세대": "remaining",
     "무순위": "remaining",
     "임의공급": "remaining",
     "취소분": "remaining",
@@ -75,7 +83,7 @@ _RESIDENTIAL_CATEGORIES = frozenset(
         "purchase_lease",
     }
 )
-_DETAIL_CATEGORIES = frozenset({"sale", "public_sale"})
+_DETAIL_CATEGORIES = frozenset({"sale", "public_sale", "remaining"})
 _DETAIL_TITLE_KEYWORDS = (
     "무순위",
     "잔여세대",
@@ -83,6 +91,10 @@ _DETAIL_TITLE_KEYWORDS = (
     "취소분",
     "불법행위재공급",
 )
+_CORRECTION_STATUSES = frozenset(
+    {"corrected", "correction", "amended", "정정", "정정공고", "변경", "변경공고"}
+)
+_CORRECTION_TITLE_MARKERS = ("정정", "변경공고", "수정")
 
 
 def normalized_category(category: str) -> str | None:
@@ -90,6 +102,10 @@ def normalized_category(category: str) -> str | None:
 
     normalized = _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", category)).strip().casefold()
     return _CATEGORY_ALIASES.get(normalized)
+
+
+def _normalized_policy_value(value: str) -> str:
+    return _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", value)).strip().casefold()
 
 
 def is_residential(notice: HousingNotice) -> bool:
@@ -101,6 +117,7 @@ def is_residential(notice: HousingNotice) -> bool:
 def needs_detailed_article(
     notice: HousingNotice,
     selected_ids: Collection[str] = (),
+    prior_detailed_ids: Collection[str] = (),
 ) -> bool:
     """Whether the admitted notice receives an individual detailed article."""
 
@@ -109,5 +126,14 @@ def needs_detailed_article(
         return False
     if notice.external_id in selected_ids or category in _DETAIL_CATEGORIES:
         return True
+    if notice.external_id in prior_detailed_ids and _is_explicit_correction(notice):
+        return True
     title = unicodedata.normalize("NFKC", notice.title)
     return any(keyword in title for keyword in _DETAIL_TITLE_KEYWORDS)
+
+
+def _is_explicit_correction(notice: HousingNotice) -> bool:
+    if _normalized_policy_value(notice.status) in _CORRECTION_STATUSES:
+        return True
+    title = unicodedata.normalize("NFKC", notice.title)
+    return any(marker in title for marker in _CORRECTION_TITLE_MARKERS)

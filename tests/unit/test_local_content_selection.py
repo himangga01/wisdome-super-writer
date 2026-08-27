@@ -105,16 +105,50 @@ def test_unapproved_title_keyword_does_not_select_detail_article(notice_factory)
     assert needs_detailed_article(notice) is False
 
 
-def test_remaining_category_needs_an_approved_detail_keyword(notice_factory) -> None:
-    notice = notice_factory(category="remaining", title="일반 공급 공고")
+@pytest.mark.parametrize("category", ["remaining", "optional_supply"])
+def test_remaining_and_optional_categories_need_detailed_articles(
+    category: str, notice_factory
+) -> None:
+    assert needs_detailed_article(notice_factory(category=category, title="일반 공급 공고"))
 
-    assert needs_detailed_article(notice) is False
+
+@pytest.mark.parametrize("category", ["unsold", "unsold_supply", "미분양", "미분양주택", "미계약"])
+def test_unsold_categories_are_residential_and_need_detailed_articles(
+    category: str, notice_factory
+) -> None:
+    notice = notice_factory(category=category, title="일반 공급 공고")
+
+    assert is_residential(notice)
+    assert needs_detailed_article(notice)
 
 
 def test_selected_id_selects_a_residential_detail_article(notice_factory) -> None:
     notice = notice_factory(category="국민임대", external_id="lh:notice:1")
 
     assert needs_detailed_article(notice, selected_ids=("lh:notice:1",))
+
+
+@pytest.mark.parametrize(
+    ("status", "title"),
+    [("corrected", "일반 공급 공고"), ("published", "정정 일반 공급 공고")],
+)
+def test_prior_detailed_notice_correction_is_selected(
+    status: str, title: str, notice_factory
+) -> None:
+    notice = notice_factory(
+        category="국민임대",
+        external_id="lh:notice:1",
+        status=status,
+        title=title,
+    )
+
+    assert needs_detailed_article(notice, prior_detailed_ids=("lh:notice:1",))
+
+
+def test_prior_detailed_notice_without_explicit_correction_is_not_selected(notice_factory) -> None:
+    notice = notice_factory(category="국민임대", external_id="lh:notice:1", status="published")
+
+    assert not needs_detailed_article(notice, prior_detailed_ids=("lh:notice:1",))
 
 
 def test_conflicting_same_source_identity_is_quarantined(
@@ -140,6 +174,31 @@ def test_same_source_identity_and_checksum_are_deduplicated(
     assert result.notices == (first,)
     assert result.conflicts == ()
     assert result.excluded_count == 0
+
+
+@pytest.mark.parametrize("source_checksum", ["", "not-a-sha256"])
+def test_invalid_checksum_notice_is_quarantined(
+    source_checksum: str, notice_factory, window: CollectionWindow
+) -> None:
+    invalid = notice_factory(external_id="invalid", source_checksum=source_checksum)
+
+    result = merge_source_reports((report(invalid),), window)
+
+    assert result.notices == ()
+    assert result.conflicts == (invalid,)
+
+
+@pytest.mark.parametrize("source_checksum", ["", "not-a-sha256"])
+def test_repeated_invalid_checksums_are_never_deduplicated(
+    source_checksum: str, notice_factory, window: CollectionWindow
+) -> None:
+    first = notice_factory(external_id="invalid", source_checksum=source_checksum)
+    second = notice_factory(external_id="invalid", source_checksum=source_checksum)
+
+    result = merge_source_reports((report(first, second),), window)
+
+    assert result.notices == ()
+    assert result.conflicts == (first, second)
 
 
 def test_same_external_id_from_different_sources_is_not_fuzzy_merged(
@@ -201,3 +260,14 @@ def test_merge_preserves_source_health_and_orders_notices_deterministically(
     assert result.source_reports[1].warnings == ("list warning",)
     assert result.source_reports[1].errors == ("list error",)
     assert [notice.external_id for notice in result.notices] == ["a", "z2", "z"]
+
+
+def test_merge_uses_original_source_key_as_report_sort_tie_breaker(
+    window: CollectionWindow,
+) -> None:
+    lower = SourceRunReport(source_key="a")
+    upper = SourceRunReport(source_key="A")
+
+    result = merge_source_reports((lower, upper), window)
+
+    assert result.source_reports == (upper, lower)
