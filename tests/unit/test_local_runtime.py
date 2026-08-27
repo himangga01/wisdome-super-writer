@@ -67,3 +67,31 @@ def test_local_ready_bypasses_redis_and_checks_local_roots(client, monkeypatch, 
         "local_objects": "ok",
     }
     assert "outbox" not in payload
+
+
+@pytest.mark.django_db
+def test_local_ready_reports_file_root_as_unavailable(client, monkeypatch, tmp_path):
+    """A probe cleanup error for a file root must not turn readiness into HTTP 500."""
+    blocked_root = tmp_path / "state-file"
+    blocked_root.write_text("not a directory")
+    original_unlink = Path.unlink
+
+    def reject_probe_cleanup(path, missing_ok=False):
+        if path.parent == blocked_root:
+            raise NotADirectoryError("state-file is not a directory")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", reject_probe_cleanup)
+    client.raise_request_exception = False
+    with override_settings(
+        IS_LOCAL_RUNTIME=True,
+        LOCAL_STATE_ROOT=blocked_root,
+        LOCAL_ARTICLE_ROOT=tmp_path / "articles",
+        LOCAL_OBJECT_ROOT=tmp_path / "objects",
+    ):
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "unavailable"
+    assert payload["checks"]["local_state"] == "unavailable"

@@ -40,7 +40,10 @@ def _local_root_check(root: Path) -> str:
             os.fsync(handle.fileno())
         probe.unlink()
     except OSError:
-        probe.unlink(missing_ok=True)
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
         return "unavailable"
     return "ok"
 
