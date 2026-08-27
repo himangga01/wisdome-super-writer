@@ -87,7 +87,13 @@ class LhPublicCollector:
         try:
             listed = self._collect_list_pages(window)
             self._require_unique_identities(listed)
-            notices = tuple(self._notice_from_listed(record) for record in listed)
+            notices_list: list[HousingNotice] = []
+            for record in listed:
+                try:
+                    notices_list.append(self._notice_from_listed(record))
+                except _ParseFailure:
+                    notices_list.append(self._notice_without_detail(record))
+            notices = tuple(notices_list)
         except _ParseFailure as exc:
             return SourceRunReport(source_key=_SOURCE_KEY, errors=(str(exc),))
         except Exception as exc:
@@ -182,6 +188,44 @@ class LhPublicCollector:
             price_summary=price_summary,
             eligibility_summary=eligibility_summary,
             facts=facts,
+            source_checksum=_checksum(fields),
+            parser_version=self.parser_version,
+            warnings=warnings,
+        )
+
+    def _notice_without_detail(self, listed: _ListedNotice) -> HousingNotice:
+        warnings = ("DETAIL_COLLECTION_FAILED",)
+        fields = {
+            "source_key": _SOURCE_KEY,
+            "external_id": listed.external_id,
+            "canonical_url": listed.canonical_url,
+            "title": listed.title,
+            "publisher": "LH",
+            "category": listed.category,
+            "region": listed.region,
+            "status": listed.status,
+            "published_at": listed.published_at.isoformat(),
+            "application_start": None,
+            "application_end": None,
+            "deadline": listed.deadline.isoformat() if listed.deadline else None,
+            "supply_count": None,
+            "price_summary": None,
+            "eligibility_summary": (),
+            "facts": (),
+            "parser_version": self.parser_version,
+            "warnings": warnings,
+        }
+        return HousingNotice(
+            source_key=_SOURCE_KEY,
+            external_id=listed.external_id,
+            canonical_url=listed.canonical_url,
+            title=listed.title,
+            publisher="LH",
+            category=listed.category,
+            region=listed.region,
+            status=listed.status,
+            published_at=listed.published_at,
+            deadline=listed.deadline,
             source_checksum=_checksum(fields),
             parser_version=self.parser_version,
             warnings=warnings,

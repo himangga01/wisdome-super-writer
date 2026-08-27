@@ -85,7 +85,13 @@ class ApplyHomePublicCollector:
             in_window = tuple(
                 record for record in listed if window.contains_publication(record.published_at)
             )
-            notices = tuple(self._notice_from_listed(record) for record in in_window)
+            notices_list: list[HousingNotice] = []
+            for record in in_window:
+                try:
+                    notices_list.append(self._notice_from_listed(record))
+                except _ParseFailure:
+                    notices_list.append(self._notice_without_detail(record))
+            notices = tuple(notices_list)
         except _ParseFailure as exc:
             return SourceRunReport(source_key=_SOURCE_KEY, errors=(str(exc),))
         except Exception as exc:
@@ -168,6 +174,45 @@ class ApplyHomePublicCollector:
             application_start=application_start,
             application_end=application_end,
             supply_count=supply_count,
+            source_checksum=_checksum(fields),
+            parser_version=self.parser_version,
+            warnings=warnings,
+        )
+
+    def _notice_without_detail(self, listed: _ListedNotice) -> HousingNotice:
+        warnings = ("DETAIL_COLLECTION_FAILED",)
+        fields = {
+            "source_key": _SOURCE_KEY,
+            "external_id": listed.external_id,
+            "canonical_url": listed.canonical_url,
+            "title": listed.title,
+            "publisher": "ApplyHome",
+            "category": listed.category,
+            "region": listed.region,
+            "status": listed.status,
+            "published_at": listed.published_at.isoformat(),
+            "application_start": None,
+            "application_end": None,
+            "deadline": None,
+            "announcement_date": None,
+            "supply_count": None,
+            "price_summary": None,
+            "eligibility_summary": (),
+            "restriction_summary": (),
+            "facts": (),
+            "parser_version": self.parser_version,
+            "warnings": warnings,
+        }
+        return HousingNotice(
+            source_key=_SOURCE_KEY,
+            external_id=listed.external_id,
+            canonical_url=listed.canonical_url,
+            title=listed.title,
+            publisher="ApplyHome",
+            category=listed.category,
+            region=listed.region,
+            status=listed.status,
+            published_at=listed.published_at,
             source_checksum=_checksum(fields),
             parser_version=self.parser_version,
             warnings=warnings,

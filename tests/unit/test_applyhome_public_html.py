@@ -79,6 +79,25 @@ def test_applyhome_collector_keeps_only_publication_dates_in_window(
     assert all(window.contains_publication(row.published_at) for row in report.notices)
 
 
+def test_applyhome_detail_fetch_failure_keeps_list_notice_with_blocking_marker(
+    fixture_fetcher: FixtureFetcher,
+    window: CollectionWindow,
+) -> None:
+    del fixture_fetcher.pages[APT_DETAIL_URL]
+
+    report = ApplyHomePublicCollector(fixture_fetcher).collect(window)
+
+    assert report.errors == ()
+    assert [notice.external_id for notice in report.notices] == [
+        "applyhome:apt:2026000001:2026000001",
+        "applyhome:apt:2026000002:2026000002",
+        "applyhome:remaining:2026940001:2026940001",
+    ]
+    assert report.notices[0].warnings == ("DETAIL_COLLECTION_FAILED",)
+    assert report.notices[0].application_start is None
+    assert report.notices[0].supply_count is None
+
+
 def test_applyhome_detail_extracts_only_explicit_schedule_and_supply(
     fixture_fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:

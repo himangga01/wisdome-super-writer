@@ -163,6 +163,29 @@ def test_lh_identity_and_detail_url_are_derived_from_official_row(
     assert len(fetcher.gets) == 51
 
 
+def test_lh_detail_fetch_failure_keeps_list_notice_with_blocking_marker(
+    fetcher: FixtureFetcher,
+    window: CollectionWindow,
+) -> None:
+    original_get = fetcher.get
+
+    def fail_one_detail(url: str) -> HtmlResponse:
+        if url == DETAIL_URL:
+            raise OSError("sensitive transport detail")
+        return original_get(url)
+
+    fetcher.get = fail_one_detail  # type: ignore[method-assign]
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.errors == ()
+    assert len(report.notices) == 51
+    assert report.notices[0].external_id == "lh:02:0000061158:05:05"
+    assert report.notices[0].warnings == ("DETAIL_COLLECTION_FAILED",)
+    assert report.notices[0].application_start is None
+    assert report.notices[0].supply_count is None
+
+
 def test_lh_collector_keeps_non_residential_rows_for_selection_layer(
     fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:
