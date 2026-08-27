@@ -13,7 +13,7 @@ from apps.local_content.contracts import (
 )
 from apps.local_content.selection import is_residential
 
-_SHA256_CHECKSUM = re.compile(r"[0-9a-f]{64}")
+_SHA256_CHECKSUM = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 
 
 def merge_source_reports(
@@ -39,7 +39,7 @@ def merge_source_reports(
                 conflicts.append(notice)
                 continue
             key = (notice.source_key, notice.external_id)
-            grouped.setdefault(key, {}).setdefault(notice.source_checksum, notice)
+            grouped.setdefault(key, {}).setdefault(notice.source_checksum.lower(), notice)
 
     accepted: list[HousingNotice] = []
     excluded_count = 0

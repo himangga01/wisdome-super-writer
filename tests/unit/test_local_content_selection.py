@@ -176,6 +176,27 @@ def test_same_source_identity_and_checksum_are_deduplicated(
     assert result.excluded_count == 0
 
 
+def test_uppercase_sha256_checksum_is_admitted(notice_factory, window: CollectionWindow) -> None:
+    uppercase = notice_factory(external_id="uppercase", source_checksum=("A" * 64))
+
+    result = merge_source_reports((report(uppercase),), window)
+
+    assert result.notices == (uppercase,)
+    assert result.conflicts == ()
+
+
+def test_checksum_dedupe_is_case_insensitive_for_the_same_source_identity(
+    notice_factory, window: CollectionWindow
+) -> None:
+    lowercase = notice_factory(external_id="case-replay", source_checksum=("a" * 64))
+    uppercase = notice_factory(external_id="case-replay", source_checksum=("A" * 64))
+
+    result = merge_source_reports((report(lowercase, uppercase),), window)
+
+    assert result.notices == (lowercase,)
+    assert result.conflicts == ()
+
+
 @pytest.mark.parametrize("source_checksum", ["", "not-a-sha256"])
 def test_invalid_checksum_notice_is_quarantined(
     source_checksum: str, notice_factory, window: CollectionWindow
