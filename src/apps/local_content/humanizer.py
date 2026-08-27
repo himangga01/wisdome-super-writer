@@ -10,7 +10,7 @@ import threading
 import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -84,6 +84,8 @@ class ProtectedArticleProse:
     token_values: tuple[tuple[str, str], ...]
     token_occurrences: tuple[str, ...]
     link_targets: tuple[str, ...]
+    anchors: tuple[str, ...]
+    anchor_occurrences: tuple[str, ...]
 
 
 class HumanizerClient:
@@ -141,7 +143,7 @@ class HumanizerClient:
                 deadline=deadline,
                 cancelled=cancelled,
             ),
-            timeout=remaining,
+            deadline=deadline,
         )
 
     def _transform_request(
@@ -205,6 +207,7 @@ def protect_article_prose(
 
     material = _coerce_blocks(blocks)
     _validate_blocks(material)
+    anchor_values = _validated_anchors(anchors)
     document = "\n\n".join(
         f"<!-- WSW:block:{block.block_id} -->\n{block.markdown}\n"
         f"<!-- WSW:endblock:{block.block_id} -->"
@@ -213,7 +216,7 @@ def protect_article_prose(
     _utf8_bytes(document, boundary=ValueError)
     if _TOKEN_PATTERN.search(document):
         raise ValueError("prose contains a reserved protected token")
-    protected_values = _protected_values(document, anchors)
+    protected_values = _protected_values(document, anchor_values)
     value_tokens = {
         value: f"[[P{index:04d}]]" for index, value in enumerate(protected_values, start=1)
     }
@@ -229,6 +232,8 @@ def protect_article_prose(
         token_values=token_values,
         token_occurrences=tuple(match.group(0) for match in _TOKEN_PATTERN.finditer(tokenized)),
         link_targets=_link_targets(document),
+        anchors=anchor_values,
+        anchor_occurrences=_anchor_occurrences(document, anchor_values),
     )
 
 
@@ -257,6 +262,8 @@ def verify_humanized_candidate(
         raise HumanizationVerificationError("block IDs or order changed")
     if _link_targets(restored) != protected.link_targets:
         raise HumanizationVerificationError("Markdown link targets changed")
+    if _anchor_occurrences(restored, protected.anchors) != protected.anchor_occurrences:
+        raise HumanizationVerificationError("protected anchor multiset or order changed")
     original_document = _restore_document(protected)
     if Counter(_markdown_occurrences(restored)) != Counter(
         _markdown_occurrences(original_document)
@@ -314,7 +321,9 @@ def _validated_loopback_base_url(value: str) -> str:
 def _run_with_watchdog(
     operation: Callable[[threading.Event], str],
     *,
-    timeout: float,
+    deadline: float,
+    clock: Callable[[], float] = monotonic,
+    wait_for_completion: Callable[[threading.Event, float], bool] | None = None,
 ) -> str:
     if not _WATCHDOG_SLOTS.acquire(blocking=False):
         raise HumanizationError("Humanizer watchdog capacity is exhausted")
@@ -341,7 +350,9 @@ def _run_with_watchdog(
     except RuntimeError:
         _WATCHDOG_SLOTS.release()
         raise HumanizationError("Humanizer watchdog could not start") from None
-    if not completed.wait(timeout):
+    remaining = deadline - clock()
+    wait = wait_for_completion or (lambda event, timeout: event.wait(timeout))
+    if remaining <= 0 or not wait(completed, remaining):
         cancelled.set()
         raise HumanizationError("Humanizer request exceeded the total deadline")
     error = outcome.get("error")
@@ -359,7 +370,7 @@ def _consume_transform_stream(
     deadline: float,
     cancelled: threading.Event,
 ) -> str:
-    buffer = bytearray()
+    parser = _NdjsonBuffer()
     received = 0
     state = _StreamState()
     for chunk in response.iter_bytes():
@@ -368,12 +379,10 @@ def _consume_transform_stream(
         received += len(chunk)
         if received > MAX_RESPONSE_BYTES:
             raise HumanizationError("Humanizer response exceeded the 5 MiB size limit")
-        buffer.extend(chunk)
-        _consume_complete_lines(buffer, state)
+        parser.feed(chunk, state)
     if cancelled.is_set() or monotonic() > deadline:
         raise HumanizationError("Humanizer request exceeded the total deadline")
-    if buffer:
-        _consume_event_bytes(bytes(buffer), state)
+    parser.finish(state)
     if not state.done:
         raise HumanizationError("Humanizer NDJSON stream was truncated before done")
     return "".join(state.deltas)
@@ -393,17 +402,34 @@ class _StreamState:
             self.deltas = []
 
 
-def _consume_complete_lines(buffer: bytearray, state: _StreamState) -> None:
-    cursor = 0
-    while (line_end := buffer.find(b"\n", cursor)) >= 0:
-        line = bytes(buffer[cursor:line_end])
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if line:
-            _consume_event_bytes(line, state)
-        cursor = line_end + 1
-    if cursor:
-        del buffer[:cursor]
+@dataclass
+class _NdjsonBuffer:
+    pending: bytearray = field(default_factory=bytearray)
+    scan_offset: int = 0
+    scan_work: int = 0
+
+    def feed(self, chunk: bytes, state: _StreamState) -> None:
+        self.pending.extend(chunk)
+        while True:
+            line_end = self.pending.find(b"\n", self.scan_offset)
+            if line_end < 0:
+                self.scan_work += len(self.pending) - self.scan_offset
+                self.scan_offset = len(self.pending)
+                return
+            self.scan_work += line_end + 1 - self.scan_offset
+            line = bytes(self.pending[:line_end])
+            del self.pending[: line_end + 1]
+            self.scan_offset = 0
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            if line:
+                _consume_event_bytes(line, state)
+
+    def finish(self, state: _StreamState) -> None:
+        if self.pending:
+            _consume_event_bytes(bytes(self.pending), state)
+        self.pending.clear()
+        self.scan_offset = 0
 
 
 def _consume_event_bytes(line: bytes, state: _StreamState) -> None:
@@ -586,22 +612,58 @@ def _validate_blocks(blocks: tuple[ProseBlock, ...]) -> None:
             raise ValueError("prose contains a reserved WSW marker")
 
 
-def _protected_values(document: str, anchors: Iterable[str]) -> tuple[str, ...]:
-    values: set[str] = set()
+def _validated_anchors(anchors: Iterable[str]) -> tuple[str, ...]:
     try:
-        anchor_values = tuple(anchors)
+        material = tuple(anchors)
     except TypeError:
         raise ValueError("protected anchors must be an iterable of strings") from None
-    for anchor in anchor_values:
+    result: list[str] = []
+    seen: set[str] = set()
+    for anchor in material:
         if not isinstance(anchor, str):
             raise ValueError("protected anchors must contain strings")
         _utf8_bytes(anchor, boundary=ValueError)
-        if anchor and anchor in document:
+        if anchor and anchor not in seen:
+            seen.add(anchor)
+            result.append(anchor)
+    return tuple(result)
+
+
+def _protected_values(document: str, anchors: tuple[str, ...]) -> tuple[str, ...]:
+    values: set[str] = set()
+    digit_spans = tuple(match.span() for match in _DIGIT_TOKEN_PATTERN.finditer(document))
+    for anchor in anchors:
+        if anchor in document and not _anchor_overlaps_spans(document, anchor, digit_spans):
             values.add(anchor)
     values.update(_markdown_protected_lines(document))
     for pattern in (_MARKDOWN_PATTERN, _URL_PATTERN, *_SENSITIVE_PATTERNS):
         values.update(match.group(0) for match in pattern.finditer(document) if match.group(0))
     return tuple(sorted(values, key=lambda value: (-len(value), value)))
+
+
+def _anchor_overlaps_spans(
+    document: str,
+    anchor: str,
+    spans: tuple[tuple[int, int], ...],
+) -> bool:
+    cursor = 0
+    while (start := document.find(anchor, cursor)) >= 0:
+        end = start + len(anchor)
+        if any(start < span_end and end > span_start for span_start, span_end in spans):
+            return True
+        cursor = start + 1
+    return False
+
+
+def _anchor_occurrences(document: str, anchors: tuple[str, ...]) -> tuple[str, ...]:
+    occurrences: list[tuple[int, int, int, str]] = []
+    for anchor_index, anchor in enumerate(anchors):
+        cursor = 0
+        while (start := document.find(anchor, cursor)) >= 0:
+            occurrences.append((start, -len(anchor), anchor_index, anchor))
+            cursor = start + 1
+    occurrences.sort()
+    return tuple(anchor for _start, _length, _index, anchor in occurrences)
 
 
 def _restore_document(protected: ProtectedArticleProse) -> str:
@@ -651,16 +713,33 @@ def _markdown_occurrences(document: str) -> tuple[str, ...]:
 
 def _markdown_protected_lines(document: str) -> tuple[str, ...]:
     protected: list[str] = []
-    for line in document.splitlines(keepends=True):
+    lines = document.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         stripped = line.lstrip(" ")
         is_reference = (
             len(line) - len(stripped) <= 3
             and stripped.startswith("[")
             and "]:" in stripped
         )
-        if "](" in line or is_reference:
+        if is_reference:
+            block = [line]
+            index += 1
+            while index < len(lines) and _is_reference_continuation(lines[index]):
+                block.append(lines[index])
+                index += 1
+            protected.append("".join(block))
+            continue
+        if "](" in line:
             protected.append(line)
+        index += 1
     return tuple(protected)
+
+
+def _is_reference_continuation(line: str) -> bool:
+    content = line.rstrip("\r\n")
+    return bool(content.strip()) and content.startswith((" ", "\t"))
 
 
 def _validate_markdown_text(document: str) -> None:

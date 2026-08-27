@@ -57,12 +57,19 @@ class _ChunkStream(httpx.SyncByteStream):
 
 
 class _BlockingStream(httpx.SyncByteStream):
-    def __init__(self, release: threading.Event, exited: threading.Event) -> None:
+    def __init__(
+        self,
+        blocked: threading.Event,
+        release: threading.Event,
+        exited: threading.Event,
+    ) -> None:
+        self._blocked = blocked
         self._release = release
         self._exited = exited
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         try:
+            self._blocked.set()
             self._release.wait()
             yield _event_bytes(COMPLETE_EVENTS)
         finally:
@@ -187,12 +194,15 @@ def test_client_total_deadline_returns_while_a_late_read_is_blocked() -> None:
 
 
 def test_client_caps_lingering_blocked_watchdog_workers() -> None:
+    blocked_reads: list[threading.Event] = []
     releases: list[threading.Event] = []
     exits: list[threading.Event] = []
 
     def blocking_client() -> HumanizerClient:
+        blocked = threading.Event()
         release = threading.Event()
         exited = threading.Event()
+        blocked_reads.append(blocked)
         releases.append(release)
         exits.append(exited)
 
@@ -200,7 +210,7 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
             return httpx.Response(
                 200,
                 headers={"content-type": "application/x-ndjson"},
-                stream=_BlockingStream(release, exited),
+                stream=_BlockingStream(blocked, release, exited),
             )
 
         return HumanizerClient(
@@ -213,6 +223,7 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
         for _ in range(humanizer_module.MAX_LINGERING_HUMANIZATIONS):
             with pytest.raises(HumanizationError, match="total deadline"):
                 blocking_client().transform("원문")
+            assert blocked_reads[-1].is_set()
 
         started = time.monotonic()
         with pytest.raises(HumanizationError, match="capacity"):
@@ -223,6 +234,47 @@ def test_client_caps_lingering_blocked_watchdog_workers() -> None:
             release.set()
         for exited in exits[:-1]:
             assert exited.wait(1.0)
+        reacquired = humanizer_module._WATCHDOG_SLOTS.acquire(timeout=1.0)
+        assert reacquired
+        if reacquired:
+            humanizer_module._WATCHDOG_SLOTS.release()
+
+    success_client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=_transport(_event_bytes(COMPLETE_EVENTS))
+    )
+    assert success_client.transform("원문") == "자연스러운 문장"
+
+
+def test_watchdog_recomputes_remaining_budget_after_thread_setup() -> None:
+    release = threading.Event()
+    started = threading.Event()
+    observed_waits: list[float] = []
+
+    def operation(_cancelled: threading.Event) -> str:
+        started.set()
+        release.wait()
+        return "late"
+
+    def wait_for_completion(event: threading.Event, timeout: float) -> bool:
+        assert started.wait(1.0)
+        observed_waits.append(timeout)
+        return event.is_set()
+
+    try:
+        with pytest.raises(HumanizationError, match="total deadline"):
+            humanizer_module._run_with_watchdog(
+                operation,
+                deadline=10.0,
+                clock=lambda: 9.75,
+                wait_for_completion=wait_for_completion,
+            )
+        assert observed_waits == [0.25]
+    finally:
+        release.set()
+        reacquired = humanizer_module._WATCHDOG_SLOTS.acquire(timeout=1.0)
+        assert reacquired
+        if reacquired:
+            humanizer_module._WATCHDOG_SLOTS.release()
 
 
 @pytest.mark.parametrize(
@@ -423,6 +475,27 @@ def test_client_rejects_input_larger_than_five_mib() -> None:
         client.transform("x" * (MAX_RESPONSE_BYTES + 1))
 
 
+def test_client_input_cap_is_independent_from_response_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, content=_event_bytes(COMPLETE_EVENTS))
+
+    monkeypatch.setattr(humanizer_module, "MAX_INPUT_BYTES", 3)
+    monkeypatch.setattr(humanizer_module, "MAX_RESPONSE_BYTES", 1000)
+    client = HumanizerClient(
+        "http://127.0.0.1:3210", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(HumanizationError, match="input.*5 MiB"):
+        client.transform("four")
+    assert called is False
+
+
 def test_client_enforces_result_limit_independently_of_response_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -591,6 +664,46 @@ def test_protection_covers_entire_contiguous_token_containing_a_digit() -> None:
     for token in protected.token_occurrences:
         without_tokens = without_tokens.replace(token, "")
     assert not any(character.isdigit() for character in without_tokens)
+
+
+def test_digit_tokens_take_priority_over_overlapping_anchor_spans() -> None:
+    source = "one housing A-26x two housing A-26y"
+    protected = protect_article_prose(
+        {"intro": source},
+        anchors=("housing A-26",),
+    )
+    values = {value: token for token, value in protected.token_values}
+
+    assert "A-26x" in values
+    assert "A-26y" in values
+    assert "x" not in protected.document
+    assert "y" not in protected.document
+    assert protected.anchor_occurrences == (
+        "housing A-26",
+        "housing A-26",
+    )
+
+    first = values["A-26x"]
+    second = values["A-26y"]
+    suffix_swap = protected.document.replace(first, "[[SWAP]]", 1)
+    suffix_swap = suffix_swap.replace(second, first, 1).replace("[[SWAP]]", second, 1)
+    with pytest.raises(HumanizationVerificationError, match="protected token"):
+        verify_humanized_candidate(protected, suffix_swap)
+
+    anchor_change = protected.document.replace("one housing", "one lodging", 1)
+    with pytest.raises(HumanizationVerificationError, match="anchor"):
+        verify_humanized_candidate(protected, anchor_change)
+
+
+def test_overlapping_anchor_occurrences_verify_without_false_positive() -> None:
+    protected = protect_article_prose(
+        {"intro": "housing A-26x and housing A-26x"},
+        anchors=("housing A-26", "A-26", "housing"),
+    )
+
+    assert verify_humanized_candidate(protected, protected.document) == (
+        ProseBlock("intro", "housing A-26x and housing A-26x"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -783,6 +896,81 @@ def test_reference_definition_protection_includes_its_line_ending() -> None:
 
     with pytest.raises(HumanizationVerificationError, match="protected token|Markdown"):
         verify_humanized_candidate(protected, candidate)
+
+
+def test_multiline_reference_definition_is_one_protected_logical_block() -> None:
+    reference_block = (
+        "[공식]:\n"
+        "  <https://example.test/a_(b)c>\n"
+        '  "공식 제목 (원문)"\n'
+    )
+    protected = protect_article_prose(
+        {"intro": f"{reference_block}다음 문장입니다."}, anchors=()
+    )
+    token, value = next(
+        (token, value)
+        for token, value in protected.token_values
+        if value.startswith("[공식]:")
+    )
+
+    assert value == reference_block
+    assert "example.test" not in protected.document
+    assert verify_humanized_candidate(
+        protected,
+        protected.document.replace("다음 문장입니다.", "다듬은 문장입니다."),
+    ) == (ProseBlock("intro", f"{reference_block}다듬은 문장입니다."),)
+
+    split_target_mutation = protected.document.replace(
+        token,
+        reference_block.replace("example.test", "evil.test"),
+        1,
+    )
+    with pytest.raises(HumanizationVerificationError, match="protected token"):
+        verify_humanized_candidate(protected, split_target_mutation)
+
+
+@pytest.mark.parametrize(
+    ("source", "protected_value", "mutable_text"),
+    [
+        (
+            "[공식]: https://example.test/a\n  \"제목\"\n본문입니다.",
+            '[공식]: https://example.test/a\n  "제목"\n',
+            "본문입니다.",
+        ),
+        (
+            "[공식]:\n\n  들여쓴 일반 문장\n본문입니다.",
+            "[공식]:\n",
+            "들여쓴 일반 문장",
+        ),
+        (
+            "[공식]:\n목적지는 들여쓰지 않음\n본문입니다.",
+            "[공식]:\n",
+            "목적지는 들여쓰지 않음",
+        ),
+    ],
+    ids=["same-block-title", "blank-terminates", "unindented-terminates"],
+)
+def test_reference_definition_logical_block_boundaries(
+    source: str,
+    protected_value: str,
+    mutable_text: str,
+) -> None:
+    protected = protect_article_prose({"intro": source}, anchors=())
+
+    assert protected_value in {value for _token, value in protected.token_values}
+    assert mutable_text in protected.document
+
+
+def test_incremental_ndjson_scanner_does_linear_work_for_one_byte_chunks() -> None:
+    parser = humanizer_module._NdjsonBuffer()
+    state = humanizer_module._StreamState()
+    size = 20_000
+
+    for _ in range(size):
+        parser.feed(b"x", state)
+
+    assert parser.scan_work == size
+    assert len(parser.pending) == size
 
 
 def test_candidate_preserves_inline_markdown_and_citation_markers() -> None:
