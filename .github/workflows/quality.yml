@@ -1,0 +1,67 @@
+name: Local quality
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-quality:
+    name: Python 3.12 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+    env:
+      WISDOME_ENVIRONMENT: development
+      WISDOME_RUNTIME_MODE: local
+      HUMANIZER_BASE_URL: http://127.0.0.1:3210
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned uv
+        run: python -m pip install uv==0.12.7
+
+      - name: Sync locked dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff changed files and local content
+        run: uv run python scripts/ci_changed_python.py --base "${{ github.event.pull_request.base.sha || github.event.before }}"
+
+      - name: Django checks
+        run: |
+          uv run python src/manage.py check
+          uv run python src/manage.py makemigrations --check --dry-run
+
+      - name: Deterministic local unit and integration tests
+        run: >-
+          uv run python -m pytest -q
+          tests/unit/test_queue_configuration.py
+          tests/unit/test_local_runtime.py
+          tests/unit/test_local_content_dates.py
+          tests/unit/test_applyhome_public_html.py
+          tests/unit/test_lh_public_html.py
+          tests/unit/test_local_content_selection.py
+          tests/unit/test_local_content_rendering.py
+          tests/unit/test_local_content_images.py
+          tests/unit/test_local_content_humanizer.py
+          tests/unit/test_local_content_bundles.py
+          tests/unit/test_local_content_preview.py
+          tests/unit/test_local_scripts.py
+          tests/integration/test_local_housing_workflow.py

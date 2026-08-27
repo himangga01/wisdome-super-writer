@@ -78,12 +78,15 @@ _STATUS_PROBLEMS: dict[int, tuple[str, str, str | None]] = {
 
 class AdminApiSecurityMiddleware:
     api_prefix = "/api/v1/"
+    public_read_paths = frozenset({"/api/v1/local-articles/status"})
     csrf_exempt_paths = frozenset({"/api/v1/publishing/oauth/google/callback"})
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
+        if request.path in self.public_read_paths and request.method in {"GET", "HEAD"}:
+            return self.get_response(request)
         if request.path.startswith(self.api_prefix):
             if not request.user.is_authenticated:
                 return problem_response(

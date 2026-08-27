@@ -1,5 +1,6 @@
 from importlib import import_module
 
+from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path
 from django.views.generic import RedirectView
@@ -27,6 +28,9 @@ urlpatterns = [
     path("api/v1/", include("apps.accounts.urls")),
     path("api/v1/", include("apps.audit.urls")),
 ]
+
+if settings.IS_LOCAL_RUNTIME:
+    urlpatterns.append(path("", include("apps.local_content.urls")))
 
 for app_name in ("topics", "collection", "evidence", "editorial", "publishing", "scheduling"):
     module_name = f"apps.{app_name}.urls"

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>로컬 주거 공고</title>
+  <link rel="stylesheet" href="/static/local_articles/preview.css">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Wisdome Super Writer</p>
+      <h1>로컬 주거 공고</h1>
+      <p>검증이 끝난 로컬 실행 결과만 표시합니다.</p>
+    </header>
+    {% if runs %}
+      <ol class="run-list">
+        {% for run in runs %}
+          <li>
+            <a href="{{ run.url }}"><strong>{{ run.name }}</strong></a>
+            <span>{{ run.article_count }}개 최종 글{% if run.generation %} · 추가 실행{% endif %}</span>
+          </li>
+        {% endfor %}
+      </ol>
+    {% else %}
+      <p class="empty">아직 검증된 실행 결과가 없습니다.</p>
+    {% endif %}
+  </main>
+</body>
+</html>

@@ -13,6 +13,84 @@
 > [`T031_WORK_IN_PROGRESS.md`](specs/001-automated-content-publishing/T031_WORK_IN_PROGRESS.md)를
 > 먼저 확인합니다.
 
+## Windows 로컬 주거 글 빠른 시작
+
+이 경로는 컨테이너 없이 Python 3.12, SQLite, 저장소 내부 파일 시스템만 사용합니다. PowerShell 5.1
+이상과 다음 위치의 형제 humanizer 프로젝트가 필요합니다.
+
+```text
+C:\project\2026\
+├─ wisdome-super-writer\
+└─ ai-text-makes-likes-human\
+```
+
+humanizer에는 `package-lock.json`, `package.json`의 `build`/`start` 스크립트, 빌드된
+`dist/server.js`가 있어야 하며 Node와 Codex 로그인이 준비되어야 합니다. 형제 프로젝트를 처음
+받았다면 그 디렉터리에서 `npm.cmd ci`, `npm.cmd run build`, `codex.cmd login status`를 먼저
+확인합니다. 최종 글을 만들 때 humanizer는 반드시 `127.0.0.1:3210`에서 정상 상태여야 합니다.
+
+### 1. 최초 설정
+
+저장소 루트에서 다음 한 명령을 실행합니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-local.ps1
+```
+
+설정 스크립트는 기존 `py -3.12`를 우선 사용합니다. 필요한 경우 원격 설치 스크립트를 실행하지
+않고 `scripts/toolchain-lock.json`에 고정된 공식 uv Windows x64 압축 파일을 내려받아 SHA-256을
+검증한 뒤 Python 3.12를 설치합니다. 이어서 `uv sync --frozen --extra dev`, 마이그레이션, 출처
+레지스트리 seed/검증, Django 검사를 실행합니다. `.env.local`은 없을 때만
+`.env.local.example`에서 만들며 기존 파일을 덮어쓰지 않습니다.
+
+공식 데이터 API 키가 필요하면 설정 후 `.env.local`에 직접 추가합니다. 설정 및 시작 스크립트는
+환경 변수 값이나 비밀 값을 출력하지 않습니다.
+
+### 2. 로컬 서버 시작
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+시작 스크립트는 `.env.local`을 현재 프로세스에 읽고 production 설정을 거부합니다. 이미 정상인
+서비스는 재시작하지 않으며, 필요한 경우 humanizer를 `127.0.0.1:3210`, Django를
+`127.0.0.1:8000`에 숨김 프로세스로 시작합니다. 정확한 PID와 로그 경로는
+`.local/state/start-local-owned.json`과 `.local/state/logs/`에 기록됩니다. `Ctrl+C`로 끝내면 이
+스크립트가 시작하고 신원을 다시 확인한 프로세스만 종료합니다.
+
+### 3. 최근 7일 수집·글 생성
+
+시작 스크립트를 실행한 창은 그대로 두고 새 PowerShell 창에서 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe src\manage.py collect_recent_housing --days 7 --humanize --write-articles
+```
+
+humanizer 검증에 실패한 글과 `--no-humanize`로 만든 글은 `article.draft.md`로만 남으며 최종 글
+미리보기에 표시되지 않습니다. 같은 날짜에 다시 실행하면 기존 결과를 바꾸지 않고
+`YYYY-MM-DD--run-<12자리 해시>` 세대가 추가됩니다.
+
+### 4. 미리보기와 상태 확인
+
+- 실행 목록: <http://127.0.0.1:8000/local-articles/>
+- 특정 실행: `http://127.0.0.1:8000/local-articles/YYYY-MM-DD/`
+- 추가 실행: `http://127.0.0.1:8000/local-articles/YYYY-MM-DD--run-<해시>/`
+- 로컬 상태: <http://127.0.0.1:8000/api/v1/local-articles/status>
+- liveness: <http://127.0.0.1:8000/health/live>
+- readiness: <http://127.0.0.1:8000/health/ready>
+
+미리보기는 로컬 런타임의 loopback 요청에서만 존재합니다. 검증된 실행 매니페스트와 최종
+`article.md`만 읽고, 공식 HTTPS 링크와 체크섬이 일치하는 로컬 이미지만 제공합니다.
+
+### 로컬 경로의 경계
+
+- SQLite, eager task 실행, 로컬 객체/글 디렉터리를 사용하므로 PostgreSQL row lock, Redis broker,
+  Celery lease·동시 worker, S3 versioning과 동등하지 않습니다.
+- OCR/HWP 격리, 외부 WordPress/Blogger 발행, 분산 보존·재조정 동작을 대신하지 않습니다.
+- 실제 공식 출처 수집과 Codex를 사용하는 humanizer 실행은 일반 CI에서 수행하지 않습니다.
+  네트워크 가용성, 공식 API 키, 로그인 및 사용량을 확인한 사람이 명시적으로 실행해야 합니다.
+- 분산/production 실행은 아래의 기존 배포 절차와 보안 게이트를 그대로 사용합니다.
+
 ## 지원 범위
 
 | 구분 | 현재 범위 |
@@ -59,7 +137,7 @@ flowchart LR
 - PaddleOCR 3.7.0 + PaddlePaddle 3.x: 로컬 PDF OCR
 - WordPress Core REST API와 Google Blogger API v3: 공식 발행 경로
 
-## 빠른 로컬 실행
+## 분산 스택 빠른 실행
 
 필요 도구는 Docker Desktop과 Docker Compose입니다. 호스트에서 Python 명령을 직접 실행하려면
 Python 3.12를 사용해야 합니다. 현재 패키지는 Python 3.13 이상을 지원 대상으로 삼지 않습니다.

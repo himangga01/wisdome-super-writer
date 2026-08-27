@@ -23,6 +23,7 @@ htmlcov/
 media/
 staticfiles/
 .local/
+.tools/
 output/
 .DS_Store
 Thumbs.db

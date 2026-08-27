@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ run_name }} · 로컬 주거 공고</title>
+  <link rel="stylesheet" href="/static/local_articles/preview.css">
+</head>
+<body>
+  <main>
+    <nav><a href="{% url 'local-article-index' %}">모든 실행 결과</a></nav>
+    <article>{{ article_html|safe }}</article>
+  </main>
+</body>
+</html>
