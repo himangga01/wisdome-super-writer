@@ -17,10 +17,13 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.local.example
 *.sqlite3
 *.log
 media/
 staticfiles/
+.local/
+output/
 .DS_Store
 Thumbs.db
 *.tmp

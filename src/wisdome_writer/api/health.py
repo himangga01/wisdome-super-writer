@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
 
 from django.conf import settings
 from django.db import connection
@@ -25,6 +28,21 @@ def _age_seconds(value: datetime | None, *, now: datetime) -> int | None:
     if value is None:
         return None
     return max(int((now - value).total_seconds()), 0)
+
+
+def _local_root_check(root: Path) -> str:
+    probe = root / f".ready-{uuid4().hex}"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with probe.open("xb") as handle:
+            handle.write(b"ready")
+            handle.flush()
+            os.fsync(handle.fileno())
+        probe.unlink()
+    except OSError:
+        probe.unlink(missing_ok=True)
+        return "unavailable"
+    return "ok"
 
 
 def _outbox_observation() -> dict[str, int | str | None]:
@@ -216,33 +234,41 @@ def ready(request):
     except Exception:
         checks["database"] = "unavailable"
 
-    client: Redis | None = None
-    try:
-        client = Redis.from_url(
-            settings.CELERY_BROKER_URL,
-            socket_connect_timeout=1,
-            socket_timeout=1,
-            decode_responses=True,
-        )
-        checks["broker"] = "ok" if client.ping() else "unavailable"
-    except Exception:
-        checks["broker"] = "unavailable"
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-
     outbox: dict[str, int | str | None] | None = None
-    if checks["database"] != "ok":
-        checks["outbox"] = "unavailable"
+    if settings.IS_LOCAL_RUNTIME:
+        for check_name, root in (
+            ("local_state", settings.LOCAL_STATE_ROOT),
+            ("local_articles", settings.LOCAL_ARTICLE_ROOT),
+            ("local_objects", settings.LOCAL_OBJECT_ROOT),
+        ):
+            checks[check_name] = _local_root_check(Path(root))
     else:
+        client: Redis | None = None
         try:
-            outbox = _outbox_observation()
-            checks["outbox"] = "ok"
+            client = Redis.from_url(
+                settings.CELERY_BROKER_URL,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+                decode_responses=True,
+            )
+            checks["broker"] = "ok" if client.ping() else "unavailable"
         except Exception:
+            checks["broker"] = "unavailable"
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        if checks["database"] != "ok":
             checks["outbox"] = "unavailable"
+        else:
+            try:
+                outbox = _outbox_observation()
+                checks["outbox"] = "ok"
+            except Exception:
+                checks["outbox"] = "unavailable"
 
     is_ready = all(value == "ok" for value in checks.values())
     is_degraded = bool(

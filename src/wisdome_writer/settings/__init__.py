@@ -1,5 +1,5 @@
-import json
 import ipaddress
+import json
 import os
 import re
 from pathlib import Path
@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from kombu import Queue
 
 from wisdome_writer.infrastructure.queues import CELERY_QUEUE_NAMES
+from wisdome_writer.runtime_mode import validate_runtime_mode
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPOSITORY_ROOT / "src"
@@ -37,6 +38,22 @@ if WISDOME_ENVIRONMENT not in {"development", "production"}:
     )
 
 IS_PRODUCTION = WISDOME_ENVIRONMENT == "production"
+WISDOME_RUNTIME_MODE = env_value(
+    "WISDOME_RUNTIME_MODE",
+    "distributed" if IS_PRODUCTION else "local",
+)
+validate_runtime_mode(WISDOME_ENVIRONMENT, WISDOME_RUNTIME_MODE)
+IS_LOCAL_RUNTIME = WISDOME_RUNTIME_MODE == "local"
+LOCAL_STATE_ROOT = Path(
+    env_value("LOCAL_STATE_ROOT", str(REPOSITORY_ROOT / ".local" / "state"))
+).resolve()
+LOCAL_ARTICLE_ROOT = Path(
+    env_value("LOCAL_ARTICLE_ROOT", str(REPOSITORY_ROOT / "output" / "housing"))
+).resolve()
+LOCAL_OBJECT_ROOT = Path(
+    env_value("LOCAL_OBJECT_ROOT", str(REPOSITORY_ROOT / ".local" / "objects"))
+).resolve()
+HUMANIZER_BASE_URL = env_value("HUMANIZER_BASE_URL", "http://127.0.0.1:3210")
 SECRET_KEY = env_value(
     "DJANGO_SECRET_KEY",
     "development-only-secret-key" if not IS_PRODUCTION else "",
@@ -144,7 +161,8 @@ def validate_production_configuration() -> None:
             or not is_public_hostname(hostname)
         ):
             errors.append(
-                f"{name} must be a public HTTPS origin without credentials, path, query, or fragment"
+                f"{name} must be a public HTTPS origin without credentials, path, "
+                "query, or fragment"
             )
             return None
         normalized = f"https://{hostname.lower()}"
@@ -172,7 +190,7 @@ def validate_production_configuration() -> None:
     ]
     if not CSRF_TRUSTED_ORIGINS:
         errors.append("DJANGO_CSRF_TRUSTED_ORIGINS is required")
-    for origin, hostname in csrf_origins:
+    for _origin, hostname in csrf_origins:
         if hostname not in normalized_allowed_hosts:
             errors.append(f"CSRF trusted origin host {hostname!r} must be in DJANGO_ALLOWED_HOSTS")
     if public_origin:
@@ -336,6 +354,8 @@ SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 
 CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_ALWAYS_EAGER = IS_LOCAL_RUNTIME
+CELERY_TASK_EAGER_PROPAGATES = IS_LOCAL_RUNTIME
 CELERY_TASK_TIME_LIMIT = 30 * 60
 CELERY_TASK_SOFT_TIME_LIMIT = 28 * 60
 CELERY_TASK_ACKS_LATE = True
