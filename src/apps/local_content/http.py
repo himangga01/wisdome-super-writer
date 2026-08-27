@@ -26,6 +26,7 @@ from wisdome_writer.infrastructure.http_safety import (
 MAX_HTML_BYTES = 5 * 1024 * 1024
 TOTAL_BUDGET_SECONDS = 30.0
 HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+MAX_PATH_DECODE_DEPTH = 4
 _CHARSET_PATTERN = re.compile(r"(?:^|;)\s*charset\s*=\s*[\"']?([^;\s\"']+)", re.IGNORECASE)
 
 
@@ -184,19 +185,36 @@ class OfficialHtmlFetcher:
         if normalized_host not in self._allowed_hosts:
             raise OfficialSourceError("Official source URL host is not approved")
         path = parsed.path or "/"
-        try:
-            decoded_path = unquote(path, errors="strict")
-        except UnicodeDecodeError:
-            raise OfficialSourceError("Official source URL path encoding is invalid") from None
-        if (
-            "\\" in decoded_path
-            or re.search(r"%[0-9a-f]{2}", decoded_path, re.IGNORECASE)
-            or re.search(r"%(?:2f|5c)", path, re.IGNORECASE)
-            or any(segment in {".", ".."} for segment in decoded_path.split("/"))
-        ):
-            raise OfficialSourceError("Official source URL path is ambiguous or traversing")
+        decoded_path = _canonicalize_path(path)
         if not any(_path_has_prefix(decoded_path, prefix) for prefix in self._path_prefixes):
             raise OfficialSourceError("Official source URL path is not approved")
+
+
+def _canonicalize_path(path: str) -> str:
+    current = path
+    _require_safe_path_shape(current)
+    for _ in range(MAX_PATH_DECODE_DEPTH):
+        try:
+            decoded = unquote(current, errors="strict")
+        except UnicodeDecodeError:
+            raise OfficialSourceError("Official source URL path encoding is invalid") from None
+        if decoded == current:
+            return current
+        if decoded.count("/") > current.count("/"):
+            raise OfficialSourceError("Official source URL path is ambiguous or traversing")
+        _require_safe_path_shape(decoded)
+        current = decoded
+    try:
+        if unquote(current, errors="strict") != current:
+            raise OfficialSourceError("Official source URL path encoding depth exceeded")
+    except UnicodeDecodeError:
+        raise OfficialSourceError("Official source URL path encoding is invalid") from None
+    return current
+
+
+def _require_safe_path_shape(path: str) -> None:
+    if "\\" in path or any(segment in {".", ".."} for segment in path.split("/")):
+        raise OfficialSourceError("Official source URL path is ambiguous or traversing")
 
 
 def _idna_host(hostname: str) -> str:

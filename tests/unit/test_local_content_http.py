@@ -325,6 +325,7 @@ def test_fetcher_rejects_ambiguous_or_traversing_paths(path: str) -> None:
         "/notices/%252e%252e/private",
         "/notices/%252Fprivate",
         "/notices/%255cprivate",
+        "/notices/%25252525252e%25252525252e/private",
     ),
 )
 def test_fetcher_rejects_nested_percent_encoded_path_delimiters(path: str) -> None:
@@ -343,6 +344,9 @@ def test_fetcher_rejects_nested_percent_encoded_path_delimiters(path: str) -> No
         "/notices/announcement%202026",
         "/notices/%ED%95%9C%EA%B8%80",
         "/notices/100%25",
+        "/notices/%2541",
+        "/notices/a%2520b",
+        "/notices/100%2525",
     ),
 )
 def test_fetcher_accepts_stable_single_encoded_path_characters(
