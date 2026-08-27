@@ -26,6 +26,7 @@ _DETAIL_PATHS = {
     "remaining": "/ai/aia/selectAPTRemndrLttotPblancDetailView.do",
 }
 _DETAIL_QUERY_KEYS = ("houseManageNo", "pblancNo", "houseSecd")
+_MAX_LIST_PAGES = 100
 _DATE_PATTERN = re.compile(
     r"(?P<year>\d{4})\s*[./-]\s*(?P<month>\d{1,2})\s*[./-]\s*(?P<day>\d{1,2})"
 )
@@ -56,6 +57,15 @@ class _ListedNotice:
         return f"applyhome:{self.category}:{self.house_manage_no}:{self.pblanc_no}"
 
 
+@dataclass(frozen=True)
+class _ParsedListPage:
+    records: tuple[_ListedNotice, ...]
+    current_page: int
+    last_page: int
+    total_count: int
+    explicit_empty: bool
+
+
 class ApplyHomePublicCollector:
     """Collect public ApplyHome notice pages through the bounded HTML fetcher."""
 
@@ -69,7 +79,7 @@ class ApplyHomePublicCollector:
             listed = tuple(
                 record
                 for category, url in (("apt", APT_LIST), ("remaining", REMAINING_LIST))
-                for record in self._parse_list(self._fetcher.get(url).body, category)
+                for record in self._collect_list_pages(category, url)
             )
             self._require_unique_identities(listed)
             in_window = tuple(
@@ -85,6 +95,38 @@ class ApplyHomePublicCollector:
             )
         return SourceRunReport(source_key=_SOURCE_KEY, notices=notices)
 
+    def _collect_list_pages(self, category: str, list_url: str) -> tuple[_ListedNotice, ...]:
+        records: list[_ListedNotice] = []
+        signatures: set[tuple[tuple[str, str], ...]] = set()
+        expected_last: int | None = None
+        expected_total: int | None = None
+        for page_index in range(1, _MAX_LIST_PAGES + 1):
+            page = self._parse_list(
+                self._fetcher.get(_list_page_url(list_url, page_index)).body,
+                category,
+            )
+            if page.current_page != page_index:
+                raise _ParseFailure("list page index does not match official material")
+            if expected_last is None:
+                expected_last = page.last_page
+                expected_total = page.total_count
+            elif page.last_page != expected_last or page.total_count != expected_total:
+                raise _ParseFailure("list pagination material changed")
+            if page.explicit_empty:
+                if page_index != 1 or page.last_page != 1 or page.total_count != 0:
+                    raise _ParseFailure("invalid explicit empty result page")
+                return ()
+            signature = tuple((record.external_id, record.canonical_url) for record in page.records)
+            if signature in signatures:
+                raise _ParseFailure("repeated list page")
+            signatures.add(signature)
+            records.extend(page.records)
+            if page_index == page.last_page:
+                if len(records) != page.total_count:
+                    raise _ParseFailure("list pagination truncated")
+                return tuple(records)
+        raise _ParseFailure("list pagination exceeded page cap")
+
     def _notice_from_listed(self, listed: _ListedNotice) -> HousingNotice:
         try:
             detail = self._fetcher.get(listed.canonical_url).body
@@ -92,13 +134,26 @@ class ApplyHomePublicCollector:
             raise _ParseFailure(f"detail fetch failed: {exc.__class__.__name__}") from None
         application_start, application_end, supply_count, warnings = self._parse_detail(detail)
         fields = {
+            "source_key": _SOURCE_KEY,
             "external_id": listed.external_id,
             "canonical_url": listed.canonical_url,
             "title": listed.title,
+            "publisher": "ApplyHome",
+            "category": listed.category,
+            "region": listed.region,
+            "status": listed.status,
             "published_at": listed.published_at.isoformat(),
             "application_start": application_start.isoformat() if application_start else None,
             "application_end": application_end.isoformat() if application_end else None,
+            "deadline": None,
+            "announcement_date": None,
             "supply_count": supply_count,
+            "price_summary": None,
+            "eligibility_summary": (),
+            "restriction_summary": (),
+            "facts": (),
+            "parser_version": self.parser_version,
+            "warnings": warnings,
         }
         return HousingNotice(
             source_key=_SOURCE_KEY,
@@ -118,15 +173,30 @@ class ApplyHomePublicCollector:
             warnings=warnings,
         )
 
-    def _parse_list(self, body: str, category: str) -> tuple[_ListedNotice, ...]:
+    def _parse_list(self, body: str, category: str) -> _ParsedListPage:
         document = HTMLParser(body)
         root = document.css_first(f'[data-notice-list="{category}"]')
         if root is None:
             raise _ParseFailure("list parser drift")
         rows = tuple(root.css("[data-house-manage-no][data-pblanc-no]"))
-        if not rows:
+        if not rows and _normalize(root.attributes.get("data-empty-results")) != "true":
             raise _ParseFailure("empty result page")
-        return tuple(self._parse_list_row(row, category) for row in rows)
+        current_page = _required_nonnegative_int(root, "data-current-page", minimum=1)
+        last_page = _required_nonnegative_int(root, "data-last-page", minimum=1)
+        total_count = _required_nonnegative_int(root, "data-total-count", minimum=0)
+        if current_page > last_page:
+            raise _ParseFailure("invalid list pagination material")
+        if not rows:
+            return _ParsedListPage((), current_page, last_page, total_count, True)
+        if total_count == 0:
+            raise _ParseFailure("invalid list pagination material")
+        return _ParsedListPage(
+            tuple(self._parse_list_row(row, category) for row in rows),
+            current_page,
+            last_page,
+            total_count,
+            False,
+        )
 
     def _parse_list_row(self, row: Node, category: str) -> _ListedNotice:
         house_manage_no = _required_attr(row, "data-house-manage-no")
@@ -180,14 +250,17 @@ class ApplyHomePublicCollector:
             _parse_date(match.group()) for match in _DATE_PATTERN.finditer(schedule or "")
         )
         application_start = dates[0] if dates else None
-        application_end = dates[1] if len(dates) > 1 else application_start
+        application_end = dates[1] if len(dates) > 1 else None
         supply = _label_value(root, ("공급세대수", "공급규모", "공급수"))
         supply_count = _parse_supply_count(supply) if supply else None
         warnings: list[str] = []
         if application_start is None:
             warnings.append("application schedule not found")
+        elif application_end is None:
+            warnings.append("application end date not found")
         if supply_count is None:
             warnings.append("supply count not found")
+        warnings.extend(("price summary not found", "eligibility summary not found"))
         return application_start, application_end, supply_count, tuple(warnings)
 
 
@@ -196,6 +269,20 @@ def _required_attr(node: Node, attribute: str) -> str:
     if not value:
         raise _ParseFailure(f"missing {attribute}")
     return value
+
+
+def _required_nonnegative_int(node: Node, attribute: str, *, minimum: int) -> int:
+    raw = _required_attr(node, attribute)
+    if not raw.isascii() or not raw.isdigit():
+        raise _ParseFailure("invalid list pagination material")
+    value = int(raw)
+    if value < minimum:
+        raise _ParseFailure("invalid list pagination material")
+    return value
+
+
+def _list_page_url(list_url: str, page_index: int) -> str:
+    return f"{list_url}?{urlencode({'pageIndex': page_index})}"
 
 
 def _find_detail_link(row: Node, category: str) -> str:
@@ -256,7 +343,7 @@ def _canonical_detail_url(
 def _label_value(node: Node, labels: tuple[str, ...]) -> str | None:
     expected = {_normalize(label) for label in labels}
     for label in node.css("dt, th, [data-label]"):
-        label_text = _normalize(label.attributes.get("data-label") or label.text(separator=" "))
+        label_text = _normalize(label.attributes.get("data-label")) or _normalized_text(label)
         if label_text not in expected:
             continue
         if label.tag in {"dt", "th"}:
@@ -308,8 +395,10 @@ def _parse_date(value: str) -> date | None:
 
 
 def _parse_supply_count(value: str) -> int | None:
-    digits = re.sub(r"[^0-9]", "", value)
-    return int(digits) if digits else None
+    match = re.fullmatch(r"\s*(\d{1,3}(?:,\d{3})*|\d+)\s*(?:세대|호)?\s*", value)
+    if match is None:
+        return None
+    return int(match.group(1).replace(",", ""))
 
 
 def _checksum(value: dict[str, object]) -> str:
