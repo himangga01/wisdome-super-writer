@@ -97,6 +97,12 @@ class BundlePublishError(BundleValidationError):
 
 
 @dataclass(frozen=True)
+class _ExistingBundleValidation:
+    bundle_hash: str
+    root_fingerprint: tuple[object, ...]
+
+
+@dataclass(frozen=True)
 class BundleFile:
     """One declared file, optionally backed by a non-symlink source path."""
 
@@ -241,8 +247,9 @@ class ArticleBundleWriter:
         date_root = root / bundle.run_date.isoformat()
         self._ensure_directory(date_root)
         primary = self._safe_child(date_root, bundle.slug)
-        target = self._publication_target(primary, bundle.bundle_hash)
-        if target.exists():
+        target, existing = self._publication_target(primary, bundle.bundle_hash)
+        if existing is not None:
+            _require_validated_existing_root(target, existing, "exact existing bundle")
             return target
 
         staging, owned_stage_fingerprint = self._create_owned_staging(
@@ -274,15 +281,22 @@ class ArticleBundleWriter:
             try:
                 os.replace(staging, target)
             except OSError as exc:
-                if target.is_dir() and self._existing_hash(target) == bundle.bundle_hash:
-                    return target
+                if target.is_dir():
+                    winner = self._existing_hash(target)
+                    if winner.bundle_hash == bundle.bundle_hash:
+                        _require_validated_existing_root(
+                            target,
+                            winner,
+                            "concurrent winning bundle",
+                        )
+                        return target
                 raise BundlePublishError(f"atomic bundle publish failed: {target}") from exc
             _require_owned_identity(
                 target,
                 owned_stage_fingerprint,
                 "published bundle",
             )
-            if self._existing_hash(target) != bundle.bundle_hash:
+            if self._existing_hash(target).bundle_hash != bundle.bundle_hash:
                 raise BundlePublishError(f"published bundle does not match owned stage: {target}")
             _fsync_directory(date_root)
             _fsync_directory(root)
@@ -466,7 +480,7 @@ class ArticleBundleWriter:
             seen_articles.add(alias)
         for article_name, expected_hash in articles.items():
             article_path = self._safe_child(run_root, article_name)
-            if self._existing_hash(article_path) != expected_hash:
+            if self._existing_hash(article_path).bundle_hash != expected_hash:
                 raise BundlePublishError(f"run article hash does not match: {article_path}")
         if _path_fingerprint(run_root, "run directory", BundlePublishError) != run_root_fingerprint:
             raise BundlePublishError(f"run directory changed during validation: {run_root}")
@@ -553,11 +567,11 @@ class ArticleBundleWriter:
             _reject_raw_html(document, item.path, allow_wsw_comments=True)
             return
         if extension == ".json" and item.mime_type == "application/json":
-            document = _decode_utf8(payload, item.path)
+            document = _decode_utf8(payload, item.path, error_type=BundlePublishError)
             _parse_strict_json_document(document, f"JSON file {item.path}")
             return
         if extension == ".ndjson" and item.mime_type == "application/x-ndjson":
-            document = _decode_utf8(payload, item.path)
+            document = _decode_utf8(payload, item.path, error_type=BundlePublishError)
             remaining_nodes = _MAX_JSON_NODES
             for line in document.splitlines():
                 if line.strip():
@@ -574,6 +588,7 @@ class ArticleBundleWriter:
         metadata = item.image_metadata
         if metadata is None:
             raise BundleValidationError(f"image metadata is required: {item.path}")
+        renderer_input = _parse_renderer_input_pairs(metadata.renderer_input, item.path)
         if item.path not in _ALLOWED_IMAGE_PATHS:
             raise BundleValidationError(f"image asset path is not approved: {item.path}")
         expected_extension = _IMAGE_EXTENSION_BY_MIME.get(item.mime_type)
@@ -628,9 +643,7 @@ class ArticleBundleWriter:
                 != hashlib.sha256(
                     f"openai-imagegen:{GENERIC_HERO_SHA256}".encode("ascii")
                 ).hexdigest()
-                or len(metadata.renderer_input) != 2
-                or dict(metadata.renderer_input)
-                != {"kind": "hero", "sha256": GENERIC_HERO_SHA256}
+                or renderer_input != {"kind": "hero", "sha256": GENERIC_HERO_SHA256}
             ):
                 raise BundleValidationError(
                     "generic hero provenance does not match repository asset"
@@ -650,10 +663,8 @@ class ArticleBundleWriter:
         else:
             expected_kind = "summary" if item.path.endswith("summary-card.webp") else "timeline"
             try:
-                if len(metadata.renderer_input) != len(dict(metadata.renderer_input)):
-                    raise ImageRenderError("card renderer input contains duplicate keys")
                 canonical_input = canonical_card_renderer_input(
-                    dict(metadata.renderer_input),
+                    renderer_input,
                     expected_kind=expected_kind,
                 )
                 rerendered = rerender_card_bytes(canonical_input)
@@ -824,12 +835,12 @@ class ArticleBundleWriter:
         bundle: ArticleBundle,
     ) -> None:
         _require_owned_identity(staging, owned_fingerprint, "owned staging")
-        observed_hash = self._existing_hash(
+        observed = self._existing_hash(
             staging,
             expected_slug=bundle.slug,
             allow_staging_name=True,
         )
-        if observed_hash != bundle.bundle_hash:
+        if observed.bundle_hash != bundle.bundle_hash:
             raise BundlePublishError(f"owned staging manifest does not match bundle: {staging}")
         _require_owned_identity(
             staging,
@@ -881,20 +892,25 @@ class ArticleBundleWriter:
             raise BundlePublishError(f"{label} bytes were substituted: {path}")
         _require_owned_identity(path, owned_fingerprint, f"handle-validated {label}")
 
-    def _publication_target(self, primary: Path, bundle_hash: str) -> Path:
+    def _publication_target(
+        self,
+        primary: Path,
+        bundle_hash: str,
+    ) -> tuple[Path, _ExistingBundleValidation | None]:
         self._assert_no_symlink(primary)
         if not _path_exists_no_follow(primary):
-            return primary
-        existing_hash = self._existing_hash(primary)
-        if existing_hash == bundle_hash:
-            return primary
+            return primary, None
+        existing = self._existing_hash(primary)
+        if existing.bundle_hash == bundle_hash:
+            return primary, existing
         revision = primary.with_name(f"{primary.name}--rev-{bundle_hash[:12]}")
         self._assert_no_symlink(revision)
         if _path_exists_no_follow(revision):
-            if self._existing_hash(revision) == bundle_hash:
-                return revision
+            existing = self._existing_hash(revision)
+            if existing.bundle_hash == bundle_hash:
+                return revision, existing
             raise BundlePublishError(f"revision hash collision: {revision}")
-        return revision
+        return revision, None
 
     def _existing_hash(
         self,
@@ -902,7 +918,7 @@ class ArticleBundleWriter:
         *,
         expected_slug: str | None = None,
         allow_staging_name: bool = False,
-    ) -> str:
+    ) -> _ExistingBundleValidation:
         ancestor_snapshot = _snapshot_ancestors(path, BundlePublishError)
         actual_files, actual_directories, entry_snapshot = _snapshot_tree(
             path,
@@ -1062,14 +1078,38 @@ class ArticleBundleWriter:
             _snapshot_ancestors(path, BundlePublishError),
             "bundle ancestor",
         )
-        return bundle_hash
+        return _ExistingBundleValidation(
+            bundle_hash=bundle_hash,
+            root_fingerprint=entry_snapshot["."],
+        )
 
 
-def _decode_utf8(payload: bytes, path: str) -> str:
+def _parse_renderer_input_pairs(value: object, path: str) -> dict[str, str]:
+    if not isinstance(value, tuple):
+        raise BundlePublishError(f"renderer input is not a closed pair sequence: {path}")
+    result: dict[str, str] = {}
+    for pair in value:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise BundlePublishError(f"renderer input has a malformed pair: {path}")
+        key, item = pair
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise BundlePublishError(f"renderer input pair types are invalid: {path}")
+        if key in result:
+            raise BundlePublishError(f"renderer input contains a duplicate key: {path}")
+        result[key] = item
+    return result
+
+
+def _decode_utf8(
+    payload: bytes,
+    path: str,
+    *,
+    error_type: type[BundleValidationError] = BundleValidationError,
+) -> str:
     try:
         return payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
-        raise BundleValidationError(f"text file is not valid UTF-8: {path}") from exc
+        raise error_type(f"text file is not valid UTF-8: {path}") from exc
 
 
 def _reject_raw_html(
@@ -1101,13 +1141,13 @@ def _reject_html_in_json_values(
         if isinstance(current, str):
             _reject_raw_html(current, path)
         elif isinstance(current, dict):
-            if observed_nodes + (len(current) * 2) > max_nodes:
+            if observed_nodes + len(stack) + (len(current) * 2) > max_nodes:
                 raise BundlePublishError(f"JSON node resource limit exceeded: {path}")
             for key, item in current.items():
                 stack.append((item, depth + 1))
                 stack.append((key, depth + 1))
         elif isinstance(current, list):
-            if observed_nodes + len(current) > max_nodes:
+            if observed_nodes + len(stack) + len(current) > max_nodes:
                 raise BundlePublishError(f"JSON node resource limit exceeded: {path}")
             stack.extend((item, depth + 1) for item in current)
     return observed_nodes
@@ -1395,6 +1435,18 @@ def _require_owned_identity(
     if observed != expected:
         raise BundlePublishError(
             f"{label} owned identity, type, or reparse state was substituted: {path}"
+        )
+
+
+def _require_validated_existing_root(
+    path: Path,
+    validation: _ExistingBundleValidation,
+    label: str,
+) -> None:
+    observed = _path_fingerprint(path, label, BundlePublishError)
+    if observed != validation.root_fingerprint:
+        raise BundlePublishError(
+            f"{label} identity, type, or reparse state was substituted: {path}"
         )
 
 

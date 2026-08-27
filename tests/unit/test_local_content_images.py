@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -274,3 +275,32 @@ def test_invalid_renderer_input_is_rejected_before_entering_rerender_cache() -> 
         rerender_card_bytes(malformed)
 
     assert image_module._rerender_card_bytes_cached.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize(
+    ("renderer", "filename"),
+    [
+        (render_summary_card, "summary.webp"),
+        (render_timeline, "timeline.webp"),
+    ],
+)
+@pytest.mark.parametrize("failure_layer", ["font", "measurement", "encoding"])
+def test_public_card_renderers_normalize_pillow_pipeline_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    renderer: Callable[[HousingNotice, Path], object],
+    filename: str,
+    failure_layer: str,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise OverflowError(f"synthetic {failure_layer} overflow")
+
+    if failure_layer == "font":
+        monkeypatch.setattr(image_module, "_font", fail)
+    elif failure_layer == "measurement":
+        monkeypatch.setattr(image_module.ImageDraw.ImageDraw, "textlength", fail)
+    else:
+        monkeypatch.setattr(image_module, "_encode_webp", fail)
+
+    with pytest.raises(ImageRenderError):
+        renderer(_notice(), tmp_path / filename)

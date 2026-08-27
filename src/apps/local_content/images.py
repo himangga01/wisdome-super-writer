@@ -134,19 +134,24 @@ def build_image_set(
 def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImage:
     """Render a stable 1200x630 WebP overview from normalized facts only."""
 
-    output_path = _card_path(output_path, "summary-card.webp")
-    renderer_input = _summary_renderer_input(notice)
-    values = dict(renderer_input)
-    image = _render_summary_image(values)
-    _save_webp(image, output_path)
-    alt, caption = card_accessibility_material(renderer_input)
-    return _card_manifest(
-        output_path,
-        bundle_path="assets/summary-card.webp",
-        alt=alt,
-        caption=caption,
-        renderer_input=renderer_input,
-    )
+    try:
+        output_path = _card_path(output_path, "summary-card.webp")
+        renderer_input = _summary_renderer_input(notice)
+        values = dict(renderer_input)
+        image = _render_summary_image(values)
+        _save_webp(image, output_path)
+        alt, caption = card_accessibility_material(renderer_input)
+        return _card_manifest(
+            output_path,
+            bundle_path="assets/summary-card.webp",
+            alt=alt,
+            caption=caption,
+            renderer_input=renderer_input,
+        )
+    except ImageRenderError:
+        raise
+    except Exception as exc:
+        raise ImageRenderError("summary card rendering failed") from exc
 
 
 def _render_summary_image(values: dict[str, str]) -> Image.Image:
@@ -189,19 +194,24 @@ def _render_summary_image(values: dict[str, str]) -> Image.Image:
 def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
     """Render a stable 1200x630 WebP timeline without filling unknown dates."""
 
-    output_path = _card_path(output_path, "timeline.webp")
-    renderer_input = _timeline_renderer_input(notice)
-    values = dict(renderer_input)
-    image = _render_timeline_image(values)
-    _save_webp(image, output_path)
-    alt, caption = card_accessibility_material(renderer_input)
-    return _card_manifest(
-        output_path,
-        bundle_path="assets/timeline.webp",
-        alt=alt,
-        caption=caption,
-        renderer_input=renderer_input,
-    )
+    try:
+        output_path = _card_path(output_path, "timeline.webp")
+        renderer_input = _timeline_renderer_input(notice)
+        values = dict(renderer_input)
+        image = _render_timeline_image(values)
+        _save_webp(image, output_path)
+        alt, caption = card_accessibility_material(renderer_input)
+        return _card_manifest(
+            output_path,
+            bundle_path="assets/timeline.webp",
+            alt=alt,
+            caption=caption,
+            renderer_input=renderer_input,
+        )
+    except ImageRenderError:
+        raise
+    except Exception as exc:
+        raise ImageRenderError("timeline card rendering failed") from exc
 
 
 def _render_timeline_image(values: dict[str, str]) -> Image.Image:

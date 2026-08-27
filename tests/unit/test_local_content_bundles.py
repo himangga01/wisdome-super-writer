@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -134,6 +135,46 @@ def test_bundle_write_is_atomic_and_repeatable(tmp_path: Path) -> None:
     manifest = json.loads((first / "manifest.json").read_text("utf-8"))
     assert manifest["bundle_hash"] == bundle.bundle_hash
     assert list(manifest["files"])[-1] == "sources.json"
+
+
+def test_exact_replay_rechecks_root_identity_after_existing_hash_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    published = writer.write(bundle)
+    backup = tmp_path / "validated-replay-root"
+    replacement = tmp_path / "substituted-replay-root"
+    real_existing_hash = writer._existing_hash
+    real_replace = bundle_module.os.replace
+    substituted = False
+
+    def substitute_after_existing_hash(
+        path: Path,
+        *,
+        expected_slug: str | None = None,
+        allow_staging_name: bool = False,
+    ) -> bundle_module._ExistingBundleValidation:
+        nonlocal substituted
+        observed = real_existing_hash(
+            path,
+            expected_slug=expected_slug,
+            allow_staging_name=allow_staging_name,
+        )
+        if path == published and not substituted:
+            shutil.copytree(path, replacement)
+            real_replace(path, backup)
+            real_replace(replacement, path)
+            substituted = True
+        return observed
+
+    monkeypatch.setattr(writer, "_existing_hash", substitute_after_existing_hash)
+
+    with pytest.raises(BundlePublishError, match="identity|substitut|reparse|changed"):
+        writer.write(bundle)
+    assert substituted is True
+    assert backup.is_dir()
 
 
 def test_changed_content_gets_deterministic_revision_without_overwrite(tmp_path: Path) -> None:
@@ -565,6 +606,37 @@ def test_bundle_rejects_non_utf8_text(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("path", "mime_type", "payload"),
     [
+        ("sources.json", "application/json", b'{"value":"\xff"}'),
+        (
+            "sources.ndjson",
+            "application/x-ndjson",
+            b'{"safe":1}\n{"value":"\xff"}\n',
+        ),
+    ],
+)
+def test_invalid_utf8_json_artifacts_raise_publish_error_at_bundle_boundary(
+    tmp_path: Path,
+    path: str,
+    mime_type: str,
+    payload: bytes,
+) -> None:
+    file = BundleFile(
+        path=path,
+        content=payload,
+        mime_type=mime_type,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    with pytest.raises(BundlePublishError, match="UTF-8") as captured:
+        ArticleBundleWriter(tmp_path / "output").write(
+            ArticleBundle(date(2026, 8, 28), "safe", (file,))
+        )
+    assert type(captured.value) is BundlePublishError
+
+
+@pytest.mark.parametrize(
+    ("path", "mime_type", "payload"),
+    [
         ("payload.bin", "application/octet-stream", b"generic-binary"),
         ("notes.txt", "text/plain", b"plain text"),
         ("sources.json", "application/json", b"not-json"),
@@ -605,6 +677,26 @@ def test_bundle_json_rejects_duplicate_or_resource_exhausting_documents(
         ArticleBundleWriter(tmp_path / "output").write(
             ArticleBundle(date(2026, 8, 28), "safe", (file,))
         )
+
+
+def test_json_node_budget_counts_pending_stack_before_wide_child_expansion() -> None:
+    class IterationTrackedList(list[object]):
+        iterated = False
+
+        def __iter__(self) -> Iterator[object]:
+            self.iterated = True
+            return super().__iter__()
+
+    wide_child = IterationTrackedList(["safe"] * 5_000)
+    nested_wide_document: list[object] = ["safe"] * 6_000
+    nested_wide_document.append(wide_child)
+
+    with pytest.raises(BundlePublishError, match="node resource limit"):
+        bundle_module._reject_html_in_json_values(
+            nested_wide_document,
+            "nested-wide JSON",
+        )
+    assert wide_child.iterated is False
 
 
 @pytest.mark.parametrize(
@@ -834,6 +926,36 @@ def test_bundle_converts_card_measurement_failure_to_publish_error(
         ArticleBundleWriter(tmp_path / "output").write(bundle)
 
 
+@pytest.mark.parametrize(
+    "renderer_input",
+    [
+        (("kind", "summary", "unexpected"),),
+        ((["kind"], "summary"),),
+    ],
+)
+def test_bundle_normalizes_malformed_renderer_input_pairs_to_publish_error(
+    tmp_path: Path,
+    renderer_input: object,
+) -> None:
+    bundle = _bundle(tmp_path)
+    summary = next(item for item in bundle.files if item.path == "assets/summary-card.webp")
+    assert summary.image_metadata is not None
+    malformed_summary = replace(
+        summary,
+        image_metadata=replace(summary.image_metadata, renderer_input=renderer_input),
+    )
+    malformed_bundle = replace(
+        bundle,
+        files=tuple(
+            malformed_summary if item.path == malformed_summary.path else item
+            for item in bundle.files
+        ),
+    )
+
+    with pytest.raises(BundlePublishError):
+        ArticleBundleWriter(tmp_path / "output").write(malformed_bundle)
+
+
 def test_exact_replay_reapplies_image_rights_and_provenance_semantics(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     writer = ArticleBundleWriter(tmp_path / "output")
@@ -972,6 +1094,56 @@ def test_concurrent_identical_publish_retains_losing_stage_and_injected_material
     assert (stages[0] / "foreign-injected.txt").read_bytes() == b"must remain untouched"
 
 
+def test_concurrent_winner_rechecks_root_identity_after_existing_hash_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle(tmp_path)
+    writer = ArticleBundleWriter(tmp_path / "output")
+    target = tmp_path / "output" / "2026-08-28" / bundle.slug
+    backup = tmp_path / "validated-winner-root"
+    replacement = tmp_path / "substituted-winner-root"
+    real_existing_hash = writer._existing_hash
+    real_replace = bundle_module.os.replace
+    substituted = False
+
+    def publish_competing_copy_then_fail(
+        source: os.PathLike[str] | str,
+        destination: os.PathLike[str] | str,
+    ) -> None:
+        if Path(destination) == target:
+            shutil.copytree(source, destination)
+            raise OSError(errno.EEXIST, "injected concurrent winner")
+        real_replace(source, destination)
+
+    def substitute_after_existing_hash(
+        path: Path,
+        *,
+        expected_slug: str | None = None,
+        allow_staging_name: bool = False,
+    ) -> bundle_module._ExistingBundleValidation:
+        nonlocal substituted
+        observed = real_existing_hash(
+            path,
+            expected_slug=expected_slug,
+            allow_staging_name=allow_staging_name,
+        )
+        if path == target and not substituted:
+            shutil.copytree(path, replacement)
+            real_replace(path, backup)
+            real_replace(replacement, path)
+            substituted = True
+        return observed
+
+    monkeypatch.setattr(bundle_module.os, "replace", publish_competing_copy_then_fail)
+    monkeypatch.setattr(writer, "_existing_hash", substitute_after_existing_hash)
+
+    with pytest.raises(BundlePublishError, match="identity|substitut|reparse|changed"):
+        writer.write(bundle)
+    assert substituted is True
+    assert backup.is_dir()
+
+
 def test_article_publish_rejects_owned_stage_substitution_during_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1016,7 +1188,7 @@ def test_article_publish_rechecks_owned_target_after_complete_validation(
         *,
         expected_slug: str | None = None,
         allow_staging_name: bool = False,
-    ) -> str:
+    ) -> bundle_module._ExistingBundleValidation:
         nonlocal substituted
         if path == target and not substituted:
             substituted = True
