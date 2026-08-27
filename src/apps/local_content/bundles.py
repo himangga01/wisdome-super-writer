@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
 import os
 import re
+import stat
+import unicodedata
+import warnings
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
-from apps.local_content.images import ArticleImage, ImageSet
+from apps.local_content.images import (
+    GENERIC_HERO_CAPTION,
+    GENERIC_HERO_PATH,
+    GENERIC_HERO_SHA256,
+    ArticleImage,
+    ImageSet,
+    card_renderer_fingerprint,
+)
 from apps.local_content.rendering import RenderedArticle
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -27,14 +38,51 @@ _TEXT_MIME_TYPES = frozenset(
     }
 )
 _IMAGE_MIME_BY_FORMAT = {"PNG": "image/png", "WEBP": "image/webp"}
+_IMAGE_EXTENSION_BY_MIME = {"image/png": ".png", "image/webp": ".webp"}
+_IMAGE_EXTENSIONS = frozenset(
+    {
+        ".png",
+        ".webp",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".ico",
+        ".avif",
+        ".heic",
+        ".heif",
+        ".svg",
+    }
+)
+_ALLOWED_IMAGE_PATHS = frozenset(
+    {"assets/hero.png", "assets/summary-card.webp", "assets/timeline.webp"}
+)
 _RESERVED_PATHS = frozenset({"manifest.json", "manifest.sha256"})
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{value}" for value in range(1, 10)),
+        *(f"lpt{value}" for value in range(1, 10)),
+    }
+)
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_BUNDLE_FILE_BYTES = 16 * 1024 * 1024
+_MAX_IMAGE_EDGE = 4096
+_MAX_IMAGE_PIXELS = 16_000_000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_RUN_TEMP = re.compile(r"\.(?:index\.md|manifest\.json)\.tmp-[0-9a-f]{12}")
 
 
 class BundleValidationError(ValueError):
     """Raised before publication when a bundle fails a safety invariant."""
 
 
-class BundlePublishError(RuntimeError):
+class BundlePublishError(BundleValidationError):
     """Raised when an otherwise-valid bundle cannot be published atomically."""
 
 
@@ -74,10 +122,13 @@ class BundleFile:
         image_metadata: ArticleImage | None = None,
     ) -> BundleFile:
         source_path = Path(source_path)
-        try:
-            checksum = _file_sha256(source_path)
-        except OSError:
-            checksum = "0" * 64
+        if image_metadata is not None:
+            checksum = image_metadata.sha256
+        else:
+            try:
+                checksum = _file_sha256(source_path)
+            except OSError:
+                checksum = "0" * 64
         return cls(
             path=path,
             content=None,
@@ -185,19 +236,21 @@ class ArticleBundleWriter:
 
         staging = target.with_name(f".{target.name}.tmp-{bundle.bundle_hash[:12]}")
         self._assert_child(root, staging)
-        if staging.exists() or staging.is_symlink():
-            raise BundlePublishError(f"staging path already exists: {staging}")
-        staging.mkdir()
+        self._recover_stale_staging(staging, validated)
         try:
+            staging.mkdir()
+            _fsync_directory(date_root)
             for item, payload in validated:
                 destination = self._safe_child(staging, item.path)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _write_bytes_fsynced(destination, payload)
+            _fsync_tree_directories(staging)
             checksum_document = "".join(
                 f"{item.sha256}  {item.path}\n"
                 for item, _payload in sorted(validated, key=lambda value: value[0].path)
             )
             _write_bytes_fsynced(staging / "manifest.sha256", checksum_document.encode("utf-8"))
+            _fsync_directory(staging)
             manifest = self._manifest(bundle, validated)
             manifest_payload = _json_bytes(manifest)
             _write_bytes_fsynced(staging / "manifest.json", manifest_payload)
@@ -206,13 +259,16 @@ class ArticleBundleWriter:
                 os.replace(staging, target)
             except OSError as exc:
                 if target.is_dir() and self._existing_hash(target) == bundle.bundle_hash:
+                    self._recover_stale_staging(staging, validated)
                     return target
                 raise BundlePublishError(f"atomic bundle publish failed: {target}") from exc
             _fsync_directory(date_root)
+            _fsync_directory(root)
             return target
-        except Exception:
-            # An interrupted/failed write remains identifiable by its .tmp- name.
+        except BundlePublishError:
             raise
+        except OSError as exc:
+            raise BundlePublishError(f"bundle write or publish failed: {target}") from exc
 
     def write_run(
         self,
@@ -225,6 +281,7 @@ class ArticleBundleWriter:
         root = self._safe_root()
         run_root = root / run_date.isoformat()
         self._ensure_directory(run_root)
+        self._recover_run_staging(run_root)
         index_markdown = (
             weekly_index.to_markdown()
             if isinstance(weekly_index, RenderedArticle)
@@ -259,17 +316,62 @@ class ArticleBundleWriter:
             run_root,
             f".manifest.json.tmp-{hashlib.sha256(_json_bytes(run_manifest)).hexdigest()[:12]}",
         )
-        if index_tmp.exists() or manifest_tmp.exists():
-            raise BundlePublishError("run staging file already exists")
-        _write_bytes_fsynced(index_tmp, index_payload)
-        _write_bytes_fsynced(manifest_tmp, _json_bytes(run_manifest))
-        os.replace(index_tmp, run_root / "index.md")
-        os.replace(manifest_tmp, run_root / "manifest.json")
-        _fsync_directory(run_root)
+        try:
+            _write_bytes_fsynced(index_tmp, index_payload)
+            _write_bytes_fsynced(manifest_tmp, _json_bytes(run_manifest))
+            _fsync_directory(run_root)
+            os.replace(index_tmp, run_root / "index.md")
+            _fsync_directory(run_root)
+            os.replace(manifest_tmp, run_root / "manifest.json")
+            _fsync_directory(run_root)
+            _fsync_directory(root)
+        except BundlePublishError:
+            raise
+        except OSError as exc:
+            raise BundlePublishError(f"run publish failed: {run_root}") from exc
+        return self.validate_run(run_date)
+
+    def validate_run(self, run_date: date) -> Path:
+        """Validate the run manifest commit marker before any reader uses the index."""
+
+        root = self._safe_root()
+        run_root = self._safe_child(root, run_date.isoformat())
+        _require_regular_directory(run_root, "run directory", BundlePublishError)
+        manifest_path = run_root / "manifest.json"
+        index_path = run_root / "index.md"
+        if not _is_regular_file_no_links(manifest_path):
+            raise BundlePublishError(f"run commit marker is missing or unsafe: {run_root}")
+        if not _is_regular_file_no_links(index_path):
+            raise BundlePublishError(f"run index is missing or unsafe: {run_root}")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="strict"))
+            index_payload = index_path.read_bytes()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BundlePublishError(f"run commit marker is invalid: {run_root}") from exc
+        if (
+            manifest.get("schema_version") != 1
+            or manifest.get("run_date") != run_date.isoformat()
+            or not isinstance(manifest.get("index_sha256"), str)
+            or not isinstance(manifest.get("articles"), dict)
+        ):
+            raise BundlePublishError(f"run commit marker has invalid fields: {run_root}")
+        if hashlib.sha256(index_payload).hexdigest() != manifest["index_sha256"]:
+            raise BundlePublishError(f"run index checksum does not match commit marker: {run_root}")
+        for article_name, expected_hash in manifest["articles"].items():
+            if not isinstance(article_name, str) or not isinstance(expected_hash, str):
+                raise BundlePublishError(f"run article commit material is invalid: {run_root}")
+            _validate_article_directory_name(article_name)
+            article_path = self._safe_child(run_root, article_name)
+            if self._existing_hash(article_path) != expected_hash:
+                raise BundlePublishError(f"run article hash does not match: {article_path}")
         return run_root
 
     def _validate(self, bundle: ArticleBundle) -> tuple[tuple[BundleFile, bytes], ...]:
-        if _SLUG.fullmatch(bundle.slug) is None:
+        if (
+            _SLUG.fullmatch(bundle.slug) is None
+            or _is_windows_device_name(bundle.slug)
+            or "--rev-" in bundle.slug
+        ):
             raise BundleValidationError("bundle slug is not a portable safe path segment")
         if not bundle.files:
             raise BundleValidationError("bundle must contain at least one file")
@@ -277,7 +379,7 @@ class ArticleBundleWriter:
         seen: set[str] = set()
         for item in bundle.files:
             self._validate_relative_path(item.path)
-            key = item.path.casefold()
+            key = unicodedata.normalize("NFC", item.path).casefold()
             if key in seen:
                 raise BundleValidationError(f"duplicate bundle path: {item.path}")
             seen.add(key)
@@ -285,12 +387,29 @@ class ArticleBundleWriter:
                 raise BundleValidationError(f"reserved manifest path: {item.path}")
             if item.source_path is not None:
                 self._assert_no_symlink(item.source_path)
-                if not item.source_path.is_file():
+                source_metadata = _lstat_no_links(
+                    item.source_path,
+                    "bundle source",
+                    BundleValidationError,
+                )
+                if not stat.S_ISREG(source_metadata.st_mode):
                     raise BundleValidationError(f"source path is not a file: {item.source_path}")
+                source_size = source_metadata.st_size
+                source_is_declared_image = (
+                    item.mime_type.startswith("image/")
+                    or PurePosixPath(item.path).suffix.casefold() in _IMAGE_EXTENSIONS
+                    or item.image_metadata is not None
+                )
+                if source_size > _MAX_BUNDLE_FILE_BYTES or (
+                    source_is_declared_image and source_size > _MAX_IMAGE_BYTES
+                ):
+                    raise BundlePublishError(f"bundle source byte limit exceeded: {item.path}")
             try:
                 payload = item.payload_bytes()
             except OSError as exc:
                 raise BundleValidationError(f"cannot read bundle source: {item.path}") from exc
+            if len(payload) > _MAX_BUNDLE_FILE_BYTES:
+                raise BundlePublishError(f"bundle file byte limit exceeded: {item.path}")
             if _SHA256.fullmatch(item.sha256) is None:
                 raise BundleValidationError(f"invalid checksum declaration: {item.path}")
             actual = hashlib.sha256(payload).hexdigest()
@@ -302,10 +421,20 @@ class ArticleBundleWriter:
                 except UnicodeDecodeError as exc:
                     message = f"text file is not valid UTF-8: {item.path}"
                     raise BundleValidationError(message) from exc
-            if item.mime_type.startswith("image/"):
+            signature_mime = _sniff_image_mime(payload)
+            extension = PurePosixPath(item.path).suffix.casefold()
+            image_like = (
+                signature_mime is not None
+                or extension in _IMAGE_EXTENSIONS
+                or item.mime_type.startswith("image/")
+                or item.image_metadata is not None
+            )
+            if signature_mime is not None and not item.mime_type.startswith("image/"):
+                raise BundleValidationError(
+                    f"image signature cannot use non-image MIME declaration: {item.path}"
+                )
+            if image_like:
                 self._validate_image(item, payload)
-            elif item.image_metadata is not None:
-                raise BundleValidationError(f"image metadata on non-image file: {item.path}")
             validated.append((item, payload))
         return tuple(validated)
 
@@ -313,6 +442,16 @@ class ArticleBundleWriter:
         metadata = item.image_metadata
         if metadata is None:
             raise BundleValidationError(f"image metadata is required: {item.path}")
+        if item.path not in _ALLOWED_IMAGE_PATHS:
+            raise BundleValidationError(f"image asset path is not approved: {item.path}")
+        expected_extension = _IMAGE_EXTENSION_BY_MIME.get(item.mime_type)
+        if (
+            expected_extension is None
+            or PurePosixPath(item.path).suffix.casefold() != expected_extension
+        ):
+            raise BundleValidationError(f"image MIME and extension do not match: {item.path}")
+        if len(payload) > _MAX_IMAGE_BYTES:
+            raise BundlePublishError(f"image exceeds source byte limit: {item.path}")
         required = (
             metadata.sha256,
             metadata.mime_type,
@@ -323,20 +462,63 @@ class ArticleBundleWriter:
             metadata.rights_status,
             metadata.rights_basis,
             metadata.attribution,
+            metadata.renderer_fingerprint,
         )
         if not all(required) or metadata.width <= 0 or metadata.height <= 0:
             raise BundleValidationError(f"image metadata is incomplete: {item.path}")
+        if (
+            metadata.width > _MAX_IMAGE_EDGE
+            or metadata.height > _MAX_IMAGE_EDGE
+            or metadata.width * metadata.height > _MAX_IMAGE_PIXELS
+        ):
+            raise BundlePublishError(f"image dimensions exceed limit: {item.path}")
         if metadata.rights_status not in {"owned", "generated"}:
             raise BundleValidationError(f"image rights are not publishable: {item.path}")
         if metadata.sha256 != item.sha256 or metadata.mime_type != item.mime_type:
             raise BundleValidationError(f"image metadata checksum or MIME mismatch: {item.path}")
+        if metadata.bundle_path != item.path:
+            raise BundleValidationError(f"image metadata asset path mismatch: {item.path}")
+        signature_mime = _sniff_image_mime(payload)
+        if signature_mime != item.mime_type:
+            raise BundleValidationError(f"image MIME does not match actual signature: {item.path}")
+        if item.path == "assets/hero.png":
+            if (
+                item.sha256 != GENERIC_HERO_SHA256
+                or metadata.rights_status != "generated"
+                or metadata.caption != GENERIC_HERO_CAPTION
+                or metadata.path.resolve(strict=False) != GENERIC_HERO_PATH.resolve(strict=True)
+            ):
+                raise BundleValidationError(
+                    "generic hero provenance does not match repository asset"
+                )
+        elif metadata.rights_status != "owned":
+            raise BundleValidationError(f"derived card must have owned rights: {item.path}")
+        elif (
+            metadata.renderer_fingerprint != card_renderer_fingerprint()
+            or (metadata.width, metadata.height) != (1200, 630)
+            or metadata.creator != "Wisdome Super Writer / Pillow"
+        ):
+            raise BundleValidationError(f"derived card provenance is invalid: {item.path}")
         try:
-            with Image.open(io.BytesIO(payload)) as image:
-                actual_mime = _IMAGE_MIME_BY_FORMAT.get(image.format or "")
-                size = image.size
-                image.verify()
-        except OSError as exc:
-            raise BundleValidationError(f"image content is invalid: {item.path}") from exc
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(payload)) as image:
+                    actual_mime = _IMAGE_MIME_BY_FORMAT.get(image.format or "")
+                    size = image.size
+                    width, height = size
+                    if (
+                        width > _MAX_IMAGE_EDGE
+                        or height > _MAX_IMAGE_EDGE
+                        or width * height > _MAX_IMAGE_PIXELS
+                    ):
+                        raise BundlePublishError(f"image dimensions exceed limit: {item.path}")
+                    image.verify()
+        except BundlePublishError:
+            raise
+        except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+            raise BundlePublishError(f"image decompression bomb rejected: {item.path}") from exc
+        except (OSError, ValueError, UnidentifiedImageError) as exc:
+            raise BundlePublishError(f"image content is invalid: {item.path}") from exc
         if actual_mime != item.mime_type or size != (metadata.width, metadata.height):
             raise BundleValidationError(f"image MIME or dimensions do not match: {item.path}")
 
@@ -365,15 +547,21 @@ class ArticleBundleWriter:
 
     def _safe_root(self) -> Path:
         self._assert_no_symlink(self.root)
+        existed = self.root.exists()
         self.root.mkdir(parents=True, exist_ok=True)
         self._assert_no_symlink(self.root)
-        return self.root.resolve(strict=True)
+        root = Path(os.path.abspath(self.root))
+        if not existed:
+            _fsync_directory(root.parent)
+        return root
 
     def _ensure_directory(self, path: Path) -> None:
-        if path.is_symlink():
-            raise BundleValidationError(f"output path contains a symlink: {path}")
+        self._assert_no_symlink(path)
+        existed = path.exists()
         path.mkdir(parents=True, exist_ok=True)
         self._assert_no_symlink(path)
+        if not existed:
+            _fsync_directory(path.parent)
 
     def _safe_child(self, parent: Path, relative: str) -> Path:
         child = parent.joinpath(*PurePosixPath(relative).parts)
@@ -383,40 +571,92 @@ class ArticleBundleWriter:
     @staticmethod
     def _assert_child(parent: Path, child: Path) -> None:
         try:
-            child.resolve(strict=False).relative_to(parent.resolve(strict=True))
-        except ValueError as exc:
+            parent_absolute = os.path.normcase(os.path.abspath(parent))
+            child_absolute = os.path.normcase(os.path.abspath(child))
+            if os.path.commonpath((parent_absolute, child_absolute)) != parent_absolute:
+                raise ValueError
+        except (OSError, ValueError) as exc:
             raise BundleValidationError(f"path escapes configured root: {child}") from exc
+        ArticleBundleWriter._assert_no_symlink(parent)
 
     @staticmethod
     def _validate_relative_path(value: str) -> None:
-        if not value or "\\" in value or "\x00" in value:
+        if (
+            not value
+            or "\\" in value
+            or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
+        ):
             raise BundleValidationError(f"invalid bundle path: {value!r}")
+        if unicodedata.normalize("NFC", value) != value:
+            raise BundleValidationError(f"non-canonical Unicode bundle path: {value}")
         path = PurePosixPath(value)
-        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        canonical = "/".join(path.parts)
+        if (
+            path.is_absolute()
+            or value != canonical
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
             raise BundleValidationError(f"unsafe bundle path: {value}")
-        if any(":" in part for part in path.parts):
-            raise BundleValidationError(f"non-portable bundle path: {value}")
+        for part in path.parts:
+            if (
+                ":" in part
+                or part.endswith((".", " "))
+                or _is_windows_device_name(part)
+            ):
+                raise BundleValidationError(f"non-portable bundle path: {value}")
 
     @staticmethod
     def _assert_no_symlink(path: Path) -> None:
         path = Path(path)
         candidates = [path, *path.parents]
         for candidate in candidates:
-            if candidate.is_symlink():
-                raise BundleValidationError(f"symlink path is not allowed: {path}")
+            try:
+                metadata = os.lstat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise BundleValidationError(f"cannot inspect path ancestor: {candidate}") from exc
+            if stat.S_ISLNK(metadata.st_mode) or (
+                getattr(metadata, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise BundleValidationError(f"symlink or reparse path is not allowed: {path}")
+
+    def _recover_stale_staging(
+        self,
+        staging: Path,
+        validated: tuple[tuple[BundleFile, bytes], ...],
+    ) -> None:
+        if not _path_exists_no_follow(staging):
+            return
+        _require_regular_directory(staging, "stale staging", BundlePublishError)
+        allowed_files = {item.path for item, _payload in validated} | _RESERVED_PATHS
+        allowed_directories = _parent_directories(allowed_files)
+        files, directories = _scan_tree(staging, BundlePublishError)
+        if not files.issubset(allowed_files) or not directories.issubset(allowed_directories):
+            raise BundlePublishError(f"stale staging contains unvalidated material: {staging}")
+        _remove_tree_no_follow(staging)
+        _fsync_directory(staging.parent)
+
+    def _recover_run_staging(self, run_root: Path) -> None:
+        for entry in os.scandir(run_root):
+            if _RUN_TEMP.fullmatch(entry.name) is None:
+                continue
+            candidate = Path(entry.path)
+            if not _is_regular_file_no_links(candidate):
+                raise BundlePublishError(f"run stale staging is unsafe: {candidate}")
+            candidate.unlink()
+        _fsync_directory(run_root)
 
     def _publication_target(self, primary: Path, bundle_hash: str) -> Path:
-        if primary.is_symlink():
-            raise BundleValidationError(f"bundle target is a symlink: {primary}")
-        if not primary.exists():
+        self._assert_no_symlink(primary)
+        if not _path_exists_no_follow(primary):
             return primary
         existing_hash = self._existing_hash(primary)
         if existing_hash == bundle_hash:
             return primary
         revision = primary.with_name(f"{primary.name}--rev-{bundle_hash[:12]}")
-        if revision.is_symlink():
-            raise BundleValidationError(f"revision target is a symlink: {revision}")
-        if revision.exists():
+        self._assert_no_symlink(revision)
+        if _path_exists_no_follow(revision):
             if self._existing_hash(revision) == bundle_hash:
                 return revision
             raise BundlePublishError(f"revision hash collision: {revision}")
@@ -425,7 +665,8 @@ class ArticleBundleWriter:
     @staticmethod
     def _existing_hash(path: Path) -> str:
         manifest_path = path / "manifest.json"
-        if not path.is_dir() or not manifest_path.is_file() or manifest_path.is_symlink():
+        _require_regular_directory(path, "existing bundle", BundlePublishError)
+        if not _is_regular_file_no_links(manifest_path):
             raise BundlePublishError(f"existing bundle is incomplete or unsafe: {path}")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="strict"))
@@ -434,6 +675,20 @@ class ArticleBundleWriter:
         bundle_hash = manifest.get("bundle_hash")
         if not isinstance(bundle_hash, str) or _SHA256.fullmatch(bundle_hash) is None:
             raise BundlePublishError(f"existing bundle manifest has no valid hash: {path}")
+        manifest_slug = manifest.get("slug")
+        expected_names = (
+            manifest_slug,
+            f"{manifest_slug}--rev-{bundle_hash[:12]}",
+        )
+        if (
+            manifest.get("schema_version") != 1
+            or not isinstance(manifest_slug, str)
+            or _SLUG.fullmatch(manifest_slug) is None
+            or _is_windows_device_name(manifest_slug)
+            or manifest.get("run_date") != path.parent.name
+            or path.name not in expected_names
+        ):
+            raise BundlePublishError(f"existing bundle identity or slug is invalid: {path}")
         files = manifest.get("files")
         if not isinstance(files, dict) or not files:
             raise BundlePublishError(f"existing bundle manifest has no files: {path}")
@@ -457,7 +712,7 @@ class ArticleBundleWriter:
             ):
                 raise BundlePublishError(f"existing bundle checksum metadata is invalid: {path}")
             source = path.joinpath(*PurePosixPath(relative).parts)
-            if source.is_symlink() or not source.is_file():
+            if not _is_regular_file_no_links(source):
                 raise BundlePublishError(f"existing bundle file is missing or unsafe: {source}")
             try:
                 payload = source.read_bytes()
@@ -476,8 +731,13 @@ class ArticleBundleWriter:
                     "image": entry.get("image"),
                 }
             )
+        expected_files = set(files) | _RESERVED_PATHS
+        expected_directories = _parent_directories(expected_files)
+        actual_files, actual_directories = _scan_tree(path, BundlePublishError)
+        if actual_files != expected_files or actual_directories != expected_directories:
+            raise BundlePublishError(f"existing bundle contains unmanifested material: {path}")
         checksum_path = path / "manifest.sha256"
-        if checksum_path.is_symlink() or not checksum_path.is_file():
+        if not _is_regular_file_no_links(checksum_path):
             raise BundlePublishError(f"existing checksum manifest is missing or unsafe: {path}")
         try:
             checksum_document = checksum_path.read_text(encoding="utf-8", errors="strict")
@@ -518,12 +778,15 @@ def _write_bytes_fsynced(path: Path, payload: bytes) -> None:
 def _fsync_directory(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        if _directory_fsync_is_unsupported(exc):
+            return
+        raise BundlePublishError(f"directory fsync open failed: {path}") from exc
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if not _directory_fsync_is_unsupported(exc):
+            raise BundlePublishError(f"directory fsync failed: {path}") from exc
     finally:
         os.close(descriptor)
 
@@ -534,3 +797,161 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _directory_fsync_is_unsupported(exc: OSError) -> bool:
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}
+    if hasattr(errno, "EOPNOTSUPP"):
+        unsupported.add(errno.EOPNOTSUPP)
+    if os.name == "nt":
+        unsupported.add(errno.EACCES)
+    return exc.errno in unsupported
+
+
+def _fsync_tree_directories(root: Path) -> None:
+    _files, directories = _scan_tree(root, BundlePublishError)
+    for relative in sorted(directories, key=lambda value: value.count("/"), reverse=True):
+        _fsync_directory(root.joinpath(*PurePosixPath(relative).parts))
+    _fsync_directory(root)
+
+
+def _sniff_image_mime(payload: bytes) -> str | None:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return "image/webp"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    if payload.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if payload.startswith(b"\x00\x00\x01\x00"):
+        return "image/x-icon"
+    if len(payload) >= 12 and payload[4:8] == b"ftyp":
+        brand = payload[8:12]
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "image/heic"
+    text_prefix = payload[:512].lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
+    if text_prefix.startswith(b"<svg") or b"<svg" in text_prefix[:256]:
+        return "image/svg+xml"
+    return None
+
+
+def _is_windows_device_name(value: str) -> bool:
+    stem = value.split(".", 1)[0].casefold()
+    return stem in _WINDOWS_DEVICE_NAMES
+
+
+def _validate_article_directory_name(value: str) -> None:
+    base, marker, revision = value.partition("--rev-")
+    if (
+        _SLUG.fullmatch(base) is None
+        or _is_windows_device_name(base)
+        or (marker and re.fullmatch(r"[0-9a-f]{12}", revision) is None)
+    ):
+        raise BundlePublishError(f"run article directory name is unsafe: {value}")
+
+
+def _path_exists_no_follow(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise BundleValidationError(f"cannot inspect path: {path}") from exc
+    return True
+
+
+def _lstat_no_links(
+    path: Path,
+    label: str,
+    error_type: type[BundleValidationError],
+) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise error_type(f"{label} is missing or cannot be inspected: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or (
+        getattr(metadata, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise error_type(f"{label} contains a symlink or reparse point: {path}")
+    return metadata
+
+
+def _require_regular_directory(
+    path: Path,
+    label: str,
+    error_type: type[BundleValidationError],
+) -> None:
+    metadata = _lstat_no_links(path, label, error_type)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise error_type(f"{label} is not a directory: {path}")
+
+
+def _is_regular_file_no_links(path: Path) -> bool:
+    try:
+        metadata = _lstat_no_links(path, "file", BundlePublishError)
+    except BundlePublishError:
+        return False
+    return stat.S_ISREG(metadata.st_mode)
+
+
+def _scan_tree(
+    root: Path,
+    error_type: type[BundleValidationError],
+) -> tuple[set[str], set[str]]:
+    files: set[str] = set()
+    directories: set[str] = set()
+
+    def visit(directory: Path, relative_parent: PurePosixPath | None = None) -> None:
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise error_type(f"cannot inspect bundle tree: {directory}") from exc
+        for entry in entries:
+            relative = (
+                PurePosixPath(entry.name)
+                if relative_parent is None
+                else relative_parent / entry.name
+            )
+            value = relative.as_posix()
+            metadata = _lstat_no_links(Path(entry.path), "bundle tree", error_type)
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.add(value)
+                visit(Path(entry.path), relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                files.add(value)
+            else:
+                raise error_type(f"bundle tree contains a non-regular entry: {entry.path}")
+
+    visit(root)
+    return files, directories
+
+
+def _parent_directories(paths: set[str] | frozenset[str]) -> set[str]:
+    result: set[str] = set()
+    for value in paths:
+        parent = PurePosixPath(value).parent
+        while parent != PurePosixPath("."):
+            result.add(parent.as_posix())
+            parent = parent.parent
+    return result
+
+
+def _remove_tree_no_follow(root: Path) -> None:
+    files, directories = _scan_tree(root, BundlePublishError)
+    for relative in sorted(files, key=lambda value: value.count("/"), reverse=True):
+        target = root.joinpath(*PurePosixPath(relative).parts)
+        _lstat_no_links(target, "stale staging", BundlePublishError)
+        target.unlink()
+    for relative in sorted(directories, key=lambda value: value.count("/"), reverse=True):
+        target = root.joinpath(*PurePosixPath(relative).parts)
+        _require_regular_directory(target, "stale staging", BundlePublishError)
+        target.rmdir()
+    _require_regular_directory(root, "stale staging", BundlePublishError)
+    root.rmdir()

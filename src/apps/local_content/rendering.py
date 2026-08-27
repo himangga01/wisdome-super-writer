@@ -9,6 +9,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from apps.local_content.contracts import HousingCollectionResult, HousingNotice
 from apps.local_content.selection import needs_detailed_article
@@ -16,6 +17,15 @@ from apps.local_content.selection import needs_detailed_article
 UNKNOWN_VALUE = "공고문에서 직접 확인 필요"
 GENERIC_HERO_ALT = "주거 공고 이해를 위한 일반적인 현대 아파트 도시 전경"
 GENERIC_HERO_CAPTION = "이해를 돕기 위한 이미지 · 실제 단지 모습과 다를 수 있음"
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
+_OFFICIAL_SOURCE_HOSTS = {
+    "applyhome": "www.applyhome.co.kr",
+    "lh": "apply.lh.or.kr",
+}
+
+
+class RenderValidationError(ValueError):
+    """Raised when normalized source material is unsafe to render."""
 
 
 @dataclass(frozen=True)
@@ -85,9 +95,11 @@ class RenderedArticle:
 def render_detailed_article(notice: HousingNotice) -> RenderedArticle:
     """Render one normalized notice without inferring any missing fact."""
 
-    title = notice.title.strip() or UNKNOWN_VALUE
+    canonical_url = _official_url(notice)
+    source_checksum = _source_checksum(notice.source_checksum)
+    title = _display_value(notice.title)
     slug = notice_slug(notice)
-    sources = (_notice_source(notice),)
+    sources = (_notice_source(notice, canonical_url=canonical_url),)
     frontmatter = _frontmatter(
         (
             ("title", title),
@@ -95,18 +107,18 @@ def render_detailed_article(notice: HousingNotice) -> RenderedArticle:
             ("article_type", "housing_notice_detail"),
             ("source_key", notice.source_key),
             ("external_id", notice.external_id),
-            ("source_checksum", notice.source_checksum),
+            ("source_checksum", source_checksum),
             ("published_at", notice.published_at.isoformat()),
         )
     )
     prose_blocks = (
         ProseBlock(
             "intro",
-            f"{_markdown_text(title)} 공고에서 확인할 핵심 항목을 공식 정보 기준으로 정리했습니다.",
+            "공고를 검토할 때 먼저 확인할 핵심 항목을 차례대로 정리했습니다.",
         ),
         ProseBlock(
             "context",
-            _context_prose(notice),
+            "위치와 공급 정보는 공식 공고의 사실 영역에서만 확인해야 합니다.",
         ),
         ProseBlock(
             "strategy",
@@ -118,7 +130,11 @@ def render_detailed_article(notice: HousingNotice) -> RenderedArticle:
         slug=slug,
         frontmatter=frontmatter,
         prose_blocks=prose_blocks,
-        factual_markdown=_detail_facts(notice),
+        factual_markdown=_detail_facts(
+            notice,
+            canonical_url=canonical_url,
+            source_checksum=source_checksum,
+        ),
         sources=sources,
         protected_anchors=_protected_anchors(notice),
     )
@@ -132,6 +148,9 @@ def render_weekly_index(
 ) -> RenderedArticle:
     """Render every admitted notice and deterministic links for detailed selections."""
 
+    for notice in result.notices:
+        _official_url(notice)
+        _source_checksum(notice.source_checksum)
     start = result.window.start.date().isoformat()
     end = result.window.end.date().isoformat()
     title = f"{start}~{end} 주간 주거 공고"
@@ -150,7 +169,7 @@ def render_weekly_index(
     blocks = (
         ProseBlock(
             "intro",
-            f"{start}부터 {end}까지 발표된 주거 공고를 한곳에서 확인할 수 있습니다.",
+            "이번 주 주거 공고를 한곳에서 차례대로 살펴볼 수 있습니다.",
         ),
         ProseBlock(
             "context",
@@ -190,7 +209,15 @@ def notice_slug(notice: HousingNotice) -> str:
     return f"{base}-{digest}"
 
 
-def _detail_facts(notice: HousingNotice) -> str:
+def _detail_facts(
+    notice: HousingNotice,
+    *,
+    canonical_url: str,
+    source_checksum: str,
+) -> str:
+    title = _display_value(notice.title)
+    publisher = _display_value(notice.publisher)
+    status = _display_value(notice.status)
     lines = [
         f'![{GENERIC_HERO_ALT}](assets/hero.png "{GENERIC_HERO_CAPTION}")',
         "",
@@ -199,20 +226,20 @@ def _detail_facts(notice: HousingNotice) -> str:
         _table(
             (
                 ("항목", "확인 내용"),
-                ("공고명", notice.title or UNKNOWN_VALUE),
-                ("기관", notice.publisher or UNKNOWN_VALUE),
+                ("공고명", title),
+                ("기관", publisher),
                 ("지역", _known(notice.region)),
-                ("공고 상태", notice.status or UNKNOWN_VALUE),
+                ("공고 상태", status),
                 ("공급 규모", _supply(notice.supply_count)),
             )
         ),
         "",
         "## 공식 공고",
         "",
-        f"- 공식 공고: [{_markdown_text(notice.title)}](<{notice.canonical_url}>)",
-        f"- 공고 기관: {_markdown_text(notice.publisher or UNKNOWN_VALUE)}",
+        f"- 공식 공고: [{_markdown_text(title)}](<{canonical_url}>)",
+        f"- 공고 기관: {_markdown_text(publisher)}",
         f"- 공고일: {notice.published_at.date().isoformat()}",
-        f"- 원문 체크섬(SHA-256): `{notice.source_checksum or UNKNOWN_VALUE}`",
+        f"- 원문 체크섬(SHA-256): `{source_checksum}`",
         "",
         "## 위치와 공급 규모",
         "",
@@ -271,7 +298,7 @@ def _detail_facts(notice: HousingNotice) -> str:
             "",
             "## 출처와 이미지 정보",
             "",
-            f"- 공식 출처: [{_markdown_text(notice.publisher)}](<{notice.canonical_url}>)",
+            f"- 공식 출처: [{_markdown_text(publisher)}](<{canonical_url}>)",
             f"- 일반 이미지: {GENERIC_HERO_CAPTION}",
             "- 요약·일정 이미지는 위 공식 공고의 정규화된 사실로 로컬 생성합니다.",
         )
@@ -340,13 +367,14 @@ def _weekly_facts(
             prior_detailed_ids=prior_detailed_ids,
         ):
             detail = f"[상세 보기](./{notice_slug(notice)}/article.md)"
-        official = f"[{_table_text(notice.title)}](<{notice.canonical_url}>)"
+        canonical_url = _official_url(notice)
+        official = f"[{_table_text(_display_value(notice.title))}](<{canonical_url}>)"
         lines.append(
             "| "
             + " | ".join(
                 (
                     notice.published_at.date().isoformat(),
-                    _table_text(notice.publisher),
+                    _table_text(_display_value(notice.publisher)),
                     _table_text(_known(notice.region)),
                     _table_text(notice.category),
                     official,
@@ -367,12 +395,6 @@ def _weekly_facts(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _context_prose(notice: HousingNotice) -> str:
-    if notice.region:
-        return f"공식 공고에는 지역이 {_markdown_text(notice.region)}로 표시되어 있습니다."
-    return "공식 공고에 명시된 지역 정보를 기준으로 주변 맥락을 살펴보세요."
-
-
 def _block_document(block: ProseBlock) -> tuple[str, str, str]:
     return (
         f"<!-- WSW:block:{block.block_id} -->",
@@ -391,7 +413,7 @@ def _protected_anchors(notice: HousingNotice) -> tuple[str, ...]:
         *notice.eligibility_summary,
         *notice.restriction_summary,
     ]
-    return _ordered_unique(value for value in candidates if value)
+    return _ordered_unique(_safe_scalar(value) for value in candidates if value)
 
 
 def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
@@ -405,13 +427,17 @@ def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _notice_source(notice: HousingNotice) -> ArticleSource:
+def _notice_source(
+    notice: HousingNotice,
+    *,
+    canonical_url: str | None = None,
+) -> ArticleSource:
     return ArticleSource(
         source_key=notice.source_key,
-        title=notice.title,
-        publisher=notice.publisher,
-        url=notice.canonical_url,
-        checksum=notice.source_checksum,
+        title=_display_value(notice.title),
+        publisher=_display_value(notice.publisher),
+        url=canonical_url or _official_url(notice),
+        checksum=_source_checksum(notice.source_checksum),
     )
 
 
@@ -454,7 +480,7 @@ def _table_text(value: str) -> str:
 
 def _markdown_text(value: str) -> str:
     return (
-        " ".join(str(value).split())
+        _safe_scalar(str(value))
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("[", "\\[")
@@ -463,9 +489,62 @@ def _markdown_text(value: str) -> str:
 
 
 def _known(value: str | None) -> str:
-    if value is None or not value.strip():
-        return UNKNOWN_VALUE
-    return value.strip()
+    return _display_value(value)
+
+
+def _display_value(value: str | None) -> str:
+    normalized = _safe_scalar(value or "")
+    return normalized or UNKNOWN_VALUE
+
+
+def _safe_scalar(value: str) -> str:
+    without_controls = "".join(
+        " " if unicodedata.category(character) in {"Cc", "Cf"} else character
+        for character in str(value)
+    )
+    return " ".join(without_controls.split())
+
+
+def _source_checksum(value: str) -> str:
+    normalized = value.strip()
+    if _SHA256.fullmatch(normalized) is None:
+        raise RenderValidationError("source checksum must be SHA-256")
+    return normalized
+
+
+def _official_url(notice: HousingNotice) -> str:
+    value = notice.canonical_url
+    if not value or value != value.strip() or any(
+        unicodedata.category(character) in {"Cc", "Cf"} for character in value
+    ):
+        raise RenderValidationError("canonical URL contains whitespace or control characters")
+    if re.search(r"%(?![0-9a-fA-F]{2})", value):
+        raise RenderValidationError("canonical URL contains invalid percent encoding")
+    if any(
+        int(match.group(1), 16) < 32 or int(match.group(1), 16) == 127
+        for match in re.finditer(r"%([0-9a-fA-F]{2})", value)
+    ):
+        raise RenderValidationError("canonical URL contains encoded control characters")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise RenderValidationError("canonical URL is invalid") from exc
+    expected_host = _OFFICIAL_SOURCE_HOSTS.get(notice.source_key.casefold())
+    if (
+        parsed.scheme != "https"
+        or expected_host is None
+        or parsed.hostname != expected_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not parsed.path.startswith("/")
+        or parsed.fragment
+    ):
+        raise RenderValidationError("canonical URL must use the official HTTPS source host")
+    path = quote(parsed.path, safe="/%-._~!$&'*,;=:@+")
+    query = quote(parsed.query, safe="/%-._~!$&'*,;=:@?+")
+    return urlunsplit(("https", expected_host, path, query, ""))
 
 
 def _date_value(value: object | None) -> str:

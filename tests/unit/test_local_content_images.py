@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 from PIL import Image
 
 from apps.local_content.contracts import HousingNotice
 from apps.local_content.images import (
     GENERIC_HERO_CAPTION,
+    GENERIC_HERO_PATH,
+    GENERIC_HERO_SHA256,
+    ImageRenderError,
     _timeline_value_lines,
     build_image_set,
     render_summary_card,
@@ -93,3 +98,54 @@ def test_image_manifest_has_required_rights_and_accessibility_fields(tmp_path: P
     assert image_set.images[0].caption == GENERIC_HERO_CAPTION
     assert image_set.images[0].rights_status == "generated"
     assert all("attachment" not in str(asset.path).casefold() for asset in image_set.images)
+
+
+def test_generic_hero_is_locked_to_the_exact_repository_asset(tmp_path: Path) -> None:
+    arbitrary = tmp_path / "arbitrary.png"
+    Image.new("RGB", (1200, 630), "white").save(arbitrary, format="PNG")
+
+    with pytest.raises(ImageRenderError, match="exact repository asset"):
+        build_image_set(_notice(), tmp_path / "cards", hero_path=arbitrary)
+
+    image_set = build_image_set(_notice(), tmp_path / "approved")
+    hero = image_set.images[0]
+    assert hero.path.resolve() == GENERIC_HERO_PATH.resolve()
+    assert hero.sha256 == GENERIC_HERO_SHA256
+
+
+def test_card_manifest_binds_the_exact_font_and_renderer_material(tmp_path: Path) -> None:
+    first = render_summary_card(_notice(), tmp_path / "first.webp")
+    second = render_summary_card(_notice(), tmp_path / "second.webp")
+    timeline = render_timeline(_notice(), tmp_path / "timeline.webp")
+
+    assert first.sha256 == second.sha256
+    assert first.renderer_fingerprint == second.renderer_fingerprint
+    assert timeline.renderer_fingerprint == first.renderer_fingerprint
+    assert re.fullmatch(r"[0-9a-f]{64}", first.renderer_fingerprint)
+
+
+def test_summary_alt_describes_every_meaningful_visible_fact(tmp_path: Path) -> None:
+    summary = render_summary_card(_notice(), tmp_path / "summary.webp")
+    unknown = render_summary_card(
+        _notice(application_start=None, price_summary=None),
+        tmp_path / "summary-unknown.webp",
+    )
+
+    for expected in ("서울특별시", "1,147세대", "2026-09-07", "공고문 기준"):
+        assert expected in summary.alt
+    assert unknown.alt.count("공고문에서 직접 확인 필요") >= 2
+
+
+def test_timeline_alt_describes_all_four_visible_schedule_fields(tmp_path: Path) -> None:
+    timeline = render_timeline(_notice(deadline=date(2026, 9, 10)), tmp_path / "timeline.webp")
+
+    for expected in ("2026-09-07", "2026-09-09", "2026-09-10", "2026-09-16"):
+        assert expected in timeline.alt
+
+
+def test_whitespace_title_is_unknown_in_card_pixels_and_alt(tmp_path: Path) -> None:
+    summary = render_summary_card(_notice(title=" \t"), tmp_path / "summary.webp")
+    timeline = render_timeline(_notice(title=" \n"), tmp_path / "timeline.webp")
+
+    assert summary.alt.startswith("공고문에서 직접 확인 필요")
+    assert timeline.alt.startswith("공고문에서 직접 확인 필요")

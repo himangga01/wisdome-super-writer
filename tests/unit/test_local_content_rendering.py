@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
 import yaml
 
 from apps.local_content.contracts import (
@@ -13,6 +14,7 @@ from apps.local_content.contracts import (
 )
 from apps.local_content.rendering import (
     UNKNOWN_VALUE,
+    RenderValidationError,
     render_detailed_article,
     render_weekly_index,
 )
@@ -175,3 +177,74 @@ def test_weekly_index_includes_every_notice_and_links_only_selected_details() ->
         "분양 공고"
     )
     assert "일부 선택 항목 누락" in rendered.factual_markdown
+
+
+def test_notice_specific_official_facts_never_enter_mutable_prose() -> None:
+    notice = _notice()
+    rendered = render_detailed_article(notice)
+    prose = "\n".join(block.markdown for block in rendered.prose_blocks)
+
+    assert notice.title not in prose
+    assert notice.publisher not in prose
+    assert notice.region not in prose
+    assert notice.status not in prose
+    assert notice.region in rendered.factual_markdown
+
+
+def test_whitespace_only_identity_fields_use_the_exact_unknown_value() -> None:
+    rendered = render_detailed_article(_notice(title=" \t", publisher="\n", status="  "))
+
+    assert rendered.title == UNKNOWN_VALUE
+    assert rendered.sources[0].title == UNKNOWN_VALUE
+    assert rendered.sources[0].publisher == UNKNOWN_VALUE
+    assert UNKNOWN_VALUE in rendered.factual_markdown
+    assert all(anchor.strip() for anchor in rendered.protected_anchors)
+
+
+@pytest.mark.parametrize(
+    "canonical_url",
+    [
+        "http://www.applyhome.co.kr/notice/1",
+        "https://user@www.applyhome.co.kr/notice/1",
+        "https://evil.example/notice/1",
+        "https://www.applyhome.co.kr/notice/1\n## injected",
+        "https://www.applyhome.co.kr/notice/\x01bad",
+        "https://www.applyhome.co.kr/notice/%0Ainjected",
+    ],
+)
+def test_detail_rejects_non_official_or_unsafe_canonical_urls(canonical_url: str) -> None:
+    with pytest.raises(RenderValidationError, match="canonical URL"):
+        render_detailed_article(_notice(canonical_url=canonical_url))
+
+
+def test_detail_rejects_invalid_source_checksum() -> None:
+    with pytest.raises(RenderValidationError, match="source checksum"):
+        render_detailed_article(_notice(source_checksum="not-sha256"))
+
+
+def test_official_url_destination_is_percent_encoded_before_markdown() -> None:
+    rendered = render_detailed_article(
+        _notice(canonical_url="https://www.applyhome.co.kr/notice/a)>?next=b)>")
+    )
+
+    assert rendered.sources[0].url == (
+        "https://www.applyhome.co.kr/notice/a%29%3E?next=b%29%3E"
+    )
+    assert "a)>" not in rendered.factual_markdown
+    assert "%29%3E" in rendered.factual_markdown
+
+
+def test_untrusted_scalar_newlines_cannot_inject_markdown_headings() -> None:
+    rendered = render_detailed_article(
+        _notice(
+            title="정상 공고\n## 악성 제목",
+            publisher="공식 기관\n## 악성 기관",
+            status="공고중\n## 악성 상태",
+        )
+    )
+
+    headings = [line for line in rendered.factual_markdown.splitlines() if line.startswith("## ")]
+    assert "## 악성 제목" not in headings
+    assert "## 악성 기관" not in headings
+    assert "## 악성 상태" not in headings
+    assert rendered.title == "정상 공고 ## 악성 제목"

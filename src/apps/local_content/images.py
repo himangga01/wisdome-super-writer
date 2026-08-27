@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
+from PIL import __version__ as PILLOW_VERSION
 
 from apps.local_content.contracts import HousingNotice
 from apps.local_content.rendering import GENERIC_HERO_CAPTION, UNKNOWN_VALUE
@@ -16,6 +20,7 @@ CARD_SIZE = (1200, 630)
 GENERIC_HERO_PATH = (
     Path(__file__).resolve().parents[2] / "static" / "local_articles" / "generic-housing-hero.png"
 )
+GENERIC_HERO_SHA256 = "885a39f027ee1693147840039bb70624bd26333bcb49f014461250c86d6047cd"
 _FONT_CANDIDATES = (
     Path("C:/Windows/Fonts/malgun.ttf"),
     Path("C:/Windows/Fonts/malgunbd.ttf"),
@@ -48,6 +53,7 @@ class ArticleImage:
     rights_status: str
     rights_basis: str
     attribution: str
+    renderer_fingerprint: str
 
     def as_manifest(self, *, path: str | None = None) -> dict[str, object]:
         return {
@@ -64,6 +70,7 @@ class ArticleImage:
             "rights_status": self.rights_status,
             "rights_basis": self.rights_basis,
             "attribution": self.attribution,
+            "renderer_fingerprint": self.renderer_fingerprint,
         }
 
 
@@ -101,7 +108,8 @@ def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImag
 
     draw.rounded_rectangle((58, 52, 1142, 578), radius=34, fill="#FFFFFF", outline="#DDE4DB")
     draw.text((92, 86), "주거 공고 한눈에 보기", font=label_font, fill="#24705B")
-    title = _fit_text(draw, notice.title or UNKNOWN_VALUE, title_font, 990)
+    notice_title = _known(notice.title)
+    title = _fit_text(draw, notice_title, title_font, 990)
     draw.text((92, 132), title, font=title_font, fill="#15251F")
     draw.line((92, 216, 1108, 216), fill="#DDE4DB", width=3)
 
@@ -135,8 +143,9 @@ def render_summary_card(notice: HousingNotice, output_path: Path) -> ArticleImag
         output_path,
         bundle_path="assets/summary-card.webp",
         alt=(
-            f"{notice.title or UNKNOWN_VALUE} 요약 카드. 지역 {_known(notice.region)}, "
-            f"공급 규모 {supply}."
+            f"{notice_title} 요약 카드. 지역 {_known(notice.region)}, "
+            f"공급 규모 {supply}, 신청 시작 {_date(notice.application_start)}, "
+            f"가격·보증금·임대료 {_known(notice.price_summary)}."
         ),
         caption="정규화된 공식 공고 사실로 만든 요약 이미지",
     )
@@ -157,7 +166,7 @@ def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
     draw.text((92, 86), "신청 일정", font=title_font, fill="#15251F")
     draw.text(
         (92, 151),
-        _fit_text(draw, notice.title or UNKNOWN_VALUE, note_font, 990),
+        _fit_text(draw, _known(notice.title), note_font, 990),
         font=note_font,
         fill="#60706A",
     )
@@ -193,14 +202,32 @@ def render_timeline(notice: HousingNotice, output_path: Path) -> ArticleImage:
     return _card_manifest(
         output_path,
         bundle_path="assets/timeline.webp",
-        alt=f"{notice.title or UNKNOWN_VALUE} 신청 일정. {alt_events}.",
+        alt=f"{_known(notice.title)} 신청 일정. {alt_events}.",
         caption="정규화된 공식 공고 날짜로 만든 신청 일정 이미지",
     )
 
 
+def card_renderer_fingerprint() -> str:
+    """Return the hash-bound Pillow/font/encoding material for derived cards."""
+
+    return _renderer_fingerprint()
+
+
 def _generic_hero(path: Path) -> ArticleImage:
+    approved = Path(os.path.abspath(GENERIC_HERO_PATH))
+    candidate = Path(os.path.abspath(path))
+    try:
+        resolved_approved = GENERIC_HERO_PATH.resolve(strict=True)
+        resolved_candidate = path.resolve(strict=True)
+    except OSError as exc:
+        raise ImageRenderError("generic hero repository asset is unavailable") from exc
+    if candidate != approved or resolved_candidate != resolved_approved:
+        raise ImageRenderError("generic hero must be the exact repository asset")
     if not path.is_file() or path.is_symlink():
         raise ImageRenderError(f"generic hero is unavailable or unsafe: {path}")
+    checksum = _sha256(path)
+    if checksum != GENERIC_HERO_SHA256:
+        raise ImageRenderError("generic hero SHA-256 does not match the repository asset")
     try:
         with Image.open(path) as image:
             if image.format != "PNG":
@@ -212,7 +239,7 @@ def _generic_hero(path: Path) -> ArticleImage:
     return ArticleImage(
         path=path,
         bundle_path="assets/hero.png",
-        sha256=_sha256(path),
+        sha256=checksum,
         mime_type="image/png",
         width=width,
         height=height,
@@ -224,6 +251,9 @@ def _generic_hero(path: Path) -> ArticleImage:
         rights_status="generated",
         rights_basis="이 저장소 전용 생성 이미지이며 공식 공고 첨부물을 사용하지 않음",
         attribution="OpenAI ImageGen으로 생성",
+        renderer_fingerprint=hashlib.sha256(
+            f"openai-imagegen:{GENERIC_HERO_SHA256}".encode("ascii")
+        ).hexdigest(),
     )
 
 
@@ -249,6 +279,7 @@ def _card_manifest(
         rights_status="owned",
         rights_basis="저장소 코드가 정규화된 사실만으로 직접 렌더링함",
         attribution="Wisdome Super Writer",
+        renderer_fingerprint=_renderer_fingerprint(),
     )
 
 
@@ -293,6 +324,23 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
         raise ImageRenderError(f"Korean font could not be loaded: {path}") from exc
 
 
+@lru_cache(maxsize=1)
+def _renderer_fingerprint() -> str:
+    regular, bold = _font_paths()
+    material = {
+        "pillow_version": PILLOW_VERSION,
+        "regular_font_sha256": _sha256(regular),
+        "bold_font_sha256": _sha256(bold),
+        "format": "WEBP",
+        "quality": 82,
+        "method": 6,
+        "exact": True,
+        "size": CARD_SIZE,
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _fit_text(
     draw: ImageDraw.ImageDraw,
     value: str,
@@ -310,7 +358,12 @@ def _fit_text(
 
 
 def _known(value: str | None) -> str:
-    return value.strip() if value and value.strip() else UNKNOWN_VALUE
+    normalized = "".join(
+        " " if unicodedata.category(character) in {"Cc", "Cf"} else character
+        for character in value or ""
+    )
+    normalized = " ".join(normalized.split())
+    return normalized or UNKNOWN_VALUE
 
 
 def _date(value: object | None) -> str:
