@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +53,7 @@ class FixtureFetcher:
             url=url,
             status_code=200,
             content_type="text/html",
-            body=self.details[url],
+            body=self.details.get(url, '<main data-lh-notice-detail="true"></main>'),
             fetched_at=datetime(2026, 8, 28, tzinfo=SEOUL),
         )
 
@@ -69,14 +70,40 @@ def window() -> CollectionWindow:
 def fetcher() -> FixtureFetcher:
     return FixtureFetcher(
         {
-            "1": (FIXTURES / "notice-list-page-1.html").read_text(encoding="utf-8"),
-            "2": (FIXTURES / "notice-list-page-2.html").read_text(encoding="utf-8"),
+            "1": _page_with_fifty_records(
+                (FIXTURES / "notice-list-page-1.html").read_text(encoding="utf-8")
+            ),
+            "2": (FIXTURES / "notice-list-page-2.html")
+            .read_text(encoding="utf-8")
+            .replace('data-total-count="2"', 'data-total-count="51"'),
         },
         {
             DETAIL_URL: (FIXTURES / "notice-detail.html").read_text(encoding="utf-8"),
             SECOND_DETAIL_URL: '<main data-lh-notice-detail="true"></main>',
         },
     )
+
+
+def _page_with_fifty_records(page: str) -> str:
+    row = re.search(r"<article[\s\S]*?</article>", page)
+    assert row is not None
+    copies = []
+    for offset in range(1, 50):
+        copies.append(
+            row.group().replace("0000061158", f"{61158 + offset:010d}", 1)
+        )
+    return page.replace('data-total-count="2"', 'data-total-count="51"').replace(
+        "</main>", f"{''.join(copies)}</main>", 1
+    )
+
+
+def _list_rows(page: str) -> list[str]:
+    return re.findall(r"<article[\s\S]*?</article>", page)
+
+
+def _with_list_rows(page: str, rows: list[str]) -> str:
+    without_rows = re.sub(r"<article[\s\S]*?</article>", "", page)
+    return without_rows.replace("</main>", f"{''.join(rows)}</main>", 1)
 
 
 def test_lh_collector_posts_exact_publication_window_and_paginates(
@@ -95,6 +122,27 @@ def test_lh_collector_posts_exact_publication_window_and_paginates(
     assert [call.data["currPage"] for call in fetcher.posts] == ["1", "2"]
 
 
+def test_lh_collector_posts_complete_stable_form_payload(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    LhPublicCollector(fetcher).collect(window)
+
+    assert fetcher.posts[0].data == {
+        "schTy": "0",
+        "startDt": "2026-08-22",
+        "endDt": "2026-08-28",
+        "currPage": "1",
+        "listCo": "50",
+        "viewType": "srch",
+        "mi": "1026",
+        "schTxt": "",
+        "schSido": "",
+        "schSigungu": "",
+        "schUppAisTpCd": "",
+        "schAisTpCd": "",
+    }
+
+
 def test_lh_identity_and_detail_url_are_derived_from_official_row(
     fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:
@@ -111,7 +159,8 @@ def test_lh_identity_and_detail_url_are_derived_from_official_row(
     assert notice.supply_count == 120
     assert notice.price_summary == "보증금 10,000,000원 / 월임대료 350,000원"
     assert notice.eligibility_summary == ("무주택세대구성원",)
-    assert fetcher.gets == [DETAIL_URL, SECOND_DETAIL_URL]
+    assert fetcher.gets[0] == DETAIL_URL
+    assert len(fetcher.gets) == 51
 
 
 def test_lh_collector_keeps_non_residential_rows_for_selection_layer(
@@ -119,12 +168,16 @@ def test_lh_collector_keeps_non_residential_rows_for_selection_layer(
 ) -> None:
     report = LhPublicCollector(fetcher).collect(window)
 
-    assert [notice.category for notice in report.notices] == ["임대주택", "토지"]
+    assert report.notices[-1].category == "토지"
+    assert all(notice.category == "임대주택" for notice in report.notices[:-1])
 
 
 def test_lh_collector_rejects_repeated_page_signature(
     fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:
+    fetcher.list_pages["1"] = fetcher.list_pages["1"].replace(
+        'data-total-count="51"', 'data-total-count="100"', 1
+    )
     fetcher.list_pages["2"] = fetcher.list_pages["1"].replace(
         'data-current-page="1"', 'data-current-page="2"', 1
     )
@@ -133,6 +186,90 @@ def test_lh_collector_rejects_repeated_page_signature(
 
     assert report.notices == ()
     assert report.errors == ("repeated list page",)
+
+
+@pytest.mark.parametrize(
+    ("page", "replacement", "expected", "error"),
+    [
+        (
+            "1",
+            'data-total-count="51"',
+            'data-total-count="50"',
+            "invalid list pagination material",
+        ),
+        ("2", 'data-last-page="2"', 'data-last-page="3"', "list pagination material changed"),
+    ],
+)
+def test_lh_collector_rejects_changed_pagination_metadata(
+    fetcher: FixtureFetcher,
+    window: CollectionWindow,
+    page: str,
+    replacement: str,
+    expected: str,
+    error: str,
+) -> None:
+    fetcher.list_pages[page] = fetcher.list_pages[page].replace(replacement, expected, 1)
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == (error,)
+
+
+@pytest.mark.parametrize(
+    ("page", "row_count"),
+    [("1", 49), ("1", 51), ("2", 0), ("2", 2)],
+)
+def test_lh_collector_rejects_invalid_page_cardinality(
+    fetcher: FixtureFetcher, window: CollectionWindow, page: str, row_count: int
+) -> None:
+    rows = _list_rows(fetcher.list_pages[page])
+    selected = rows[:row_count]
+    if row_count > len(rows):
+        selected.append(rows[-1])
+    fetcher.list_pages[page] = _with_list_rows(fetcher.list_pages[page], selected)
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("invalid list page cardinality",)
+
+
+def test_lh_collector_rejects_page_index_mismatch(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    fetcher.list_pages["2"] = fetcher.list_pages["2"].replace(
+        'data-current-page="2"', 'data-current-page="1"', 1
+    )
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("list page index does not match official material",)
+
+
+def test_lh_collector_rejects_truncated_pagination(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    fetcher.list_pages["2"] = _with_list_rows(fetcher.list_pages["2"], [])
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("invalid list page cardinality",)
+
+
+def test_lh_collector_enforces_page_cap(
+    fetcher: FixtureFetcher, window: CollectionWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.local_content.sources import lh
+
+    monkeypatch.setattr(lh, "_MAX_LIST_PAGES", 1)
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("list pagination exceeded page cap",)
 
 
 def test_lh_collector_accepts_explicit_zero_results(
@@ -152,6 +289,22 @@ def test_lh_collector_accepts_explicit_zero_results(
     assert len(fetcher.posts) == 1
 
 
+def test_lh_collector_rejects_malformed_explicit_empty_result(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    fetcher.list_pages = {
+        "1": (
+            '<main data-lh-notice-list="true" data-empty-results="true" '
+            'data-current-page="1" data-last-page="2" data-total-count="0"></main>'
+        )
+    }
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("invalid explicit empty result page",)
+
+
 def test_lh_collector_rejects_an_old_corrected_notice(
     fetcher: FixtureFetcher, window: CollectionWindow
 ) -> None:
@@ -163,6 +316,60 @@ def test_lh_collector_rejects_an_old_corrected_notice(
 
     assert report.notices == ()
     assert report.errors == ("publication date outside requested window",)
+
+
+def test_lh_collector_rejects_repeated_identity(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    first = _list_rows(fetcher.list_pages["1"])[0]
+    fetcher.list_pages["2"] = fetcher.list_pages["2"].replace(
+        _list_rows(fetcher.list_pages["2"])[0], first, 1
+    )
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("repeated notice identity",)
+
+
+def test_lh_collector_rejects_conflicting_identity(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    first = _list_rows(fetcher.list_pages["1"])[0].replace("공고중", "마감", 1)
+    fetcher.list_pages["2"] = fetcher.list_pages["2"].replace(
+        _list_rows(fetcher.list_pages["2"])[0], first, 1
+    )
+
+    report = LhPublicCollector(fetcher).collect(window)
+
+    assert report.notices == ()
+    assert report.errors == ("conflicting notice identity",)
+
+
+def test_lh_collector_normalizes_hidden_accessibility_text(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    fetcher.list_pages["1"] = fetcher.list_pages["1"].replace(
+        'class="notice-title">', 'class="notice-title"><span class="sr-only">duplicate</span>', 1
+    )
+
+    notice = LhPublicCollector(fetcher).collect(window).notices[0]
+
+    assert "duplicate" not in notice.title
+
+
+def test_lh_checksum_changes_for_region_or_status(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    original = LhPublicCollector(fetcher).collect(window).notices[0]
+    changed_region = fetcher.list_pages["1"].replace("서울특별시", "경기도", 1)
+    fetcher.list_pages["1"] = changed_region
+    region_changed = LhPublicCollector(fetcher).collect(window).notices[0]
+    fetcher.list_pages["1"] = changed_region.replace("공고중", "마감", 1)
+    status_changed = LhPublicCollector(fetcher).collect(window).notices[0]
+
+    assert region_changed.source_checksum != original.source_checksum
+    assert status_changed.source_checksum != region_changed.source_checksum
 
 
 def test_lh_detail_leaves_optional_values_empty_with_warnings(
@@ -180,3 +387,40 @@ def test_lh_detail_leaves_optional_values_empty_with_warnings(
     assert "application schedule not found" in notice.warnings
     assert "supply count not found" in notice.warnings
     assert "eligibility summary not found" in notice.warnings
+
+
+def test_lh_detail_accepts_one_explicitly_labelled_schedule_range(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    notice = LhPublicCollector(fetcher).collect(window).notices[0]
+
+    assert notice.application_start is not None
+    assert notice.application_end is not None
+
+
+def test_lh_detail_rejects_multiple_schedule_periods_as_ambiguous(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    fetcher.details[DETAIL_URL] = (FIXTURES / "notice-detail.html").read_text(
+        encoding="utf-8"
+    ).replace(
+        "2026. 09. 01. ~ 2026. 09. 03.",
+        "2026. 09. 01. ~ 2026. 09. 03. / 2026. 09. 04. ~ 2026. 09. 05.",
+    )
+
+    notice = LhPublicCollector(fetcher).collect(window).notices[0]
+
+    assert notice.application_start is None
+    assert notice.application_end is None
+    assert "application schedule ambiguous" in notice.warnings
+
+
+def test_lh_attachment_is_internal_analysis_only_observation_without_fetch(
+    fetcher: FixtureFetcher, window: CollectionWindow
+) -> None:
+    notice = LhPublicCollector(fetcher).collect(window).notices[0]
+
+    assert notice.facts == (
+        ("attachment", "/lhapply/file/download.do?fileId=example|internal_analysis_only"),
+    )
+    assert all("download.do" not in url for url in fetcher.gets)

@@ -24,7 +24,7 @@ _DATE_PATTERN = re.compile(
     r"(?P<year>\d{4})\s*[./-]\s*(?P<month>\d{1,2})\s*[./-]\s*(?P<day>\d{1,2})"
 )
 _WHITESPACE = re.compile(r"\s+")
-_DETAIL_QUERY_KEYS = ("aisTpCd", "ccrCnntSysDsCd", "mi", "panId", "uppAisTpCd")
+_SCHEDULE_SEPARATOR = re.compile(r"[.\s]*(?:~|∼|–|—|to)[.\s]*", re.IGNORECASE)
 
 
 class HtmlFetcher(Protocol):
@@ -116,6 +116,7 @@ class LhPublicCollector:
                 if page_index != 1 or page.last_page != 1 or page.total_count != 0:
                     raise _ParseFailure("invalid explicit empty result page")
                 return ()
+            self._validate_page_cardinality(page)
             signature = tuple((record.external_id, record.canonical_url) for record in page.records)
             if signature in signatures:
                 raise _ParseFailure("repeated list page")
@@ -192,15 +193,19 @@ class LhPublicCollector:
         if root is None:
             raise _ParseFailure("list parser drift")
         rows = tuple(root.css("[data-id1][data-id2][data-id3][data-id4]"))
-        if not rows and _normalize(root.attributes.get("data-empty-results")) != "true":
-            raise _ParseFailure("empty result page")
         current_page = _required_int(root, "data-current-page", minimum=1)
         last_page = _required_int(root, "data-last-page", minimum=1)
         total_count = _required_int(root, "data-total-count", minimum=0)
         if current_page > last_page:
             raise _ParseFailure("invalid list pagination material")
         if not rows:
-            return _ParsedListPage((), current_page, last_page, total_count, True)
+            return _ParsedListPage(
+                (),
+                current_page,
+                last_page,
+                total_count,
+                _normalize(root.attributes.get("data-empty-results")) == "true",
+            )
         if total_count == 0:
             raise _ParseFailure("invalid list pagination material")
         return _ParsedListPage(
@@ -210,6 +215,15 @@ class LhPublicCollector:
             total_count=total_count,
             explicit_empty=False,
         )
+
+    @staticmethod
+    def _validate_page_cardinality(page: _ParsedListPage) -> None:
+        expected_last = (page.total_count + 49) // 50
+        if page.total_count == 0 or page.last_page != expected_last:
+            raise _ParseFailure("invalid list pagination material")
+        expected_rows = 50 if page.current_page < page.last_page else page.total_count % 50 or 50
+        if len(page.records) != expected_rows:
+            raise _ParseFailure("invalid list page cardinality")
 
     def _parse_list_row(self, row: Node) -> _ListedNotice:
         title = _normalized_text(row.css_first(".notice-title, .title, h2, h3, a"))
@@ -252,12 +266,7 @@ class LhPublicCollector:
         if root is None:
             raise _ParseFailure("detail parser drift")
         schedule = _label_value(root, ("청약접수기간", "신청접수기간", "접수기간"))
-        dates = tuple(
-            _parse_date(match.group()) for match in _DATE_PATTERN.finditer(schedule or "")
-        )
-        dates = tuple(value for value in dates if value is not None)
-        application_start = dates[0] if dates else None
-        application_end = dates[1] if len(dates) > 1 else None
+        application_start, application_end, schedule_warning = _parse_schedule_range(schedule)
         supply = _label_value(root, ("공급세대수", "공급규모", "공급수"))
         supply_count = _parse_supply_count(supply) if supply else None
         price_summary = _label_value(root, ("임대조건", "임대보증금 및 월임대료", "분양가격"))
@@ -269,7 +278,9 @@ class LhPublicCollector:
             and "attachment" in (_normalize(link.attributes.get("class")) or "").lower()
         )
         warnings: list[str] = []
-        if application_start is None:
+        if schedule_warning:
+            warnings.append(schedule_warning)
+        elif application_start is None:
             warnings.append("application schedule not found")
         elif application_end is None:
             warnings.append("application end date not found")
@@ -377,6 +388,22 @@ def _parse_published_at(value: str) -> datetime:
     if parsed is None:
         raise _ParseFailure("bad publication date")
     return datetime(parsed.year, parsed.month, parsed.day, tzinfo=_SEOUL)
+
+
+def _parse_schedule_range(value: str | None) -> tuple[date | None, date | None, str | None]:
+    if value is None:
+        return None, None, None
+    matches = tuple(_DATE_PATTERN.finditer(value))
+    if len(matches) != 2:
+        return None, None, "application schedule ambiguous"
+    separator = value[matches[0].end() : matches[1].start()]
+    if _SCHEDULE_SEPARATOR.fullmatch(separator) is None:
+        return None, None, "application schedule ambiguous"
+    start = _parse_date(matches[0].group())
+    end = _parse_date(matches[1].group())
+    if start is None or end is None:
+        return None, None, "application schedule ambiguous"
+    return start, end, None
 
 
 def _parse_date(value: str) -> date | None:
