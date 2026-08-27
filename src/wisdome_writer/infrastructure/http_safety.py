@@ -104,6 +104,7 @@ def safe_get(
     before_request: Callable[[], None] | None = None,
     url_validator: Callable[[str], None] | None = None,
     allowed_content_types: Collection[str] | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> httpx.Response:
     """GET a public HTTP(S) resource with DNS pinning, redirect checks, and bounded streaming."""
     return _safe_request(
@@ -119,6 +120,7 @@ def safe_get(
         before_request=before_request,
         url_validator=url_validator,
         allowed_content_types=allowed_content_types,
+        transport=transport,
     )
 
 
@@ -136,6 +138,7 @@ def safe_post_form(
     before_request: Callable[[], None] | None = None,
     url_validator: Callable[[str], None] | None = None,
     allowed_content_types: Collection[str] | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> httpx.Response:
     """POST an encoded form through the same pinned, bounded path as ``safe_get``."""
     return _safe_request(
@@ -152,6 +155,7 @@ def safe_post_form(
         before_request=before_request,
         url_validator=url_validator,
         allowed_content_types=allowed_content_types,
+        transport=transport,
     )
 
 
@@ -169,6 +173,7 @@ def _safe_request(
     before_request: Callable[[], None] | None,
     url_validator: Callable[[str], None] | None,
     allowed_content_types: Collection[str] | None,
+    transport: httpx.BaseTransport | None,
     form_data: Mapping[str, Any] | None = None,
 ) -> httpx.Response:
 
@@ -209,6 +214,7 @@ def _safe_request(
             deadline=deadline,
             before_request=before_request,
             allowed_content_types=allowed_content_types,
+            transport=transport,
         )
         location = response.headers.get("location")
         if not 300 <= response.status_code < 400:
@@ -349,6 +355,7 @@ def _request_pinned(
     deadline: float,
     before_request: Callable[[], None] | None,
     allowed_content_types: Collection[str] | None,
+    transport: httpx.BaseTransport | None,
 ) -> httpx.Response:
     last_failure: str | None = None
     for address in target.addresses:
@@ -363,6 +370,7 @@ def _request_pinned(
                 timeout=_bounded_timeout(timeout, remaining),
                 follow_redirects=False,
                 trust_env=False,
+                transport=transport,
             ) as client:
                 with client.stream(
                     method,
