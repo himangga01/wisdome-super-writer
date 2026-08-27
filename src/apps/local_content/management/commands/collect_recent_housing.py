@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import stat
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +24,20 @@ from apps.local_content.sources.applyhome import (
     ApplyHomePublicCollector,
 )
 from apps.local_content.sources.lh import LH_LIST, LhPublicCollector
-from apps.local_content.workflow import LocalHousingWorkflow
+from apps.local_content.workflow import LocalHousingWorkflow, WorkflowError
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[5]
+_APPROVED_FIXTURE_ROOT = _REPOSITORY_ROOT / "tests" / "fixtures" / "local-content"
+_FIXTURE_FILES = (
+    "applyhome/apt-list.html",
+    "applyhome/apt-list-page-2.html",
+    "applyhome/remaining-list.html",
+    "applyhome/apt-detail.html",
+    "lh/notice-list-page-1.html",
+    "lh/notice-list-page-2.html",
+    "lh/notice-detail.html",
+)
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class Command(BaseCommand):
@@ -48,18 +63,21 @@ class Command(BaseCommand):
         del args
         if not settings.IS_LOCAL_RUNTIME:
             raise CommandError("collect_recent_housing requires the local runtime")
-        fixture_root = options.get("fixture_root")
-        workflow = _build_workflow(
-            fixture_root=Path(fixture_root) if fixture_root else None,
-            dry_run=bool(options["dry_run"]),
-        )
-        report = workflow.run(
-            now=datetime.now(SEOUL),
-            days=options["days"],
-            humanize=options["humanize"],
-            write_articles=options["write_articles"],
-            selected_ids=tuple(options["selected_id"]),
-        )
+        try:
+            fixture_root = options.get("fixture_root")
+            workflow = _build_workflow(
+                fixture_root=Path(fixture_root) if fixture_root else None,
+                dry_run=bool(options["dry_run"]),
+            )
+            report = workflow.run(
+                now=datetime.now(SEOUL),
+                days=options["days"],
+                humanize=options["humanize"],
+                write_articles=options["write_articles"],
+                selected_ids=tuple(options["selected_id"]),
+            )
+        except WorkflowError as exc:
+            raise CommandError(f"local housing workflow failed: {exc.code}") from None
         metadata = {
             "workflow_id": report.workflow_id,
             "mode": report.mode,
@@ -103,14 +121,80 @@ def _build_workflow(*, fixture_root: Path | None, dry_run: bool) -> LocalHousing
         collectors=collectors,
         humanizer=humanizer,
         output_root=settings.LOCAL_ARTICLE_ROOT,
+        state_root=settings.LOCAL_STATE_ROOT,
         mode=mode,
         dry_run=dry_run,
     )
 
 
 def _fixture_collectors(root: Path):
-    fixture = _FixtureFetcher(root)
+    try:
+        resolved = Path(root).resolve(strict=True)
+        approved = _APPROVED_FIXTURE_ROOT.resolve(strict=True)
+    except OSError:
+        raise WorkflowError("FIXTURE_ROOT_UNAPPROVED") from None
+    if resolved != approved:
+        raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
+    _verify_fixture_manifest(resolved, approved_root=approved)
+    fixture = _FixtureFetcher(resolved)
     return (ApplyHomePublicCollector(fixture), LhPublicCollector(fixture))
+
+
+def _verify_fixture_manifest(root: Path, *, approved_root: Path) -> None:
+    root = Path(root)
+    approved_root = Path(approved_root)
+    if root.resolve(strict=True) != approved_root.resolve(strict=True):
+        raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
+    manifest_path = root / "manifest.json"
+    try:
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_fixture_pairs,
+        )
+    except (OSError, UnicodeError, ValueError):
+        raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "files"}
+        or manifest.get("schema_version") != 1
+        or not isinstance(manifest.get("files"), dict)
+        or tuple(manifest["files"]) != _FIXTURE_FILES
+    ):
+        raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+    fixture_parent = root.parent.resolve(strict=True)
+    for relative in _FIXTURE_FILES:
+        expected = manifest["files"].get(relative)
+        if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+        path = root.parent / relative
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = path.lstat()
+            confined = resolved.is_relative_to(fixture_parent)
+            unsafe = (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or bool(
+                    getattr(metadata, "st_file_attributes", 0)
+                    & _FILE_ATTRIBUTE_REPARSE_POINT
+                )
+            )
+            observed = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID") from None
+        if not confined or unsafe:
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID")
+        if observed != expected:
+            raise WorkflowError("FIXTURE_CHECKSUM_MISMATCH")
+
+
+def _strict_fixture_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate fixture manifest key")
+        result[key] = value
+    return result
 
 
 class _FixtureHumanizer:
@@ -122,7 +206,7 @@ class _FixtureFetcher:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         if not self.root.is_dir() or self.root.name != "local-content":
-            raise CommandError("fixture root must be the local-content fixture assembly")
+            raise WorkflowError("FIXTURE_ROOT_UNAPPROVED")
         fixture_root = self.root.parent
         self.applyhome = fixture_root / "applyhome"
         self.lh = fixture_root / "lh"
@@ -136,7 +220,7 @@ class _FixtureFetcher:
             self.lh / "notice-detail.html",
         )
         if any(not path.is_file() for path in required):
-            raise CommandError("local-content fixture assembly is incomplete")
+            raise WorkflowError("FIXTURE_MANIFEST_INVALID")
 
     def get(self, url: str) -> HtmlResponse:
         split = urlsplit(url)

@@ -100,6 +100,7 @@ class BundlePublishError(BundleValidationError):
 class _ExistingBundleValidation:
     bundle_hash: str
     root_fingerprint: tuple[object, ...]
+    file_hashes: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -239,12 +240,18 @@ class ArticleBundleWriter:
         self.root = Path(root)
         self._writer_token = secrets.token_hex(8)
 
-    def write(self, bundle: ArticleBundle) -> Path:
+    def write(
+        self,
+        bundle: ArticleBundle,
+        *,
+        run_directory: str | None = None,
+    ) -> Path:
         """Validate and atomically publish one immutable article bundle."""
 
         root = self._safe_root()
         validated = self._validate(bundle)
-        date_root = root / bundle.run_date.isoformat()
+        run_name = _validated_run_directory(bundle.run_date, run_directory)
+        date_root = root / run_name
         self._ensure_directory(date_root)
         primary = self._safe_child(date_root, bundle.slug)
         target, existing = self._publication_target(primary, bundle.bundle_hash)
@@ -316,11 +323,14 @@ class ArticleBundleWriter:
         run_date: date,
         weekly_index: RenderedArticle | str,
         bundles: tuple[ArticleBundle, ...] | list[ArticleBundle] = (),
+        *,
+        run_directory: str | None = None,
     ) -> Path:
         """Publish article bundles, then atomically replace the run index and manifest."""
 
         root = self._safe_root()
-        run_root = root / run_date.isoformat()
+        run_name = _validated_run_directory(run_date, run_directory)
+        run_root = root / run_name
         self._ensure_directory(run_root)
         index_markdown = (
             weekly_index.to_markdown()
@@ -334,7 +344,7 @@ class ArticleBundleWriter:
         for bundle in bundles:
             if bundle.run_date != run_date:
                 raise BundleValidationError("article bundle run date does not match run index")
-            path = self.write(bundle)
+            path = self.write(bundle, run_directory=run_name)
             published[path.name] = bundle.bundle_hash
             if path.name != bundle.slug:
                 index_markdown = index_markdown.replace(
@@ -401,7 +411,11 @@ class ArticleBundleWriter:
             raise
         except OSError as exc:
             raise BundlePublishError(f"run publish failed: {run_root}") from exc
-        validated_run = self.validate_run(run_date)
+        validated_run = (
+            self.validate_run(run_date)
+            if run_directory is None
+            else self.validate_run(run_date, run_directory=run_name)
+        )
         _require_owned_identity(
             index_target,
             index_fingerprint,
@@ -414,11 +428,17 @@ class ArticleBundleWriter:
         )
         return validated_run
 
-    def validate_run(self, run_date: date) -> Path:
+    def validate_run(
+        self,
+        run_date: date,
+        *,
+        run_directory: str | None = None,
+    ) -> Path:
         """Validate the run manifest commit marker before any reader uses the index."""
 
         root = self._safe_root()
-        run_root = self._safe_child(root, run_date.isoformat())
+        run_name = _validated_run_directory(run_date, run_directory)
+        run_root = self._safe_child(root, run_name)
         _require_regular_directory(run_root, "run directory", BundlePublishError)
         ancestor_snapshot = _snapshot_ancestors(run_root, BundlePublishError)
         run_root_fingerprint = _path_fingerprint(
@@ -490,6 +510,81 @@ class ArticleBundleWriter:
             "run ancestor",
         )
         return run_root
+
+    def validated_run_article_metadata(
+        self,
+        run_date: date,
+        *,
+        run_directory: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Return verification JSON only from bundles referenced by a valid run."""
+
+        root = self._safe_root()
+        run_name = _validated_run_directory(run_date, run_directory)
+        run_root = self._safe_child(root, run_name)
+        manifest_path = run_root / "manifest.json"
+        manifest_fingerprint = _path_fingerprint(
+            manifest_path,
+            "run manifest",
+            BundlePublishError,
+        )
+        manifest_payload = _read_bound_file(
+            manifest_path,
+            manifest_fingerprint,
+            max_bytes=_MAX_MANIFEST_BYTES,
+            label="run manifest",
+        )
+        manifest = _parse_strict_json_object(manifest_payload, "run")
+        self.validate_run(run_date, run_directory=run_name)
+        _require_unchanged_fingerprint(
+            manifest_path,
+            manifest_fingerprint,
+            BundlePublishError,
+        )
+        articles = manifest.get("articles")
+        if not isinstance(articles, dict):
+            raise BundlePublishError("validated run has invalid article references")
+        result: list[dict[str, object]] = []
+        for article_name, expected_bundle_hash in sorted(articles.items()):
+            if not isinstance(article_name, str) or not isinstance(
+                expected_bundle_hash,
+                str,
+            ):
+                raise BundlePublishError("validated run has invalid article references")
+            article_root = self._safe_child(run_root, article_name)
+            verification_path = article_root / "verification.json"
+            verification_fingerprint = _path_fingerprint(
+                verification_path,
+                "article verification",
+                BundlePublishError,
+            )
+            verification_payload = _read_bound_file(
+                verification_path,
+                verification_fingerprint,
+                max_bytes=_MAX_MANIFEST_BYTES,
+                label="article verification",
+            )
+            validation = self._existing_hash(article_root)
+            declared_hashes = dict(validation.file_hashes)
+            if (
+                validation.bundle_hash != expected_bundle_hash
+                or declared_hashes.get("verification.json")
+                != hashlib.sha256(verification_payload).hexdigest()
+            ):
+                raise BundlePublishError("validated article metadata hash does not match")
+            _require_unchanged_fingerprint(
+                verification_path,
+                verification_fingerprint,
+                BundlePublishError,
+            )
+            result.append(_parse_strict_json_object(verification_payload, "verification"))
+        self.validate_run(run_date, run_directory=run_name)
+        _require_unchanged_fingerprint(
+            manifest_path,
+            manifest_fingerprint,
+            BundlePublishError,
+        )
+        return tuple(result)
 
     def _validate(self, bundle: ArticleBundle) -> tuple[tuple[BundleFile, bytes], ...]:
         if (
@@ -953,7 +1048,7 @@ class ArticleBundleWriter:
             or not isinstance(manifest_slug, str)
             or _SLUG.fullmatch(manifest_slug) is None
             or _is_windows_device_name(manifest_slug)
-            or manifest.get("run_date") != path.parent.name
+            or manifest.get("run_date") != _run_date_from_directory(path.parent.name)
             or (expected_slug is not None and manifest_slug != expected_slug)
             or (not allow_staging_name and path.name not in expected_names)
         ):
@@ -1081,6 +1176,15 @@ class ArticleBundleWriter:
         return _ExistingBundleValidation(
             bundle_hash=bundle_hash,
             root_fingerprint=entry_snapshot["."],
+            file_hashes=tuple(
+                sorted(
+                    (relative, entry["sha256"])
+                    for relative, entry in files.items()
+                    if isinstance(relative, str)
+                    and isinstance(entry, dict)
+                    and isinstance(entry.get("sha256"), str)
+                )
+            ),
         )
 
 
@@ -1368,6 +1472,22 @@ def _validate_article_directory_name(value: str) -> None:
         or (marker and re.fullmatch(r"[0-9a-f]{12}", revision) is None)
     ):
         raise BundlePublishError(f"run article directory name is unsafe: {value}")
+
+
+def _validated_run_directory(run_date: date, value: str | None) -> str:
+    expected = run_date.isoformat()
+    run_directory = expected if value is None else value
+    if not isinstance(run_directory, str) or re.fullmatch(
+        rf"{re.escape(expected)}(?:--run-[0-9a-f]{{12}})?",
+        run_directory,
+    ) is None:
+        raise BundlePublishError("run directory name is unsafe")
+    return run_directory
+
+
+def _run_date_from_directory(value: str) -> str | None:
+    match = re.fullmatch(r"(?P<date>\d{4}-\d{2}-\d{2})(?:--run-[0-9a-f]{12})?", value)
+    return match.group("date") if match is not None else None
 
 
 def _path_exists_no_follow(path: Path) -> bool:

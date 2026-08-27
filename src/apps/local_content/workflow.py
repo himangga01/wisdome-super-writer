@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
+import hashlib
 import json
 import os
 import re
@@ -17,7 +16,17 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Protocol
 
-from apps.local_content.bundles import ArticleBundle, ArticleBundleWriter, BundleFile
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+from apps.local_content.bundles import (
+    ArticleBundle,
+    ArticleBundleWriter,
+    BundleFile,
+    BundlePublishError,
+)
 from apps.local_content.contracts import (
     CollectionWindow,
     HousingCollectionResult,
@@ -46,7 +55,6 @@ PHASE_NAMES = (
     "verify",
     "write",
 )
-LOCK_FILENAME = ".collect-recent-housing.lock"
 ACCEPTANCE_FILENAME = "acceptance-report.json"
 _SHA256_CHECKSUM = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 _MARKDOWN_DETAIL_LINK = r"\[[^\]\r\n]+\]\(\./%s/article\.md\)"
@@ -62,7 +70,15 @@ class Humanizer(Protocol):
     def transform(self, document: str) -> str: ...
 
 
-class WorkflowLockedError(RuntimeError):
+class WorkflowError(RuntimeError):
+    """A metadata-safe workflow failure with one stable public code."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class WorkflowLockedError(WorkflowError):
     """Another workflow owns the configured local writer lock."""
 
 
@@ -233,6 +249,7 @@ class LocalHousingWorkflow:
         collectors: Iterable[Collector],
         humanizer: Humanizer | None,
         output_root: Path,
+        state_root: Path | None = None,
         mode: str = "live",
         dry_run: bool = False,
     ) -> None:
@@ -241,6 +258,11 @@ class LocalHousingWorkflow:
         self.collectors = tuple(collectors)
         self.humanizer = humanizer
         self.output_root = Path(output_root)
+        self.state_root = (
+            Path(state_root)
+            if state_root is not None
+            else self.output_root.parent / ".local-state"
+        )
         self.mode = "dry_run" if dry_run else mode
         self.dry_run = dry_run
 
@@ -268,18 +290,25 @@ class LocalHousingWorkflow:
             end=observed,
         )
         workflow_id = uuid.uuid4().hex
-        run_relative = observed.date().isoformat()
-        report_relative = f"{run_relative}/{ACCEPTANCE_FILENAME}"
+        run_relative: str | None = None
+        report_relative: str | None = None
+        run_root: Path | None = None
         phases = [PhaseReport(name) for name in PHASE_NAMES]
         source_reports: tuple[SourceRunReport, ...] = ()
         source_summaries: tuple[SourceWorkflowReport, ...] = ()
         collection: HousingCollectionResult | None = None
         article_work: list[_ArticleWork] = []
         errors: list[str] = []
+        detail_failure_ids: tuple[str, ...] = ()
         all_sources_failed = False
         final_state = False
 
-        lock = _WorkflowLock(self.output_root, workflow_id, observed)
+        lock = _WorkflowGuard(
+            self.output_root,
+            self.state_root,
+            workflow_id,
+            observed,
+        )
         temporary_context = (
             tempfile.TemporaryDirectory(prefix="wsw-local-housing-")
             if write_articles and not self.dry_run
@@ -288,7 +317,9 @@ class LocalHousingWorkflow:
 
         def snapshot() -> WorkflowReport:
             blocked = all_sources_failed or any(article.blocked for article in article_work)
-            incomplete_sources = any(not report.complete for report in source_reports)
+            incomplete_sources = any(not report.complete for report in source_reports) or bool(
+                detail_failure_ids
+            )
             report_errors = tuple(
                 dict.fromkeys(
                     [*errors, *(code for article in article_work for code in article.errors)]
@@ -299,7 +330,7 @@ class LocalHousingWorkflow:
                 and not incomplete_sources
                 and not blocked
                 and "SELECTED_ID_NOT_FOUND" not in errors
-                and "WRITE_FAILED" not in errors
+                and "BUNDLE_WRITE_FAILED" not in errors
             )
             return WorkflowReport(
                 workflow_id=workflow_id,
@@ -327,13 +358,30 @@ class LocalHousingWorkflow:
 
         def persist() -> None:
             if not self.dry_run:
-                _atomic_write_json(lock.root / report_relative, snapshot().as_dict())
+                if run_root is None:
+                    raise WorkflowError("RUN_PATH_UNAVAILABLE")
+                _atomic_write_json(
+                    run_root / ACCEPTANCE_FILENAME,
+                    snapshot().as_dict(),
+                )
 
         try:
             lock.acquire()
+            if self.dry_run:
+                lock.bind_output_root(create=False)
+            else:
+                run_root, run_relative = _allocate_run_directory(
+                    lock.output_root,
+                    observed,
+                    workflow_id,
+                )
+                report_relative = f"{run_relative}/{ACCEPTANCE_FILENAME}"
+                lock.bind_output_root(create=True)
+            lock.verify()
             with temporary_context as temporary_root:
                 collected: list[SourceRunReport] = []
                 for collector in self.collectors:
+                    lock.verify()
                     try:
                         report = collector.collect(window)
                         if not isinstance(report, SourceRunReport):
@@ -345,13 +393,43 @@ class LocalHousingWorkflow:
                         )
                     collected.append(report)
                 source_reports = tuple(collected)
+                detail_failure_ids = tuple(
+                    notice.external_id
+                    for report in source_reports
+                    for notice in report.notices
+                    if _has_detail_failure(notice)
+                )
                 source_summaries = tuple(
                     SourceWorkflowReport(
                         source_key=report.source_key,
-                        status="complete" if report.complete else "failed",
+                        status=(
+                            "failed"
+                            if not report.complete
+                            else (
+                                "incomplete"
+                                if any(
+                                    _has_detail_failure(notice)
+                                    for notice in report.notices
+                                )
+                                else "complete"
+                            )
+                        ),
                         notice_count=len(report.notices),
                         warning_count=len(report.warnings),
-                        error_codes=("SOURCE_COLLECTION_FAILED",) if report.errors else (),
+                        error_codes=tuple(
+                            code
+                            for code, present in (
+                                ("SOURCE_COLLECTION_FAILED", bool(report.errors)),
+                                (
+                                    "DETAIL_COLLECTION_FAILED",
+                                    any(
+                                        _has_detail_failure(notice)
+                                        for notice in report.notices
+                                    ),
+                                ),
+                            )
+                            if present
+                        ),
                     )
                     for report in sorted(
                         source_reports,
@@ -361,14 +439,25 @@ class LocalHousingWorkflow:
                 failed_sources = sum(not report.complete for report in source_reports)
                 if failed_sources:
                     errors.append("SOURCE_INCOMPLETE")
+                if detail_failure_ids:
+                    errors.append("DETAIL_INCOMPLETE")
                 all_sources_failed = failed_sources >= 2 and failed_sources == len(source_reports)
                 if all_sources_failed:
                     errors.append("ALL_SOURCES_FAILED")
                 phases[0] = PhaseReport(
                     "collect",
-                    "completed" if not failed_sources else "completed_with_errors",
+                    "completed"
+                    if not failed_sources and not detail_failure_ids
+                    else "completed_with_errors",
                     count=sum(len(report.notices) for report in source_reports),
-                    error_codes=("SOURCE_INCOMPLETE",) if failed_sources else (),
+                    error_codes=tuple(
+                        code
+                        for code, present in (
+                            ("SOURCE_INCOMPLETE", bool(failed_sources)),
+                            ("DETAIL_INCOMPLETE", bool(detail_failure_ids)),
+                        )
+                        if present
+                    ),
                 )
                 persist()
 
@@ -384,10 +473,19 @@ class LocalHousingWorkflow:
                 notice_ids = {notice.external_id for notice in collection.notices}
                 if any(value not in notice_ids for value in selected):
                     errors.append("SELECTED_ID_NOT_FOUND")
+                prior_detailed_ids = _validated_prior_detailed_ids(
+                    lock.output_root,
+                    observed,
+                    current_run=run_relative,
+                )
                 selected_notices = tuple(
                     notice
                     for notice in collection.notices
-                    if needs_detailed_article(notice, selected_ids=selected)
+                    if needs_detailed_article(
+                        notice,
+                        selected_ids=selected,
+                        prior_detailed_ids=prior_detailed_ids,
+                    )
                 )
                 article_work = [
                     _ArticleWork(notice=notice, slug=notice_slug(notice))
@@ -469,31 +567,51 @@ class LocalHousingWorkflow:
                             )
                             article.protected = protected
                             article.protected_input = protected.document
+                        except Exception:
+                            article.fail(
+                                "HUMANIZE_PROTECTION_FAILED",
+                                humanization_failed=True,
+                            )
+                            continue
+                        try:
                             if self.humanizer is None:
                                 raise RuntimeError
                             article.candidate_output = self.humanizer.transform(protected.document)
                             article.humanization_status = "candidate"
                             article.status = "humanized"
                         except Exception:
-                            article.fail("HUMANIZE_FAILED", humanization_failed=True)
-                    humanize_errors = sum(
-                        "HUMANIZE_FAILED" in article.errors for article in article_work
+                            article.fail(
+                                "HUMANIZE_TRANSFORM_FAILED",
+                                humanization_failed=True,
+                            )
+                    humanize_codes = tuple(
+                        code
+                        for code in (
+                            "HUMANIZE_PROTECTION_FAILED",
+                            "HUMANIZE_TRANSFORM_FAILED",
+                        )
+                        if any(code in article.errors for article in article_work)
                     )
                     phases[5] = PhaseReport(
                         "humanize",
-                        "completed_with_errors" if humanize_errors else "completed",
+                        "completed_with_errors" if humanize_codes else "completed",
                         count=sum(
                             article.humanization_status == "candidate"
                             for article in article_work
                         ),
-                        error_codes=("HUMANIZE_FAILED",) if humanize_errors else (),
+                        error_codes=humanize_codes,
                     )
                 elif write_articles and not self.dry_run:
                     for article in article_work:
                         if not article.blocked:
                             article.humanization_status = "disabled"
-                            article.status = "humanize_disabled"
-                    phases[5] = PhaseReport("humanize", "skipped", count=0)
+                            article.fail("HUMANIZATION_DISABLED")
+                    phases[5] = PhaseReport(
+                        "humanize",
+                        "completed_with_errors" if article_work else "skipped",
+                        count=0,
+                        error_codes=("HUMANIZATION_DISABLED",) if article_work else (),
+                    )
                 else:
                     phases[5] = PhaseReport("humanize", "skipped", count=0)
                 persist()
@@ -503,35 +621,40 @@ class LocalHousingWorkflow:
                         if article.blocked or article.rendered is None or article.images is None:
                             continue
                         try:
-                            if humanize:
-                                if article.protected is None or article.candidate_output is None:
-                                    raise RuntimeError
-                                verified_blocks = verify_humanized_candidate(
-                                    article.protected,
-                                    article.candidate_output,
-                                )
-                                final_article = replace(
-                                    article.rendered,
-                                    prose_blocks=verified_blocks,
-                                )
-                                _require_fact_identity(article.rendered, final_article)
-                                article.humanization_status = "verified"
-                            else:
-                                final_article = article.rendered
+                            if article.protected is None or article.candidate_output is None:
+                                raise RuntimeError
+                            verified_blocks = verify_humanized_candidate(
+                                article.protected,
+                                article.candidate_output,
+                            )
+                            final_article = replace(
+                                article.rendered,
+                                prose_blocks=verified_blocks,
+                            )
+                            _require_fact_identity(article.rendered, final_article)
+                            article.humanization_status = "verified"
                             article.final_article = final_article
-                            article.final_bundle = _final_bundle(article, observed.date())
                             article.status = "verified"
                         except Exception:
                             article.fail("HUMANIZE_VERIFY_FAILED", humanization_failed=True)
-                    verify_errors = sum(
-                        "HUMANIZE_VERIFY_FAILED" in article.errors
-                        for article in article_work
+                            continue
+                        try:
+                            article.final_bundle = _final_bundle(article, observed.date())
+                        except Exception:
+                            article.fail("BUNDLE_ASSEMBLY_FAILED")
+                    verify_codes = tuple(
+                        code
+                        for code in (
+                            "HUMANIZE_VERIFY_FAILED",
+                            "BUNDLE_ASSEMBLY_FAILED",
+                        )
+                        if any(code in article.errors for article in article_work)
                     )
                     phases[6] = PhaseReport(
                         "verify",
-                        "completed_with_errors" if verify_errors else "completed",
+                        "completed_with_errors" if verify_codes else "completed",
                         count=sum(article.final_bundle is not None for article in article_work),
-                        error_codes=("HUMANIZE_VERIFY_FAILED",) if verify_errors else (),
+                        error_codes=verify_codes,
                     )
                 else:
                     phases[6] = PhaseReport("verify", "skipped", count=0)
@@ -551,52 +674,65 @@ class LocalHousingWorkflow:
                     persist()
                 else:
                     try:
-                        writer = ArticleBundleWriter(lock.root)
+                        assert run_relative is not None
+                        assert run_root is not None
+                        writer = ArticleBundleWriter(lock.output_root)
                         final_bundles: list[ArticleBundle] = []
                         for article in article_work:
                             if article.final_bundle is not None:
-                                published = writer.write(article.final_bundle)
-                                article.article_path = _relative_path(lock.root, published)
+                                published = writer.write(
+                                    article.final_bundle,
+                                    run_directory=run_relative,
+                                )
+                                article.article_path = _relative_path(
+                                    lock.output_root,
+                                    published,
+                                )
                                 article.status = "written"
                                 final_bundles.append(article.final_bundle)
                             elif article.blocked:
                                 diagnostic = _diagnostic_bundle(article, observed.date())
-                                published = writer.write(diagnostic)
-                                article.draft_path = _relative_path(lock.root, published)
+                                published = writer.write(
+                                    diagnostic,
+                                    run_directory=run_relative,
+                                )
+                                article.draft_path = _relative_path(
+                                    lock.output_root,
+                                    published,
+                                )
                         index = _workflow_index(collection, article_work)
                         _atomic_write_json(
-                            lock.root / run_relative / "notices.json",
+                            run_root / "notices.json",
                             _notices_document(collection),
                         )
                         run_path = writer.write_run(
                             observed.date(),
                             index,
                             tuple(final_bundles),
+                            run_directory=run_relative,
                         )
                         phases[7] = PhaseReport(
                             "write",
                             "completed",
                             count=sum(article.status == "written" for article in article_work),
-                            paths=(_relative_path(lock.root, run_path),),
+                            paths=(_relative_path(lock.output_root, run_path),),
                         )
                         final_state = True
                     except Exception:
-                        errors.append("WRITE_FAILED")
+                        errors.append("BUNDLE_WRITE_FAILED")
                         for article in article_work:
                             if article.status == "verified":
-                                article.fail("WRITE_FAILED")
+                                article.fail("BUNDLE_WRITE_FAILED")
                         phases[7] = PhaseReport(
                             "write",
                             "failed",
                             count=sum(article.status == "written" for article in article_work),
-                            error_codes=("WRITE_FAILED",),
+                            error_codes=("BUNDLE_WRITE_FAILED",),
                         )
                         final_state = True
                     persist()
         finally:
             lock.release()
-            if self.dry_run:
-                lock.remove_created_empty_root()
         return snapshot()
 
 
@@ -665,6 +801,61 @@ def _has_detail_failure(notice: HousingNotice) -> bool:
         or warning.casefold().startswith("detail fetch failed")
         for warning in notice.warnings
     )
+
+
+def _validated_prior_detailed_ids(
+    output_root: Path,
+    observed: datetime,
+    *,
+    current_run: str | None,
+) -> tuple[str, ...]:
+    if not os.path.lexists(output_root):
+        return ()
+    _reject_link_ancestors(output_root)
+    run_date = observed.date()
+    prefix = re.compile(
+        rf"{re.escape(run_date.isoformat())}(?:--run-[0-9a-f]{{12}})?"
+    )
+    try:
+        candidates = tuple(
+            sorted(
+                path.name
+                for path in output_root.iterdir()
+                if path.name != current_run and prefix.fullmatch(path.name)
+            )
+        )
+    except OSError:
+        raise WorkflowError("PRIOR_RUN_SCAN_FAILED") from None
+    writer = ArticleBundleWriter(output_root)
+    result: set[str] = set()
+    for run_name in candidates:
+        try:
+            metadata_rows = writer.validated_run_article_metadata(
+                run_date,
+                run_directory=run_name,
+            )
+        except (BundlePublishError, OSError):
+            continue
+        for metadata in metadata_rows:
+            if set(metadata) != {
+                "status",
+                "source_key",
+                "external_id",
+                "source_checksum",
+                "humanization_status",
+            }:
+                continue
+            external_id = metadata.get("external_id")
+            if (
+                metadata.get("status") == "verified"
+                and metadata.get("humanization_status") == "verified"
+                and isinstance(metadata.get("source_key"), str)
+                and isinstance(external_id, str)
+                and external_id
+                and isinstance(metadata.get("source_checksum"), str)
+            ):
+                result.add(external_id)
+    return tuple(sorted(result))
 
 
 def _require_fact_identity(draft: RenderedArticle, final: RenderedArticle) -> None:
@@ -778,20 +969,38 @@ def _diagnostic_bundle(article: _ArticleWork, run_date) -> ArticleBundle:
         files.append(
             BundleFile.text("humanize/output.md", article.candidate_output, "text/markdown")
         )
-    if article.protected_input is not None:
+    humanization_codes = {
+        "HUMANIZE_PROTECTION_FAILED",
+        "HUMANIZE_TRANSFORM_FAILED",
+        "HUMANIZE_VERIFY_FAILED",
+        "HUMANIZATION_DISABLED",
+    }
+    if article.protected_input is not None or humanization_codes.intersection(
+        article.errors
+    ):
+        if "HUMANIZATION_DISABLED" in article.errors:
+            humanize_status = "disabled"
+        elif "HUMANIZE_PROTECTION_FAILED" in article.errors:
+            humanize_status = "protection_failed"
+        elif "HUMANIZE_TRANSFORM_FAILED" in article.errors:
+            humanize_status = "failed"
+        else:
+            humanize_status = "completed"
+        verify_status = (
+            "verified" if article.humanization_status == "verified" else "blocked"
+        )
         files.extend(
             (
                 BundleFile.text(
                     "humanize/events.ndjson",
-                    _humanize_events(
-                        "failed" if "HUMANIZE_FAILED" in article.errors else "completed",
-                        "blocked",
-                    ),
+                    _humanize_events(humanize_status, verify_status),
                     "application/x-ndjson",
                 ),
                 BundleFile.text(
                     "humanize/verification.json",
-                    _json_text({"status": "blocked", "error_codes": article.errors}),
+                    _json_text(
+                        {"status": verify_status, "error_codes": article.errors}
+                    ),
                     "application/json",
                 ),
             )
@@ -832,6 +1041,18 @@ def _workflow_index(
         else:
             replacement = "[NOT WRITTEN: WRITE_DISABLED]"
         markdown = pattern.sub(lambda _match, value=replacement: value, markdown)
+    affected = tuple(
+        notice
+        for notice in (*collection.notices, *collection.conflicts)
+        if _has_detail_failure(notice)
+    )
+    if affected:
+        lines = ["", "## Workflow notice status", ""]
+        lines.extend(
+            f"- `{_safe_status_id(notice.external_id)}`: DETAIL_COLLECTION_FAILED"
+            for notice in affected
+        )
+        markdown = markdown.rstrip() + "\n" + "\n".join(lines) + "\n"
     return markdown
 
 
@@ -843,7 +1064,17 @@ def _sanitized_index_collection(
             source_key=report.source_key,
             notices=report.notices,
             warnings=("SOURCE_WARNING",) if report.warnings else (),
-            errors=("SOURCE_COLLECTION_FAILED",) if report.errors else (),
+            errors=tuple(
+                code
+                for code, present in (
+                    ("SOURCE_COLLECTION_FAILED", bool(report.errors)),
+                    (
+                        "DETAIL_COLLECTION_FAILED",
+                        any(_has_detail_failure(notice) for notice in report.notices),
+                    ),
+                )
+                if present
+            ),
         )
         for report in collection.source_reports
     )
@@ -860,6 +1091,10 @@ def _sources_document(article: RenderedArticle) -> str:
     return _json_text([source.as_dict() for source in article.sources])
 
 
+def _safe_status_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9:._-]", "_", value)[:240]
+
+
 def _notices_document(collection: HousingCollectionResult) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -867,7 +1102,8 @@ def _notices_document(collection: HousingCollectionResult) -> dict[str, object]:
             "start": collection.window.start.isoformat(),
             "end": collection.window.end.isoformat(),
         },
-        "complete": collection.complete,
+        "complete": collection.complete
+        and not any(_has_detail_failure(notice) for notice in collection.notices),
         "notices": [
             {
                 "source_key": notice.source_key,
@@ -897,6 +1133,11 @@ def _notices_document(collection: HousingCollectionResult) -> dict[str, object]:
                 "source_checksum": notice.source_checksum,
                 "parser_version": notice.parser_version,
                 "warning_count": len(notice.warnings),
+                "error_codes": (
+                    ["DETAIL_COLLECTION_FAILED"]
+                    if _has_detail_failure(notice)
+                    else []
+                ),
             }
             for notice in collection.notices
         ],
@@ -906,6 +1147,11 @@ def _notices_document(collection: HousingCollectionResult) -> dict[str, object]:
                 "external_id": notice.external_id,
                 "source_checksum": notice.source_checksum,
                 "status": "quarantined",
+                "error_codes": (
+                    ["DETAIL_COLLECTION_FAILED"]
+                    if _has_detail_failure(notice)
+                    else []
+                ),
             }
             for notice in collection.conflicts
         ],
@@ -968,29 +1214,145 @@ def _atomic_write_json(path: Path, payload: object) -> None:
             pass
 
 
-class _WorkflowLock:
-    def __init__(self, root: Path, workflow_id: str, started_at: datetime) -> None:
-        self.root = Path(os.path.abspath(root))
-        self.path = self.root / LOCK_FILENAME
+class _WorkflowGuard:
+    def __init__(
+        self,
+        output_root: Path,
+        state_root: Path,
+        workflow_id: str,
+        started_at: datetime,
+    ) -> None:
+        _reject_link_ancestors(Path(output_root))
+        self.output_root = Path(_canonical_path(output_root))
+        self.state_root = Path(os.path.abspath(state_root))
+        self.guard_root = self.state_root / "locks"
+        digest = hashlib.sha256(
+            _canonical_path(output_root).encode("utf-8")
+        ).hexdigest()
+        self.path = self.guard_root / f"{digest}.guard"
         self.workflow_id = workflow_id
         self.started_at = started_at
-        self.fingerprint: tuple[object, ...] | None = None
-        self.root_created = False
+        self.descriptor: int | None = None
+        self.locked = False
+        self.state_identity: tuple[object, ...] | None = None
+        self.guard_root_identity: tuple[object, ...] | None = None
+        self.guard_identity: tuple[object, ...] | None = None
+        self.output_identity: tuple[object, ...] | None = None
+        self.output_absent_parent: tuple[Path, tuple[object, ...]] | None = None
 
     def acquire(self) -> None:
-        _reject_link_ancestors(self.root)
-        self.root_created = not self.root.exists()
-        self.root.mkdir(parents=True, exist_ok=True)
-        _reject_link_ancestors(self.root)
-        for _attempt in range(2):
-            try:
-                self._create()
-                return
-            except FileExistsError:
-                self._recover_stale()
-        raise WorkflowLockedError("local housing workflow is already running")
+        if os.name not in {"nt", "posix"}:
+            raise WorkflowError("WORKFLOW_LOCK_UNSUPPORTED")
+        try:
+            _reject_link_ancestors(self.state_root)
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            _reject_link_ancestors(self.state_root)
+            self.guard_root.mkdir(parents=True, exist_ok=True)
+            _reject_link_ancestors(self.guard_root)
+            self.state_identity = _directory_identity(self.state_root, "state root")
+            self.guard_root_identity = _directory_identity(
+                self.guard_root,
+                "guard root",
+            )
+            if os.path.lexists(self.path):
+                _regular_file_identity(self.path, "workflow guard")
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            descriptor = os.open(self.path, flags, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or _is_reparse(metadata)
+                or metadata.st_nlink != 1
+            ):
+                os.close(descriptor)
+                raise WorkflowError("WORKFLOW_GUARD_UNSAFE")
+            self.descriptor = descriptor
+            self.guard_identity = _identity_fingerprint(metadata)
+            self._verify_guard_paths()
+            self._lock_nonblocking()
+            self._verify_guard_paths()
+            self._write_metadata()
+            self._verify_guard_paths()
+        except WorkflowError:
+            self.release()
+            raise
+        except OSError:
+            self.release()
+            raise WorkflowError("WORKFLOW_LOCK_UNAVAILABLE") from None
 
-    def _create(self) -> None:
+    def bind_output_root(self, *, create: bool) -> None:
+        try:
+            _reject_link_ancestors(self.output_root)
+            if create:
+                self.output_root.mkdir(parents=True, exist_ok=True)
+                _reject_link_ancestors(self.output_root)
+            if os.path.lexists(self.output_root):
+                self.output_identity = _directory_identity(
+                    self.output_root,
+                    "output root",
+                )
+                self.output_absent_parent = None
+            else:
+                parent = _nearest_existing_parent(self.output_root)
+                self.output_absent_parent = (
+                    parent,
+                    _directory_identity(parent, "output ancestor"),
+                )
+                self.output_identity = None
+        except WorkflowError:
+            raise
+        except OSError:
+            raise WorkflowError("OUTPUT_ROOT_UNSAFE") from None
+
+    def verify(self) -> None:
+        self._verify_guard_paths()
+        _reject_link_ancestors(self.output_root)
+        if self.output_identity is not None:
+            if _directory_identity(self.output_root, "output root") != self.output_identity:
+                raise WorkflowError("OUTPUT_ROOT_CHANGED")
+        elif self.output_absent_parent is not None:
+            if os.path.lexists(self.output_root):
+                raise WorkflowError("OUTPUT_ROOT_CHANGED")
+            parent, identity = self.output_absent_parent
+            if _directory_identity(parent, "output ancestor") != identity:
+                raise WorkflowError("OUTPUT_ROOT_CHANGED")
+
+    def _verify_guard_paths(self) -> None:
+        if self.state_identity is None or self.guard_root_identity is None:
+            raise WorkflowError("WORKFLOW_GUARD_UNAVAILABLE")
+        if _directory_identity(self.state_root, "state root") != self.state_identity:
+            raise WorkflowError("WORKFLOW_STATE_ROOT_CHANGED")
+        if (
+            _directory_identity(self.guard_root, "guard root")
+            != self.guard_root_identity
+        ):
+            raise WorkflowError("WORKFLOW_GUARD_ROOT_CHANGED")
+        if self.guard_identity is None or (
+            _regular_file_identity(self.path, "workflow guard")
+            != self.guard_identity
+        ):
+            raise WorkflowError("WORKFLOW_GUARD_CHANGED")
+
+    def _lock_nonblocking(self) -> None:
+        if self.descriptor is None:
+            raise WorkflowError("WORKFLOW_GUARD_UNAVAILABLE")
+        try:
+            if os.name == "nt":
+                os.lseek(self.descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(self.descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.locked = True
+        except OSError:
+            raise WorkflowLockedError("WORKFLOW_ALREADY_RUNNING") from None
+
+    def _write_metadata(self) -> None:
+        if self.descriptor is None:
+            raise WorkflowError("WORKFLOW_GUARD_UNAVAILABLE")
         payload = _json_text(
             {
                 "pid": os.getpid(),
@@ -998,155 +1360,36 @@ class _WorkflowLock:
                 "workflow_id": self.workflow_id,
             }
         ).encode("utf-8")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(self.path, flags, 0o600)
-        try:
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-            self.fingerprint = _metadata_fingerprint(os.fstat(descriptor))
-        except Exception:
-            os.close(descriptor)
-            descriptor = -1
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        _fsync_directory(self.root)
-
-    def _recover_stale(self) -> None:
-        try:
-            metadata, document = _read_lock(self.path)
-            if set(document) != {"pid", "started_at", "workflow_id"}:
-                raise ValueError
-            pid = document["pid"]
-            started_at = document["started_at"]
-            workflow_id = document["workflow_id"]
-            if (
-                isinstance(pid, bool)
-                or not isinstance(pid, int)
-                or pid <= 0
-                or not isinstance(started_at, str)
-                or not isinstance(workflow_id, str)
-                or not workflow_id
-            ):
-                raise ValueError
-            parsed_start = datetime.fromisoformat(started_at)
-            if parsed_start.tzinfo is None or parsed_start.utcoffset() is None:
-                raise ValueError
-        except (OSError, ValueError, json.JSONDecodeError):
-            raise WorkflowLockedError(
-                "local housing workflow lock owner cannot be proven absent"
-            ) from None
-        if _pid_state(pid) != "absent":
-            raise WorkflowLockedError("local housing workflow is already running")
-        try:
-            current = os.lstat(self.path)
-        except OSError:
-            raise WorkflowLockedError(
-                "local housing workflow lock changed during recovery"
-            ) from None
-        if _metadata_fingerprint(current) != _metadata_fingerprint(metadata):
-            raise WorkflowLockedError("local housing workflow lock changed during recovery")
-        try:
-            self.path.unlink()
-            _fsync_directory(self.root)
-        except OSError:
-            raise WorkflowLockedError("stale workflow lock could not be recovered") from None
+        if len(payload) > _MAX_LOCK_BYTES:
+            raise WorkflowError("WORKFLOW_GUARD_METADATA_INVALID")
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        os.ftruncate(self.descriptor, 0)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(self.descriptor, payload[offset:])
+            if written <= 0:
+                raise WorkflowError("WORKFLOW_GUARD_METADATA_WRITE_FAILED")
+            offset += written
+        os.ftruncate(self.descriptor, len(payload))
+        os.fsync(self.descriptor)
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
 
     def release(self) -> None:
-        if self.fingerprint is None:
+        descriptor = self.descriptor
+        if descriptor is None:
             return
         try:
-            metadata, document = _read_lock(self.path)
-            if (
-                _metadata_fingerprint(metadata) == self.fingerprint
-                and document.get("workflow_id") == self.workflow_id
-                and document.get("pid") == os.getpid()
-            ):
-                self.path.unlink()
-                _fsync_directory(self.root)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return
+            if self.locked and os.name == "nt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            elif self.locked and os.name == "posix":
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
         finally:
-            self.fingerprint = None
-
-    def remove_created_empty_root(self) -> None:
-        if self.root_created:
-            try:
-                self.root.rmdir()
-            except OSError:
-                pass
-
-
-def _read_lock(path: Path) -> tuple[os.stat_result, dict[str, object]]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or _is_reparse(metadata):
-            raise ValueError("workflow lock is not a regular file")
-        if metadata.st_size > _MAX_LOCK_BYTES:
-            raise ValueError("workflow lock is too large")
-        payload = os.read(descriptor, _MAX_LOCK_BYTES + 1)
-        if len(payload) > _MAX_LOCK_BYTES:
-            raise ValueError("workflow lock is too large")
-    finally:
-        os.close(descriptor)
-    document = json.loads(
-        payload.decode("utf-8", errors="strict"),
-        object_pairs_hook=_strict_json_pairs,
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
-        raise ValueError("workflow lock schema is invalid")
-    return metadata, document
-
-
-def _strict_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate workflow lock key")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(_value: str) -> object:
-    raise ValueError("non-standard workflow lock value")
-
-
-def _pid_state(pid: int) -> str:
-    """Return active, absent, or unknown without sending a signal on Windows."""
-
-    if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)
-        if not handle:
-            return "absent" if ctypes.get_last_error() == 87 else "unknown"
-        try:
-            exit_code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return "unknown"
-            return "active" if exit_code.value == 259 else "absent"
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return "absent"
-    except PermissionError:
-        return "active"
-    except OSError as exc:
-        return "absent" if exc.errno == errno.ESRCH else "unknown"
-    return "active"
+            os.close(descriptor)
+            self.descriptor = None
+            self.locked = False
 
 
 def _reject_link_ancestors(path: Path) -> None:
@@ -1154,7 +1397,7 @@ def _reject_link_ancestors(path: Path) -> None:
     existing: list[Path] = []
     cursor = absolute
     while True:
-        if cursor.exists():
+        if os.path.lexists(cursor):
             existing.append(cursor)
         if cursor == cursor.parent:
             break
@@ -1162,22 +1405,103 @@ def _reject_link_ancestors(path: Path) -> None:
     for candidate in reversed(existing):
         metadata = os.lstat(candidate)
         if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
-            raise WorkflowLockedError("workflow output root contains a link or reparse point")
+            raise WorkflowError("PATH_LINK_OR_REPARSE_UNSAFE")
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
     return bool(getattr(metadata, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def _metadata_fingerprint(metadata: os.stat_result) -> tuple[object, ...]:
+def _identity_fingerprint(metadata: os.stat_result) -> tuple[object, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_size,
-        metadata.st_mtime_ns,
         getattr(metadata, "st_file_attributes", 0),
     )
+
+
+def _canonical_path(path: Path) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _directory_identity(path: Path, _label: str) -> tuple[object, ...]:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise WorkflowError("WORKFLOW_PATH_UNAVAILABLE") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse(metadata)
+    ):
+        raise WorkflowError("WORKFLOW_DIRECTORY_UNSAFE")
+    return _identity_fingerprint(metadata)
+
+
+def _regular_file_identity(path: Path, _label: str) -> tuple[object, ...]:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise WorkflowError("WORKFLOW_GUARD_UNAVAILABLE") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse(metadata)
+        or metadata.st_nlink != 1
+    ):
+        raise WorkflowError("WORKFLOW_GUARD_UNSAFE")
+    return _identity_fingerprint(metadata)
+
+
+def _nearest_existing_parent(path: Path) -> Path:
+    cursor = path.parent
+    while not os.path.lexists(cursor):
+        if cursor == cursor.parent:
+            raise WorkflowError("OUTPUT_ROOT_UNAVAILABLE")
+        cursor = cursor.parent
+    return cursor
+
+
+def _allocate_run_directory(
+    output_root: Path,
+    observed: datetime,
+    workflow_id: str,
+) -> tuple[Path, str]:
+    _reject_link_ancestors(output_root)
+    try:
+        output_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise WorkflowError("OUTPUT_ROOT_UNAVAILABLE") from None
+    _reject_link_ancestors(output_root)
+    _directory_identity(output_root, "output root")
+    date_name = observed.date().isoformat()
+    primary = output_root / date_name
+    generation_pattern = re.compile(
+        rf"{re.escape(date_name)}(?:--run-[0-9a-f]{{12}})?"
+    )
+    try:
+        has_generation = os.path.lexists(primary) or any(
+            generation_pattern.fullmatch(path.name)
+            for path in output_root.iterdir()
+        )
+    except OSError:
+        raise WorkflowError("RUN_PATH_UNAVAILABLE") from None
+    if not has_generation:
+        run_name = date_name
+    else:
+        suffix = hashlib.sha256(workflow_id.encode("ascii")).hexdigest()[:12]
+        run_name = f"{date_name}--run-{suffix}"
+    run_root = output_root / run_name
+    if os.path.lexists(run_root):
+        raise WorkflowError("RUN_PATH_CONFLICT")
+    try:
+        run_root.mkdir()
+    except OSError:
+        raise WorkflowError("RUN_PATH_UNAVAILABLE") from None
+    _reject_link_ancestors(run_root)
+    _directory_identity(run_root, "run root")
+    return run_root, run_name
 
 
 def _fsync_directory(path: Path) -> None:
