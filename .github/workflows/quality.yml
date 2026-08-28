@@ -35,11 +35,22 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Install Korean font
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends fonts-noto-cjk
+
       - name: Install pinned uv
         run: python -m pip install uv==0.12.7
 
       - name: Sync locked dependencies
         run: uv sync --frozen --extra dev
+
+      - name: Create and migrate fresh local SQLite
+        run: |
+          uv run python scripts/prepare_ci_sqlite.py
+          uv run python src/manage.py migrate --noinput
 
       - name: Ruff changed files and local content
         env:
@@ -56,19 +67,4 @@ jobs:
           uv run python src/manage.py makemigrations --check --dry-run
 
       - name: Deterministic local unit and integration tests
-        run: >-
-          uv run python -m pytest -q
-          tests/unit/test_queue_configuration.py
-          tests/unit/test_local_runtime.py
-          tests/unit/test_local_content_dates.py
-          tests/unit/test_local_content_http.py
-          tests/unit/test_applyhome_public_html.py
-          tests/unit/test_lh_public_html.py
-          tests/unit/test_local_content_selection.py
-          tests/unit/test_local_content_rendering.py
-          tests/unit/test_local_content_images.py
-          tests/unit/test_local_content_humanizer.py
-          tests/unit/test_local_content_bundles.py
-          tests/unit/test_local_content_preview.py
-          tests/unit/test_local_scripts.py
-          tests/integration/test_local_housing_workflow.py
+        run: uv run python -m pytest -q tests/unit tests/integration

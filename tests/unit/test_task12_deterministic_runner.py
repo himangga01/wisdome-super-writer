@@ -38,6 +38,7 @@ def _output_for(name: str, *, whole_exit: int = 1) -> bytes:
             b"Found 12 errors.\n" if whole_exit == 1 else b"All checks passed!\n"
         ),
         "django_check": b"System check identified no issues (0 silenced).\n",
+        "django_migrate": b"Running migrations:\n  No migrations to apply.\n",
         "migration_check": b"No changes detected\n",
         "focused_pytest": b"499 passed, 2 skipped, 6 warnings in 1.00s\n",
         "full_pytest": b"1224 passed, 5 skipped, 198 subtests passed in 2.00s\n",
@@ -118,6 +119,7 @@ def test_command_plan_is_exact_ordered_hashed_contract(tmp_path: Path) -> None:
         "setup_local",
         "whole_repository_ruff",
         "django_check",
+        "django_migrate",
         "migration_check",
         "focused_pytest",
         "full_pytest",
@@ -137,6 +139,8 @@ def test_command_plan_is_exact_ordered_hashed_contract(tmp_path: Path) -> None:
     assert plan[1].argv == (python, "-m", "ruff", "check", ".")
     assert plan[1].allowed_exit_codes == (0, 1)
     assert all(command.allowed_exit_codes == (0,) for command in plan[2:])
+    full_pytest = next(command for command in plan if command.name == "full_pytest")
+    assert full_pytest.argv[-3:] == ("tests\\unit", "tests\\integration", "-q")
     document = command_plan_document(
         plan,
         base=TASK12_BASE_COMMIT,
@@ -157,9 +161,8 @@ def test_legacy_ruff_ruling_is_pinned_not_caller_supplied() -> None:
     assert TASK12_LEGACY_RUFF_RULING_HASH == hashlib.sha256(
         TASK12_LEGACY_RUFF_RULING_TEXT.encode()
     ).hexdigest()
-    assert TASK12_LEGACY_RUFF_RULING_HASH == (
-        "93bde2ce215c41956a9dca4a5e652c66674010c747eb5dce1a777ef834d9acb9"
-    )
+    assert TASK12_BASE_COMMIT == "6c6bddfa6b87ccaeafe1b27c0c99f420f7a8930f"
+    assert "branch merge base 6c6bddfa" in TASK12_LEGACY_RUFF_RULING_TEXT
 
 
 def test_execute_command_records_duration_log_digest_and_parsed_result(

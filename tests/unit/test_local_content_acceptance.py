@@ -33,6 +33,7 @@ def _command_output(name: str) -> bytes:
         ),
         "whole_repository_ruff": b"Found 2 errors.\n",
         "django_check": b"System check identified no issues.\n",
+        "django_migrate": b"Running migrations:\n  No migrations to apply.\n",
         "migration_check": b"No changes detected\n",
         "focused_pytest": b"10 passed in 1.00s\n",
         "full_pytest": b"20 passed, 2 subtests passed in 2.00s\n",

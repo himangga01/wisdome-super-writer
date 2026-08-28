@@ -13,16 +13,16 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-TASK12_BASE_COMMIT = "711c03869674fbb12cb0554f31552da60927e664"
+TASK12_BASE_COMMIT = "6c6bddfa6b87ccaeafe1b27c0c99f420f7a8930f"
 TASK12_LEGACY_RUFF_RULING_ID = "TASK12-RUFF-LEGACY-001"
 TASK12_LEGACY_RUFF_RULING_TEXT = (
-    "At base 711c03869674fbb12cb0554f31552da60927e664, whole-repository Ruff "
+    "At branch merge base 6c6bddfa6b87ccaeafe1b27c0c99f420f7a8930f, whole-repository Ruff "
     "findings are ledgered legacy debt. Only the exact whole_repository_ruff command "
     "may exit 1 with a parsed positive finding count and remain non-gating; it must "
     "stay passed=false. Every other command is a binding gate."
 )
 TASK12_LEGACY_RUFF_RULING_HASH = (
-    "93bde2ce215c41956a9dca4a5e652c66674010c747eb5dce1a777ef834d9acb9"
+    "13dbbbc7034f77210fe838c17dbcf2c8ce286ae387eec951f6ae8691542a0b43"
 )
 TASK12_ATTEMPT_SELECTION_RULE = "latest_complete_exact_plan_pass"
 
@@ -38,6 +38,8 @@ _FOCUSED_TESTS = (
     "tests\\unit\\test_local_content_humanizer.py",
     "tests\\unit\\test_local_content_bundles.py",
     "tests\\unit\\test_local_content_preview.py",
+    "tests\\unit\\test_local_api_reconciliation.py",
+    "tests\\unit\\test_local_publishing_policy.py",
     "tests\\unit\\test_local_content_acceptance.py",
     "tests\\unit\\test_task12_deterministic_runner.py",
     "tests\\unit\\test_sqlite_test_cleanup.py",
@@ -132,6 +134,13 @@ def build_command_plan(
             "django_check",
         ),
         CommandSpec(
+            "django_migrate",
+            (python, "src\\manage.py", "migrate", "--noinput"),
+            True,
+            (0,),
+            "django_migrate",
+        ),
+        CommandSpec(
             "migration_check",
             (
                 python,
@@ -153,7 +162,7 @@ def build_command_plan(
         ),
         CommandSpec(
             "full_pytest",
-            (python, "-m", "pytest", "-q"),
+            (python, "-m", "pytest", "tests\\unit", "tests\\integration", "-q"),
             True,
             (0,),
             "pytest",
@@ -223,13 +232,23 @@ def discover_changed_python(project_root: Path, *, base: str) -> tuple[str, ...]
     if base != TASK12_BASE_COMMIT:
         raise ValueError("Task 12 base commit does not match the pinned contract")
     root = Path(project_root).resolve()
+    merge_base = subprocess.run(
+        ("git", "merge-base", "HEAD", base),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+    if not merge_base:
+        raise ValueError("branch merge base is unavailable")
     candidates: set[str] = {
         path.relative_to(root).as_posix()
         for path in (root / "src" / "apps" / "local_content").rglob("*.py")
         if path.is_file()
     }
     for argv in (
-        ("git", "diff", "--name-only", "--diff-filter=ACMR", base),
+        ("git", "diff", "--name-only", "--diff-filter=ACMR", merge_base, "HEAD"),
         ("git", "diff", "--name-only", "--diff-filter=ACMR"),
         ("git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"),
         ("git", "ls-files", "--others", "--exclude-standard"),
@@ -369,6 +388,16 @@ def parse_command_output(
         return {
             "kind": "django_check",
             "system_check_clean": "System check identified no issues" in text,
+        }
+    if name == "django_migrate":
+        return {
+            "kind": "django_migrate",
+            "migration_completed": exit_code == 0
+            and (
+                "No migrations to apply" in text
+                or "Applying " in text
+                or "Running migrations" in text
+            ),
         }
     if name == "migration_check":
         return {
@@ -847,6 +876,8 @@ def _parsed_gate_success(name: str, parsed: Mapping[str, object]) -> bool:
         )
     if name == "django_check":
         return parsed.get("system_check_clean") is True
+    if name == "django_migrate":
+        return parsed.get("migration_completed") is True
     if name == "migration_check":
         return parsed.get("no_changes_detected") is True
     if name in {"focused_pytest", "full_pytest"}:

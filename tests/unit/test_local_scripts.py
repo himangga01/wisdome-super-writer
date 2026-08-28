@@ -1386,29 +1386,18 @@ def test_ci_configuration_has_portable_locked_local_gates() -> None:
     assert "${{" not in commands
     assert "uv sync --frozen --extra dev" in commands
     assert "scripts/ci_changed_python.py" in commands
+    assert "scripts/prepare_ci_sqlite.py" in commands
+    assert "src/manage.py migrate --noinput" in commands
     assert "makemigrations --check --dry-run" in commands
-    assert "test_local_housing_workflow.py" in commands
+    assert "pytest -q tests/unit tests/integration" in commands
     assert "collect_recent_housing" not in commands
-    expected_tests = {
-        "tests/unit/test_queue_configuration.py",
-        "tests/unit/test_local_runtime.py",
-        "tests/unit/test_local_content_dates.py",
-        "tests/unit/test_local_content_http.py",
-        "tests/unit/test_applyhome_public_html.py",
-        "tests/unit/test_lh_public_html.py",
-        "tests/unit/test_local_content_selection.py",
-        "tests/unit/test_local_content_rendering.py",
-        "tests/unit/test_local_content_images.py",
-        "tests/unit/test_local_content_humanizer.py",
-        "tests/unit/test_local_content_bundles.py",
-        "tests/unit/test_local_content_preview.py",
-        "tests/unit/test_local_scripts.py",
-        "tests/integration/test_local_housing_workflow.py",
-    }
-    configured_tests = {
+    configured_files = {
         token for token in commands.split() if token.startswith("tests/") and token.endswith(".py")
     }
-    assert configured_tests == expected_tests
+    assert configured_files == set()
+    font_step = next(step for step in steps if step.get("name") == "Install Korean font")
+    assert font_step["if"] == "runner.os == 'Linux'"
+    assert "apt-get install --no-install-recommends fonts-noto-cjk" in font_step["run"]
     ruff_step = next(
         step for step in steps if step.get("name") == "Ruff changed files and local content"
     )
@@ -1419,6 +1408,22 @@ def test_ci_configuration_has_portable_locked_local_gates() -> None:
         "GITHUB_EVENT_NAME",
         "GITHUB_REF_NAME",
     }
+
+
+def test_ci_sqlite_initializer_reserves_one_exact_fresh_database(tmp_path: Path) -> None:
+    path = REPOSITORY_ROOT / "scripts" / "prepare_ci_sqlite.py"
+    spec = importlib.util.spec_from_file_location("prepare_ci_sqlite_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    database = tmp_path / "state" / "db.sqlite3"
+
+    module.prepare_fresh_sqlite(database)
+
+    assert database.is_file()
+    assert database.stat().st_size == 0
+    with pytest.raises(FileExistsError):
+        module.prepare_fresh_sqlite(database)
 
 
 def _initialize_git_repository(repository: Path) -> None:

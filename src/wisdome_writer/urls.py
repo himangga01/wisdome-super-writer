@@ -5,8 +5,8 @@ from django.contrib import admin
 from django.urls import include, path
 from django.views.generic import RedirectView
 
-from wisdome_writer.api.health import live, ready
 from wisdome_writer import console
+from wisdome_writer.api.health import live, ready
 
 admin.site.site_header = "Wisdome Super Writer"
 admin.site.site_title = "Wisdome Super Writer Admin"
