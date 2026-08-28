@@ -105,6 +105,7 @@ class OfficialHtmlFetcher:
                 "max_bytes": MAX_HTML_BYTES,
                 "timeout": remaining,
                 "allowed_hosts": self._allowed_hosts,
+                "headers": {"Accept-Encoding": "identity"},
                 "max_elapsed_seconds": remaining,
                 "https_only": True,
                 "before_request": claim_attempt,

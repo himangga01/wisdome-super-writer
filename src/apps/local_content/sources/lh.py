@@ -235,7 +235,7 @@ class LhPublicCollector:
         document = HTMLParser(body)
         root = document.css_first("[data-lh-notice-list]")
         if root is None:
-            raise _ParseFailure("list parser drift")
+            return self._parse_public_table(document)
         rows = tuple(root.css("[data-id1][data-id2][data-id3][data-id4]"))
         explicit_empty = _normalize(root.attributes.get("data-empty-results")) == "true"
         if explicit_empty and rows:
@@ -261,6 +261,86 @@ class LhPublicCollector:
             last_page=last_page,
             total_count=total_count,
             explicit_empty=False,
+        )
+
+    def _parse_public_table(self, document: HTMLParser) -> _ParsedListPage:
+        paging_form = document.css_first('form[name="pagingForm"]')
+        identity_selector = (
+            "a.wrtancInfoBtn[data-id1][data-id2][data-id3][data-id4]"
+        )
+        tables = tuple(
+            table for table in document.css("table") if table.css_first(identity_selector)
+        )
+        if paging_form is None or len(tables) != 1:
+            raise _ParseFailure("list parser drift")
+        table = tables[0]
+        current_node = paging_form.css_first('input[name="currPage"]')
+        page_size_node = paging_form.css_first('input[name="listCo"]')
+        current_page = _required_input_int(current_node, minimum=1)
+        page_size = _required_input_int(page_size_node, minimum=1)
+        if page_size != 50:
+            raise _ParseFailure("invalid list pagination material")
+        rows = tuple(
+            row
+            for row in table.css("tbody tr")
+            if row.css_first("a.wrtancInfoBtn[data-id1][data-id2][data-id3][data-id4]")
+            is not None
+        )
+        if not rows:
+            raise _ParseFailure("empty result page")
+        first_cells = tuple(rows[0].css("td"))
+        if len(first_cells) != 9:
+            raise _ParseFailure("invalid list row cardinality")
+        first_ordinal = _text_int(_table_cell_text(first_cells[0]), minimum=1)
+        total_count = (current_page - 1) * page_size + first_ordinal
+        last_page = (total_count + page_size - 1) // page_size
+        if current_page > last_page:
+            raise _ParseFailure("invalid list pagination material")
+        records: list[_ListedNotice] = []
+        for offset, row in enumerate(rows):
+            cells = tuple(row.css("td"))
+            if len(cells) != 9:
+                raise _ParseFailure("invalid list row cardinality")
+            expected_ordinal = first_ordinal - offset
+            if _text_int(_table_cell_text(cells[0]), minimum=1) != expected_ordinal:
+                raise _ParseFailure("invalid list pagination material")
+            records.append(self._parse_public_table_row(row, cells))
+        return _ParsedListPage(
+            records=tuple(records),
+            current_page=current_page,
+            last_page=last_page,
+            total_count=total_count,
+            explicit_empty=False,
+        )
+
+    def _parse_public_table_row(
+        self,
+        row: Node,
+        cells: tuple[Node, ...],
+    ) -> _ListedNotice:
+        del row
+        link = cells[2].css_first(
+            "a.wrtancInfoBtn[data-id1][data-id2][data-id3][data-id4]"
+        )
+        if link is None:
+            raise _ParseFailure("missing notice identity")
+        title = _public_link_title(link)
+        if not title:
+            raise _ParseFailure("missing notice title")
+        published = _table_cell_text(cells[5])
+        if not published:
+            raise _ParseFailure("missing publication date")
+        return _ListedNotice(
+            ccr=_required_attr(link, "data-id2"),
+            pan_id=_required_attr(link, "data-id1"),
+            upp=_required_attr(link, "data-id3"),
+            ais=_required_attr(link, "data-id4"),
+            category=_table_cell_text(cells[1]) or "unknown",
+            title=title,
+            region=_table_cell_text(cells[3]),
+            published_at=_parse_published_at(published),
+            deadline=_parse_date(_table_cell_text(cells[6]) or ""),
+            status=_table_cell_text(cells[7]) or "published",
         )
 
     @staticmethod
@@ -311,7 +391,7 @@ class LhPublicCollector:
         document = HTMLParser(body)
         root = document.css_first("[data-lh-notice-detail]")
         if root is None:
-            raise _ParseFailure("detail parser drift")
+            return _parse_public_detail(document)
         schedule = _label_value(root, ("청약접수기간", "신청접수기간", "접수기간"))
         application_start, application_end, schedule_warning = _parse_schedule_range(schedule)
         supply = _label_value(root, ("공급세대수", "공급규모", "공급수"))
@@ -359,6 +439,102 @@ class LhPublicCollector:
             seen[record.external_id] = record
 
 
+def _parse_public_detail(
+    document: HTMLParser,
+) -> tuple[
+    date | None,
+    date | None,
+    int | None,
+    str | None,
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    tuple[str, ...],
+]:
+    supply_headers = (
+        "금회공급 세대수 (예비자 포함)",
+        "금회공급 세대수(예비자 포함)",
+        "금회공급 세대수",
+    )
+    matching: list[tuple[Node, int]] = []
+    for table in document.css("table"):
+        headers = tuple(_table_cell_text(node) for node in table.css("thead th"))
+        matched = next((header for header in supply_headers if header in headers), None)
+        if matched is not None:
+            matching.append((table, headers.index(matched)))
+    if not matching and _is_sparse_public_detail(document):
+        return (
+            None,
+            None,
+            None,
+            None,
+            (),
+            (),
+            (
+                "application schedule not found",
+                "supply count not found",
+                "price summary not found",
+                "eligibility summary not found",
+            ),
+        )
+    if not matching:
+        raise _ParseFailure("detail parser drift")
+    counts: list[int] = []
+    for table, supply_index in matching:
+        table_counts: list[int] = []
+        for row in table.css("tbody tr"):
+            cells = tuple(row.css("th, td"))
+            if len(cells) <= supply_index:
+                raise _ParseFailure("invalid detail row cardinality")
+            value = _table_cell_text(cells[supply_index])
+            if value is None or re.fullmatch(r"\d{1,3}(?:,\d{3})*|\d+", value) is None:
+                raise _ParseFailure("invalid supply count")
+            table_counts.append(int(value.replace(",", "")))
+        if not table_counts:
+            raise _ParseFailure("detail parser drift")
+        counts.extend(table_counts)
+    if not counts:
+        raise _ParseFailure("detail parser drift")
+    schedule_dates: list[date] = []
+    for candidate in document.css("table"):
+        headers = tuple(_table_cell_text(node) for node in candidate.css("thead th"))
+        if "신청일시" not in headers:
+            continue
+        schedule_index = headers.index("신청일시")
+        for row in candidate.css("tbody tr"):
+            cells = tuple(row.css("th, td"))
+            if len(cells) <= schedule_index:
+                raise _ParseFailure("invalid detail row cardinality")
+            schedule_dates.extend(
+                parsed
+                for match in _DATE_PATTERN.finditer(
+                    _table_cell_text(cells[schedule_index]) or ""
+                )
+                if (parsed := _parse_date(match.group())) is not None
+            )
+    application_start = min(schedule_dates) if schedule_dates else None
+    application_end = max(schedule_dates) if schedule_dates else None
+    warnings = ["price summary not found", "eligibility summary not found"]
+    if application_start is None:
+        warnings.insert(0, "application schedule not found")
+    return (
+        application_start,
+        application_end,
+        sum(counts),
+        None,
+        (),
+        (),
+        tuple(warnings),
+    )
+
+
+def _is_sparse_public_detail(document: HTMLParser) -> bool:
+    headings = {
+        _table_cell_text(node) for node in document.css("h1, h2, h3, h4")
+    }
+    labels = {_table_cell_text(node) for node in document.css("dl dt")}
+    return "공고문" in headings and "공고문" in labels
+
+
 def _list_form(window: CollectionWindow, page_index: int) -> dict[str, str]:
     start = window.start.astimezone(_SEOUL).date().isoformat()
     end = window.end.astimezone(_SEOUL).date().isoformat()
@@ -393,6 +569,35 @@ def _required_int(node: Node, attribute: str, *, minimum: int) -> int:
     if value < minimum:
         raise _ParseFailure("invalid list pagination material")
     return value
+
+
+def _required_input_int(node: Node | None, *, minimum: int) -> int:
+    if node is None:
+        raise _ParseFailure("invalid list pagination material")
+    return _text_int(_normalize(node.attributes.get("value")), minimum=minimum)
+
+
+def _text_int(value: str | None, *, minimum: int) -> int:
+    if value is None or not value.isascii() or not value.isdigit():
+        raise _ParseFailure("invalid list pagination material")
+    parsed = int(value)
+    if parsed < minimum:
+        raise _ParseFailure("invalid list pagination material")
+    return parsed
+
+
+def _public_link_title(link: Node) -> str | None:
+    parsed = HTMLParser(link.html)
+    for hidden in parsed.css(
+        "[aria-hidden='true'], .sr-only, .visually-hidden, .blind, .hidden, .day"
+    ):
+        hidden.decompose()
+    visible = parsed.css_first("a")
+    return _normalize(visible.text(separator=" ") if visible is not None else "")
+
+
+def _table_cell_text(node: Node | None) -> str | None:
+    return _normalize(node.text(separator=" ") if node is not None else "")
 
 
 def _label_value(node: Node, labels: tuple[str, ...]) -> str | None:

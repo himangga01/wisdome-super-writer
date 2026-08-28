@@ -17,6 +17,10 @@ from apps.local_content.selection import needs_detailed_article
 UNKNOWN_VALUE = "공고문에서 직접 확인 필요"
 GENERIC_HERO_ALT = "주거 공고 이해를 위한 일반적인 현대 아파트 도시 전경"
 GENERIC_HERO_CAPTION = "이해를 돕기 위한 이미지 · 실제 단지 모습과 다를 수 있음"
+SUMMARY_CARD_ALT = "공고 핵심 정보를 정리한 요약 카드"
+SUMMARY_CARD_CAPTION = "정규화된 공식 공고 사실 요약"
+TIMELINE_ALT = "공고 신청 일정을 정리한 타임라인"
+TIMELINE_CAPTION = "정규화된 공식 공고 일정 요약"
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 _OFFICIAL_SOURCE_HOSTS = {
     "applyhome": "www.applyhome.co.kr",
@@ -220,6 +224,10 @@ def _detail_facts(
     status = _display_value(notice.status)
     lines = [
         f'![{GENERIC_HERO_ALT}](assets/hero.png "{GENERIC_HERO_CAPTION}")',
+        "",
+        f'![{SUMMARY_CARD_ALT}](assets/summary-card.webp "{SUMMARY_CARD_CAPTION}")',
+        "",
+        f'![{TIMELINE_ALT}](assets/timeline.webp "{TIMELINE_CAPTION}")',
         "",
         "## 한눈에 보기",
         "",

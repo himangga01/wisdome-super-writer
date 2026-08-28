@@ -21,11 +21,17 @@ REMAINING_LIST = "https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancL
 _SOURCE_KEY = "applyhome"
 _OFFICIAL_HOST = "www.applyhome.co.kr"
 _SEOUL = ZoneInfo("Asia/Seoul")
-_DETAIL_PATHS = {
+_LEGACY_DETAIL_PATHS = {
     "apt": "/ai/aia/selectAPTLttotPblancDetailView.do",
     "remaining": "/ai/aia/selectAPTRemndrLttotPblancDetailView.do",
 }
-_DETAIL_QUERY_KEYS = ("houseManageNo", "pblancNo", "houseSecd")
+_PUBLIC_DETAIL_PATHS = {
+    "apt": "/ai/aia/selectAPTLttotPblancDetail.do",
+    "remaining": "/ai/aia/selectAPTRemndrLttotPblancDetailView.do",
+}
+_LEGACY_DETAIL_QUERY_KEYS = ("houseManageNo", "pblancNo", "houseSecd")
+_PUBLIC_DETAIL_QUERY_KEYS = ("houseManageNo", "pblancNo")
+_PUBLIC_PAGE_SIZE = 10
 _MAX_LIST_PAGES = 100
 _DATE_PATTERN = re.compile(
     r"(?P<year>\d{4})\s*[./-]\s*(?P<month>\d{1,2})\s*[./-]\s*(?P<day>\d{1,2})"
@@ -62,7 +68,7 @@ class _ParsedListPage:
     records: tuple[_ListedNotice, ...]
     current_page: int
     last_page: int
-    total_count: int
+    total_count: int | None
     explicit_empty: bool
 
 
@@ -115,9 +121,13 @@ class ApplyHomePublicCollector:
                 raise _ParseFailure("list page index does not match official material")
             if expected_last is None:
                 expected_last = page.last_page
-                expected_total = page.total_count
-            elif page.last_page != expected_last or page.total_count != expected_total:
+            elif page.last_page != expected_last:
                 raise _ParseFailure("list pagination material changed")
+            if page.total_count is not None:
+                if expected_total is None:
+                    expected_total = page.total_count
+                elif page.total_count != expected_total:
+                    raise _ParseFailure("list pagination material changed")
             if page.explicit_empty:
                 if page_index != 1 or page.last_page != 1 or page.total_count != 0:
                     raise _ParseFailure("invalid explicit empty result page")
@@ -128,7 +138,7 @@ class ApplyHomePublicCollector:
             signatures.add(signature)
             records.extend(page.records)
             if page_index == page.last_page:
-                if len(records) != page.total_count:
+                if expected_total is None or len(records) != expected_total:
                     raise _ParseFailure("list pagination truncated")
                 return tuple(records)
         raise _ParseFailure("list pagination exceeded page cap")
@@ -222,7 +232,7 @@ class ApplyHomePublicCollector:
         document = HTMLParser(body)
         root = document.css_first(f'[data-notice-list="{category}"]')
         if root is None:
-            raise _ParseFailure("list parser drift")
+            return self._parse_public_table(document, category)
         rows = tuple(root.css("[data-house-manage-no][data-pblanc-no]"))
         if not rows and _normalize(root.attributes.get("data-empty-results")) != "true":
             raise _ParseFailure("empty result page")
@@ -241,6 +251,80 @@ class ApplyHomePublicCollector:
             last_page,
             total_count,
             False,
+        )
+
+    def _parse_public_table(self, document: HTMLParser, category: str) -> _ParsedListPage:
+        rows = tuple(document.css("table.tbl_st tbody tr[data-pbno][data-hmno]"))
+        pager = document.css_first("#paging")
+        active = pager.css_first("a.active") if pager is not None else None
+        if not rows or pager is None or active is None:
+            raise _ParseFailure("list parser drift")
+        current_page = _ascii_int(_normalized_text(active), minimum=1)
+        advertised_pages = [current_page]
+        for link in pager.css("a[href]"):
+            try:
+                values = parse_qs(
+                    urlsplit(link.attributes.get("href") or "").query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+            except ValueError:
+                continue
+            page_values = values.get("pageIndex", ())
+            if len(page_values) == 1:
+                advertised_pages.append(_ascii_int(page_values[0], minimum=1))
+        last_page = max(advertised_pages)
+        if current_page > last_page or len(rows) > _PUBLIC_PAGE_SIZE:
+            raise _ParseFailure("invalid list pagination material")
+        if current_page < last_page and len(rows) != _PUBLIC_PAGE_SIZE:
+            raise _ParseFailure("invalid list page cardinality")
+        total_count = (
+            (last_page - 1) * _PUBLIC_PAGE_SIZE + len(rows)
+            if current_page == last_page
+            else None
+        )
+        return _ParsedListPage(
+            records=tuple(self._parse_public_table_row(row, category) for row in rows),
+            current_page=current_page,
+            last_page=last_page,
+            total_count=total_count,
+            explicit_empty=False,
+        )
+
+    def _parse_public_table_row(self, row: Node, category: str) -> _ListedNotice:
+        cells = tuple(row.css("td"))
+        expected_cells = 11 if category == "apt" else 8
+        if len(cells) != expected_cells:
+            raise _ParseFailure("invalid list row cardinality")
+        house_manage_no = _required_attr(row, "data-hmno")
+        pblanc_no = _required_attr(row, "data-pbno")
+        title_index = 3 if category == "apt" else 2
+        published_index = 6 if category == "apt" else 4
+        title = _normalized_text(cells[title_index].css_first("a"))
+        if not title:
+            raise _ParseFailure("missing notice title")
+        published = _table_cell_text(cells[published_index])
+        if not published:
+            raise _ParseFailure("missing publication date")
+        detail_path = _PUBLIC_DETAIL_PATHS[category]
+        detail_query = urlencode(
+            (("houseManageNo", house_manage_no), ("pblancNo", pblanc_no))
+        )
+        canonical_url = _canonical_detail_url(
+            f"{detail_path}?{detail_query}",
+            category=category,
+            house_manage_no=house_manage_no,
+            pblanc_no=pblanc_no,
+        )
+        return _ListedNotice(
+            category=category,
+            house_manage_no=house_manage_no,
+            pblanc_no=pblanc_no,
+            canonical_url=canonical_url,
+            title=title,
+            published_at=_parse_published_at(published),
+            region=_table_cell_text(cells[0]),
+            status="published",
         )
 
     def _parse_list_row(self, row: Node, category: str) -> _ListedNotice:
@@ -289,7 +373,7 @@ class ApplyHomePublicCollector:
         document = HTMLParser(body)
         root = document.css_first("[data-notice-detail]")
         if root is None:
-            raise _ParseFailure("detail parser drift")
+            return _parse_public_detail(document)
         schedule = _label_value(root, ("청약신청기간", "신청기간"))
         dates = tuple(
             _parse_date(match.group()) for match in _DATE_PATTERN.finditer(schedule or "")
@@ -309,6 +393,53 @@ class ApplyHomePublicCollector:
         return application_start, application_end, supply_count, tuple(warnings)
 
 
+def _parse_public_detail(
+    document: HTMLParser,
+) -> tuple[date | None, date | None, int | None, tuple[str, ...]]:
+    if not document.css("table.tbl_st"):
+        raise _ParseFailure("detail parser drift")
+    application_start = _parse_date(
+        _table_cell_text(document.css_first("#rnk1CrsRceptPd")) or ""
+    )
+    application_end = _parse_date(
+        _table_cell_text(document.css_first("#rnk2CrsRceptPd")) or ""
+    )
+    if application_start is None:
+        schedule = _public_table_label_value(document, ("청약접수", "청약기간"))
+        dates = tuple(
+            parsed
+            for match in _DATE_PATTERN.finditer(schedule or "")
+            if (parsed := _parse_date(match.group())) is not None
+        )
+        application_start = dates[0] if dates else None
+        application_end = dates[1] if len(dates) > 1 else None
+    supply = _public_table_label_value(document, ("공급규모", "공급세대수"))
+    supply_count = _parse_supply_count(supply) if supply else None
+    warnings: list[str] = []
+    if application_start is None:
+        warnings.append("application schedule not found")
+    elif application_end is None:
+        warnings.append("application end date not found")
+    if supply_count is None:
+        warnings.append("supply count not found")
+    warnings.extend(("price summary not found", "eligibility summary not found"))
+    return application_start, application_end, supply_count, tuple(warnings)
+
+
+def _public_table_label_value(document: HTMLParser, labels: tuple[str, ...]) -> str | None:
+    expected = {_normalize(label) for label in labels}
+    for row in document.css("table tr"):
+        cells = tuple(row.css("th, td"))
+        if len(cells) < 2 or _table_cell_text(cells[0]) not in expected:
+            continue
+        return _table_cell_text(cells[1])
+    return None
+
+
+def _table_cell_text(node: Node | None) -> str | None:
+    return _normalize(node.text(separator=" ") if node is not None else "")
+
+
 def _required_attr(node: Node, attribute: str) -> str:
     value = _normalize(node.attributes.get(attribute))
     if not value:
@@ -324,6 +455,15 @@ def _required_nonnegative_int(node: Node, attribute: str, *, minimum: int) -> in
     if value < minimum:
         raise _ParseFailure("invalid list pagination material")
     return value
+
+
+def _ascii_int(value: str | None, *, minimum: int) -> int:
+    if value is None or not value.isascii() or not value.isdigit():
+        raise _ParseFailure("invalid list pagination material")
+    parsed = int(value)
+    if parsed < minimum:
+        raise _ParseFailure("invalid list pagination material")
+    return parsed
 
 
 def _list_page_url(list_url: str, page_index: int) -> str:
@@ -360,26 +500,45 @@ def _canonical_detail_url(
         raise _ParseFailure("detail URL host is not approved")
     if port not in (None, 443):
         raise _ParseFailure("detail URL host is not approved")
-    if parsed.path != _DETAIL_PATHS[category] or parsed.fragment:
+    allowed_paths = {
+        _LEGACY_DETAIL_PATHS[category],
+        _PUBLIC_DETAIL_PATHS[category],
+    }
+    if parsed.path not in allowed_paths or parsed.fragment:
         raise _ParseFailure("detail URL path is not approved")
     try:
         values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         raise _ParseFailure("detail URL query is not approved") from None
-    if set(values) != set(_DETAIL_QUERY_KEYS) or any(
-        len(values[key]) != 1 for key in _DETAIL_QUERY_KEYS
+    observed_keys = set(values)
+    if (
+        parsed.path == _PUBLIC_DETAIL_PATHS[category]
+        and observed_keys == set(_PUBLIC_DETAIL_QUERY_KEYS)
+    ):
+        query_keys = _PUBLIC_DETAIL_QUERY_KEYS
+    elif (
+        parsed.path == _LEGACY_DETAIL_PATHS[category]
+        and observed_keys == set(_LEGACY_DETAIL_QUERY_KEYS)
+    ):
+        query_keys = _LEGACY_DETAIL_QUERY_KEYS
+    else:
+        raise _ParseFailure("detail URL query is not approved")
+    if any(
+        len(values[key]) != 1 for key in query_keys
     ):
         raise _ParseFailure("detail URL query is not approved")
     if values["houseManageNo"][0] != house_manage_no or values["pblancNo"][0] != pblanc_no:
         raise _ParseFailure("detail URL identity does not match list record")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", values["houseSecd"][0]):
+    if "houseSecd" in values and not re.fullmatch(
+        r"[A-Za-z0-9_-]+", values["houseSecd"][0]
+    ):
         raise _ParseFailure("detail URL query is not approved")
     return urlunsplit(
         (
             "https",
             _OFFICIAL_HOST,
             parsed.path,
-            urlencode([(key, values[key][0]) for key in _DETAIL_QUERY_KEYS]),
+            urlencode([(key, values[key][0]) for key in query_keys]),
             "",
         )
     )

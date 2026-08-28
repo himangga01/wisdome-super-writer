@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import TestCase as UnitTestCase
 from unittest.mock import patch
 
+from django.core.exceptions import FieldDoesNotExist
 from django.db import (
     IntegrityError,
     OperationalError,
@@ -496,7 +497,8 @@ class PublicationIntentSQLiteGuardTests(TestCase):
         with self.assertRaises(IntegrityError), transaction.atomic():
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "UPDATE publishing_publicationattempt SET request_fingerprint = %s WHERE id = %s",
+                    "UPDATE publishing_publicationattempt "
+                    "SET request_fingerprint = %s WHERE id = %s",
                     ["9" * 64, attempt.id.hex],
                 )
         with self.assertRaises(IntegrityError), transaction.atomic():
@@ -805,7 +807,7 @@ class PublicationIdentityMigrationExecutorTests(
             legacy_intent = state.apps.get_model(
                 "publishing", "PublicationIntent"
             )
-            with self.assertRaises(Exception):
+            with self.assertRaises(FieldDoesNotExist):
                 legacy_intent._meta.get_field("request_hash")
         finally:
             MigrationExecutor(connection).migrate(latest)
@@ -871,10 +873,10 @@ class PublicationIdentityMigrationExecutorTests(
             with self.assertRaises(IrreversibleError):
                 MigrationExecutor(connection).migrate(self.before)
         finally:
+            MigrationExecutor(connection).migrate(latest)
             publishing_models.Publication.objects.filter(
                 id=publication_id
             ).delete()
-            MigrationExecutor(connection).migrate(latest)
 
 
 class PublicationIdentityConcurrencyTests(

@@ -1,6 +1,6 @@
 import json
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +8,6 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
-
 
 REQUIRED_GATES = {
     "all_publishable_claims_grounded",
@@ -84,7 +83,7 @@ def write_policy(root: Path, document: dict, *, raw: str | None = None):
 
 
 def valid_evidence(*, evidence_id="e-1", authority="primary_government"):
-    published = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    published = datetime(2026, 8, 8, tzinfo=UTC)
     return {
         "evidenceId": evidence_id,
         "selectionState": "selected",
@@ -1662,7 +1661,9 @@ def test_manual_revalidation_claims_event_before_domain_locks(
         "00000000-0000-0000-0000-000000000003"
     )
     article = SimpleNamespace(id=task_args[0])
-    article_query.select_for_update.return_value.select_related.return_value.get.return_value = article
+    article_query.select_for_update.return_value.select_related.return_value.get.return_value = (
+        article
+    )
     article_query.select_for_update.return_value.get.return_value = article
     revision = SimpleNamespace(
         id=task_args[1],
@@ -1685,7 +1686,9 @@ def test_manual_revalidation_claims_event_before_domain_locks(
         quality_state="pending",
     )
     revision_query = MagicMock()
-    revision_query.select_for_update.return_value.select_related.return_value.get.return_value = revision
+    revision_query.select_for_update.return_value.select_related.return_value.get.return_value = (
+        revision
+    )
     domain_query = MagicMock()
 
     def event_fence(**_kwargs):
@@ -1819,14 +1822,13 @@ class EditorialModelContractTests(TestCase):
         from apps.editorial.models import (
             ArticleRevision,
             DraftArticle,
-            EditorialPolicySnapshot,
         )
+        from apps.editorial.policies import resolve_editorial_policy_snapshot
         from apps.editorial.services import (
             _stale_open_publication_intents_locked,
         )
         from apps.publishing.models import PublicationIntent
         from apps.topics.models import SourceRegistrySnapshot, TopicPolicy
-        from apps.editorial.policies import resolve_editorial_policy_snapshot
 
         sha = "a" * 64
         now = timezone.now()
@@ -1909,7 +1911,7 @@ class EditorialModelContractTests(TestCase):
                 article_id=article.id,
                 article_revision=revision,
                 revision_no=revision.revision_no,
-                revision_content_hash=sha,
+                revision_content_hash=revision.content_hash,
                 target_snapshot_refs=[],
                 target_commands=[],
                 target_snapshot_manifest_hash=sha,

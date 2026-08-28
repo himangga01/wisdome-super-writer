@@ -14,14 +14,14 @@ import django
 
 django.setup()
 
-from apps.publishing import services
-from apps.publishing.models import Approval, PublicationAction
-from django.contrib.auth import get_user_model
-from django.test import TestCase as DjangoTestCase
-from django.utils import timezone
-from wisdome_writer.domain.errors import Conflict, InvalidInput
-from wisdome_writer.domain.hashing import sha256_hex
+from django.contrib.auth import get_user_model  # noqa: E402
+from django.test import TestCase as DjangoTestCase  # noqa: E402
+from django.utils import timezone  # noqa: E402
 
+from apps.publishing import services  # noqa: E402
+from apps.publishing.models import Approval, PublicationAction  # noqa: E402
+from wisdome_writer.domain.errors import Conflict, InvalidInput  # noqa: E402
+from wisdome_writer.domain.hashing import sha256_hex  # noqa: E402
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -1017,9 +1017,6 @@ class ApprovalProjectionTests(TestCase):
         approval_query.select_related.return_value.get.return_value = approval
         head_query = MagicMock()
         head_query.select_related.return_value.filter.return_value.first.return_value = head
-        latest_intent_query = MagicMock()
-        latest_intent_query.filter.return_value.order_by.return_value.values_list.return_value.first.return_value = intent.id
-
         material = {
             "revisionContentHash": revision.content_hash,
             "generationAttemptId": str(intent.generation_attempt_id),
@@ -1036,9 +1033,9 @@ class ApprovalProjectionTests(TestCase):
                 return_value=head_query,
             ),
             patch.object(
-                services.PublicationIntent.objects,
-                "using",
-                return_value=latest_intent_query,
+                services,
+                "resolve_current_publication_intent",
+                return_value=intent,
             ),
             patch.object(services, "_intent_material_data", return_value=material),
             patch.object(services, "_intent_hash", return_value=intent.intent_hash),
@@ -1353,6 +1350,7 @@ class OriginRunProjectionTests(TestCase):
             ),
             patch("apps.collection.services.project_run_terminal_observation"),
             patch("apps.collection.services.project_step_terminal_observation") as project_step,
+            patch("apps.collection.services.schedule_queue_one_release") as schedule_release,
         ):
             services._project_origin_run_terminal_locked(succeeded)
 
@@ -1362,6 +1360,7 @@ class OriginRunProjectionTests(TestCase):
         step.save.assert_called_once()
         project_step.assert_called_once()
         self.assertEqual(run.state, "completed")
+        schedule_release.assert_called_once_with(run)
 
     def test_terminal_projection_waits_for_every_dispatched_intent_in_the_run(self):
         from apps.publishing.models import PublicationAttempt
@@ -1384,21 +1383,47 @@ class OriginRunProjectionTests(TestCase):
             target_commands=[{"targetId": "a"}, {"targetId": "b"}],
             state="dispatched",
         )
+        first_publication = SimpleNamespace(
+            id=uuid.uuid4(),
+            target_id=uuid.uuid4(),
+            target=SimpleNamespace(channel="blogger"),
+        )
+        second_publication = SimpleNamespace(
+            id=uuid.uuid4(),
+            target_id=uuid.uuid4(),
+            target=SimpleNamespace(channel="blogger"),
+        )
         stale = SimpleNamespace(
             id=uuid.uuid4(),
             publication_intent=first_intent,
             publication_intent_id=first_intent.id,
+            publication_id=first_publication.id,
+            publication=first_publication,
+            resolved_action=PublicationAction.CREATE,
+            correlation_id=run.correlation_id,
             state=PublicationAttempt.State.STALE,
-            publication=SimpleNamespace(
-                target=SimpleNamespace(channel="blogger")
-            ),
         )
         queued = SimpleNamespace(
             id=uuid.uuid4(),
             publication_intent=second_intent,
             publication_intent_id=second_intent.id,
+            publication_id=second_publication.id,
+            publication=second_publication,
+            resolved_action=PublicationAction.CREATE,
+            correlation_id=run.correlation_id,
             state=PublicationAttempt.State.QUEUED,
         )
+        dispatches = [
+            SimpleNamespace(
+                publication_intent_id=row.publication_intent_id,
+                attempt_count=1,
+                attempt_manifest_hash=services.sha256_hex(
+                    services._publication_attempt_manifest([row])
+                ),
+                correlation_id=row.correlation_id,
+            )
+            for row in (stale, queued)
+        ]
         run_query = MagicMock()
         run_query.get.return_value = run
         step_query = MagicMock()
@@ -1406,22 +1431,13 @@ class OriginRunProjectionTests(TestCase):
             SimpleNamespace(state="queued"),
             False,
         )
-        intent_query = MagicMock()
-        intent_query.filter.return_value.order_by.return_value = [
-            first_intent,
-            second_intent,
-        ]
+        dispatch_query = MagicMock()
+        dispatch_query.filter.return_value.order_by.return_value = dispatches
         attempt_query = MagicMock()
-
-        def attempts_for_scope(**kwargs):
-            result = MagicMock()
-            if "publication_intent" in kwargs:
-                result.order_by.return_value = [stale]
-            else:
-                result.order_by.return_value = [stale, queued]
-            return result
-
-        attempt_query.filter.side_effect = attempts_for_scope
+        attempt_query.select_related.return_value.filter.return_value.order_by.return_value = [
+            stale,
+            queued,
+        ]
 
         with (
             patch.object(
@@ -1435,9 +1451,9 @@ class OriginRunProjectionTests(TestCase):
                 return_value=step_query,
             ),
             patch.object(
-                services.PublicationIntent.objects,
+                services.PublicationDispatch.objects,
                 "select_for_update",
-                return_value=intent_query,
+                return_value=dispatch_query,
             ),
             patch.object(
                 services.PublicationAttempt.objects,

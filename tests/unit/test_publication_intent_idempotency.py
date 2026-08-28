@@ -4,12 +4,11 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
 from django.db import IntegrityError, OperationalError
+from django.test import SimpleTestCase
 
 from apps.publishing import services
 from wisdome_writer.domain.errors import Conflict, InvalidInput
-
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -503,9 +502,21 @@ class PublicationIntentCreateTests(SimpleTestCase):
             patch.object(services, "_find_publication_intent_replay", return_value=None),
             patch.object(services, "_current_revision", return_value=(article, revision)),
             patch.object(services, "_revision_publication_material", return_value=material),
-            patch.object(services.PublicationIntent.objects, "select_for_update", return_value=latest_query),
-            patch.object(services.PublicationTarget.objects, "select_for_update", return_value=target_query),
-            patch.object(services.PublicationIntent.objects, "create", return_value=intent) as create_intent,
+            patch.object(
+                services.PublicationIntent.objects,
+                "select_for_update",
+                return_value=latest_query,
+            ),
+            patch.object(
+                services.PublicationTarget.objects,
+                "select_for_update",
+                return_value=target_query,
+            ),
+            patch.object(
+                services.PublicationIntent.objects,
+                "create",
+                return_value=intent,
+            ) as create_intent,
             patch.object(services, "_create_preview_render"),
             patch.object(services, "_record_publishing_audit"),
             patch.object(services, "_audit_state", return_value={}),
@@ -1008,6 +1019,7 @@ class PublicationDispatchCreateTests(SimpleTestCase):
             revision_no=1,
             state="approved",
             intent_hash=SHA_A,
+            correction_case_id=None,
         )
         target = SimpleNamespace(
             id=TARGET_A,
@@ -1060,15 +1072,27 @@ class PublicationDispatchCreateTests(SimpleTestCase):
             patch.object(services, "_lock_article_external_write_fence"),
             patch.object(services, "_lock_target_intent_fences"),
             patch.object(services, "_find_publication_dispatch_replay", return_value=None),
-            patch.object(services.PublicationIntent.objects, "select_related", return_value=candidate_query),
-            patch.object(services.PublicationIntent.objects, "select_for_update", return_value=locked_query),
+            patch.object(
+                services.PublicationIntent.objects,
+                "select_related",
+                return_value=candidate_query,
+            ),
+            patch.object(
+                services.PublicationIntent.objects,
+                "select_for_update",
+                return_value=locked_query,
+            ),
             patch.object(services.PublicationIntent.objects, "filter", return_value=latest_query),
             patch.object(
                 services,
                 "resolve_current_publication_intent",
                 return_value=intent,
             ),
-            patch.object(services.PublicationTarget.objects, "select_for_update", return_value=target_query),
+            patch.object(
+                services.PublicationTarget.objects,
+                "select_for_update",
+                return_value=target_query,
+            ),
             patch.object(services.PublicationAttempt.objects, "filter", return_value=attempt_query),
             patch.object(
                 services.PublicationAttempt.objects,

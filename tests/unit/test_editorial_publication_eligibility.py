@@ -12,14 +12,14 @@ import django
 
 django.setup()
 
-from apps.publishing import api, automation, corrections, services, tasks
-from apps.publishing.models import Approval, PublicationAction
-from wisdome_writer.domain.errors import Conflict, InvalidInput
-from wisdome_writer.infrastructure.models import (
+from apps.publishing import api, automation, corrections, services, tasks  # noqa: E402
+from apps.publishing.models import Approval, PublicationAction  # noqa: E402
+from wisdome_writer.domain.errors import Conflict, InvalidInput  # noqa: E402
+from wisdome_writer.infrastructure.event_routes import route_for  # noqa: E402
+from wisdome_writer.infrastructure.models import (  # noqa: E402
     OutboxConsumerReceipt,
     OutboxMessage,
 )
-from wisdome_writer.infrastructure.event_routes import route_for
 
 
 def _revision(**overrides):
@@ -196,35 +196,28 @@ class PublicationEligibilityPolicyTests(TestCase):
             )
         )
 
-    def test_approval_subject_hash_binds_decision_and_head_version(self):
-        intent = SimpleNamespace(
-            id="intent-1",
-            article_revision_id="revision-1",
-            quality_report_hash="quality-1",
-        )
-        command = {
-            "targetSnapshotId": "snapshot-1",
-            "targetConfigHash": "config-1",
-        }
-        approved = services._approval_subject_hash(
-            intent=intent,
-            target_id="target-1",
-            action=PublicationAction.CREATE,
-            command=command,
-            subject={"kind": "content_preview"},
+    def test_approval_decision_hash_binds_decision_and_head_version(self):
+        approved = services._approval_decision_hash(
+            subject_hash="subject-1",
             decision=Approval.Decision.APPROVED,
             head_version=1,
             supersedes_approval_id=None,
+            request_hash="request-1",
+            actor_type="admin",
+            actor_id="actor-1",
+            event_key="event-1",
+            decision_reason="approved",
         )
-        revoked = services._approval_subject_hash(
-            intent=intent,
-            target_id="target-1",
-            action=PublicationAction.CREATE,
-            command=command,
-            subject={"kind": "content_preview"},
+        revoked = services._approval_decision_hash(
+            subject_hash="subject-1",
             decision=Approval.Decision.REVOKED,
             head_version=2,
             supersedes_approval_id="approval-1",
+            request_hash="request-1",
+            actor_type="admin",
+            actor_id="actor-1",
+            event_key="event-1",
+            decision_reason="approved",
         )
 
         self.assertNotEqual(approved, revoked)

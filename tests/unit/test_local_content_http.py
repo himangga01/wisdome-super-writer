@@ -83,6 +83,35 @@ def test_fetcher_returns_decoded_html_metadata_through_injected_transport(
     assert result.fetched_at <= datetime.now(UTC)
 
 
+def test_fetcher_requests_identity_encoding_for_broken_official_compression(
+    public_dns: None,
+) -> None:
+    observed: list[str | None] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        encoding = request.headers.get("accept-encoding")
+        observed.append(encoding)
+        if encoding != "identity":
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+                content=b"not-a-gzip-stream",
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/html"},
+            content=b"<html>official</html>",
+        )
+
+    fetcher = OfficialHtmlFetcher(
+        allowed_hosts={"example.go.kr"},
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert fetcher.get("https://example.go.kr/notices").body == "<html>official</html>"
+    assert observed == ["identity"]
+
+
 def test_fetcher_sends_get_params_and_post_form_without_exposing_values(
     public_dns: None,
 ) -> None:

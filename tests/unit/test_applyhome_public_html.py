@@ -13,6 +13,7 @@ from apps.local_content.sources.applyhome import APT_LIST, REMAINING_LIST, Apply
 
 SEOUL = ZoneInfo("Asia/Seoul")
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "applyhome"
+LIVE_REGRESSIONS = Path(__file__).parents[1] / "fixtures" / "live-regressions"
 APT_DETAIL_URL = (
     "https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetailView.do?"
     "houseManageNo=2026000001&pblancNo=2026000001&houseSecd=01"
@@ -64,6 +65,72 @@ def fixture_fetcher() -> FixtureFetcher:
             REMAINING_DETAIL_URL: '<main data-notice-detail="remaining"></main>',
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("category", "fixture_name", "expected_id", "expected_path"),
+    [
+        (
+            "apt",
+            "applyhome-apt-list-2026-08-28.html",
+            "applyhome:apt:2026000401:2026000401",
+            "/ai/aia/selectAPTLttotPblancDetail.do",
+        ),
+        (
+            "remaining",
+            "applyhome-remaining-list-2026-08-28.html",
+            "applyhome:remaining:2026940401:2026940401",
+            "/ai/aia/selectAPTRemndrLttotPblancDetailView.do",
+        ),
+    ],
+)
+def test_applyhome_parses_sanitized_live_table_shape(
+    category: str,
+    fixture_name: str,
+    expected_id: str,
+    expected_path: str,
+) -> None:
+    body = (LIVE_REGRESSIONS / fixture_name).read_text(encoding="utf-8")
+
+    page = ApplyHomePublicCollector(FixtureFetcher({}))._parse_list(body, category)
+
+    assert (page.current_page, page.last_page, page.total_count) == (1, 1, 1)
+    assert len(page.records) == 1
+    assert page.records[0].external_id == expected_id
+    assert page.records[0].canonical_url.startswith(
+        f"https://www.applyhome.co.kr{expected_path}?"
+    )
+    assert page.records[0].published_at.isoformat() == "2026-08-28T00:00:00+09:00"
+
+
+def test_applyhome_parses_sanitized_live_detail_shape() -> None:
+    body = (LIVE_REGRESSIONS / "applyhome-apt-detail-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+
+    application_start, application_end, supply_count, warnings = (
+        ApplyHomePublicCollector._parse_detail(body)
+    )
+
+    assert application_start.isoformat() == "2026-09-07"
+    assert application_end.isoformat() == "2026-09-08"
+    assert supply_count == 22
+    assert warnings == ("price summary not found", "eligibility summary not found")
+
+
+def test_applyhome_parses_sanitized_remaining_detail_schedule() -> None:
+    body = (
+        LIVE_REGRESSIONS / "applyhome-remaining-detail-2026-08-28.html"
+    ).read_text(encoding="utf-8")
+
+    application_start, application_end, supply_count, warnings = (
+        ApplyHomePublicCollector._parse_detail(body)
+    )
+
+    assert application_start.isoformat() == "2026-09-02"
+    assert application_end.isoformat() == "2026-09-08"
+    assert supply_count == 4
+    assert warnings == ("price summary not found", "eligibility summary not found")
 
 
 def test_applyhome_collector_keeps_only_publication_dates_in_window(

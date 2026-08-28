@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -13,13 +14,13 @@ import django
 
 django.setup()
 
-from apps.publishing import automation
-from wisdome_writer.domain.errors import Conflict
+from apps.publishing import automation  # noqa: E402
+from wisdome_writer.domain.errors import Conflict  # noqa: E402
 
 
 class FrozenScheduleDispatchTests(TestCase):
     def _frozen_execution(self):
-        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 11, tzinfo=UTC)
         execution = {
             "schemaVersion": "schedule-execution-material-v1",
             "scheduleDispatchId": "dispatch-1",
@@ -347,6 +348,11 @@ class FrozenScheduleDispatchTests(TestCase):
                 return_value=(SimpleNamespace(attempts=tuple(attempts)), False),
             ) as dispatch,
             patch.object(automation, "require_audit_replay"),
+            patch.object(
+                automation.transaction,
+                "atomic",
+                return_value=nullcontext(),
+            ),
         ):
             observed = automation.finalize_scheduled_publication_delivery_failure(
                 "run-1",

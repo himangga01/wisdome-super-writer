@@ -19,7 +19,6 @@ from apps.local_content.contracts import HousingNotice
 from apps.local_content.images import build_image_set
 from apps.local_content.rendering import render_detailed_article
 
-
 SEOUL = ZoneInfo("Asia/Seoul")
 ASSET_URL = re.compile(
     rb'/local-articles/assets/2026-08-28/sample/[0-9a-f]{64}/assets/hero\.png'
@@ -106,6 +105,11 @@ def test_local_preview_lists_generations_and_renders_only_final_article(
     assert b'href="/local-articles/2026-08-28/sample/"' in run.content
     assert b'href="/local-articles/2026-08-28/blocked-draft/"' not in run.content
     assert article.status_code == 200
+    assert all(
+        b'rel="icon" href="/static/local_articles/generic-housing-hero.png"'
+        in response.content
+        for response in (listing, run, article)
+    )
     assert "한눈에 보기" in article.content.decode("utf-8")
     assert b'href="https://www.applyhome.co.kr/notice/1"' in article.content
     assert b'href="https://example.com/should-not-link"' not in article.content

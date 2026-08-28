@@ -17,10 +17,10 @@ from django.core.management import call_command
 
 django.setup()
 
-from adapters.extractors.base import ExtractorError
-from adapters.extractors.paddleocr import PaddleOCRExtractor
-from apps.evidence.services import canonical_hash
-from apps.evidence.profiles import load_profile_documents
+from adapters.extractors.base import ExtractorError  # noqa: E402
+from adapters.extractors.paddleocr import PaddleOCRExtractor  # noqa: E402
+from apps.evidence.profiles import load_profile_documents  # noqa: E402
+from apps.evidence.services import canonical_hash  # noqa: E402
 
 
 class PaddleOCRModelBootstrapTests(unittest.TestCase):
@@ -174,7 +174,7 @@ class PaddleOCRModelBootstrapTests(unittest.TestCase):
                     result = output.getvalue()
                 except Exception as exc:  # The pre-T014 command attempts a database query.
                     result = str(exc)
-        self.assertIn("verified 2 PaddleOCR profiles", result)
+        self.assertIn("verified 4 PaddleOCR profiles", result)
 
     def test_profile_loading_rejects_zero_hash_model_manifest(self) -> None:
         """A placeholder digest would otherwise permit an unverified OCR deployment."""
@@ -272,12 +272,18 @@ class PaddleOCRModelBootstrapTests(unittest.TestCase):
                             "files": [
                                 {
                                     "path": "a.bin",
-                                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                            "sha256": (
+                                "ba7816bf8f01cfea414140de5dae2223"
+                                "b00361a396177a9cb410ff61f20015ad"
+                            ),
                                     "byte_size": 3,
                                 },
                                 {
                                     "path": "z.bin",
-                                    "sha256": "594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06",
+                            "sha256": (
+                                "594e519ae499312b29433b7dd8a97ff0"
+                                "68defcba9755b6d5d00e84c524d67b06"
+                            ),
                                     "byte_size": 1,
                                 },
                             ],

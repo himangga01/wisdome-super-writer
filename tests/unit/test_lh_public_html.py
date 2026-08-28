@@ -14,6 +14,7 @@ from apps.local_content.sources.lh import LH_LIST, LhPublicCollector
 
 SEOUL = ZoneInfo("Asia/Seoul")
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "lh"
+LIVE_REGRESSIONS = Path(__file__).parents[1] / "fixtures" / "live-regressions"
 DETAIL_URL = (
     "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do?"
     "aisTpCd=05&ccrCnntSysDsCd=02&mi=1026&panId=0000061158&uppAisTpCd=05"
@@ -82,6 +83,90 @@ def fetcher() -> FixtureFetcher:
             SECOND_DETAIL_URL: '<main data-lh-notice-detail="true"></main>',
         },
     )
+
+
+def test_lh_parses_sanitized_live_table_shape() -> None:
+    body = (LIVE_REGRESSIONS / "lh-list-2026-08-28.html").read_text(encoding="utf-8")
+
+    page = LhPublicCollector(FixtureFetcher({}, {}))._parse_list(body)
+
+    assert (page.current_page, page.last_page, page.total_count) == (1, 1, 1)
+    assert len(page.records) == 1
+    notice = page.records[0]
+    assert notice.external_id == "lh:03:2015122300099999:06:08"
+    assert notice.title == "검증용 공공임대"
+    assert notice.category == "공공임대"
+    assert notice.region == "전북특별자치도"
+    assert notice.published_at.isoformat() == "2026-08-28T00:00:00+09:00"
+    assert notice.deadline.isoformat() == "2026-09-15"
+
+
+def test_lh_parses_sanitized_live_detail_without_attachment_bytes() -> None:
+    body = (LIVE_REGRESSIONS / "lh-detail-2026-08-28.html").read_text(encoding="utf-8")
+
+    (
+        application_start,
+        application_end,
+        supply_count,
+        price_summary,
+        eligibility,
+        facts,
+        warnings,
+    ) = LhPublicCollector._parse_detail(body)
+
+    assert application_start is None
+    assert application_end is None
+    assert supply_count == 80
+    assert price_summary is None
+    assert eligibility == ()
+    assert facts == ()
+    assert warnings == (
+        "application schedule not found",
+        "price summary not found",
+        "eligibility summary not found",
+    )
+
+
+def test_lh_parses_sanitized_short_supply_header_variant() -> None:
+    body = (LIVE_REGRESSIONS / "lh-detail-2026-08-28.html").read_text(
+        encoding="utf-8"
+    ).replace("금회공급 세대수 (예비자 포함)", "금회공급 세대수")
+
+    result = LhPublicCollector._parse_detail(body)
+
+    assert result[2] == 80
+
+
+def test_lh_accepts_sparse_official_detail_with_explicit_missing_field_warnings() -> None:
+    body = (LIVE_REGRESSIONS / "lh-detail-sparse-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+
+    result = LhPublicCollector._parse_detail(body)
+
+    assert result[:6] == (None, None, None, None, (), ())
+    assert result[6] == (
+        "application schedule not found",
+        "supply count not found",
+        "price summary not found",
+        "eligibility summary not found",
+    )
+
+
+def test_lh_sums_multiple_verified_supply_tables() -> None:
+    body = (LIVE_REGRESSIONS / "lh-detail-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+    second_table = """
+    <table>
+      <thead><tr><th>주택형</th><th>금회공급 세대수</th></tr></thead>
+      <tbody><tr><th>000018</th><td>20</td></tr></tbody>
+    </table>
+    """
+
+    result = LhPublicCollector._parse_detail(body + second_table)
+
+    assert result[2] == 100
 
 
 def _page_with_fifty_records(page: str) -> str:

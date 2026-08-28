@@ -127,6 +127,15 @@ def test_detail_output_separates_yaml_prose_facts_sources_and_protected_anchors(
     assert "![" in rendered.factual_markdown
 
 
+def test_detail_article_embeds_all_three_rights_safe_assets() -> None:
+    markdown = render_detailed_article(_notice()).factual_markdown
+
+    assert markdown.count("![") == 3
+    assert "(assets/hero.png " in markdown
+    assert "(assets/summary-card.webp " in markdown
+    assert "(assets/timeline.webp " in markdown
+
+
 def test_detail_render_is_deterministic_and_does_not_mutate_notice() -> None:
     notice = _notice()
 

@@ -4,7 +4,7 @@ import hashlib
 import json
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -22,8 +22,8 @@ from adapters.extractors.base import (
     ExtractorError,
     GenericExtractionOutput,
     canonical_bytes,
-    sha256_file,
     sha256_bytes,
+    sha256_file,
     sniff_mime,
 )
 from adapters.extractors.html import HtmlExtractor
@@ -37,8 +37,8 @@ from adapters.extractors.structured import StructuredDataExtractor
 from adapters.sources import (
     source_attachment_content_types,
 )
-from adapters.sources.http import download_source_attachment
 from adapters.sources.errors import SourceAccessError
+from adapters.sources.http import download_source_attachment
 from adapters.storage import ObjectInfo, S3ObjectStorage
 from adapters.storage.s3 import content_addressed_key
 from apps.collection.models import (
@@ -56,12 +56,11 @@ from apps.collection.services import (
 )
 from wisdome_writer.infrastructure.http_safety import redact_url
 from wisdome_writer.infrastructure.outbox import (
-    CURRENT_EVENT_CONSUMER_LEASE_TOKEN,
     CURRENT_EVENT_CONSUMER_LEASE_GENERATION,
+    CURRENT_EVENT_CONSUMER_LEASE_TOKEN,
     CURRENT_EVENT_CONSUMER_NAME,
     CURRENT_EVENT_ID,
     PermanentEventError,
-    current_event_consumer_attempt,
     enqueue_event,
 )
 
@@ -88,33 +87,32 @@ from .services import (
     EvidenceConflict,
     EvidenceExtractionStopped,
     aggregate_document_extraction,
-    bind_extraction_object_write,
     begin_document_extraction,
     begin_evidence_fanout,
     begin_extraction_run,
     begin_generic_extraction,
+    bind_extraction_object_write,
     calculate_publishable,
     calculate_review_subject_hash,
     canonical_hash,
+    document_evidence_manifest_entry,
+    document_extraction_completion_fence,
     evidence_content_hash,
     evidence_fanout_completion_fence,
-    document_extraction_completion_fence,
-    document_evidence_manifest_entry,
-    extraction_run_completion_fence,
     extraction_fingerprint,
+    extraction_run_completion_fence,
+    generic_evidence_manifest_hash,
+    generic_extraction_completion_fence,
     generic_extraction_fingerprint,
     group_routes,
-    generic_evidence_manifest_hash,
-    validate_generic_evidence_set,
-    generic_extraction_completion_fence,
+    mark_extraction_object_uploaded,
     normalize_low_confidence_reasons,
     orphan_unbound_extraction_object_writes,
-    profile_material,
     queue_document_extraction_retry,
     queue_generic_extraction_retry,
-    mark_extraction_object_uploaded,
     reserve_extraction_object_write,
     route_pdf_pages,
+    validate_generic_evidence_set,
 )
 
 _GENERIC_BINARY_MIME_TYPES = frozenset(
@@ -340,6 +338,7 @@ def _get_or_create_document_extraction(
     input_page_count: int,
     expected_page_indices: list[int],
     input_frame_count: int | None = None,
+    page_identity_authoritative: bool = False,
 ) -> DocumentExtraction:
     fingerprint = _document_input_fingerprint(
         run_source_item_id=run_source_item.id,
@@ -376,11 +375,17 @@ def _get_or_create_document_extraction(
             input_checksum=input_checksum,
             input_page_count=input_page_count,
             expected_page_indices=expected_page_indices,
+            page_identity_authoritative=page_identity_authoritative,
         )
     return document
 
 
-def _validate_reused_document_identity(document: Any, **expected: Any) -> None:
+def _validate_reused_document_identity(
+    document: Any,
+    *,
+    page_identity_authoritative: bool | None = None,
+    **expected: Any,
+) -> None:
     """Fail closed when a fingerprint collision points at different persisted material."""
     immutable_fields = (
         "run_source_item_id",
@@ -392,6 +397,17 @@ def _validate_reused_document_identity(document: Any, **expected: Any) -> None:
         "input_mime_type",
         "input_checksum",
     )
+    if page_identity_authoritative is None:
+        page_identity_authoritative = (
+            expected["input_page_count"] != 1
+            or expected["expected_page_indices"] != [0]
+        )
+    if page_identity_authoritative:
+        immutable_fields += (
+            "input_frame_count",
+            "input_page_count",
+            "expected_page_indices",
+        )
     for field in immutable_fields:
         value = expected[field]
         if getattr(document, field) != value:
@@ -448,7 +464,9 @@ def _verified_legacy_hwp_record_material(
     try:
         report_bytes = canonical_bytes(dict(report))
     except (TypeError, ValueError) as exc:
-        raise ExtractorError("legacy_hwp_report_invalid", "Conversion report is not canonical") from exc
+        raise ExtractorError(
+            "legacy_hwp_report_invalid", "Conversion report is not canonical"
+        ) from exc
 
     page_count = report.get("page_count")
     input_size = report.get("input_byte_size")
@@ -677,6 +695,7 @@ def _converge_legacy_hwp_document_locked(
         input_checksum=evidence.checksum,
         input_page_count=page_count,
         expected_page_indices=list(range(page_count)),
+        page_identity_authoritative=True,
     )
     _enqueue_document_extraction(document)
     return attempt
@@ -906,8 +925,14 @@ def _verify_profile(profile: ExtractionProfileSnapshot) -> None:
         "model_manifest_hash": profile.model_manifest_hash,
     }
     if canonical_hash(value) != profile.profile_material_hash:
-        raise ExtractorError("profile_material_mismatch", "Extraction profile material hash does not match")
-    if profile.model_manifest is not None and canonical_hash(profile.model_manifest) != profile.model_manifest_hash:
+        raise ExtractorError(
+            "profile_material_mismatch",
+            "Extraction profile material hash does not match",
+        )
+    if (
+        profile.model_manifest is not None
+        and canonical_hash(profile.model_manifest) != profile.model_manifest_hash
+    ):
         raise ExtractorError("model_manifest_mismatch", "Model manifest hash does not match")
     try:
         from .profiles import release_profile_snapshot_values
@@ -969,7 +994,11 @@ def _create_raw_evidence(
     fanout_fence: Mapping[str, Any],
 ) -> EvidenceAsset:
     item = run_source_item.source_item
-    content_hash = evidence_content_hash(text=item.body_text, structured_data=item.metadata, checksum=None)
+    content_hash = evidence_content_hash(
+        text=item.body_text,
+        structured_data=item.metadata,
+        checksum=None,
+    )
     fingerprint = _raw_input_fingerprint(
         run_source_item_id=run_source_item.id,
         source_item_id=item.id,
@@ -1155,7 +1184,11 @@ def _persist_attachment(
     fanout_fence: Mapping[str, Any],
 ):
     checksum = hashlib.sha256(data).hexdigest()
-    key = content_addressed_key(namespace="evidence/raw", checksum_sha256=checksum, filename=filename)
+    key = content_addressed_key(
+        namespace="evidence/raw",
+        checksum_sha256=checksum,
+        filename=filename,
+    )
     with transaction.atomic():
         step = _lock_expected_fanout(run_source_item.run_id, fanout_fence)
         reservation = reserve_extraction_object_write(
@@ -1226,7 +1259,11 @@ def _persist_attachment(
         scope=_attachment_rights_scope(mime_type),
         attachment=attachment,
     )
-    content_hash = evidence_content_hash(text=None, structured_data={"title": attachment.get("title")}, checksum=checksum)
+    content_hash = evidence_content_hash(
+        text=None,
+        structured_data={"title": attachment.get("title")},
+        checksum=checksum,
+    )
     fingerprint = _raw_input_fingerprint(
         run_source_item_id=run_source_item.id,
         source_item_id=run_source_item.source_item_id,
@@ -1808,7 +1845,11 @@ def _load_or_create_document_plan(
                 else {}
             )
             frozen_profile = frozen_routing.get(engine)
-            if not isinstance(frozen_profile, dict) and isinstance(safety, dict) and safety.get("engine") == engine:
+            if (
+                not isinstance(frozen_profile, dict)
+                and isinstance(safety, dict)
+                and safety.get("engine") == engine
+            ):
                 frozen_profile = safety
             if isinstance(frozen_profile, dict):
                 try:
@@ -2045,7 +2086,10 @@ def _run_document_extraction(
             )
             inspection = NativePdfExtractor(native_profile.config).inspect(path)
             if inspection.checksum != document.input_checksum:
-                raise ExtractorError("input_checksum_mismatch", "Local PDF checksum differs from provenance")
+                raise ExtractorError(
+                    "input_checksum_mismatch",
+                    "Local PDF checksum differs from provenance",
+                )
             document.input_page_count = inspection.page_count
             document.expected_page_indices = list(range(inspection.page_count))
             routes = route_pdf_pages(signal.as_dict() for signal in inspection.page_signals)
@@ -2298,7 +2342,10 @@ def _generic_extractor(profile: ExtractionProfileSnapshot):
     try:
         return GENERIC_ENGINE_FACTORIES[profile.engine](profile.config)
     except KeyError as exc:
-        raise ExtractorError("generic_engine_unsupported", f"No local adapter for {profile.engine}") from exc
+        raise ExtractorError(
+            "generic_engine_unsupported",
+            f"No local adapter for {profile.engine}",
+        ) from exc
 
 
 def _validate_generic_output(
@@ -2315,7 +2362,10 @@ def _validate_generic_output(
             "Generic extractor output differs from the frozen profile identity",
         )
     if not output.records:
-        raise ExtractorError("generic_result_empty", "Generic extractor returned no evidence records")
+        raise ExtractorError(
+            "generic_result_empty",
+            "Generic extractor returned no evidence records",
+        )
     configured_limit = int(getattr(profile, "config", {}).get("max_records", 50_000))
     if len(output.records) > min(max(configured_limit, 1), 50_000):
         raise ExtractorError(
@@ -2418,7 +2468,9 @@ def _run_generic_extraction(
     _verify_profile(profile)
     if attempt.input_asset is None or not attempt.input_asset.object_key:
         raise ExtractorError("generic_input_missing", "Generic extraction input object is missing")
-    suffix = Path(str((attempt.input_asset.structured_data or {}).get("source_url", "input.bin"))).suffix
+    suffix = Path(
+        str((attempt.input_asset.structured_data or {}).get("source_url", "input.bin"))
+    ).suffix
     with tempfile.TemporaryDirectory(prefix="wisdome-generic-") as temp_dir:
         path = Path(temp_dir) / f"input{suffix or '.bin'}"
         if profile.engine == ExtractionEngine.LEGACY_HWP:
@@ -2492,12 +2544,18 @@ def _run_generic_extraction(
             reason_reservation_id = None
         first = output.records[0] if output.records else None
         if first is None:
-            raise ExtractorError("generic_result_empty", "Generic extractor returned no evidence records")
+            raise ExtractorError(
+                "generic_result_empty",
+                "Generic extractor returned no evidence records",
+            )
         legacy_info = None
         if profile.engine == ExtractionEngine.LEGACY_HWP:
             converted_path = Path(first.object_path or "")
             if not converted_path.is_file():
-                raise ExtractorError("legacy_hwp_output_invalid", "Converted PDF disappeared before storage")
+                raise ExtractorError(
+                    "legacy_hwp_output_invalid",
+                    "Converted PDF disappeared before storage",
+                )
             converted_size = converted_path.stat().st_size
             converted_checksum = sha256_file(converted_path)
             first_record = first.as_dict()
@@ -2693,6 +2751,7 @@ def _run_generic_extraction(
                     input_checksum=converted_checksum,
                     input_page_count=converted_page_count,
                     expected_page_indices=list(range(converted_page_count)),
+                    page_identity_authoritative=True,
                 )
                 _enqueue_document_extraction(document)
     return attempt
