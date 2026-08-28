@@ -394,12 +394,67 @@ def test_setup_env_post_create_fault_fails_and_removes_only_owned_partial(
     assert failed.returncode != 0
     assert phase in (failed.stdout + failed.stderr).casefold()
     assert not env_path.exists()
+    abandoned = list(repository.glob(".env.local.setup-*.tmp"))
+    assert len(abandoned) == 1
+    assert abandoned[0].is_file()
     env_path.write_text("SENTINEL=preexisting\n", encoding="utf-8")
 
     collision = _powershell(*arguments)
 
     assert collision.returncode == 0, collision.stdout + collision.stderr
     assert env_path.read_text("utf-8") == "SENTINEL=preexisting\n"
+    assert list(repository.glob(".env.local.setup-*.tmp")) == abandoned
+
+
+@WINDOWS_ONLY
+def test_setup_env_atomic_move_collision_preserves_existing_and_owned_temp(
+    tmp_path: Path,
+) -> None:
+    repository, humanizer = _script_fixture(tmp_path)
+    env_path = repository / ".env.local"
+    env_path.unlink()
+
+    result = _powershell(
+        "-File",
+        str(REPOSITORY_ROOT / "scripts" / "setup-local.ps1"),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        "-InitializeEnvironmentOnly",
+        "-EnvironmentFaultPhase",
+        "move-collision",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert env_path.read_text("utf-8") == "SENTINEL=move-collision\n"
+    abandoned = list(repository.glob(".env.local.setup-*.tmp"))
+    assert len(abandoned) == 1
+    assert abandoned[0].read_text("utf-8").startswith("WISDOME_ENVIRONMENT=")
+
+
+@WINDOWS_ONLY
+def test_setup_env_temp_substitution_fails_identity_and_never_publishes(tmp_path: Path) -> None:
+    repository, humanizer = _script_fixture(tmp_path)
+    env_path = repository / ".env.local"
+    env_path.unlink()
+
+    result = _powershell(
+        "-File",
+        str(REPOSITORY_ROOT / "scripts" / "setup-local.ps1"),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        "-InitializeEnvironmentOnly",
+        "-EnvironmentFaultPhase",
+        "substitution",
+    )
+
+    assert result.returncode != 0
+    assert "identity" in (result.stdout + result.stderr).casefold()
+    assert not env_path.exists()
+    assert len(list(repository.glob(".env.local.setup-*"))) >= 2
 
 
 @WINDOWS_ONLY
@@ -596,7 +651,7 @@ def test_suspended_assignment_failure_terminates_by_handle_before_child_executes
 
     assert result.returncode != 0
     normalized_error = re.sub(r"\s+", " ", result.stdout + result.stderr).casefold()
-    assert "injected assignment" in normalized_error
+    assert "native_assign_failed" in normalized_error.replace(" ", "")
     assert "invalidoperationexception" in normalized_error
     assert not marker.exists()
 
@@ -835,6 +890,228 @@ def test_console_handler_closes_job_and_commits_inactive_ledger_without_pipeline
     assert payload["alive"] is False
     assert payload["state"]["active"] is False
     assert payload["state"]["status"] == "stopped"
+
+
+@WINDOWS_ONLY
+def test_stop_request_does_not_publish_cleanup_completion_or_state(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; Enable-LocalStopSignal; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "Initialize-LocalStopSignalContext -Context $c; "
+        "$before=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "[WisdomeConsoleStopSignal]::RequestStopForTest(); "
+        "$after=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$result=[pscustomobject]@{requested=[WisdomeConsoleStopSignal]::StopRequested;"
+        "completed=[WisdomeConsoleStopSignal]::CleanupIsCompleted;"
+        "handled=[WisdomeConsoleStopSignal]::WasHandled;before=$before;after=$after}; "
+        "[WisdomeConsoleStopSignal]::RunCleanupForTest() | Out-Null; "
+        "[void](Complete-LocalSupervisorAfterSignal -Context $c); Disable-LocalStopSignal; "
+        "$result | ConvertTo-Json -Depth 6 -Compress",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["requested"] is True
+    assert payload["completed"] is False
+    assert payload["handled"] is False
+    assert payload["before"] == payload["after"]
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "boundary",
+    ["owner-acquired", "job-closed", "processes-waited", "state-written"],
+)
+def test_cleanup_interleaving_has_one_owner_and_exact_close_counts(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; Enable-LocalStopSignal; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}' -DeferJob; "
+        "Initialize-LocalStopSignalContext -Context $c; "
+        "Initialize-LocalSupervisorJob -Context $c; "
+        "$p=Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        "-Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 60'); "
+        f"$probe=[WisdomeConsoleStopSignal]::ExerciseCleanupInterleavingForTest('{boundary}'); "
+        "$done=Complete-LocalSupervisorAfterSignal -Context $c; "
+        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; Disable-LocalStopSignal; "
+        "$nativeClosed=$c.NativeProcesses[0].Closed; "
+        "[pscustomobject]@{probe=$probe;done=$done;state=$state;nativeClosed=$nativeClosed} "
+        "| ConvertTo-Json -Depth 7 -Compress",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["done"] is True
+    assert payload["nativeClosed"] is True
+    assert payload["state"]["active"] is False
+    assert payload["probe"] == {
+        "CallerCount": 2,
+        "CleanupCompleted": True,
+        "JobCloseCount": 1,
+        "OwnerCount": 1,
+        "ProcessCloseCount": 1,
+        "Succeeded": True,
+    }
+
+
+@WINDOWS_ONLY
+def test_explicit_handle_list_does_not_inherit_unlisted_sentinel(tmp_path: Path) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    sentinel_path = tmp_path / "sentinel.bin"
+    marker = tmp_path / "inherited.txt"
+    child = tmp_path / "handle-child.ps1"
+    child.write_text(
+        "param([long]$Handle,[string]$Marker)\n"
+        "try {\n"
+        "  $safe=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]$Handle,$false)\n"
+        "  $stream=[IO.FileStream]::new($safe,[IO.FileAccess]::Read)\n"
+        "  [void]$stream.ReadByte(); $stream.Dispose()\n"
+        "  Set-Content -LiteralPath $Marker -Value inherited\n"
+        "} catch { }\n",
+        encoding="utf-8",
+    )
+    result = _powershell(
+        "-Command",
+        "$ErrorActionPreference='Stop'; "
+        f"Import-Module '{module}' -Force; "
+        f"$sentinel=[WisdomeProcessNative]::CreateInheritableSentinel('{sentinel_path}'); "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "try { $p=Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        f"-Arguments @('-NoProfile','-File','{child}',[string]$sentinel,'{marker}'); "
+        "while (-not $p.HasExited()) { Start-Sleep -Milliseconds 20 } } "
+        "finally { [void](Exit-LocalSupervisor -Context $c); "
+        "[WisdomeProcessNative]::CloseTestHandle($sentinel) }",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not marker.exists()
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "attribute-initialize",
+        "attribute-update",
+        "attribute-delete",
+        "create",
+        "assign",
+        "resume",
+        "terminate",
+        "wait",
+        "close",
+    ],
+)
+def test_suspended_launcher_native_faults_are_stable_and_never_run_child(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    marker = tmp_path / "must-not-run.txt"
+    child = tmp_path / "fault-child.ps1"
+    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8")
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        "$ErrorActionPreference='Stop'; "
+        f"Import-Module '{module}' -Force; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "try { Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        f"-Arguments @('-NoProfile','-File','{child}') -NativeFault '{fault}' }} "
+        "finally { [void](Exit-LocalSupervisor -Context $c) }",
+    )
+    normalized = re.sub(r"\s+", " ", result.stdout + result.stderr).casefold()
+
+    assert result.returncode != 0
+    assert f"native_{fault.replace('-', '_')}_failed" in normalized.replace(" ", "")
+    assert not marker.exists()
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("job-close", "JOB_CLOSE_FAILED"),
+        ("process-wait", "PROCESS_WAIT_FAILED"),
+        ("process-close", "PROCESS_CLOSE_FAILED"),
+        ("state-write", "STATE_WRITE_FAILED"),
+    ],
+)
+def test_signal_cleanup_faults_retain_active_error_with_stable_code(
+    tmp_path: Path,
+    fault: str,
+    code: str,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; Enable-LocalStopSignal; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}' -DeferJob; "
+        "Initialize-LocalStopSignalContext -Context $c; "
+        "Initialize-LocalSupervisorJob -Context $c; "
+        "$p=Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        "-Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 60'); "
+        f"[WisdomeConsoleStopSignal]::SetCleanupFaultForTest('{fault}'); "
+        "[WisdomeConsoleStopSignal]::RequestStopForTest(); "
+        "[WisdomeConsoleStopSignal]::RunCleanupForTest() | Out-Null; "
+        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$completed=[WisdomeConsoleStopSignal]::CleanupIsCompleted; "
+        "Disable-LocalStopSignal; "
+        "[pscustomobject]@{state=$state;completed=$completed} | ConvertTo-Json -Depth 6 -Compress",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["completed"] is True
+    assert payload["state"]["active"] is True
+    assert payload["state"]["status"] == "cleanup_error"
+    assert payload["state"]["errorCode"] == code
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("job-close", "JOB_CLOSE_FAILED"),
+        ("process-wait", "PROCESS_WAIT_FAILED"),
+        ("process-close", "PROCESS_CLOSE_FAILED"),
+        ("state-write", "STATE_WRITE_FAILED"),
+    ],
+)
+def test_main_cleanup_faults_return_false_and_retain_active_error(
+    tmp_path: Path,
+    fault: str,
+    code: str,
+) -> None:
+    repository, _humanizer = _script_fixture(tmp_path)
+    module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
+    result = _powershell(
+        "-Command",
+        f"Import-Module '{module}' -Force; "
+        f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
+        "$p=Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
+        "-Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 60'); "
+        f"$closed=Exit-LocalSupervisor -Context $c -CleanupFault '{fault}'; "
+        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "[pscustomobject]@{closed=$closed;state=$state} | ConvertTo-Json -Depth 6 -Compress",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["closed"] is False
+    assert payload["state"]["active"] is True
+    assert payload["state"]["status"] == "cleanup_error"
+    assert payload["state"]["errorCode"] == code
 
 
 class _HealthHandler(http.server.BaseHTTPRequestHandler):

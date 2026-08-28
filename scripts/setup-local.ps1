@@ -5,7 +5,7 @@ param(
     [string]$HumanizerRoot = '',
     [string]$ToolchainLockPath = '',
     [string]$UvArchivePath = '',
-    [ValidateSet('', 'write', 'flush', 'close')]
+    [ValidateSet('', 'write', 'flush', 'close', 'move-collision', 'substitution')]
     [string]$EnvironmentFaultPhase = '',
     [switch]$ValidateOnly,
     [switch]$ProvisionUvOnly,
@@ -453,19 +453,24 @@ function Initialize-LocalEnvironment {
 
     $source = Assert-SafeRepositoryFile -Root $Root -Path (Join-Path $Root '.env.local.example') -Label 'Local environment template'
     $target = Assert-RepositoryPathChain -Root $Root -Path (Join-Path $Root '.env.local') -Label 'Local environment file'
+    if ([System.IO.File]::Exists($target)) {
+        [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Existing local environment file')
+        return $target
+    }
     $payload = [System.IO.File]::ReadAllBytes($source)
+    $temporary = Join-Path $Root ('.env.local.setup-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    [void](Assert-RepositoryPathChain -Root $Root -Path $temporary -Label 'Owned environment temporary file')
     $stream = $null
     try {
         $stream = New-Object System.IO.FileStream(
-            $target,
+            $temporary,
             [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::None
         )
     }
     catch [System.IO.IOException] {
-        [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Existing local environment file')
-        return $target
+        throw 'Owned environment temporary FileMode.CreateNew failed.'
     }
 
     $ownedIdentity = Get-HeldStreamIdentity -Stream $stream
@@ -485,18 +490,32 @@ function Initialize-LocalEnvironment {
         }
     }
     catch {
-        $failure = $_
         if ($null -ne $stream) {
             try { $stream.Dispose() } catch { }
             $stream = $null
         }
-        $currentIdentity = Get-PathFileIdentity -RepositoryRoot $Root -Path $target -Label 'Owned partial environment file'
-        if ($currentIdentity -cne $ownedIdentity) {
-            throw 'Owned partial environment file identity changed; cleanup refused.'
-        }
-        [System.IO.File]::Delete($target)
-        throw $failure
+        throw
     }
+
+    if ($FaultPhase -eq 'substitution') {
+        [System.IO.File]::Move($temporary, $temporary + '.original')
+        [System.IO.File]::WriteAllText($temporary, 'attacker')
+    }
+    $currentIdentity = Get-PathFileIdentity -RepositoryRoot $Root -Path $temporary -Label 'Owned environment temporary file'
+    if ($currentIdentity -cne $ownedIdentity) {
+        throw 'Owned environment temporary file identity changed before publish.'
+    }
+    if ($FaultPhase -eq 'move-collision') {
+        [System.IO.File]::WriteAllText($target, "SENTINEL=move-collision`n")
+    }
+    try {
+        [System.IO.File]::Move($temporary, $target)
+    }
+    catch [System.IO.IOException] {
+        [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Existing local environment file')
+        return $target
+    }
+    [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Published local environment file')
     return $target
 }
 

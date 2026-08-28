@@ -225,7 +225,7 @@ try {
 }
 catch {
     $caughtFailure = $true
-    if ($null -ne $context -and -not [WisdomeConsoleStopSignal]::WasHandled) {
+    if ($null -ne $context -and -not [WisdomeConsoleStopSignal]::StopRequested) {
         Set-LocalSupervisorTerminalStatus -Context $context -Status 'error' -ErrorCode 'START_FAILED'
     }
     throw
@@ -233,15 +233,15 @@ catch {
 finally {
     try {
         if ($null -ne $context) {
-            $signalHandled = [WisdomeConsoleStopSignal]::WasHandled
-            $closed = if ($signalHandled) {
-                [void](Complete-LocalSupervisorAfterSignal -Context $context)
-                $true
+            $stopRequested = [WisdomeConsoleStopSignal]::StopRequested
+            $closed = if ($stopRequested) {
+                [void][WisdomeConsoleStopSignal]::RunCleanup()
+                Complete-LocalSupervisorAfterSignal -Context $context
             }
             else {
                 Exit-LocalSupervisor -Context $context
             }
-            if (-not $signalHandled -and -not $closed -and -not $caughtFailure) {
+            if (-not $closed -and -not $caughtFailure) {
                 throw 'The owned Windows job could not be closed cleanly.'
             }
         }
