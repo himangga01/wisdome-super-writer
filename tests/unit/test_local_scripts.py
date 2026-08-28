@@ -122,6 +122,76 @@ def _provision_uv(
     )
 
 
+def _initialize_environment(
+    repository: Path,
+    humanizer: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return _powershell(
+        "-File",
+        str(REPOSITORY_ROOT / "scripts" / "setup-local.ps1"),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        "-InitializeEnvironmentOnly",
+        env=env,
+    )
+
+
+def _full_setup_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    repository, humanizer = _script_fixture(tmp_path)
+    shutil.copy2(sys.executable, repository / ".venv" / "Scripts" / "python.exe")
+    marker = tmp_path / "manage-boundary.log"
+    (repository / "src" / "manage.py").write_text(
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "roots = ('LOCAL_STATE_ROOT', 'LOCAL_ARTICLE_ROOT', 'LOCAL_OBJECT_ROOT')\n"
+        "missing = [name for name in roots if not Path(os.environ[name]).is_dir()]\n"
+        "if missing:\n"
+        "    raise SystemExit('missing local roots: ' + ', '.join(missing))\n"
+        "with Path(os.environ['SETUP_ROOT_PROBE']).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(sys.argv[1] + '\\n')\n",
+        encoding="utf-8",
+    )
+    script_root = tmp_path / "controlled-setup"
+    script_root.mkdir()
+    for name in ("local-toolchain.psm1", "toolchain-lock.json"):
+        shutil.copy2(REPOSITORY_ROOT / "scripts" / name, script_root / name)
+    source = (REPOSITORY_ROOT / "scripts" / "setup-local.ps1").read_text("utf-8")
+    toolchain_start = source.index("$uv = Install-PinnedUv -Root $repository")
+    venv_line = (
+        "$venvPython = Assert-SafeRepositoryFile -Root $repository -Path "
+        "(Join-Path $repository '.venv\\Scripts\\python.exe') "
+        "-Label 'Project Python environment'"
+    )
+    toolchain_end = source.index(venv_line) + len(venv_line)
+    (script_root / "setup-local.ps1").write_text(
+        source[:toolchain_start] + venv_line + source[toolchain_end:], encoding="utf-8"
+    )
+    return repository, humanizer, marker, script_root / "setup-local.ps1"
+
+
+def _full_setup(
+    repository: Path,
+    humanizer: Path,
+    script: Path,
+    *,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return _powershell(
+        "-File",
+        str(script),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        env=env,
+    )
+
+
 @WINDOWS_ONLY
 def test_powershell_scripts_parse_and_contain_no_container_cli_invocation() -> None:
     files = (
@@ -390,6 +460,185 @@ def test_setup_initialization_creates_default_local_roots_required_by_sqlite_mig
     assert (repository / ".local" / "state").is_dir()
     assert (repository / "output" / "housing").is_dir()
     assert (repository / ".local" / "objects").is_dir()
+
+
+@WINDOWS_ONLY
+def test_setup_initialization_resolves_repository_relative_local_root_overrides(
+    tmp_path: Path,
+) -> None:
+    """Dropping RepositoryRoot resolution would create roots relative to the caller instead."""
+    repository, humanizer = _script_fixture(tmp_path)
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        "LOCAL_STATE_ROOT=runtime/state\n"
+        "LOCAL_ARTICLE_ROOT=generated/articles\n"
+        "LOCAL_OBJECT_ROOT=runtime/objects\n",
+        encoding="utf-8",
+    )
+
+    result = _initialize_environment(repository, humanizer)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repository / "runtime" / "state").is_dir()
+    assert (repository / "generated" / "articles").is_dir()
+    assert (repository / "runtime" / "objects").is_dir()
+
+
+@WINDOWS_ONLY
+def test_setup_initialization_honors_contained_absolute_local_root_overrides(
+    tmp_path: Path,
+) -> None:
+    """Rejecting all absolute values would break supported repository-contained overrides."""
+    repository, humanizer = _script_fixture(tmp_path)
+    roots = (
+        repository / "absolute" / "state",
+        repository / "absolute" / "articles",
+        repository / "absolute" / "objects",
+    )
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        f"LOCAL_STATE_ROOT={roots[0]}\n"
+        f"LOCAL_ARTICLE_ROOT={roots[1]}\n"
+        f"LOCAL_OBJECT_ROOT={roots[2]}\n",
+        encoding="utf-8",
+    )
+
+    result = _initialize_environment(repository, humanizer)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all(root.is_dir() for root in roots)
+
+
+@WINDOWS_ONLY
+def test_setup_initialization_rejects_local_root_escape_without_creating_outside_directory(
+    tmp_path: Path,
+) -> None:
+    """Removing path-chain validation would permit a local-root escape to create files outside."""
+    repository, humanizer = _script_fixture(tmp_path)
+    outside = tmp_path / "outside"
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        "LOCAL_STATE_ROOT=..\\outside\\state\n",
+        encoding="utf-8",
+    )
+
+    result = _initialize_environment(repository, humanizer)
+
+    assert result.returncode != 0
+    assert "escapes" in (result.stdout + result.stderr).casefold()
+    assert not outside.exists()
+
+
+@WINDOWS_ONLY
+def test_setup_initialization_rejects_reparse_local_root_without_target_write(
+    tmp_path: Path,
+) -> None:
+    """Skipping reparse checks would let root initialization write through a junction."""
+    repository, humanizer = _script_fixture(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(repository / ".local"), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if junction.returncode != 0:
+        pytest.skip("junction creation is unavailable")
+
+    result = _initialize_environment(repository, humanizer)
+
+    assert result.returncode != 0
+    assert "reparse" in (result.stdout + result.stderr).casefold()
+    assert not (outside / "state").exists()
+    assert not (outside / "objects").exists()
+
+
+@WINDOWS_ONLY
+def test_setup_initialization_keeps_explicit_process_local_root_over_env_file(
+    tmp_path: Path,
+) -> None:
+    """Unconditional environment import incorrectly replaces explicit process root overrides."""
+    repository, humanizer = _script_fixture(tmp_path)
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        "LOCAL_STATE_ROOT=from-env-file/state\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["LOCAL_STATE_ROOT"] = "from-process/state"
+
+    result = _initialize_environment(repository, humanizer, env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repository / "from-process" / "state").is_dir()
+    assert not (repository / "from-env-file" / "state").exists()
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("WISDOME_ENVIRONMENT", "production"), ("WISDOME_RUNTIME_MODE", "distributed")),
+)
+def test_full_setup_refuses_process_runtime_values_conflicting_with_env_file(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    """Unconditional import can silently switch an explicit unsafe runtime into local mode."""
+    repository, humanizer, marker, script = _full_setup_fixture(tmp_path)
+    env = dict(os.environ)
+    for key in ("LOCAL_STATE_ROOT", "LOCAL_ARTICLE_ROOT", "LOCAL_OBJECT_ROOT"):
+        env.pop(key, None)
+    env.update(
+        {
+            "SETUP_ROOT_PROBE": str(marker),
+            "WISDOME_ENVIRONMENT": "development",
+            "WISDOME_RUNTIME_MODE": "local",
+            name: value,
+        }
+    )
+
+    result = _full_setup(repository, humanizer, script, env=env)
+
+    assert result.returncode != 0
+    assert "requires development environment and local runtime mode" in (
+        result.stdout + result.stderr
+    ).casefold()
+    assert not marker.exists()
+
+
+@WINDOWS_ONLY
+def test_full_setup_exposes_created_local_roots_to_each_manage_command(tmp_path: Path) -> None:
+    """Moving root initialization after migrate would make the real Python boundary reject setup."""
+    repository, humanizer, marker, script = _full_setup_fixture(tmp_path)
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        "LOCAL_STATE_ROOT=runtime/state\n"
+        "LOCAL_ARTICLE_ROOT=generated/articles\n"
+        "LOCAL_OBJECT_ROOT=runtime/objects\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    for key in ("LOCAL_STATE_ROOT", "LOCAL_ARTICLE_ROOT", "LOCAL_OBJECT_ROOT"):
+        env.pop(key, None)
+    env.update(
+        {
+            "SETUP_ROOT_PROBE": str(marker),
+            "WISDOME_ENVIRONMENT": "development",
+            "WISDOME_RUNTIME_MODE": "local",
+        }
+    )
+
+    result = _full_setup(repository, humanizer, script, env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text("utf-8").splitlines() == [
+        "migrate",
+        "seed_source_registry",
+        "verify_source_registry_snapshots",
+        "check",
+    ]
 
 
 @WINDOWS_ONLY

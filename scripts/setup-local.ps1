@@ -587,7 +587,9 @@ function Import-LocalEnvironment {
         if ($value.Length -ge 2 -and $value[0] -eq $value[$value.Length - 1] -and $value[0] -in @("'", '"')) {
             $value = $value.Substring(1, $value.Length - 2)
         }
-        [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+        if ($null -eq [Environment]::GetEnvironmentVariable($key, 'Process')) {
+            [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+        }
     }
 }
 
