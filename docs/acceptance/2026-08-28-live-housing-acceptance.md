@@ -151,3 +151,67 @@ Remaining concerns are limited to the ledgered whole-repository Ruff debt, eight
 non-failing pytest warnings (six absent-generated-staticfiles notices and two
 Windows subprocess reader encoding warnings), and official facts available only in
 attachments. Attachment bytes remain deliberately unfetched and uncopied.
+
+## Review fix round 2
+
+The round-2 evidence-contract implementation is committed as `8cda141`.
+
+Deterministic evidence now uses a production-defined ordered command plan with exact
+argv, gate classification, parser, and allowed exits. The selected schema-v2 attempt
+is `round2-attempt1`, with plan SHA-256
+`a5e15afd772067fc0f5d0b21f7f4438e661a1e954c126a89b834d949762fc7b0`.
+Each command record contains aware start/end timestamps, duration, exit code, output
+and log byte counts/SHA-256, confined log path, and a closed parsed result.
+
+The finalizer independently rebuilt the plan and verified every command in order,
+re-read each confined log, recomputed its byte count and digest, reparsed results,
+and checked the exact pinned Ruff ruling. Counterexamples for a fake ruling, wrong
+argv, missing digest, launch exit 127, reordered command, naive timestamp, escaped
+log path, modified log, forged parsed count, and forged plan hash all fail.
+
+Retained attempt history is digest-bound and ordered:
+
+- `round1-attempt1`: schema 1, failed `full_pytest` because port 3210 was occupied;
+- `round1-attempt2`: schema 1, passed under the older evidence contract; and
+- `round2-attempt1`: schema 2, independently eligible and selected.
+
+The exact selection rule is `latest_complete_exact_plan_pass`; only
+`round2-attempt1` is eligible under the closed schema. Its authoritative results are:
+
+- setup-local: exit 0;
+- whole-repository Ruff: exit 1, 1,566 parsed findings, `passed=false`, exact pinned
+  `legacy_debt_not_gate` ruling;
+- Django and migrations: exit 0;
+- focused pytest: 533 passed, 2 skipped, 6 warnings;
+- full pytest: 1251 passed, 5 skipped, 8 warnings, 198 subtests;
+- changed/branch plus every `local_content` Ruff target: exit 0;
+- CI-material and diff checks: exit 0.
+
+Humanizer evidence no longer treats prose reuse as a uniqueness gate. The report
+transparently records 19 candidate output hashes with 14 unique values and
+`candidate_output_uniqueness_gate=false`. Binding identities remain strict: 19/19
+unique job hashes, 19/19 final bundle hashes, 19/19 final article hashes, and 19/19
+verification-record hashes. Every candidate was still reverified against protected
+input and factual/frontmatter/source/image identity.
+
+ApplyHome now evaluates the complete set of identity-bearing observed response and
+official attachment/detail URLs; it must equal the expected singleton pair. LH now
+requires each hidden identity field's complete value set to equal its expected
+singleton. Matching-plus-wrong mixed identities fail for both sources.
+
+Artifact audit also requires the exact literal start
+`2026-08-22T00:00:00+09:00`, literal `+09:00` end representation, same KST run date,
+and end not after audit execution. UTC-equivalent strings fail even when they denote
+the same instant. The existing live run re-audits with all artifact requirements and
+the four final derived acceptance requirements passing.
+
+Brave was not rerun because neither browser evidence nor preview behavior changed;
+the previously retained all-19-page schema-v2 Brave evidence remains a passing gate.
+No service was started for round 2, and ports 3210/8000 remain free.
+
+New deterministic evidence is retained under:
+
+```text
+output/housing/2026-08-28/acceptance/deterministic-round2-attempt1/
+output/housing/2026-08-28/acceptance/deterministic-round2-attempt1-evidence.json
+```
