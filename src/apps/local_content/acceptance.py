@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -52,6 +55,7 @@ _RAW_OBSERVATION_KEYS = frozenset(
     }
 )
 _MAX_JSON_BYTES = 16 * 1024 * 1024
+_EVIDENCE_REFERENCE_KEYS = frozenset({"path", "bytes", "sha256"})
 _PREVIEW_CSP = (
     "default-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; "
     "object-src 'none'; img-src 'self'; style-src 'self'"
@@ -194,24 +198,31 @@ def derive_task12_acceptance(
     if not isinstance(section, dict):
         section = {}
         report["task12_acceptance"] = section
-    artifact = section.get("artifact_audit")
-    browser = section.get("browser")
-    workflow_passed = (
-        report.get("live_success") is True
-        and report.get("complete") is True
-        and report.get("blocked") is False
-        and report.get("error_codes") == []
-    )
-    artifact_passed = (
-        isinstance(artifact, dict) and artifact.get("overall_passed") is True
-    )
-    browser_passed = isinstance(browser, dict) and browser.get("passed") is True
     if project_root is None:
+        workflow_passed = artifact_passed = browser_passed = False
+        workflow_evidence = artifact_evidence = browser_evidence = {
+            "failures": ["PROJECT_ROOT_REQUIRED"]
+        }
         deterministic_passed = False
         deterministic_evidence: dict[str, object] = {
             "failures": ["PROJECT_ROOT_REQUIRED"]
         }
     else:
+        workflow_passed, workflow_evidence = verify_workflow_evidence(
+            report,
+            section.get("workflow_evidence"),
+            project_root=project_root,
+        )
+        artifact_passed, artifact_evidence = verify_artifact_evidence(
+            section.get("artifact_evidence"),
+            project_root=project_root,
+        )
+        browser_passed, browser_evidence = verify_brave_evidence(
+            section.get("browser_evidence"),
+            project_root=project_root,
+            expected_run_name=str(report.get("run_path", "")),
+            expected_details=_expected_written_articles(report),
+        )
         selection = verify_attempt_selection(
             history=section.get("deterministic_attempt_history"),
             selection=section.get("deterministic_selection"),
@@ -222,9 +233,9 @@ def derive_task12_acceptance(
         deterministic_passed = selection.passed
         deterministic_evidence = selection.evidence
     requirements = [
-        _verdict("workflow_live_success", workflow_passed, {}),
-        _verdict("artifact_audit", artifact_passed, {}),
-        _verdict("django_brave_all_pages", browser_passed, {}),
+        _verdict("workflow_live_success", workflow_passed, workflow_evidence),
+        _verdict("artifact_audit", artifact_passed, artifact_evidence),
+        _verdict("django_brave_all_pages", browser_passed, browser_evidence),
         _verdict(
             "deterministic_commands_and_ruff_ruling",
             deterministic_passed,
@@ -236,6 +247,389 @@ def derive_task12_acceptance(
         requirement["passed"] is True for requirement in requirements
     )
     return section
+
+
+def build_evidence_reference(path: Path) -> dict[str, object]:
+    payload = Path(path).read_bytes()
+    return {
+        "path": str(Path(path).resolve()),
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def merge_evidence_reference(
+    report_path: Path,
+    *,
+    field: str,
+    evidence_path: Path,
+) -> None:
+    if field not in {"workflow_evidence", "artifact_evidence", "browser_evidence"}:
+        raise ValueError("unsupported acceptance evidence field")
+    path = Path(report_path)
+    report = _read_json_object(path)
+    section = report.setdefault("task12_acceptance", {})
+    if not isinstance(section, dict):
+        raise ValueError("task12 acceptance report section must be an object")
+    section[field] = build_evidence_reference(evidence_path)
+    payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True).encode(
+        "utf-8"
+    ) + b"\n"
+    temporary = path.with_name(f".{path.name}.{field}.tmp")
+    temporary.write_bytes(payload)
+    temporary.replace(path)
+
+
+def workflow_report_core(report: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in report.items() if key != "task12_acceptance"}
+
+
+def verify_workflow_evidence(
+    report: dict[str, object],
+    reference: object,
+    *,
+    project_root: Path,
+) -> tuple[bool, dict[str, object]]:
+    failures: list[str] = []
+    document = _referenced_json(reference, project_root, failures, label="WORKFLOW")
+    expected_keys = {
+        "schema_version",
+        "command",
+        "report_path",
+        "report_core_sha256",
+        "run_name",
+        "official_api_reconciliation",
+    }
+    if set(document) != expected_keys or document.get("schema_version") != 1:
+        failures.append("WORKFLOW_SCHEMA")
+    command = document.get("command")
+    if not isinstance(command, dict) or set(command) != {
+        "argv",
+        "cwd",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+        "exit_code",
+        "log_path",
+        "log_bytes",
+        "log_sha256",
+        "log_truncated",
+        "output_bytes",
+        "output_sha256",
+    }:
+        failures.append("WORKFLOW_COMMAND_SCHEMA")
+        command = {}
+    root = Path(project_root).resolve()
+    expected_tail = [
+        "src\\manage.py",
+        "collect_recent_housing",
+        "--days",
+        "7",
+        "--humanize",
+        "--write-articles",
+    ]
+    argv = command.get("argv")
+    if (
+        not isinstance(argv, list)
+        or len(argv) != len(expected_tail) + 1
+        or argv[1:] != expected_tail
+        or _normalized_absolute(Path(str(argv[0])))
+        != _normalized_absolute(root / ".venv" / "Scripts" / "python.exe")
+        or command.get("cwd") != str(root)
+        or command.get("exit_code") != 0
+        or command.get("log_truncated") is not False
+    ):
+        failures.append("WORKFLOW_COMMAND")
+    started = _aware_datetime(command.get("started_at"))
+    finished = _aware_datetime(command.get("finished_at"))
+    if (
+        started is None
+        or finished is None
+        or finished < started
+        or command.get("duration_ms")
+        != round((finished - started).total_seconds() * 1000)
+    ):
+        failures.append("WORKFLOW_TIMESTAMPS")
+    log_payload = _referenced_payload(
+        {
+            "path": command.get("log_path"),
+            "bytes": command.get("log_bytes"),
+            "sha256": command.get("log_sha256"),
+        },
+        root,
+        failures,
+        label="WORKFLOW_LOG",
+    )
+    if (
+        command.get("output_bytes") != len(log_payload)
+        or command.get("output_sha256") != hashlib.sha256(log_payload).hexdigest()
+    ):
+        failures.append("WORKFLOW_OUTPUT_DIGEST")
+    summary = _last_json_object(log_payload)
+    if summary is None:
+        failures.append("WORKFLOW_LOG_SUMMARY")
+        summary = {}
+    core = workflow_report_core(report)
+    core_hash = _canonical_sha256(core)
+    if document.get("report_core_sha256") != core_hash:
+        failures.append("WORKFLOW_REPORT_DIGEST")
+    run_name = document.get("run_name")
+    report_path = _confined_output_path(
+        document.get("report_path"),
+        root,
+        failures,
+        label="WORKFLOW_REPORT",
+    )
+    if (
+        not isinstance(run_name, str)
+        or report_path is None
+        or report_path.name != "acceptance-report.json"
+        or report_path.parent.name != run_name
+        or workflow_report_core(_read_json_object(report_path)) != core
+    ):
+        failures.append("WORKFLOW_REPORT_BINDING")
+    truth, counts = _workflow_core_truth(core, summary, run_name)
+    if not truth:
+        failures.append("WORKFLOW_FACTS")
+    if document.get("official_api_reconciliation") not in {
+        "active",
+        "inactive_no_key",
+    }:
+        failures.append("WORKFLOW_API_STATE")
+    if summary.get("official_api_reconciliation") != document.get(
+        "official_api_reconciliation"
+    ):
+        failures.append("WORKFLOW_API_STATE_MISMATCH")
+    unique_failures = list(dict.fromkeys(failures))
+    return not unique_failures, {
+        "failures": unique_failures,
+        "run_name": run_name,
+        "counts": counts,
+        "report_core_sha256": core_hash,
+        "official_api_reconciliation": document.get("official_api_reconciliation"),
+    }
+
+
+def verify_artifact_evidence(
+    reference: object,
+    *,
+    project_root: Path,
+) -> tuple[bool, dict[str, object]]:
+    failures: list[str] = []
+    document = _referenced_json(reference, project_root, failures, label="ARTIFACT")
+    if set(document) != {
+        "schema_version",
+        "run_root",
+        "window_start",
+        "executed_at",
+        "expectations",
+        "audit",
+    } or document.get("schema_version") != 2:
+        failures.append("ARTIFACT_SCHEMA")
+    root = Path(project_root).resolve()
+    run_root = _confined_output_path(
+        document.get("run_root"), root, failures, label="ARTIFACT_RUN"
+    )
+    expectations_value = document.get("expectations")
+    try:
+        if not isinstance(expectations_value, dict) or set(expectations_value) != {
+            "raw_observations",
+            "excluded_notices",
+            "indexed_notices",
+            "detailed_articles",
+            "source_keys",
+        }:
+            raise ValueError
+        expectations = AcceptanceExpectations(
+            raw_observations=_positive_int(expectations_value["raw_observations"]),
+            excluded_notices=_nonnegative_int(expectations_value["excluded_notices"]),
+            indexed_notices=_positive_int(expectations_value["indexed_notices"]),
+            detailed_articles=_positive_int(expectations_value["detailed_articles"]),
+            source_keys=tuple(expectations_value["source_keys"]),
+        )
+        window_start = datetime.fromisoformat(str(document.get("window_start")))
+        executed_at = datetime.fromisoformat(str(document.get("executed_at")))
+        if any(
+            value.tzinfo is None or value.utcoffset() is None
+            for value in (window_start, executed_at)
+        ):
+            raise ValueError
+    except (TypeError, ValueError):
+        failures.append("ARTIFACT_INPUTS")
+        expectations = AcceptanceExpectations(1, 0, 1, 1)
+        window_start = executed_at = datetime.now(SEOUL)
+    stored = document.get("audit")
+    if run_root is None:
+        fresh: dict[str, object] = {"overall_passed": False}
+    else:
+        try:
+            fresh = audit_live_run(
+                run_root,
+                window_start=window_start,
+                expectations=expectations,
+                executed_at=executed_at,
+            )
+        except (OSError, UnicodeError, ValueError):
+            failures.append("ARTIFACT_REAUDIT_FAILED")
+            fresh = {"overall_passed": False}
+    if stored != fresh:
+        failures.append("ARTIFACT_REAUDIT_MISMATCH")
+    if fresh.get("overall_passed") is not True:
+        failures.append("ARTIFACT_REQUIREMENTS")
+    unique_failures = list(dict.fromkeys(failures))
+    return not unique_failures, {
+        "failures": unique_failures,
+        "run_name": fresh.get("run_name"),
+        "counts": fresh.get("counts", {}),
+        "audit_sha256": _canonical_sha256(fresh),
+    }
+
+
+def verify_brave_evidence(
+    reference: object,
+    *,
+    project_root: Path,
+    expected_run_name: str,
+    expected_details: int,
+) -> tuple[bool, dict[str, object]]:
+    failures: list[str] = []
+    document = _referenced_json(reference, project_root, failures, label="BRAVE")
+    expected_keys = {
+        "schema_version",
+        "checked_at",
+        "brave_executable",
+        "brave_owned_pids",
+        "brave_surviving_owned_pids",
+        "django_owned_pids",
+        "requested_index",
+        "run_index",
+        "detail_pages",
+        "mobile",
+        "status_endpoint",
+        "asset_headers",
+        "traversal_statuses",
+        "diagnostics",
+        "screenshots",
+        "assertions",
+        "passed",
+    }
+    if set(document) != expected_keys or document.get("schema_version") != 3:
+        failures.append("BRAVE_SCHEMA")
+    checked_at = _aware_datetime(document.get("checked_at"))
+    if checked_at is None:
+        failures.append("BRAVE_TIMESTAMP")
+    expected_brave = (
+        Path(r"C:\Users\c\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe")
+        .resolve()
+    )
+    try:
+        brave_exact = Path(str(document.get("brave_executable"))).resolve() == expected_brave
+    except OSError:
+        brave_exact = False
+    requested_passed = _browser_index_passed(document.get("requested_index"))
+    run_record = document.get("run_index")
+    run_passed = _browser_index_passed(run_record) and _record_url_has_run(
+        run_record, expected_run_name
+    )
+    details = document.get("detail_pages")
+    detail_passed = (
+        isinstance(details, list)
+        and len(details) == expected_details
+        and expected_details > 0
+        and all(
+            _browser_detail_passed(row) and _record_url_has_run(row, expected_run_name)
+            for row in details
+        )
+    )
+    mobile = document.get("mobile")
+    try:
+        mobile_font = float(str(mobile.get("body_font_size", "0px")).removesuffix("px"))
+    except (AttributeError, ValueError):
+        mobile_font = 0
+    mobile_passed = (
+        _browser_detail_passed(mobile)
+        and _record_url_has_run(mobile, expected_run_name)
+        and mobile_font >= 16
+    )
+    diagnostics = document.get("diagnostics")
+    diagnostic_keys = {
+        "console_error_count",
+        "page_error_count",
+        "failed_request_count",
+        "bad_local_response_count",
+        "local_response_count",
+    }
+    diagnostics_closed = (
+        isinstance(diagnostics, dict)
+        and set(diagnostics) == diagnostic_keys
+        and all(type(diagnostics[key]) is int and diagnostics[key] >= 0 for key in diagnostics)
+    )
+    no_errors = diagnostics_closed and all(
+        diagnostics[key] == 0
+        for key in diagnostic_keys
+        if key != "local_response_count"
+    )
+    traversal = document.get("traversal_statuses")
+    traversal_passed = traversal == [404, 404]
+    status = document.get("status_endpoint")
+    status_passed = (
+        isinstance(status, dict)
+        and set(status)
+        == {"status", "headers_exact", "humanizer_ready", "security_headers"}
+        and status.get("status") == 200
+        and status.get("headers_exact") is True
+        and status.get("humanizer_ready") is True
+        and isinstance(status.get("security_headers"), dict)
+        and preview_headers_match(status["security_headers"], cache_control="no-store")
+    )
+    asset_headers = document.get("asset_headers")
+    asset_headers_passed = isinstance(asset_headers, dict) and preview_headers_match(
+        asset_headers,
+        cache_control="public, max-age=31536000, immutable",
+    )
+    screenshots_passed = _verify_screenshot_evidence(
+        document.get("screenshots"), Path(project_root), failures
+    )
+    owned = document.get("brave_owned_pids")
+    surviving = document.get("brave_surviving_owned_pids")
+    django_pids = document.get("django_owned_pids")
+    processes_closed = (
+        isinstance(owned, list)
+        and bool(owned)
+        and all(type(value) is int and value > 0 for value in owned)
+        and surviving == []
+        and isinstance(django_pids, list)
+        and bool(django_pids)
+        and all(type(value) is int and value > 0 for value in django_pids)
+    )
+    stored_assertions = document.get("assertions")
+    assertions = {
+        "brave_executable_exact": brave_exact,
+        "requested_index": requested_passed,
+        "run_index": run_passed,
+        "all_detail_pages": detail_passed,
+        "representative_mobile": mobile_passed,
+        "asset_headers_exact": asset_headers_passed,
+        "no_console_or_page_errors": no_errors,
+        "no_failed_requests": no_errors,
+        "no_bad_local_responses": no_errors,
+        "traversal_rejected": traversal_passed,
+        "status_ready_headers_exact": status_passed,
+        "owned_brave_processes_closed": processes_closed,
+        "screenshots_digest_bound": screenshots_passed,
+    }
+    if stored_assertions != assertions:
+        failures.append("BRAVE_ASSERTIONS")
+    if document.get("passed") is not all(assertions.values()):
+        failures.append("BRAVE_SUMMARY")
+    if not all(assertions.values()):
+        failures.append("BRAVE_REQUIREMENTS")
+    unique_failures = list(dict.fromkeys(failures))
+    return not unique_failures, {
+        "failures": unique_failures,
+        "detail_page_count": len(details) if isinstance(details, list) else 0,
+        "assertions": assertions,
+    }
 
 
 def audit_live_run(
@@ -803,6 +1197,383 @@ def _strict_json_loads(payload: bytes) -> object:
         object_pairs_hook=reject_duplicate,
         parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("JSON constant")),
     )
+
+
+def _referenced_json(
+    reference: object,
+    project_root: Path,
+    failures: list[str],
+    *,
+    label: str,
+) -> dict[str, object]:
+    payload = _referenced_payload(reference, project_root, failures, label=label)
+    try:
+        value = _strict_json_loads(payload)
+    except (UnicodeError, ValueError):
+        failures.append(f"{label}_JSON")
+        return {}
+    if not isinstance(value, dict):
+        failures.append(f"{label}_OBJECT")
+        return {}
+    return value
+
+
+def _referenced_payload(
+    reference: object,
+    project_root: Path,
+    failures: list[str],
+    *,
+    label: str,
+) -> bytes:
+    if not isinstance(reference, dict) or set(reference) != _EVIDENCE_REFERENCE_KEYS:
+        failures.append(f"{label}_REFERENCE_SCHEMA")
+        return b""
+    path = _confined_output_path(
+        reference.get("path"),
+        Path(project_root),
+        failures,
+        label=f"{label}_REFERENCE",
+    )
+    if path is None:
+        return b""
+    try:
+        metadata = os.lstat(path)
+        if not stat.S_ISREG(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise ValueError
+        payload = path.read_bytes()
+    except (OSError, ValueError):
+        failures.append(f"{label}_REFERENCE_READ")
+        return b""
+    if (
+        not payload
+        or len(payload) > _MAX_JSON_BYTES
+        or reference.get("bytes") != len(payload)
+        or reference.get("sha256") != hashlib.sha256(payload).hexdigest()
+    ):
+        failures.append(f"{label}_REFERENCE_DIGEST")
+    return payload
+
+
+def _confined_output_path(
+    value: object,
+    project_root: Path,
+    failures: list[str],
+    *,
+    label: str,
+) -> Path | None:
+    if not isinstance(value, str):
+        failures.append(f"{label}_PATH")
+        return None
+    try:
+        path = Path(value)
+        resolved = path.resolve(strict=True)
+        resolved.relative_to((Path(project_root).resolve() / "output" / "housing").resolve())
+        if _normalized_absolute(path) != _normalized_absolute(resolved):
+            raise ValueError
+        return resolved
+    except (OSError, ValueError):
+        failures.append(f"{label}_NOT_CONFINED")
+        return None
+
+
+def _workflow_core_truth(
+    core: dict[str, object],
+    summary: dict[str, object],
+    run_name: object,
+) -> tuple[bool, dict[str, int]]:
+    expected_keys = {
+        "schema_version",
+        "workflow_id",
+        "started_at",
+        "mode",
+        "complete",
+        "blocked",
+        "live_success",
+        "window",
+        "counts",
+        "run_path",
+        "report_path",
+        "error_codes",
+        "sources",
+        "phases",
+        "articles",
+    }
+    counts = core.get("counts")
+    sources = core.get("sources")
+    phases = core.get("phases")
+    articles = core.get("articles")
+    expected_phases = [
+        "collect",
+        "merge",
+        "select",
+        "render",
+        "images",
+        "humanize",
+        "verify",
+        "write",
+    ]
+    source_valid = (
+        isinstance(sources, list)
+        and [row.get("source_key") for row in sources if isinstance(row, dict)]
+        == ["applyhome", "lh"]
+        and all(
+            isinstance(row, dict)
+            and row.get("status") == "complete"
+            and row.get("error_codes") == []
+            and type(row.get("notice_count")) is int
+            and row["notice_count"] >= 0
+            for row in sources
+        )
+    )
+    phases_valid = (
+        isinstance(phases, list)
+        and [row.get("name") for row in phases if isinstance(row, dict)] == expected_phases
+        and all(
+            isinstance(row, dict)
+            and row.get("status") == "completed"
+            and row.get("error_codes") == []
+            for row in phases
+        )
+    )
+    articles_valid = (
+        isinstance(articles, list)
+        and bool(articles)
+        and all(
+            isinstance(row, dict)
+            and row.get("status") == "written"
+            and row.get("humanization_status") == "verified"
+            and row.get("error_codes") == []
+            and isinstance(row.get("article_path"), str)
+            and row.get("draft_path") is None
+            for row in articles
+        )
+    )
+    counts_valid = (
+        isinstance(counts, dict)
+        and set(counts)
+        == {
+            "sources",
+            "notices",
+            "conflicts",
+            "excluded",
+            "selected_articles",
+            "written_articles",
+        }
+        and counts.get("sources") == 2
+        and counts.get("conflicts") == 0
+        and isinstance(articles, list)
+        and counts.get("selected_articles") == len(articles)
+    )
+    if counts_valid:
+        counts_valid = counts.get("written_articles") == len(articles)
+    summary_valid = all(
+        summary.get(key) == value
+        for key, value in {
+            "workflow_id": core.get("workflow_id"),
+            "mode": "live",
+            "complete": True,
+            "blocked": False,
+            "live_success": True,
+            "run_path": run_name,
+            "report_path": f"{run_name}/acceptance-report.json",
+            "error_codes": [],
+        }.items()
+    ) and summary.get("written_count") == (
+        counts.get("written_articles") if isinstance(counts, dict) else None
+    )
+    truth = (
+        set(core) == expected_keys
+        and core.get("schema_version") == 1
+        and core.get("mode") == "live"
+        and core.get("complete") is True
+        and core.get("blocked") is False
+        and core.get("live_success") is True
+        and core.get("error_codes") == []
+        and core.get("run_path") == run_name
+        and core.get("report_path") == f"{run_name}/acceptance-report.json"
+        and source_valid
+        and phases_valid
+        and articles_valid
+        and counts_valid
+        and summary_valid
+    )
+    safe_counts = {
+        key: value
+        for key, value in (counts.items() if isinstance(counts, dict) else ())
+        if isinstance(key, str) and type(value) is int
+    }
+    return truth, safe_counts
+
+
+def _last_json_object(payload: bytes) -> dict[str, object] | None:
+    try:
+        lines = payload.decode("utf-8", errors="strict").splitlines()
+    except UnicodeError:
+        return None
+    for line in reversed(lines):
+        try:
+            value = _strict_json_loads(line.encode("utf-8"))
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _expected_written_articles(report: dict[str, object]) -> int:
+    counts = report.get("counts")
+    value = counts.get("written_articles") if isinstance(counts, dict) else None
+    return value if type(value) is int and value > 0 else 0
+
+
+def _positive_int(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError
+    return value
+
+
+def _nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError
+    return value
+
+
+def _browser_index_passed(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "url",
+            "status",
+            "heading_has_korean",
+            "html_lang",
+            "horizontal_overflow",
+            "security_headers",
+            "headers_exact",
+            "passed",
+        }
+        and value.get("status") == 200
+        and value.get("heading_has_korean") is True
+        and value.get("html_lang") == "ko"
+        and value.get("horizontal_overflow") is False
+        and value.get("headers_exact") is True
+        and isinstance(value.get("security_headers"), dict)
+        and preview_headers_match(value["security_headers"], cache_control="no-store")
+        and value.get("passed") is True
+    )
+
+
+def _browser_detail_passed(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    allowed = {
+        "url",
+        "status",
+        "heading_has_korean",
+        "horizontal_overflow",
+        "images",
+        "official_link_count",
+        "security_headers",
+        "headers_exact",
+        "passed",
+    }
+    if "body_font_size" in value:
+        allowed.add("body_font_size")
+    images = value.get("images")
+    return (
+        set(value) == allowed
+        and value.get("status") == 200
+        and value.get("heading_has_korean") is True
+        and value.get("horizontal_overflow") is False
+        and value.get("headers_exact") is True
+        and isinstance(value.get("security_headers"), dict)
+        and preview_headers_match(value["security_headers"], cache_control="no-store")
+        and type(value.get("official_link_count")) is int
+        and value["official_link_count"] > 0
+        and isinstance(images, list)
+        and len(images) == 3
+        and all(
+            isinstance(image, dict)
+            and set(image) == {"src", "alt_present", "complete", "width", "height"}
+            and image.get("alt_present") is True
+            and image.get("complete") is True
+            and type(image.get("width")) is int
+            and image["width"] > 0
+            and type(image.get("height")) is int
+            and image["height"] > 0
+            for image in images
+        )
+        and value.get("passed") is True
+    )
+
+
+def _record_url_has_run(value: object, run_name: str) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("url"), str):
+        return False
+    try:
+        parsed = urlsplit(value["url"])
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port == 8000
+        and f"/local-articles/{run_name}/" in parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _verify_screenshot_evidence(
+    value: object,
+    project_root: Path,
+    failures: list[str],
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "requested_index",
+        "run_index",
+        "detail_desktop",
+        "detail_mobile",
+    }:
+        failures.append("BRAVE_SCREENSHOT_SCHEMA")
+        return False
+    passed = True
+    for name, reference in value.items():
+        payload = _referenced_payload(
+            reference,
+            project_root,
+            failures,
+            label=f"BRAVE_SCREENSHOT_{name.upper()}",
+        )
+        if not payload:
+            passed = False
+    return passed
+
+
+def _aware_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_absolute(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
 
 
 def _verdict(

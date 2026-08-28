@@ -97,6 +97,11 @@ class Command(BaseCommand):
             "run_path": report.run_path,
             "report_path": report.report_path,
             "error_codes": list(report.error_codes),
+            "official_api_reconciliation": getattr(
+                workflow,
+                "official_api_reconciliation",
+                "not_applicable_fixture",
+            ),
         }
         self.stdout.write(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
         if not report.complete or report.blocked:
@@ -138,7 +143,7 @@ def _build_workflow(*, fixture_root: Path | None, dry_run: bool) -> LocalHousing
             )
         humanizer = HumanizerClient(settings.HUMANIZER_BASE_URL)
         mode = "live"
-    return LocalHousingWorkflow(
+    workflow = LocalHousingWorkflow(
         collectors=collectors,
         humanizer=humanizer,
         output_root=settings.LOCAL_ARTICLE_ROOT,
@@ -146,6 +151,14 @@ def _build_workflow(*, fixture_root: Path | None, dry_run: bool) -> LocalHousing
         mode=mode,
         dry_run=dry_run,
     )
+    workflow.official_api_reconciliation = (
+        "not_applicable_fixture"
+        if fixture_root is not None
+        else "active"
+        if service_key
+        else "inactive_no_key"
+    )
+    return workflow
 
 
 def _fixture_collectors(root: Path):

@@ -18,7 +18,10 @@ from playwright.sync_api import Page, sync_playwright
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from apps.local_content.acceptance import preview_headers_match  # noqa: E402
+from apps.local_content.acceptance import (  # noqa: E402
+    merge_evidence_reference,
+    preview_headers_match,
+)
 
 DEFAULT_BRAVE = Path(
     r"C:\Users\c\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"
@@ -65,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     traversal_statuses: list[int] = []
     status_record: dict[str, object] = {}
     asset_header_valid = False
+    asset_headers: dict[str, str | None] = {}
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -157,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                     dict(asset_response.headers),
                     cache_control="public, max-age=31536000, immutable",
                 )
+                asset_headers = _security_headers(dict(asset_response.headers))
                 parsed_asset = urlsplit(first_image)
                 traversal_path = (
                     parsed_asset.path.rsplit("/", 1)[0] + "/%2e%2e%2fmanifest.json"
@@ -180,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                     dict(status_response.headers),
                     cache_control="no-store",
                 ),
+                "security_headers": _security_headers(dict(status_response.headers)),
                 "humanizer_ready": (
                     isinstance(status_payload, dict)
                     and status_payload.get("humanizer", {}).get("status") == "ready"
@@ -209,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     mobile_passed = bool(mobile_record) and mobile_record.get("passed") is True and float(
         str(mobile_record.get("body_font_size", "0px")).removesuffix("px")
     ) >= 16
+    screenshots_digest_bound = set(screenshots) == set(screenshot_paths)
     assertions = {
         "brave_executable_exact": brave == DEFAULT_BRAVE,
         "requested_index": requested_record.get("passed") is True,
@@ -225,9 +232,10 @@ def main(argv: list[str] | None = None) -> int:
         and status_record.get("headers_exact") is True
         and status_record.get("humanizer_ready") is True,
         "owned_brave_processes_closed": bool(owned_pids) and not surviving,
+        "screenshots_digest_bound": screenshots_digest_bound,
     }
     evidence = {
-        "schema_version": 2,
+        "schema_version": 3,
         "checked_at": datetime.now(UTC).isoformat(),
         "brave_executable": str(brave),
         "brave_owned_pids": sorted(owned_pids),
@@ -238,12 +246,13 @@ def main(argv: list[str] | None = None) -> int:
         "detail_pages": detail_records,
         "mobile": mobile_record,
         "status_endpoint": status_record,
+        "asset_headers": asset_headers,
         "traversal_statuses": traversal_statuses,
         "diagnostics": {
-            "console_errors": console_errors,
-            "page_errors": page_errors,
-            "failed_requests": failed_requests,
-            "bad_local_responses": bad_local_responses,
+            "console_error_count": len(console_errors),
+            "page_error_count": len(page_errors),
+            "failed_request_count": len(failed_requests),
+            "bad_local_response_count": len(bad_local_responses),
             "local_response_count": local_response_count,
         },
         "screenshots": screenshots,
@@ -252,21 +261,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     evidence_path = evidence_root / "brave-evidence.json"
     _write_json(evidence_path, evidence)
-    _merge_report(
+    merge_evidence_reference(
         arguments.report,
-        {
-            "passed": evidence["passed"],
-            "evidence_path": evidence_path.as_posix(),
-            "detail_page_count": len(detail_records),
-            "mobile_representative": mobile_record.get("url"),
-            "screenshots": screenshots,
-            "brave": {
-                "executable": str(brave),
-                "owned_pids": sorted(owned_pids),
-                "closed": not surviving,
-            },
-            "django_owned_pids": sorted(set(arguments.django_pid)),
-        },
+        field="browser_evidence",
+        evidence_path=evidence_path,
     )
     print(
         json.dumps(
@@ -319,7 +317,8 @@ def _inspect_detail(page: Page, url: str) -> dict[str, object]:
         "document.documentElement.scrollWidth > document.documentElement.clientWidth + 1"
     )
     images = page.locator("img").evaluate_all(
-        "els => els.map(el => ({src: el.currentSrc, alt: el.alt, complete: el.complete, "
+        "els => els.map(el => ({src: el.currentSrc, "
+        "alt_present: Boolean(el.alt.trim()), complete: el.complete, "
         "width: el.naturalWidth, height: el.naturalHeight}))"
     )
     official_links = page.locator("a[href^='https://']").evaluate_all(
@@ -329,7 +328,7 @@ def _inspect_detail(page: Page, url: str) -> dict[str, object]:
         row["complete"]
         and row["width"] > 0
         and row["height"] > 0
-        and row["alt"].strip()
+        and row["alt_present"]
         for row in images
     )
     official_valid = bool(official_links) and all(
@@ -415,18 +414,6 @@ def _write_json(path: Path, value: object) -> None:
         encoding="utf-8",
     )
     temporary.replace(target)
-
-
-def _merge_report(path: Path, browser: dict[str, object]) -> None:
-    target = Path(path)
-    report = json.loads(target.read_text(encoding="utf-8"))
-    if not isinstance(report, dict):
-        raise ValueError("acceptance report must be a JSON object")
-    section = report.setdefault("task12_acceptance", {})
-    if not isinstance(section, dict):
-        raise ValueError("task12 acceptance section must be a JSON object")
-    section["browser"] = browser
-    _write_json(target, report)
 
 
 if __name__ == "__main__":
