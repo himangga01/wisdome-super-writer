@@ -101,6 +101,57 @@ def test_unknown_values_use_exact_notice_confirmation_wording() -> None:
     assert "예상" not in rendered.factual_markdown
 
 
+def test_detail_maps_machine_warning_category_and_status_to_natural_korean() -> None:
+    notice = _notice(
+        category="remaining",
+        status="published",
+        warnings=(
+            "price summary not found",
+            "eligibility summary not found",
+            "DETAIL_COLLECTION_FAILED",
+        ),
+    )
+
+    markdown = render_detailed_article(notice).to_markdown()
+
+    assert "잔여·무순위 공급" in markdown
+    assert "공고 중" in markdown
+    assert "가격·보증금·임대료 정보를 공고문에서 직접 확인해야 합니다." in markdown
+    assert "신청 자격을 공고문에서 직접 확인해야 합니다." in markdown
+    assert "상세 페이지를 확인하지 못해 공고 원문 확인이 필요합니다." in markdown
+    assert "price summary not found" not in markdown
+    assert "eligibility summary not found" not in markdown
+    assert "DETAIL_COLLECTION_FAILED" not in markdown
+    assert notice.warnings[0] == "price summary not found"
+
+
+def test_weekly_index_hides_machine_source_diagnostics_but_keeps_korean_guidance() -> None:
+    notice = _notice(category="apt", status="open")
+    result = HousingCollectionResult(
+        window=CollectionWindow(
+            start=datetime(2026, 8, 22, tzinfo=SEOUL),
+            end=datetime(2026, 8, 28, 23, 59, tzinfo=SEOUL),
+        ),
+        notices=(notice,),
+        source_reports=(
+            SourceRunReport(
+                source_key="applyhome",
+                notices=(notice,),
+                warnings=("parser warning in English",),
+                errors=("official fetch failed: RuntimeError",),
+            ),
+        ),
+    )
+
+    markdown = render_weekly_index(result).to_markdown()
+
+    assert "분양주택" in markdown
+    assert "공식 출처의 일부 항목을 확인해야 합니다." in markdown
+    assert "공식 출처 수집 상태를 확인해야 합니다." in markdown
+    assert "parser warning in English" not in markdown
+    assert "official fetch failed" not in markdown
+
+
 def test_detail_output_separates_yaml_prose_facts_sources_and_protected_anchors() -> None:
     rendered = render_detailed_article(_notice())
 

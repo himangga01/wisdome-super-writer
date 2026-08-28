@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from apps.local_content.contracts import HousingCollectionResult, HousingNotice
-from apps.local_content.selection import needs_detailed_article
+from apps.local_content.selection import needs_detailed_article, normalized_category
 
 UNKNOWN_VALUE = "공고문에서 직접 확인 필요"
 GENERIC_HERO_ALT = "주거 공고 이해를 위한 일반적인 현대 아파트 도시 전경"
@@ -25,6 +25,39 @@ _SHA256 = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 _OFFICIAL_SOURCE_HOSTS = {
     "applyhome": "www.applyhome.co.kr",
     "lh": "apply.lh.or.kr",
+}
+_CATEGORY_LABELS = {
+    "sale": "분양주택",
+    "public_sale": "공공분양",
+    "remaining": "잔여·무순위 공급",
+    "public_rental": "공공임대",
+    "national_rental": "국민임대",
+    "permanent_rental": "영구임대",
+    "integrated_public_rental": "통합공공임대",
+    "happy_housing": "행복주택",
+    "purchase_lease": "매입·전세임대",
+    "non_residential": "비주거 공고",
+}
+_STATUS_LABELS = {
+    "active": "공고 중",
+    "open": "공고 중",
+    "published": "공고 중",
+    "corrected": "정정 공고",
+    "correction": "정정 공고",
+    "amended": "변경 공고",
+    "closed": "접수 마감",
+    "retracted": "공고 철회",
+    "unavailable": "확인 불가",
+}
+_WARNING_LABELS = {
+    "application schedule not found": "신청 일정을 공고문에서 직접 확인해야 합니다.",
+    "application end date not found": "신청 종료일을 공고문에서 직접 확인해야 합니다.",
+    "application schedule ambiguous": "신청 일정 표기가 모호해 공고문 확인이 필요합니다.",
+    "supply count not found": "공급 규모를 공고문에서 직접 확인해야 합니다.",
+    "price summary not found": "가격·보증금·임대료 정보를 공고문에서 직접 확인해야 합니다.",
+    "eligibility summary not found": "신청 자격을 공고문에서 직접 확인해야 합니다.",
+    "DETAIL_COLLECTION_FAILED": "상세 페이지를 확인하지 못해 공고 원문 확인이 필요합니다.",
+    "OFFICIAL_API_RECONCILED": "공식 API 정보와 공개 페이지 정보가 일치했습니다.",
 }
 
 
@@ -221,7 +254,8 @@ def _detail_facts(
 ) -> str:
     title = _display_value(notice.title)
     publisher = _display_value(notice.publisher)
-    status = _display_value(notice.status)
+    status = _display_status(notice.status)
+    category = _display_category(notice.category)
     lines = [
         f'![{GENERIC_HERO_ALT}](assets/hero.png "{GENERIC_HERO_CAPTION}")',
         "",
@@ -237,6 +271,7 @@ def _detail_facts(
                 ("공고명", title),
                 ("기관", publisher),
                 ("지역", _known(notice.region)),
+                ("공고 분류", category),
                 ("공고 상태", status),
                 ("공급 규모", _supply(notice.supply_count)),
             )
@@ -320,7 +355,7 @@ def _weekly_facts(
     selected_ids: Collection[str],
     prior_detailed_ids: Collection[str],
 ) -> str:
-    category_counts = Counter(_display_value(notice.category) for notice in result.notices)
+    category_counts = Counter(_display_category(notice.category) for notice in result.notices)
     publication_counts = Counter(
         notice.published_at.date().isoformat() for notice in result.notices
     )
@@ -340,8 +375,14 @@ def _weekly_facts(
     for report in result.source_reports:
         status = "완전" if report.complete else "오류"
         lines.append(f"- {_markdown_text(report.source_key)}: {status}")
-        lines.extend(f"  - 경고: {_markdown_text(value)}" for value in report.warnings)
-        lines.extend(f"  - 오류: {_markdown_text(value)}" for value in report.errors)
+        lines.extend(
+            f"  - 경고: {_markdown_text(_source_diagnostic(value, error=False))}"
+            for value in report.warnings
+        )
+        lines.extend(
+            f"  - 오류: {_markdown_text(_source_diagnostic(value, error=True))}"
+            for value in report.errors
+        )
     lines.extend(("", "## 분류별 건수", ""))
     if category_counts:
         lines.extend(
@@ -384,7 +425,7 @@ def _weekly_facts(
                     notice.published_at.date().isoformat(),
                     _table_text(_display_value(notice.publisher)),
                     _table_text(_known(notice.region)),
-                    _table_text(_display_value(notice.category)),
+                    _table_text(_display_category(notice.category)),
                     official,
                     detail,
                 )
@@ -505,6 +546,48 @@ def _display_value(value: str | None) -> str:
     return normalized or UNKNOWN_VALUE
 
 
+def _display_category(value: str) -> str:
+    category = normalized_category(value)
+    if category is not None:
+        return _CATEGORY_LABELS[category]
+    normalized = _safe_scalar(value)
+    if not normalized:
+        return UNKNOWN_VALUE
+    return normalized if re.search(r"[가-힣]", normalized) else "기타 주거 공고"
+
+
+def _display_status(value: str) -> str:
+    normalized = _safe_scalar(value)
+    mapped = _STATUS_LABELS.get(normalized.casefold())
+    if mapped is not None:
+        return mapped
+    return normalized if re.search(r"[가-힣]", normalized) else "상태 확인 필요"
+
+
+def _warning_text(value: str) -> str:
+    mapped = _WARNING_LABELS.get(value)
+    if mapped is not None:
+        return mapped
+    normalized = _safe_scalar(value)
+    if re.search(r"[가-힣]", normalized):
+        return normalized
+    return "공고의 일부 정보를 원문에서 다시 확인해야 합니다."
+
+
+def _source_diagnostic(value: str, *, error: bool) -> str:
+    mapped = _WARNING_LABELS.get(value)
+    if mapped is not None:
+        return mapped
+    normalized = _safe_scalar(value)
+    if re.search(r"[가-힣]", normalized):
+        return normalized
+    return (
+        "공식 출처 수집 상태를 확인해야 합니다."
+        if error
+        else "공식 출처의 일부 항목을 확인해야 합니다."
+    )
+
+
 def _safe_scalar(value: str) -> str:
     without_controls = "".join(
         " " if unicodedata.category(character) in {"Cc", "Cf"} else character
@@ -584,7 +667,10 @@ def _publishable_facts(facts: Iterable[tuple[str, str]]) -> tuple[tuple[str, str
 
 
 def _confirmation_items(notice: HousingNotice) -> tuple[str, ...]:
-    items = [f"- 수집 경고: {_markdown_text(warning)}" for warning in notice.warnings]
+    items = [
+        f"- 수집 경고: {_markdown_text(_warning_text(warning))}"
+        for warning in notice.warnings
+    ]
     if notice.price_summary is None:
         items.append(f"- 가격·보증금·임대료: {UNKNOWN_VALUE}")
     if not any(_safe_scalar(value) for value in notice.eligibility_summary):
