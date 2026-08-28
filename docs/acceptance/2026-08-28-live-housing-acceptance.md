@@ -215,3 +215,89 @@ New deterministic evidence is retained under:
 output/housing/2026-08-28/acceptance/deterministic-round2-attempt1/
 output/housing/2026-08-28/acceptance/deterministic-round2-attempt1-evidence.json
 ```
+
+## Final whole-branch fix acceptance
+
+The final integrated source fix is committed as `e7c679e`. Unlike review round 2,
+this acceptance uses a genuinely new official collection and humanization run made
+after the ApplyHome transport repair and every final-review fix.
+
+The new authoritative ignored run is:
+
+```text
+output/housing/2026-08-28--run-b22ed7662034
+```
+
+Its final report is:
+
+```text
+output/housing/2026-08-28--run-b22ed7662034/acceptance-report.json
+```
+
+Final derivation independently passed all four requirements:
+`workflow_live_success`, `artifact_audit`, `django_brave_all_pages`, and
+`deterministic_commands_and_ruff_ruling`.
+
+### Fresh official workflow and artifacts
+
+The exact KST window is `2026-08-22T00:00:00+09:00` through
+`2026-08-28T15:38:21.583360+09:00`.
+
+- ApplyHome: 16 observations, complete, including successful redirected detail
+  identity preservation.
+- LH: 58 observations, complete.
+- Raw official observations: 74; non-residential exclusions: 29; residential index
+  rows: 45.
+- Detailed, humanized, strictly verified, and written articles: 19; verified owned
+  images: 57.
+- `DATA_GO_KR_SERVICE_KEY` was not configured, so the conditional official API
+  reconciliation layer correctly recorded `inactive_no_key`; no key was invented.
+- Machine diagnostics remain in JSON evidence, while a scan of every user-facing
+  `index.md` and `article.md` found none of the English parser warning strings.
+- Binding identities are 19/19 unique for jobs, bundles, final articles, and
+  verification records. Candidate prose has 19 hashes and 9 unique values; prose
+  reuse remains transparently non-gating.
+
+The fresh no-write production audit independently passed exact bundle inventory,
+raw observation/window/selection, weekly index identity/link reconciliation, and
+all article humanization/source/image checks.
+
+### Closed evidence and deterministic gates
+
+Workflow, artifact, and Brave results are no longer accepted from mutable summary
+booleans. Each is a confined SHA-256 reference. Finalization reread and rebound the
+workflow argv/timestamps/log/report core, reran the artifact auditor, recomputed the
+closed Brave schema, and verified the selected deterministic command history.
+
+The selected deterministic attempt is `final-fix-attempt1`, plan SHA-256
+`9aa81e0d488cf59f9d343d73e466d077e4e894ba7fc2401d4db0d5c1d85b3426`:
+
+- setup-local, Django check, explicit `migrate --noinput`, migration drift, CI
+  material, diff check, and all binding Ruff gates exited 0;
+- focused pytest: 556 passed, 2 skipped;
+- complete `tests/unit tests/integration`: 1,276 passed, 5 skipped, 198 subtests;
+- true merge-base changed/local Ruff: 69 targets, zero findings;
+- whole-repository Ruff: exit 1 with 1,561 legacy findings, truthfully recorded as
+  `passed=false` and `legacy_debt_not_gate` under the updated hash-bound ruling.
+
+Evidence is retained under:
+
+```text
+output/housing/2026-08-28/acceptance/final-fix-live/
+output/housing/2026-08-28/acceptance/brave-final-fix/
+output/housing/2026-08-28/acceptance/deterministic-final-fix-attempt1/
+output/housing/2026-08-28/acceptance/deterministic-final-fix-attempt1-evidence.json
+```
+
+### Brave and owned-process cleanup
+
+Installed Brave visited the date index, immutable run index, all 19 detailed pages,
+and one representative 390 px mobile page. All pages had Korean headings, exact
+security/cache headers, no horizontal overflow, valid official HTTPS links, and
+exactly three nonzero images per detail. Console errors, page errors, failed
+requests, and unexpected local error responses were all zero; both traversal probes
+returned 404.
+
+Owned Brave PIDs `21168, 26940, 35584, 39380, 40984`, owned humanizer PID `29636`,
+and owned Django PID `36664` all exited. Only those owned processes were stopped;
+ports 3210 and 8000 are free.
