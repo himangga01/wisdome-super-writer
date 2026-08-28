@@ -6,12 +6,16 @@ import re
 
 from django.conf import settings
 from django.core.exceptions import (
-    BadRequest as DjangoBadRequest,
     NON_FIELD_ERRORS,
     ObjectDoesNotExist,
     PermissionDenied,
     RequestDataTooBig,
     SuspiciousOperation,
+)
+from django.core.exceptions import (
+    BadRequest as DjangoBadRequest,
+)
+from django.core.exceptions import (
     ValidationError as DjangoValidationError,
 )
 from django.http import Http404, HttpRequest, HttpResponse
@@ -26,6 +30,10 @@ from wisdome_writer.domain.errors import (
     MethodNotAllowed,
     RateLimited,
     ValidationIssue,
+)
+from wisdome_writer.external_publishing import (
+    external_publishing_enabled,
+    external_publishing_http_path,
 )
 
 from .problems import is_api_request, problem_response
@@ -53,7 +61,11 @@ _STATUS_PROBLEMS: dict[int, tuple[str, str, str | None]] = {
     ),
     406: ("not_acceptable", "지원하지 않는 응답 형식입니다", None),
     408: ("request_timeout", "요청 시간이 초과되었습니다", None),
-    409: ("state_conflict", "현재 상태에서는 요청을 처리할 수 없습니다", "최신 상태를 확인한 뒤 요청하세요."),
+    409: (
+        "state_conflict",
+        "현재 상태에서는 요청을 처리할 수 없습니다",
+        "최신 상태를 확인한 뒤 요청하세요.",
+    ),
     410: ("gone", "더 이상 제공되지 않는 대상입니다", None),
     413: ("payload_too_large", "요청 본문이 너무 큽니다", None),
     414: ("uri_too_long", "요청 URI가 너무 깁니다", None),
@@ -71,7 +83,11 @@ _STATUS_PROBLEMS: dict[int, tuple[str, str, str | None]] = {
     500: ("internal_error", "내부 오류가 발생했습니다", None),
     501: ("not_implemented", "지원하지 않는 기능입니다", None),
     502: ("upstream_failure", "외부 서비스 응답에 실패했습니다", None),
-    503: ("service_unavailable", "서비스를 일시적으로 사용할 수 없습니다", "잠시 후 다시 요청하세요."),
+    503: (
+        "service_unavailable",
+        "서비스를 일시적으로 사용할 수 없습니다",
+        "잠시 후 다시 요청하세요.",
+    ),
     504: ("upstream_timeout", "외부 서비스 응답 시간이 초과되었습니다", "잠시 후 다시 요청하세요."),
 }
 
@@ -85,6 +101,15 @@ class AdminApiSecurityMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        if (
+            not external_publishing_enabled()
+            and external_publishing_http_path(request.path)
+        ):
+            return problem_response(
+                status=404,
+                code="not_found",
+                title="대상을 찾을 수 없습니다",
+            )
         if request.path in self.public_read_paths and request.method in {"GET", "HEAD"}:
             return self.get_response(request)
         if request.path.startswith(self.api_prefix):

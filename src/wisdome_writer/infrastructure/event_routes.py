@@ -5,6 +5,10 @@ from typing import Any
 
 from django.core.exceptions import ObjectDoesNotExist
 
+from wisdome_writer.external_publishing import (
+    external_publishing_enabled,
+    external_publishing_event,
+)
 
 EventKey = tuple[str, int]
 
@@ -993,6 +997,8 @@ EVENT_PAYLOAD_SCHEMAS: dict[EventKey, PayloadSchema] = {
 
 
 def route_for(event_type: str, event_version: int) -> EventRoute | None:
+    if external_publishing_event(event_type) and not external_publishing_enabled():
+        return None
     return EVENT_ROUTES.get((event_type, event_version))
 
 
@@ -1018,6 +1024,8 @@ def _collection_queue(topic_code: str) -> str:
 
 def queue_for(route: EventRoute, envelope: dict[str, Any]) -> str:
     event_type = envelope["event_type"]
+    if external_publishing_event(event_type) and not external_publishing_enabled():
+        raise EventRoutingError("external_publishing_disabled")
     payload = envelope["payload"]
     try:
         if event_type in {

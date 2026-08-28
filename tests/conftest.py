@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from django.db import connections
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
@@ -84,3 +85,11 @@ def _fixture_teardown_with_sqlite_trigger_suspension(
 
 
 TransactionTestCase._fixture_teardown = _fixture_teardown_with_sqlite_trigger_suspension
+
+
+@pytest.fixture(autouse=True)
+def _enable_distributed_publishing_contracts(request, settings):
+    """Legacy publishing tests exercise the distributed publishing profile."""
+
+    if request.node.path.name != "test_local_publishing_policy.py":
+        settings.EXTERNAL_PUBLISHING_ENABLED = True
