@@ -1,0 +1,6 @@
+# Immutable fixture bytes are pinned by the local-content manifest.
+tests/fixtures/applyhome/*.html text eol=lf
+tests/fixtures/lh/*.html text eol=lf
+tests/fixtures/live-regressions/*.html text eol=lf
+tests/fixtures/local-content/manifest.json text eol=lf
+tests/fixtures/local-content/README.md text eol=lf
