@@ -11,7 +11,6 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
-import httpx
 from django.conf import settings
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
@@ -27,6 +26,7 @@ from apps.local_content.bundles import (
     _read_bound_file,
     _require_unchanged_fingerprint,
 )
+from apps.local_content.status import local_runtime_status
 
 _RUN_NAME = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})(?:--run-[0-9a-f]{12})?")
 _ARTICLE_NAME = re.compile(
@@ -166,14 +166,20 @@ def local_article_asset(
 def local_article_status(request: HttpRequest) -> JsonResponse:
     _require_local_request(request)
     runs = _list_validated_runs()
+    runtime = local_runtime_status(
+        humanizer_base_url=settings.HUMANIZER_BASE_URL,
+        output_root=Path(settings.LOCAL_ARTICLE_ROOT),
+        state_root=Path(settings.LOCAL_STATE_ROOT),
+    )
     response = JsonResponse(
         {
             "status": "ok",
             "workflow": {
                 "validRunCount": len(runs),
                 "latestRun": runs[0]["name"] if runs else None,
+                **runtime["workflow"],
             },
-            "humanizer": _humanizer_status(),
+            "humanizer": runtime["humanizer"],
         }
     )
     return _secure_response(response, cache_control="no-store")  # type: ignore[return-value]
@@ -599,20 +605,9 @@ def _require_local_request(request: HttpRequest) -> None:
 
 
 def _humanizer_status() -> dict[str, str]:
-    endpoint = "http://127.0.0.1:3210"
-    if settings.HUMANIZER_BASE_URL != endpoint:
-        return {"status": "misconfigured", "endpoint": endpoint}
-    try:
-        response = httpx.get(f"{endpoint}/api/health", timeout=0.5)
-        payload = response.json()
-        ready = (
-            response.status_code == 200
-            and isinstance(payload, dict)
-            and payload.get("status") == "ready"
-        )
-    except (httpx.HTTPError, ValueError, TypeError):
-        ready = False
-    return {"status": "ready" if ready else "unavailable", "endpoint": endpoint}
+    from apps.local_content.status import humanizer_status
+
+    return humanizer_status(settings.HUMANIZER_BASE_URL)
 
 
 def _page_response(response: HttpResponse) -> HttpResponse:

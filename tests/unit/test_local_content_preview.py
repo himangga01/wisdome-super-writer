@@ -184,8 +184,16 @@ def test_preview_status_is_loopback_only_and_never_cached(
 ) -> None:
     settings.LOCAL_ARTICLE_ROOT = preview_root
     monkeypatch.setattr(
-        "apps.local_content.views._humanizer_status",
-        lambda: {"status": "ready", "endpoint": "http://127.0.0.1:3210"},
+        "apps.local_content.views.local_runtime_status",
+        lambda **_kwargs: {
+            "humanizer": {"status": "ready", "endpoint": "http://127.0.0.1:3210"},
+            "workflow": {
+                "status": "active",
+                "workflowId": "workflow-live",
+                "pid": 123,
+                "startedAt": "2026-08-28T12:00:00+09:00",
+            },
+        },
     )
 
     response = client.get("/api/v1/local-articles/status")
@@ -195,6 +203,8 @@ def test_preview_status_is_loopback_only_and_never_cached(
     assert response["Referrer-Policy"] == "no-referrer"
     assert response.json()["workflow"]["validRunCount"] == 2
     assert response.json()["humanizer"]["status"] == "ready"
+    assert response.json()["workflow"]["status"] == "active"
+    assert response.json()["workflow"]["workflowId"] == "workflow-live"
     assert (
         client.get("/api/v1/local-articles/status", REMOTE_ADDR="198.51.100.5").status_code
         == 404
@@ -264,7 +274,10 @@ def test_humanizer_status_treats_non_object_json_as_unavailable(
             return payload
 
     settings.HUMANIZER_BASE_URL = "http://127.0.0.1:3210"
-    monkeypatch.setattr(views.httpx, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        "apps.local_content.status.httpx.get",
+        lambda *_args, **_kwargs: Response(),
+    )
 
     assert views._humanizer_status()["status"] == "unavailable"
 
@@ -283,6 +296,9 @@ def test_humanizer_status_treats_malformed_json_as_unavailable(
             raise ValueError("malformed")
 
     settings.HUMANIZER_BASE_URL = "http://127.0.0.1:3210"
-    monkeypatch.setattr(views.httpx, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        "apps.local_content.status.httpx.get",
+        lambda *_args, **_kwargs: Response(),
+    )
 
     assert views._humanizer_status()["status"] == "unavailable"

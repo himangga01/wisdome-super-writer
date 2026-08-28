@@ -61,7 +61,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local.ps
 
 ### 3. 최근 7일 수집·글 생성
 
-시작 스크립트를 실행한 창은 그대로 두고 새 PowerShell 창에서 실행합니다.
+시작 스크립트를 실행한 창은 그대로 두고 새 PowerShell 창에서 실행합니다. Django 설정은 저장소의
+`.env.local`을 직접 읽으므로 새 창에서 환경 변수를 다시 입력할 필요가 없습니다. 이미 설정된
+프로세스 환경 변수는 `.env.local`보다 우선하며, production 프로세스에는 로컬 파일을 적용하지
+않습니다.
 
 ```powershell
 .\.venv\Scripts\python.exe src\manage.py collect_recent_housing --days 7 --humanize --write-articles

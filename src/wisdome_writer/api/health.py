@@ -13,6 +13,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_GET
 from redis import Redis
 
+from apps.local_content.status import local_runtime_status
 from wisdome_writer.infrastructure.models import (
     OutboxConsumerReceipt,
     OutboxMessage,
@@ -245,6 +246,16 @@ def ready(request):
             ("local_objects", settings.LOCAL_OBJECT_ROOT),
         ):
             checks[check_name] = _local_root_check(Path(root))
+        local_status = local_runtime_status(
+            humanizer_base_url=settings.HUMANIZER_BASE_URL,
+            output_root=Path(settings.LOCAL_ARTICLE_ROOT),
+            state_root=Path(settings.LOCAL_STATE_ROOT),
+        )
+        checks["humanizer"] = (
+            "ok" if local_status["humanizer"].get("status") == "ready" else "unavailable"
+        )
+        workflow_status = str(local_status["workflow"].get("status", "unavailable"))
+        checks["workflow_lock"] = workflow_status
     else:
         client: Redis | None = None
         try:
@@ -273,7 +284,10 @@ def ready(request):
             except Exception:
                 checks["outbox"] = "unavailable"
 
-    is_ready = all(value == "ok" for value in checks.values())
+    is_ready = all(
+        value == "ok" or (name == "workflow_lock" and value in {"idle", "active"})
+        for name, value in checks.items()
+    )
     is_degraded = bool(
         outbox is not None and outbox["recoveryState"] != "clear"
     )
@@ -289,6 +303,8 @@ def ready(request):
     }
     if outbox is not None:
         payload["outbox"] = outbox
+    if settings.IS_LOCAL_RUNTIME:
+        payload["local_runtime"] = local_status
     return _no_store(
         JsonResponse(
             payload,

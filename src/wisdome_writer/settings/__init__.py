@@ -17,6 +17,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPOSITORY_ROOT / "src"
 BASE_DIR = SRC_ROOT
 load_dotenv(REPOSITORY_ROOT / ".env")
+if os.getenv("WISDOME_ENVIRONMENT", "").strip() != "production":
+    load_dotenv(REPOSITORY_ROOT / ".env.local", override=False)
 
 
 def env_value(name: str, default: str = "") -> str:
@@ -71,7 +73,13 @@ PUBLIC_BASE_URL = env_value(
 
 DATABASE_URL = env_value(
     "DATABASE_URL",
-    f"sqlite:///{REPOSITORY_ROOT / 'db.sqlite3'}" if not IS_PRODUCTION else "",
+    (
+        f"sqlite:///{LOCAL_STATE_ROOT / 'db.sqlite3'}"
+        if IS_LOCAL_RUNTIME
+        else f"sqlite:///{REPOSITORY_ROOT / 'db.sqlite3'}"
+        if not IS_PRODUCTION
+        else ""
+    ),
 )
 REDIS_URL = env_value("REDIS_URL", "redis://localhost:6379/0" if not IS_PRODUCTION else "")
 CELERY_BROKER_URL = env_value("CELERY_BROKER_URL", REDIS_URL)
