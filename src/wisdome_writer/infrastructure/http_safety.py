@@ -20,6 +20,7 @@ STREAM_CHUNK_BYTES = 64 * 1024
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 _DNS_RESOLUTION_SLOTS = threading.BoundedSemaphore(DNS_RESOLVER_CAPACITY)
+_VALIDATED_LOGICAL_URL_EXTENSION = "wisdome.validated-logical-url"
 
 
 class HttpSafetyError(Exception):
@@ -44,6 +45,21 @@ class OutboundResolutionFailed(HttpSafetyError):
 
 class OutboundResponseMimeRejected(HttpSafetyError):
     """Raised from response headers before an unapproved body is consumed."""
+
+
+class _ValidatedLogicalUrl:
+    """Opaque in-memory redirect result whose representation never exposes query data."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "<validated-logical-url>"
 
 
 @dataclass(frozen=True)
@@ -93,6 +109,15 @@ def redact_url_values(value: Any) -> Any:
     if isinstance(value, str):
         return redact_urls_in_text(value)
     return value
+
+
+def validated_logical_url(response: httpx.Response) -> str:
+    """Return the final URL validated by this boundary without using request metadata."""
+
+    handle = response.extensions.get(_VALIDATED_LOGICAL_URL_EXTENSION)
+    if not isinstance(handle, _ValidatedLogicalUrl):
+        raise HttpSafetyError("Outbound response has no validated logical URL")
+    return handle.reveal()
 
 
 def safe_get(
@@ -480,6 +505,11 @@ def _request_pinned(
                         headers=streamed.headers,
                         content=content,
                         request=safe_request,
+                        extensions={
+                            _VALIDATED_LOGICAL_URL_EXTENSION: _ValidatedLogicalUrl(
+                                target.logical_url
+                            )
+                        },
                     )
         except HttpSafetyError:
             raise

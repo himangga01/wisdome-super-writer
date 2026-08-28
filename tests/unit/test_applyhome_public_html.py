@@ -5,12 +5,14 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 
 from apps.local_content.contracts import CollectionWindow
-from apps.local_content.http import HtmlResponse
+from apps.local_content.http import HtmlResponse, OfficialHtmlFetcher
 from apps.local_content.sources import applyhome
 from apps.local_content.sources.applyhome import APT_LIST, REMAINING_LIST, ApplyHomePublicCollector
+from wisdome_writer.infrastructure import http_safety
 
 SEOUL = ZoneInfo("Asia/Seoul")
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "applyhome"
@@ -159,6 +161,89 @@ def test_applyhome_binds_attachmentless_official_detail_by_title_and_publication
     )
 
     assert result[2] == 22
+
+
+def test_applyhome_real_fetcher_preserves_redirected_detail_identity_out_of_band(
+    monkeypatch: pytest.MonkeyPatch,
+    window: CollectionWindow,
+) -> None:
+    monkeypatch.setattr(
+        http_safety.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (
+                http_safety.socket.AF_INET,
+                http_safety.socket.SOCK_STREAM,
+                http_safety.socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            )
+        ],
+    )
+    list_body = (LIVE_REGRESSIONS / "applyhome-apt-list-2026-08-28.html").read_bytes()
+    detail_body = (
+        LIVE_REGRESSIONS / "applyhome-apt-detail-title-date-2026-08-28.html"
+    ).read_bytes()
+    observed_detail_requests = 0
+
+    def official_transport(request: httpx.Request) -> httpx.Response:
+        nonlocal observed_detail_requests
+        path = request.url.path
+        query = request.url.query.decode()
+        if path.endswith("selectAPTLttotPblancListView.do"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=list_body,
+            )
+        if path.endswith("selectAPTLttotPblancDetail.do"):
+            observed_detail_requests += 1
+            if "transportRedirect=1" not in query:
+                return httpx.Response(
+                    302,
+                    headers={
+                        "Location": (
+                            f"{path}?houseManageNo=2026000401&"
+                            "pblancNo=2026000401&transportRedirect=1"
+                        )
+                    },
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=detail_body,
+            )
+        if path.endswith("selectAPTRemndrLttotPblancListView.do"):
+            empty = (
+                '<main data-notice-list="remaining" data-current-page="1" '
+                'data-last-page="1" data-total-count="0" data-empty-results="true"></main>'
+            )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=empty.encode(),
+            )
+        raise AssertionError(f"unexpected official path {path}")
+
+    collector = ApplyHomePublicCollector(
+        OfficialHtmlFetcher(
+            allowed_hosts={"www.applyhome.co.kr"},
+            path_prefixes=("/ai/aia/",),
+            transport=httpx.MockTransport(official_transport),
+        )
+    )
+
+    report = collector.collect(window)
+
+    assert report.errors == ()
+    assert observed_detail_requests == 2
+    assert [notice.external_id for notice in report.notices] == [
+        "applyhome:apt:2026000401:2026000401"
+    ]
+    assert report.notices[0].warnings == (
+        "price summary not found",
+        "eligibility summary not found",
+    )
 
 
 def test_applyhome_public_detail_rejects_mixed_matching_and_wrong_identity() -> None:

@@ -151,7 +151,7 @@ class ApplyHomePublicCollector:
         application_start, application_end, supply_count, warnings = self._parse_detail(
             response.body,
             listed=listed,
-            observed_detail_url=response.url,
+            observed_detail_url=response.validated_logical_url(),
         )
         fields = {
             "source_key": _SOURCE_KEY,

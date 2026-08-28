@@ -142,6 +142,45 @@ def test_fetcher_sends_get_params_and_post_form_without_exposing_values(
     assert "top-secret" not in get_result.url
 
 
+def test_fetcher_keeps_validated_final_logical_url_out_of_band_across_redirect(
+    public_dns: None,
+) -> None:
+    secret = "service-key-must-not-surface"
+
+    def redirect_then_respond(request: httpx.Request) -> httpx.Response:
+        query = request.url.query.decode()
+        if "redirect=1" in query:
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": (
+                        "https://example.go.kr/notices/detail?"
+                        f"houseManageNo=2026000001&serviceKey={secret}"
+                    )
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/html"},
+            content=b"<html>official</html>",
+        )
+
+    fetcher = OfficialHtmlFetcher(
+        allowed_hosts={"example.go.kr"},
+        path_prefixes=("/notices/",),
+        transport=httpx.MockTransport(redirect_then_respond),
+    )
+
+    result = fetcher.get("https://example.go.kr/notices/list?redirect=1")
+
+    assert result.url == "https://example.go.kr/notices/detail"
+    assert result.validated_logical_url().endswith(
+        f"houseManageNo=2026000001&serviceKey={secret}"
+    )
+    assert secret not in repr(result)
+    assert secret not in str(result)
+
+
 @pytest.mark.parametrize(
     ("headers", "content", "message"),
     [

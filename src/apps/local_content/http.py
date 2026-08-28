@@ -4,7 +4,7 @@ import codecs
 import email.utils
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic, sleep
 from urllib.parse import unquote, urlsplit
@@ -21,6 +21,7 @@ from wisdome_writer.infrastructure.http_safety import (
     redact_urls_in_text,
     safe_get,
     safe_post_form,
+    validated_logical_url,
 )
 
 MAX_HTML_BYTES = 5 * 1024 * 1024
@@ -34,13 +35,25 @@ class OfficialSourceError(Exception):
     """A persistence-safe failure while reading an approved official source."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HtmlResponse:
     url: str
     status_code: int
     content_type: str
     body: str
     fetched_at: datetime
+    _validated_logical_url: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        logical_url = self._validated_logical_url or self.url
+        object.__setattr__(self, "_validated_logical_url", logical_url)
+        object.__setattr__(self, "url", redact_url(self.url))
+
+    def validated_logical_url(self) -> str:
+        """Reveal the validated final URL only to the in-memory parser boundary."""
+
+        assert self._validated_logical_url is not None
+        return self._validated_logical_url
 
 
 class OfficialHtmlFetcher:
@@ -160,12 +173,14 @@ class OfficialHtmlFetcher:
             )
         content_type = response.headers.get("content-type", "")
         body = _decode_html(response.content, content_type, url)
+        logical_url = validated_logical_url(response)
         return HtmlResponse(
-            url=str(response.request.url),
+            url=logical_url,
             status_code=response.status_code,
             content_type=content_type,
             body=body,
             fetched_at=datetime.now(UTC),
+            _validated_logical_url=logical_url,
         )
 
     def _validate_url(self, url: str) -> None:
