@@ -53,6 +53,101 @@ evidence:
 
 ## Authoritative round-1 evidence
 
-Pending the final live rerun, deterministic runner, machine artifact audit, and
-all-page Brave pass. The final section will record the new ignored run path, exact
-counts, command results, service PIDs/logs, screenshots, shutdown state, and commit.
+The review support implementation is committed as `62e879a`.
+
+The authoritative ignored run is:
+
+```text
+output/housing/2026-08-28--run-9cf4661bcd83
+```
+
+Its machine report is:
+
+```text
+output/housing/2026-08-28--run-9cf4661bcd83/acceptance-report.json
+```
+
+The final machine-derived verdict is `overall_passed=true`; its four derived gates
+(`workflow_live_success`, `artifact_audit`, `django_brave_all_pages`, and
+`deterministic_commands_and_ruff_ruling`) all pass.
+
+### Official collection and artifacts
+
+The authoritative window is `2026-08-22T00:00:00+09:00` through
+`2026-08-28T13:23:31.621371+09:00`.
+
+- ApplyHome: 16 observations, collection `OK`, zero detail failures.
+- LH: 56 observations, collection `OK`, zero detail failures.
+- Raw official observations: 72 unique stable IDs.
+- Excluded by production `is_residential`: 29.
+- Residential index rows and official links: 43.
+- Detailed, written, and humanizer-verified articles: 19.
+- Verified images: 57, exactly hero/summary/timeline per article.
+- Official attachment bytes copied: zero.
+- Humanizer audit proofs: 19 unique job hashes and 19 verification hashes.
+
+The production auditor passed schema-v2 root validation, exact root/bundle
+inventories, raw-source completeness, production selection recomputation, exact
+index ID/link reconciliation, all article/source/image checks, and a fresh
+`verify_humanization_audit` call for every final article.
+
+### Deterministic commands
+
+The evidence runner executed and recorded exact argv, timestamps, exit codes, log
+paths, byte counts, and SHA-256 output digests. The authoritative attempt passed:
+
+- setup-local: exit 0;
+- Django check: exit 0;
+- migration check: exit 0;
+- focused pytest: 499 passed, 2 skipped, 6 warnings;
+- unrestricted pytest: 1224 passed, 5 skipped, 8 warnings, 198 subtests;
+- changed/branch Python plus every `local_content` Python Ruff target: exit 0;
+- local CI-material check: exit 0; and
+- diff check against the requested base: exit 0.
+
+Whole-repository Ruff exited 1 with 1,566 legacy findings. Its command record remains
+`passed=false` and `disposition=legacy_debt_not_gate`; the explicit ruling ID, text,
+and SHA-256 are stored in the report. It does not weaken changed/local-content Ruff.
+
+The first deterministic attempt is retained separately. It failed only because the
+then-running required humanizer owned port 3210 while a local-script test needed to
+bind that port (`1 failed, 1223 passed, 5 skipped, 198 subtests`). Only the owned
+humanizer was stopped, both ports were verified free, and the complete matrix was
+rerun rather than selectively retrying the failing test.
+
+GitHub-hosted CI was not executed locally and is not claimed.
+
+### Django and Brave
+
+Playwright launched the exact installed Brave executable and opened both indexes,
+all 19 detail URLs on desktop, and one representative 390 px mobile detail.
+
+- Every page returned 200 and had Korean layout without horizontal overflow.
+- Every detail loaded exactly three nonzero images with alt text.
+- Every detail's official links were HTTPS and host-allowlisted.
+- CSP, referrer, nosniff, frame, and cache headers matched exact required values.
+- The representative immutable asset headers matched exactly.
+- Console errors, page errors, failed requests, and bad local responses were zero.
+- Both traversal probes returned 404.
+- Mobile body font was 16 px.
+- Brave owned PIDs `7980, 9176, 36508, 37700, 38744` all exited.
+
+Evidence is retained under:
+
+```text
+output/housing/2026-08-28/acceptance/brave-round1/
+output/housing/2026-08-28/acceptance/deterministic-round1-attempt2/
+output/housing/2026-08-28/acceptance/deterministic-round1-attempt2-evidence.json
+```
+
+### Process ownership and remaining concerns
+
+The live humanizer used owned PID/listener `35204`; the preview humanizer used
+`43636`; Django used launcher/listener `30508/38632`. Only those owned service
+processes were stopped. Ports 3210 and 8000 are free, and no Brave process launched
+by the acceptance run survives.
+
+Remaining concerns are limited to the ledgered whole-repository Ruff debt, eight
+non-failing pytest warnings (six absent-generated-staticfiles notices and two
+Windows subprocess reader encoding warnings), and official facts available only in
+attachments. Attachment bytes remain deliberately unfetched and uncopied.
