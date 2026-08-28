@@ -10,6 +10,8 @@ using System.Runtime.InteropServices;
 
 public static class WisdomeFileIdentityNative
 {
+    private const UInt32 MOVEFILE_WRITE_THROUGH = 0x00000008;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct FILETIME
     {
@@ -38,6 +40,13 @@ public static class WisdomeFileIdentityNative
         out BY_HANDLE_FILE_INFORMATION information
     );
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool MoveFileEx(
+        string existingPath,
+        string newPath,
+        UInt32 flags
+    );
+
     public static string Identity(IntPtr handle)
     {
         BY_HANDLE_FILE_INFORMATION information;
@@ -45,6 +54,11 @@ public static class WisdomeFileIdentityNative
             throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle failed");
         return information.VolumeSerialNumber.ToString("x8") + ":" +
             information.FileIndexHigh.ToString("x8") + information.FileIndexLow.ToString("x8");
+    }
+
+    public static bool MoveFileNoReplaceWriteThrough(string source, string target)
+    {
+        return MoveFileEx(source, target, MOVEFILE_WRITE_THROUGH);
     }
 }
 '@

@@ -105,6 +105,21 @@ function Import-LocalEnvironment {
     }
 }
 
+function Assert-LocalStopNotRequested {
+    if ([WisdomeConsoleStopSignal]::StopRequested) {
+        throw 'Local supervisor stop was requested.'
+    }
+}
+
+function Invoke-LocalBoundedStep {
+    param([scriptblock]$Action)
+
+    Assert-LocalStopNotRequested
+    $result = & $Action
+    Assert-LocalStopNotRequested
+    return $result
+}
+
 function Test-Health {
     param([string]$Url, [string]$ExpectedStatus = '')
 
@@ -129,13 +144,15 @@ function Wait-Health {
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
-        if ([WisdomeConsoleStopSignal]::Wait(0)) {
-            throw 'Local supervisor stop was requested.'
-        }
-        if (Test-Health -Url $Url -ExpectedStatus $ExpectedStatus) {
+        Assert-LocalStopNotRequested
+        $healthy = Test-Health -Url $Url -ExpectedStatus $ExpectedStatus
+        Assert-LocalStopNotRequested
+        if ($healthy) {
             return
         }
-        Start-Sleep -Milliseconds 250
+        if ([WisdomeConsoleStopSignal]::Wait(250)) {
+            throw 'Local supervisor stop was requested.'
+        }
     }
     throw "Timed out waiting for local health endpoint $Url."
 }
@@ -185,42 +202,58 @@ try {
     Enable-LocalStopSignal
     $stopSignalEnabled = $true
     $context = Enter-LocalSupervisor -RepositoryRoot $repository -DeferJob
-    Initialize-LocalStopSignalContext -Context $context
-    Initialize-LocalSupervisorJob -Context $context
+    Assert-LocalStopNotRequested
+    [void](Invoke-LocalBoundedStep { Initialize-LocalSupervisorJob -Context $context })
 
-    if (Test-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready') {
-        Assert-LoopbackListener -Port 3210
+    $humanizerReady = Invoke-LocalBoundedStep {
+        Test-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready'
+    }
+    if ($humanizerReady) {
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 3210 })
     }
     else {
         $env:HOST = '127.0.0.1'
         $env:PORT = '3210'
         $env:CODEX_CHUNK_CONCURRENCY = '1'
-        [void](Start-LocalOwnedProcess -Context $context -Name 'humanizer' -FilePath $node.Source -Arguments @('dist\server.js') -WorkingDirectory $humanizer)
-        Wait-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready' -TimeoutSeconds $HealthTimeoutSeconds
-        Assert-LoopbackListener -Port 3210
+        [void](Invoke-LocalBoundedStep {
+            Start-LocalOwnedProcess -Context $context -Name 'humanizer' -FilePath $node.Source -Arguments @('dist\server.js') -WorkingDirectory $humanizer
+        })
+        [void](Invoke-LocalBoundedStep {
+            Wait-Health -Url "$humanizerOrigin/api/health" -ExpectedStatus 'ready' -TimeoutSeconds $HealthTimeoutSeconds
+        })
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 3210 })
     }
 
-    if (Test-Health -Url "$djangoOrigin/health/live") {
-        Assert-LoopbackListener -Port 8000
+    $djangoLive = Invoke-LocalBoundedStep { Test-Health -Url "$djangoOrigin/health/live" }
+    if ($djangoLive) {
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 8000 })
     }
     else {
-        [void](Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository)
-        Wait-Health -Url "$djangoOrigin/health/live" -TimeoutSeconds $HealthTimeoutSeconds
-        Assert-LoopbackListener -Port 8000
+        [void](Invoke-LocalBoundedStep {
+            Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository
+        })
+        [void](Invoke-LocalBoundedStep {
+            Wait-Health -Url "$djangoOrigin/health/live" -TimeoutSeconds $HealthTimeoutSeconds
+        })
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 8000 })
     }
-    Wait-Health -Url "$djangoOrigin/health/ready" -TimeoutSeconds $HealthTimeoutSeconds
-    Set-LocalSupervisorRunning -Context $context
+    [void](Invoke-LocalBoundedStep {
+        Wait-Health -Url "$djangoOrigin/health/ready" -TimeoutSeconds $HealthTimeoutSeconds
+    })
+    [void](Invoke-LocalBoundedStep { Set-LocalSupervisorRunning -Context $context })
 
     Write-Output "Preview: $djangoOrigin/local-articles/"
     Write-Output 'Collect: .\.venv\Scripts\python.exe src\manage.py collect_recent_housing --days 7 --humanize --write-articles'
     Write-Output "State: $($context.StatePath)"
     Write-Output 'Press Ctrl+C to close this instance job and stop only its owned process tree.'
     while (-not (Wait-LocalStopSignal -Milliseconds 1000)) {
+        Assert-LocalStopNotRequested
         for ($index = 0; $index -lt $context.NativeProcesses.Count; $index += 1) {
             if ($context.NativeProcesses[$index].HasExited()) {
                 throw "$($context.Processes[$index].name) exited; inspect its instance log paths."
             }
         }
+        Assert-LocalStopNotRequested
     }
 }
 catch {
@@ -233,14 +266,7 @@ catch {
 finally {
     try {
         if ($null -ne $context) {
-            $stopRequested = [WisdomeConsoleStopSignal]::StopRequested
-            $closed = if ($stopRequested) {
-                [void][WisdomeConsoleStopSignal]::RunCleanup()
-                Complete-LocalSupervisorAfterSignal -Context $context
-            }
-            else {
-                Exit-LocalSupervisor -Context $context
-            }
+            $closed = Exit-LocalSupervisor -Context $context
             if (-not $closed -and -not $caughtFailure) {
                 throw 'The owned Windows job could not be closed cleanly.'
             }

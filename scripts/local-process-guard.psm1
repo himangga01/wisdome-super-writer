@@ -5,8 +5,10 @@ $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
 if (-not ('WisdomeProcessNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -35,6 +37,8 @@ public sealed class WisdomeOwnedProcess
     public long CreationTimeTicks { get; private set; }
     public IntPtr NativeHandle { get { return handle; } }
     public bool Closed { get { return handle == IntPtr.Zero; } }
+    public int WaitAttemptCount { get; private set; }
+    public int CloseAttemptCount { get; private set; }
 
     public bool HasExited()
     {
@@ -45,19 +49,54 @@ public sealed class WisdomeOwnedProcess
         throw new InvalidOperationException("PROCESS_WAIT_FAILED");
     }
 
-    public bool WaitForExitAndClose(int milliseconds)
+    public bool WaitForExit(int milliseconds, bool fail)
     {
         if (Closed) return true;
-        UInt32 result = WaitForSingleObject(handle, (UInt32)Math.Max(milliseconds, 0));
+        WaitAttemptCount++;
+        UInt32 result = fail ? WAIT_FAILED :
+            WaitForSingleObject(handle, (UInt32)Math.Max(milliseconds, 0));
         if (result == WAIT_TIMEOUT) return false;
         if (result == WAIT_FAILED) throw new InvalidOperationException("PROCESS_WAIT_FAILED");
         if (result != WAIT_OBJECT_0) throw new InvalidOperationException("PROCESS_WAIT_FAILED");
-        if (!CloseHandle(handle)) throw new InvalidOperationException("PROCESS_CLOSE_FAILED");
+        return true;
+    }
+
+    public bool Close(bool fail)
+    {
+        if (Closed) return true;
+        CloseAttemptCount++;
+        if (fail || !CloseHandle(handle)) return false;
         handle = IntPtr.Zero;
         return true;
     }
 
+    public bool WaitForExitAndClose(int milliseconds)
+    {
+        if (!WaitForExit(milliseconds, false)) return false;
+        if (!Close(false)) throw new InvalidOperationException("PROCESS_CLOSE_FAILED");
+        return true;
+    }
+
     public void MarkClosedExternally() { handle = IntPtr.Zero; }
+}
+
+public sealed class WisdomeNativeCleanupProbe
+{
+    public WisdomeNativeCleanupProbe()
+    {
+        RetainedHandleKinds = new string[0];
+    }
+
+    public string FailureCode { get; set; }
+    public int StandardInputCloseAttemptCount { get; set; }
+    public int StandardOutputCloseAttemptCount { get; set; }
+    public int StandardErrorCloseAttemptCount { get; set; }
+    public int TerminateAttemptCount { get; set; }
+    public int WaitAttemptCount { get; set; }
+    public int ProcessCloseAttemptCount { get; set; }
+    public int ThreadCloseAttemptCount { get; set; }
+    public int RetainedHandleCount { get; set; }
+    public string[] RetainedHandleKinds { get; set; }
 }
 
 public static class WisdomeProcessNative
@@ -78,9 +117,14 @@ public static class WisdomeProcessNative
     private const UInt32 CREATE_NO_WINDOW = 0x08000000;
     private const UInt32 STARTF_USESTDHANDLES = 0x00000100;
     private const UInt32 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+    private const UInt32 MOVEFILE_REPLACE_EXISTING = 0x00000001;
+    private const UInt32 MOVEFILE_WRITE_THROUGH = 0x00000008;
     private const UInt32 WAIT_OBJECT_0 = 0;
     private const UInt32 WAIT_FAILED = UInt32.MaxValue;
     private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+    private static readonly List<IntPtr> RetainedFailureHandles = new List<IntPtr>();
+
+    public static WisdomeNativeCleanupProbe LastStartCleanupProbe { get; private set; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
@@ -215,6 +259,9 @@ public static class WisdomeProcessNative
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool MoveFileEx(string existingPath, string newPath, UInt32 flags);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation,
         out FILETIME exit, out FILETIME kernel, out FILETIME user);
@@ -225,11 +272,19 @@ public static class WisdomeProcessNative
 
     private static void Fail(string code) { throw new InvalidOperationException(code); }
 
-    private static void CheckedClose(ref IntPtr handle, string code)
+    private static bool TryCloseOnce(ref IntPtr handle, bool fail, ref int attempts)
     {
-        if (handle == IntPtr.Zero || handle == INVALID_HANDLE_VALUE) return;
-        if (!CloseHandle(handle)) Fail(code);
+        if (handle == IntPtr.Zero || handle == INVALID_HANDLE_VALUE) return true;
+        if (attempts != 0) return false;
+        attempts++;
+        if (fail || !CloseHandle(handle)) return false;
         handle = IntPtr.Zero;
+        return true;
+    }
+
+    private static void CheckedClose(ref IntPtr handle, string code, ref int attempts)
+    {
+        if (!TryCloseOnce(ref handle, false, ref attempts)) Fail(code);
     }
 
     private static IntPtr CreateInheritedFile(string path, UInt32 access, UInt32 creation)
@@ -272,7 +327,9 @@ public static class WisdomeProcessNative
         IntPtr list = IntPtr.Zero, handleValues = IntPtr.Zero;
         bool listInitialized = false, listDeleted = false, created = false;
         PROCESS_INFORMATION process = new PROCESS_INFORMATION();
-        string stable = null;
+        int stdinCloseAttempts = 0, stdoutCloseAttempts = 0, stderrCloseAttempts = 0;
+        int processCloseAttempts = 0, threadCloseAttempts = 0;
+        LastStartCleanupProbe = null;
         try
         {
             stdout = CreateInheritedFile(stdoutPath, GENERIC_WRITE, CREATE_NEW);
@@ -316,16 +373,16 @@ public static class WisdomeProcessNative
             if (fault == "attribute-delete") Fail("NATIVE_ATTRIBUTE_DELETE_FAILED");
             Marshal.FreeHGlobal(list); list = IntPtr.Zero;
             Marshal.FreeHGlobal(handleValues); handleValues = IntPtr.Zero;
-            CheckedClose(ref stdin, "NATIVE_CLOSE_FAILED");
-            CheckedClose(ref stdout, "NATIVE_CLOSE_FAILED");
-            CheckedClose(ref stderr, "NATIVE_CLOSE_FAILED");
+            CheckedClose(ref stdin, "NATIVE_CLOSE_FAILED", ref stdinCloseAttempts);
+            CheckedClose(ref stdout, "NATIVE_CLOSE_FAILED", ref stdoutCloseAttempts);
+            CheckedClose(ref stderr, "NATIVE_CLOSE_FAILED", ref stderrCloseAttempts);
 
             if (fault == "assign" || fault == "terminate" || fault == "wait" ||
-                fault == "close") Fail("NATIVE_" + fault.ToUpperInvariant() + "_FAILED");
-            if (!AssignProcessToJobObject(job, process.ProcessHandle)) Fail("NATIVE_ASSIGN_FAILED");
+                fault == "close" || !AssignProcessToJobObject(job, process.ProcessHandle))
+                Fail("NATIVE_ASSIGN_FAILED");
             if (fault == "resume" || ResumeThread(process.ThreadHandle) == UInt32.MaxValue)
                 Fail("NATIVE_RESUME_FAILED");
-            CheckedClose(ref process.ThreadHandle, "NATIVE_CLOSE_FAILED");
+            CheckedClose(ref process.ThreadHandle, "NATIVE_CLOSE_FAILED", ref threadCloseAttempts);
             FILETIME creation, exit, kernel, user;
             if (!GetProcessTimes(process.ProcessHandle, out creation, out exit,
                 out kernel, out user)) Fail("NATIVE_PROCESS_TIME_FAILED");
@@ -334,19 +391,75 @@ public static class WisdomeProcessNative
         }
         catch (Exception error)
         {
-            stable = error.Message.StartsWith("NATIVE_") ? error.Message : "NATIVE_CREATE_FAILED";
+            string stable = error.Message.StartsWith("NATIVE_") ?
+                error.Message : "NATIVE_CREATE_FAILED";
+            WisdomeNativeCleanupProbe probe = new WisdomeNativeCleanupProbe();
+            List<string> retainedKinds = new List<string>();
             if (created && process.ProcessHandle != IntPtr.Zero)
             {
-                bool terminated = TerminateProcess(process.ProcessHandle, 1);
-                if (!terminated || fault == "terminate") stable = "NATIVE_TERMINATE_FAILED";
-                UInt32 waited = WaitForSingleObject(process.ProcessHandle, 5000);
-                if (waited != WAIT_OBJECT_0 || fault == "wait") stable = "NATIVE_WAIT_FAILED";
-                bool threadClosed = process.ThreadHandle == IntPtr.Zero || CloseHandle(process.ThreadHandle);
-                process.ThreadHandle = IntPtr.Zero;
-                bool processClosed = CloseHandle(process.ProcessHandle);
-                process.ProcessHandle = IntPtr.Zero;
-                if (!threadClosed || !processClosed || fault == "close") stable = "NATIVE_CLOSE_FAILED";
+                probe.TerminateAttemptCount++;
+                bool terminateResult = TerminateProcess(process.ProcessHandle, 1);
+                if (fault == "terminate") terminateResult = false;
+                if (!terminateResult) stable = "NATIVE_TERMINATE_FAILED";
+
+                probe.WaitAttemptCount++;
+                UInt32 waitResult = WaitForSingleObject(process.ProcessHandle, 5000);
+                if (fault == "wait") waitResult = WAIT_FAILED;
+                if (waitResult != WAIT_OBJECT_0 && stable != "NATIVE_TERMINATE_FAILED")
+                    stable = "NATIVE_WAIT_FAILED";
+
+                bool processClosed = TryCloseOnce(ref process.ProcessHandle,
+                    fault == "close", ref processCloseAttempts);
+                if (!processClosed)
+                {
+                    lock (RetainedFailureHandles)
+                    { RetainedFailureHandles.Add(process.ProcessHandle); }
+                    probe.RetainedHandleCount++;
+                    retainedKinds.Add("process");
+                    if (stable != "NATIVE_TERMINATE_FAILED" && stable != "NATIVE_WAIT_FAILED")
+                        stable = "NATIVE_CLOSE_FAILED";
+                }
+                bool threadClosed = TryCloseOnce(ref process.ThreadHandle, false,
+                    ref threadCloseAttempts);
+                if (!threadClosed)
+                {
+                    lock (RetainedFailureHandles)
+                    { RetainedFailureHandles.Add(process.ThreadHandle); }
+                    probe.RetainedHandleCount++;
+                    retainedKinds.Add("thread");
+                    if (stable != "NATIVE_TERMINATE_FAILED" && stable != "NATIVE_WAIT_FAILED")
+                        stable = "NATIVE_CLOSE_FAILED";
+                }
             }
+            if (!TryCloseOnce(ref stdin, false, ref stdinCloseAttempts))
+            {
+                lock (RetainedFailureHandles) { RetainedFailureHandles.Add(stdin); }
+                probe.RetainedHandleCount++;
+                retainedKinds.Add("stdin");
+                stable = "NATIVE_CLOSE_FAILED";
+            }
+            if (!TryCloseOnce(ref stdout, false, ref stdoutCloseAttempts))
+            {
+                lock (RetainedFailureHandles) { RetainedFailureHandles.Add(stdout); }
+                probe.RetainedHandleCount++;
+                retainedKinds.Add("stdout");
+                stable = "NATIVE_CLOSE_FAILED";
+            }
+            if (!TryCloseOnce(ref stderr, false, ref stderrCloseAttempts))
+            {
+                lock (RetainedFailureHandles) { RetainedFailureHandles.Add(stderr); }
+                probe.RetainedHandleCount++;
+                retainedKinds.Add("stderr");
+                stable = "NATIVE_CLOSE_FAILED";
+            }
+            probe.FailureCode = stable;
+            probe.StandardInputCloseAttemptCount = stdinCloseAttempts;
+            probe.StandardOutputCloseAttemptCount = stdoutCloseAttempts;
+            probe.StandardErrorCloseAttemptCount = stderrCloseAttempts;
+            probe.ProcessCloseAttemptCount = processCloseAttempts;
+            probe.ThreadCloseAttemptCount = threadCloseAttempts;
+            probe.RetainedHandleKinds = retainedKinds.ToArray();
+            LastStartCleanupProbe = probe;
             throw new InvalidOperationException(stable);
         }
         finally
@@ -354,12 +467,6 @@ public static class WisdomeProcessNative
             if (listInitialized && !listDeleted) DeleteProcThreadAttributeList(list);
             if (handleValues != IntPtr.Zero) Marshal.FreeHGlobal(handleValues);
             if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
-            if (stdin != IntPtr.Zero && stdin != INVALID_HANDLE_VALUE && !CloseHandle(stdin))
-                Fail("NATIVE_CLOSE_FAILED");
-            if (stdout != IntPtr.Zero && stdout != INVALID_HANDLE_VALUE && !CloseHandle(stdout))
-                Fail("NATIVE_CLOSE_FAILED");
-            if (stderr != IntPtr.Zero && stderr != INVALID_HANDLE_VALUE && !CloseHandle(stderr))
-                Fail("NATIVE_CLOSE_FAILED");
         }
     }
 
@@ -384,9 +491,40 @@ public static class WisdomeProcessNative
         finally { if (!CloseHandle(handle)) Fail("REPOSITORY_HANDLE_CLOSE_FAILED"); }
     }
 
+    public static bool MoveFileReplaceWriteThrough(string source, string target)
+    {
+        return MoveFileEx(source, target,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+
+    public static bool CloseHandleForCleanup(IntPtr handle, bool fail)
+    {
+        return !fail && CloseHandle(handle);
+    }
+
     public static IntPtr CreateInheritableSentinel(string path)
     {
-        return CreateInheritedFile(path, GENERIC_WRITE, CREATE_NEW);
+        IntPtr handle = CreateInheritedFile(path, GENERIC_READ | GENERIC_WRITE, CREATE_NEW);
+        SafeFileHandle safe = new SafeFileHandle(handle, false);
+        using (FileStream stream = new FileStream(safe, FileAccess.ReadWrite))
+        {
+            stream.WriteByte(90);
+            stream.Flush(true);
+            stream.Position = 0;
+        }
+        return handle;
+    }
+
+    public static int ReadSentinelForTest(IntPtr handle)
+    {
+        SafeFileHandle safe = new SafeFileHandle(handle, false);
+        using (FileStream stream = new FileStream(safe, FileAccess.Read))
+        {
+            stream.Position = 0;
+            int value = stream.ReadByte();
+            stream.Position = 0;
+            return value;
+        }
     }
 
     public static void CloseTestHandle(IntPtr handle)
@@ -395,162 +533,23 @@ public static class WisdomeProcessNative
     }
 }
 
-public sealed class WisdomeCleanupProbe
-{
-    public int CallerCount { get; set; }
-    public bool CleanupCompleted { get; set; }
-    public int JobCloseCount { get; set; }
-    public int OwnerCount { get; set; }
-    public int ProcessCloseCount { get; set; }
-    public bool Succeeded { get; set; }
-}
-
 public static class WisdomeConsoleStopSignal
 {
     private enum ControlType : uint { CtrlC = 0, CtrlBreak = 1 }
     private delegate bool HandlerRoutine(ControlType value);
     private static readonly ManualResetEvent StopEvent = new ManualResetEvent(false);
-    private static readonly ManualResetEvent CleanupCompletedEvent = new ManualResetEvent(false);
     private static readonly HandlerRoutine Handler = HandleControl;
     private static int stopRequested;
-    private static int cleanupOwner;
-    private static int ownerCount;
-    private static int callerCount;
-    private static int jobCloseCount;
-    private static int processCloseCount;
     private static bool installed;
-    private static bool configured;
-    private static bool handled;
-    private static bool succeeded;
-    private static IntPtr job;
-    private static IntPtr[] processHandles = new IntPtr[0];
-    private static string statePath;
-    private static string stoppedJson;
-    private static string errorJson;
-    private static string cleanupFault;
-    private static string pauseBoundary;
-    private static ManualResetEvent pauseReached;
-    private static ManualResetEvent pauseRelease;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern UInt32 WaitForSingleObject(IntPtr handle, UInt32 milliseconds);
 
     private static bool HandleControl(ControlType value)
     {
         if (value != ControlType.CtrlC && value != ControlType.CtrlBreak) return false;
         RequestStop();
-        ExecuteStop();
         return true;
-    }
-
-    private static void Boundary(string value)
-    {
-        if (pauseBoundary == value && pauseReached != null)
-        {
-            pauseReached.Set();
-            pauseRelease.WaitOne();
-        }
-    }
-
-    private static void AtomicWrite(string path, string payload)
-    {
-        string directory = Path.GetDirectoryName(path);
-        string temporary = Path.Combine(directory, ".signal-" + Guid.NewGuid().ToString("N") + ".tmp");
-        string backup = Path.Combine(directory, ".signal-" + Guid.NewGuid().ToString("N") + ".backup");
-        File.WriteAllText(temporary, payload, new UTF8Encoding(false));
-        if (File.Exists(path))
-        {
-            File.Replace(temporary, path, backup);
-            File.Delete(backup);
-        }
-        else File.Move(temporary, path);
-    }
-
-    private static string ErrorCodeForFault(string fault)
-    {
-        if (fault == "job-close") return "JOB_CLOSE_FAILED";
-        if (fault == "process-wait") return "PROCESS_WAIT_FAILED";
-        if (fault == "process-close") return "PROCESS_CLOSE_FAILED";
-        if (fault == "state-write") return "STATE_WRITE_FAILED";
-        return null;
-    }
-
-    private static string ErrorPayload(string code)
-    {
-        return errorJson.Replace("JOB_CLOSE_FAILED", code);
-    }
-
-    private static bool ExecuteStop()
-    {
-        Interlocked.Increment(ref callerCount);
-        if (!configured || job == IntPtr.Zero)
-        {
-            if (!configured)
-            {
-                handled = true; succeeded = true; CleanupCompletedEvent.Set();
-            }
-            return succeeded;
-        }
-        if (Interlocked.CompareExchange(ref cleanupOwner, 1, 0) != 0)
-        {
-            CleanupCompletedEvent.WaitOne();
-            return succeeded;
-        }
-        Interlocked.Increment(ref ownerCount);
-        string code = null;
-        try
-        {
-            Boundary("owner-acquired");
-            Interlocked.Increment(ref jobCloseCount);
-            bool jobClosed = cleanupFault != "job-close" && CloseHandle(job);
-            if (!jobClosed) code = "JOB_CLOSE_FAILED";
-            else job = IntPtr.Zero;
-            Boundary("job-closed");
-            if (code == null)
-            {
-                for (int index = 0; index < processHandles.Length; index++)
-                {
-                    UInt32 waited = cleanupFault == "process-wait" ? UInt32.MaxValue :
-                        WaitForSingleObject(processHandles[index], 10000);
-                    if (waited != 0) { code = "PROCESS_WAIT_FAILED"; break; }
-                }
-            }
-            Boundary("processes-waited");
-            if (code == null)
-            {
-                for (int index = 0; index < processHandles.Length; index++)
-                {
-                    bool closed = cleanupFault != "process-close" &&
-                        CloseHandle(processHandles[index]);
-                    if (!closed) { code = "PROCESS_CLOSE_FAILED"; break; }
-                    processHandles[index] = IntPtr.Zero;
-                    Interlocked.Increment(ref processCloseCount);
-                }
-            }
-            bool stateWritten = false;
-            try
-            {
-                if (cleanupFault == "state-write")
-                    throw new IOException("injected");
-                AtomicWrite(statePath, code == null ? stoppedJson : ErrorPayload(code));
-                stateWritten = true;
-            }
-            catch
-            {
-                code = "STATE_WRITE_FAILED";
-                try { AtomicWrite(statePath, ErrorPayload(code)); stateWritten = true; }
-                catch { stateWritten = false; }
-            }
-            if (stateWritten) Boundary("state-written");
-            succeeded = code == null && stateWritten;
-            handled = stateWritten;
-            return succeeded;
-        }
-        finally { CleanupCompletedEvent.Set(); }
     }
 
     private static void RequestStop()
@@ -561,11 +560,8 @@ public static class WisdomeConsoleStopSignal
 
     public static void Install()
     {
-        StopEvent.Reset(); CleanupCompletedEvent.Reset();
-        stopRequested = cleanupOwner = ownerCount = callerCount = 0;
-        jobCloseCount = processCloseCount = 0;
-        configured = handled = succeeded = false;
-        cleanupFault = pauseBoundary = null;
+        StopEvent.Reset();
+        stopRequested = 0;
         if (!installed && !SetConsoleCtrlHandler(Handler, true))
             throw new InvalidOperationException("CONSOLE_HANDLER_INSTALL_FAILED");
         installed = true;
@@ -573,64 +569,14 @@ public static class WisdomeConsoleStopSignal
 
     public static void Uninstall()
     {
-        if (StopRequested && !CleanupCompletedEvent.WaitOne(15000))
-            throw new InvalidOperationException("CLEANUP_NOT_COMPLETED");
         if (installed && !SetConsoleCtrlHandler(Handler, false))
             throw new InvalidOperationException("CONSOLE_HANDLER_REMOVE_FAILED");
         installed = false;
     }
-
-    public static void ConfigureState(string path, string stopped, string error)
-    {
-        if (configured) throw new InvalidOperationException("SIGNAL_ALREADY_CONFIGURED");
-        statePath = path; stoppedJson = stopped; errorJson = error; configured = true;
-    }
-
-    public static void UpdateState(string stopped, string error)
-    { stoppedJson = stopped; errorJson = error; }
-    public static void UpdateProcesses(IntPtr[] handles)
-    { processHandles = handles ?? new IntPtr[0]; }
-    public static void AssociateJob(IntPtr value)
-    {
-        job = value;
-        if (StopRequested) ExecuteStop();
-    }
     public static bool Wait(int milliseconds) { return StopEvent.WaitOne(milliseconds); }
-    public static bool WaitForCleanup(int milliseconds)
-    { return CleanupCompletedEvent.WaitOne(milliseconds); }
     public static bool StopRequested { get { return stopRequested != 0; } }
-    public static bool CleanupIsCompleted { get { return CleanupCompletedEvent.WaitOne(0); } }
-    public static bool WasHandled { get { return handled; } }
-    public static bool Succeeded { get { return succeeded; } }
     public static void RequestStopForTest() { RequestStop(); }
-    public static bool RunCleanupForTest() { return ExecuteStop(); }
-    public static bool RunCleanup() { return ExecuteStop(); }
-    public static void TriggerForTest() { RequestStop(); ExecuteStop(); }
-    public static void SetCleanupFaultForTest(string value) { cleanupFault = value; }
-
-    public static WisdomeCleanupProbe ExerciseCleanupInterleavingForTest(string boundary)
-    {
-        pauseBoundary = boundary;
-        pauseReached = new ManualResetEvent(false);
-        pauseRelease = new ManualResetEvent(false);
-        RequestStop();
-        Thread first = new Thread(() => ExecuteStop());
-        Thread second = new Thread(() => ExecuteStop());
-        first.Start();
-        if (!pauseReached.WaitOne(5000)) throw new InvalidOperationException("BOUNDARY_NOT_REACHED");
-        second.Start();
-        Thread.Sleep(50);
-        pauseRelease.Set();
-        first.Join(); second.Join();
-        return new WisdomeCleanupProbe {
-            CallerCount = callerCount,
-            CleanupCompleted = CleanupIsCompleted,
-            JobCloseCount = jobCloseCount,
-            OwnerCount = ownerCount,
-            ProcessCloseCount = processCloseCount,
-            Succeeded = succeeded
-        };
-    }
+    public static void TriggerForTest() { RequestStop(); }
 }
 '@
 }
@@ -727,18 +673,24 @@ function Write-LocalSupervisorState {
     $temporary = Join-Path $Context.InstanceRoot ('.state-' + [Guid]::NewGuid().ToString('N') + '.tmp')
     $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew,
         [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $stream.Write($payload, 0, $payload.Length); $stream.Flush($true) }
+    try {
+        $stream.Write($payload, 0, $payload.Length)
+        $stream.Flush($true)
+    }
+    catch { throw 'STATE_WRITE_FAILED' }
     finally { $stream.Dispose() }
-    if ([IO.File]::Exists($Context.StatePath)) {
-        $backup = $temporary + '.backup'; [IO.File]::Replace($temporary, $Context.StatePath, $backup)
-        [IO.File]::Delete($backup)
-    } else { [IO.File]::Move($temporary, $Context.StatePath) }
+    if (-not [WisdomeProcessNative]::MoveFileReplaceWriteThrough(
+        $temporary, $Context.StatePath
+    )) { throw 'STATE_WRITE_FAILED' }
 }
 
 function Release-LocalMutex {
     param([pscustomobject]$Context)
     if ($Context.MutexOwned) { $Context.Mutex.ReleaseMutex(); $Context.MutexOwned = $false }
-    $Context.Mutex.Dispose()
+    if (-not $Context.MutexDisposed) {
+        $Context.Mutex.Dispose()
+        $Context.MutexDisposed = $true
+    }
 }
 
 function Enter-LocalSupervisor {
@@ -768,10 +720,12 @@ function Enter-LocalSupervisor {
             RepositoryRoot=$repository; PhysicalRepositoryRoot=$repository; MutexName=$mutexName
             InstanceId=$instanceId; InstanceRoot=$instanceRoot
             StatePath=(Join-Path $instanceRoot 'state.json'); LogRoot=$logRoot
-            Mutex=$mutex; MutexOwned=$true; JobHandle=$job
+            Mutex=$mutex; MutexOwned=$true; MutexDisposed=$false; JobHandle=$job
             Processes=(New-Object Collections.ArrayList)
             NativeProcesses=(New-Object Collections.ArrayList)
-            SignalConfigured=$false; TerminalStatus='stopped'; TerminalErrorCode=''
+            TerminalStatus='stopped'; TerminalErrorCode=''
+            CleanupStarted=$false; CleanupCompleted=$false; CleanupSucceeded=$false
+            CleanupErrorCode=''; JobCloseAttempts=0; CleanupStateWriteAttempts=0
         }
         if ($SimulateInitialStateFailure) { throw 'Injected initial state failure.' }
         Write-LocalSupervisorState $context $true 'starting'
@@ -793,7 +747,6 @@ function Initialize-LocalSupervisorJob {
     param([pscustomobject]$Context)
     if ($Context.JobHandle -ne [IntPtr]::Zero) { return }
     $Context.JobHandle = [WisdomeProcessNative]::CreateKillOnCloseJob()
-    [WisdomeConsoleStopSignal]::AssociateJob($Context.JobHandle)
 }
 
 function Assert-InstanceLogPath {
@@ -836,7 +789,6 @@ function Start-LocalOwnedProcess {
     }
     [void]$Context.Processes.Add($record)
     Write-LocalSupervisorState $Context $true 'running'
-    if ($Context.SignalConfigured) { Update-LocalStopSignalContext $Context }
     return $process
 }
 
@@ -845,60 +797,90 @@ function Set-LocalSupervisorTerminalStatus {
     param([pscustomobject]$Context,[string]$Status,[string]$ErrorCode='')
     $Context.TerminalStatus=$Status; $Context.TerminalErrorCode=$ErrorCode
     Write-LocalSupervisorState $Context $true $Status $ErrorCode
-    if ($Context.SignalConfigured) { Update-LocalStopSignalContext $Context }
 }
 
 function Set-LocalSupervisorRunning {
     [CmdletBinding()] param([pscustomobject]$Context)
     Write-LocalSupervisorState $Context $true 'running'
-    if ($Context.SignalConfigured) { Update-LocalStopSignalContext $Context }
-}
-
-function Write-CleanupError {
-    param([pscustomobject]$Context,[string]$Code)
-    try { Write-LocalSupervisorState $Context $true 'cleanup_error' $Code }
-    catch { return $false }
-    return $true
 }
 
 function Exit-LocalSupervisor {
     [CmdletBinding()]
     param([pscustomobject]$Context,
-        [scriptblock]$CloseHandle={param($h)[WisdomeProcessNative]::CloseHandle($h)},
+        [scriptblock]$CloseHandle={param($h)[WisdomeProcessNative]::CloseHandleForCleanup($h,$false)},
         [int]$TimeoutSeconds=10,
         [ValidateSet('','job-close','process-wait','process-close','state-write')]
-        [string]$CleanupFault='')
-    try {
-        if ($Context.JobHandle -eq [IntPtr]::Zero -or
-            $CleanupFault -eq 'job-close' -or
-            -not [bool](& $CloseHandle $Context.JobHandle)) {
-            [void](Write-CleanupError $Context 'JOB_CLOSE_FAILED'); return $false
-        }
-        $Context.JobHandle=[IntPtr]::Zero
-        if($CleanupFault -eq 'process-wait'){
-            [void](Write-CleanupError $Context 'PROCESS_WAIT_FAILED');return $false
-        }
-        if($CleanupFault -eq 'process-close'){
-            [void](Write-CleanupError $Context 'PROCESS_CLOSE_FAILED');return $false
-        }
-        $remaining=$TimeoutSeconds*1000
-        foreach($native in $Context.NativeProcesses) {
-            $started=[Environment]::TickCount
-            try { $done=$native.WaitForExitAndClose($remaining) }
-            catch {
-                $code=if($_.Exception.Message -match 'PROCESS_CLOSE'){'PROCESS_CLOSE_FAILED'}else{'PROCESS_WAIT_FAILED'}
-                [void](Write-CleanupError $Context $code); return $false
+        [string[]]$CleanupFault=@())
+    if ($Context.CleanupCompleted) { return [bool]$Context.CleanupSucceeded }
+    if ($Context.CleanupStarted) { return $false }
+    $Context.CleanupStarted=$true
+    $faults=@($CleanupFault)
+    $resourceError=''
+
+    if ($Context.JobHandle -ne [IntPtr]::Zero) {
+        $Context.JobCloseAttempts += 1
+        $jobClosed=$false
+        try {
+            if ($faults -contains 'job-close') {
+                $jobClosed=[WisdomeProcessNative]::CloseHandleForCleanup($Context.JobHandle,$true)
+            } else {
+                $jobClosed=[bool](& $CloseHandle $Context.JobHandle)
             }
-            if(-not $done){[void](Write-CleanupError $Context 'PROCESS_WAIT_FAILED');return $false}
-            $remaining=[Math]::Max(0,$remaining-[Math]::Max(0,[Environment]::TickCount-$started))
+        } catch { $jobClosed=$false }
+        if ($jobClosed) { $Context.JobHandle=[IntPtr]::Zero }
+        elseif (-not $resourceError) { $resourceError='JOB_CLOSE_FAILED' }
+    }
+
+    $remaining=[Math]::Max(0,$TimeoutSeconds*1000)
+    foreach($native in $Context.NativeProcesses) {
+        $started=[Environment]::TickCount
+        $waited=$false
+        try {
+            $waited=$native.WaitForExit(
+                $remaining, [bool]($faults -contains 'process-wait')
+            )
+        } catch { $waited=$false }
+        if (-not $waited -and -not $resourceError) { $resourceError='PROCESS_WAIT_FAILED' }
+        $elapsed=[Math]::Max(0,[Environment]::TickCount-$started)
+        $remaining=[Math]::Max(0,$remaining-$elapsed)
+
+        $processClosed=$false
+        try {
+            $processClosed=$native.Close([bool]($faults -contains 'process-close'))
+        } catch { $processClosed=$false }
+        if (-not $processClosed -and -not $resourceError) { $resourceError='PROCESS_CLOSE_FAILED' }
+    }
+
+    $stateFailure=$false
+    $stateWritten=$false
+    $Context.CleanupStateWriteAttempts += 1
+    try {
+        if ($faults -contains 'state-write') { throw 'STATE_WRITE_FAILED' }
+        if ($resourceError) {
+            Write-LocalSupervisorState $Context $true 'cleanup_error' $resourceError
+        } else {
+            Write-LocalSupervisorState $Context $false $Context.TerminalStatus $Context.TerminalErrorCode
         }
-        if($CleanupFault -eq 'state-write'){
-            [void](Write-CleanupError $Context 'STATE_WRITE_FAILED');return $false
-        }
-        try { Write-LocalSupervisorState $Context $false $Context.TerminalStatus $Context.TerminalErrorCode }
-        catch { [void](Write-CleanupError $Context 'STATE_WRITE_FAILED'); return $false }
-        Release-LocalMutex $Context; return $true
-    } catch { [void](Write-CleanupError $Context 'CLEANUP_INTERNAL_FAILED'); return $false }
+        $stateWritten=$true
+    } catch { $stateFailure=$true }
+
+    if (-not $stateWritten) {
+        $fallbackCode=if($resourceError){$resourceError}else{'STATE_WRITE_FAILED'}
+        $Context.CleanupStateWriteAttempts += 1
+        try {
+            Write-LocalSupervisorState $Context $true 'cleanup_error' $fallbackCode
+            $stateWritten=$true
+        } catch { $stateWritten=$false }
+    }
+
+    $cleanupCode=if($resourceError){$resourceError}elseif($stateFailure){'STATE_WRITE_FAILED'}else{''}
+    $mutexReleased=$true
+    try { Release-LocalMutex $Context }
+    catch { $mutexReleased=$false; if(-not $cleanupCode){$cleanupCode='CLEANUP_INTERNAL_FAILED'} }
+    $Context.CleanupErrorCode=$cleanupCode
+    $Context.CleanupSucceeded=(-not $cleanupCode -and $stateWritten -and $mutexReleased)
+    $Context.CleanupCompleted=$true
+    return [bool]$Context.CleanupSucceeded
 }
 
 function Enable-LocalStopSignal {[WisdomeConsoleStopSignal]::Install()}
@@ -906,43 +888,9 @@ function Wait-LocalStopSignal { [CmdletBinding()]param([int]$Milliseconds)
     return [WisdomeConsoleStopSignal]::Wait($Milliseconds) }
 function Disable-LocalStopSignal {[WisdomeConsoleStopSignal]::Uninstall()}
 
-function Initialize-LocalStopSignalContext {
-    [CmdletBinding()]param([pscustomobject]$Context)
-    if($Context.SignalConfigured){throw 'Stop signal context is already configured.'}
-    $stopped=Get-LocalSupervisorStateJson $Context $false $Context.TerminalStatus $Context.TerminalErrorCode
-    $error=Get-LocalSupervisorStateJson $Context $true 'cleanup_error' 'JOB_CLOSE_FAILED'
-    [WisdomeConsoleStopSignal]::ConfigureState($Context.StatePath,$stopped,$error)
-    $Context.SignalConfigured=$true
-    Update-LocalStopSignalContext $Context
-}
-
-function Update-LocalStopSignalContext {
-    [CmdletBinding()]param([pscustomobject]$Context)
-    if(-not $Context.SignalConfigured){Initialize-LocalStopSignalContext $Context;return}
-    $stopped=Get-LocalSupervisorStateJson $Context $false $Context.TerminalStatus $Context.TerminalErrorCode
-    $error=Get-LocalSupervisorStateJson $Context $true 'cleanup_error' 'JOB_CLOSE_FAILED'
-    [WisdomeConsoleStopSignal]::UpdateState($stopped,$error)
-    [WisdomeConsoleStopSignal]::UpdateProcesses(
-        [IntPtr[]]@($Context.NativeProcesses|ForEach-Object{$_.NativeHandle}))
-    if($Context.JobHandle-ne[IntPtr]::Zero){[WisdomeConsoleStopSignal]::AssociateJob($Context.JobHandle)}
-}
-
-function Test-LocalStopSignalHandled {return [WisdomeConsoleStopSignal]::WasHandled}
-function Complete-LocalSupervisorAfterSignal {
-    [CmdletBinding()]param([pscustomobject]$Context)
-    if(-not [WisdomeConsoleStopSignal]::CleanupIsCompleted -and
-        -not [WisdomeConsoleStopSignal]::WaitForCleanup(15000)){return $false}
-    $Context.JobHandle=[IntPtr]::Zero
-    if(-not [WisdomeConsoleStopSignal]::Succeeded){return $false}
-    foreach($native in $Context.NativeProcesses){$native.MarkClosedExternally()}
-    Release-LocalMutex $Context; return $true
-}
-
 Export-ModuleMember -Function @(
     'Assert-LocalRepositoryFile','Enter-LocalSupervisor','Initialize-LocalSupervisorJob',
     'Start-LocalOwnedProcess','Set-LocalSupervisorRunning',
     'Set-LocalSupervisorTerminalStatus','Exit-LocalSupervisor','Enable-LocalStopSignal',
-    'Wait-LocalStopSignal','Disable-LocalStopSignal','Update-LocalStopSignalContext',
-    'Initialize-LocalStopSignalContext','Test-LocalStopSignalHandled',
-    'Complete-LocalSupervisorAfterSignal'
+    'Wait-LocalStopSignal','Disable-LocalStopSignal'
 )

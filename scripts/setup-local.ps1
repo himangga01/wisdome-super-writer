@@ -5,7 +5,7 @@ param(
     [string]$HumanizerRoot = '',
     [string]$ToolchainLockPath = '',
     [string]$UvArchivePath = '',
-    [ValidateSet('', 'write', 'flush', 'close', 'move-collision', 'substitution')]
+    [ValidateSet('', 'write', 'flush', 'close', 'move-collision', 'substitution', 'in-place')]
     [string]$EnvironmentFaultPhase = '',
     [switch]$ValidateOnly,
     [switch]$ProvisionUvOnly,
@@ -497,25 +497,72 @@ function Initialize-LocalEnvironment {
         throw
     }
 
-    if ($FaultPhase -eq 'substitution') {
-        [System.IO.File]::Move($temporary, $temporary + '.original')
-        [System.IO.File]::WriteAllText($temporary, 'attacker')
-    }
     $currentIdentity = Get-PathFileIdentity -RepositoryRoot $Root -Path $temporary -Label 'Owned environment temporary file'
     if ($currentIdentity -cne $ownedIdentity) {
         throw 'Owned environment temporary file identity changed before publish.'
     }
+    if ($FaultPhase -eq 'substitution') {
+        [System.IO.File]::Move($temporary, $temporary + '.original')
+        [System.IO.File]::WriteAllText($temporary, "SENTINEL=substitution`n")
+    }
+    elseif ($FaultPhase -eq 'in-place') {
+        [System.IO.File]::WriteAllText($temporary, "SENTINEL=in-place`n")
+    }
     if ($FaultPhase -eq 'move-collision') {
         [System.IO.File]::WriteAllText($target, "SENTINEL=move-collision`n")
     }
-    try {
-        [System.IO.File]::Move($temporary, $target)
-    }
-    catch [System.IO.IOException] {
+    if (-not [WisdomeFileIdentityNative]::MoveFileNoReplaceWriteThrough($temporary, $target)) {
+        if (-not [System.IO.File]::Exists($target)) {
+            throw 'Atomic environment publish failed.'
+        }
         [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Existing local environment file')
         return $target
     }
     [void](Assert-SafeRepositoryFile -Root $Root -Path $target -Label 'Published local environment file')
+
+    $expectedSha = $null
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedSha = ([System.BitConverter]::ToString($sha.ComputeHash($payload))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+    $published = New-Object System.IO.FileStream(
+        $target,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        if ((Get-HeldStreamIdentity -Stream $published) -cne $ownedIdentity) {
+            throw 'Published local environment file identity does not match the owned temporary file.'
+        }
+        if ((Get-HeldStreamSha256 -Stream $published) -cne $expectedSha) {
+            throw 'Published local environment file content checksum does not match the template.'
+        }
+        if ($published.Length -ne $payload.Length) {
+            throw 'Published local environment file content bytes do not match the template.'
+        }
+        $published.Position = 0
+        $actual = New-Object byte[] $payload.Length
+        $offset = 0
+        while ($offset -lt $actual.Length) {
+            $read = $published.Read($actual, $offset, $actual.Length - $offset)
+            if ($read -le 0) {
+                throw 'Published local environment file content bytes do not match the template.'
+            }
+            $offset += $read
+        }
+        for ($index = 0; $index -lt $payload.Length; $index += 1) {
+            if ($actual[$index] -ne $payload[$index]) {
+                throw 'Published local environment file content bytes do not match the template.'
+            }
+        }
+    }
+    finally {
+        $published.Dispose()
+    }
     return $target
 }
 
