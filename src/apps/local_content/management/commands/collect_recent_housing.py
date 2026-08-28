@@ -17,6 +17,12 @@ from urllib.parse import parse_qs, urlsplit
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from apps.local_content.api_reconciliation import (
+    ApplyHomeApiObserver,
+    LhApiObserver,
+    OfficialApiFetcher,
+    ReconciledOfficialCollector,
+)
 from apps.local_content.dates import SEOUL
 from apps.local_content.http import HtmlResponse, OfficialHtmlFetcher
 from apps.local_content.humanizer import HumanizerClient
@@ -117,6 +123,19 @@ def _build_workflow(*, fixture_root: Path | None, dry_run: bool) -> LocalHousing
             ApplyHomePublicCollector(applyhome_fetcher),
             LhPublicCollector(lh_fetcher),
         )
+        service_key = os.getenv("DATA_GO_KR_SERVICE_KEY", "").strip()
+        if service_key:
+            api_fetcher = OfficialApiFetcher(service_key)
+            collectors = (
+                ReconciledOfficialCollector(
+                    collectors[0],
+                    ApplyHomeApiObserver(api_fetcher),
+                ),
+                ReconciledOfficialCollector(
+                    collectors[1],
+                    LhApiObserver(api_fetcher),
+                ),
+            )
         humanizer = HumanizerClient(settings.HUMANIZER_BASE_URL)
         mode = "live"
     return LocalHousingWorkflow(
