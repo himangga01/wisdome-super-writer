@@ -148,7 +148,10 @@ class ApplyHomePublicCollector:
             detail = self._fetcher.get(listed.canonical_url).body
         except Exception as exc:
             raise _ParseFailure(f"detail fetch failed: {exc.__class__.__name__}") from None
-        application_start, application_end, supply_count, warnings = self._parse_detail(detail)
+        application_start, application_end, supply_count, warnings = self._parse_detail(
+            detail,
+            listed=listed,
+        )
         fields = {
             "source_key": _SOURCE_KEY,
             "external_id": listed.external_id,
@@ -369,10 +372,17 @@ class ApplyHomePublicCollector:
             seen[record.external_id] = record
 
     @staticmethod
-    def _parse_detail(body: str) -> tuple[date | None, date | None, int | None, tuple[str, ...]]:
+    def _parse_detail(
+        body: str,
+        *,
+        listed: _ListedNotice | None = None,
+    ) -> tuple[date | None, date | None, int | None, tuple[str, ...]]:
         document = HTMLParser(body)
         root = document.css_first("[data-notice-detail]")
         if root is None:
+            if listed is None:
+                raise _ParseFailure("detail identity is required")
+            _require_public_detail_identity(document, listed)
             return _parse_public_detail(document)
         schedule = _label_value(root, ("청약신청기간", "신청기간"))
         dates = tuple(
@@ -424,6 +434,53 @@ def _parse_public_detail(
         warnings.append("supply count not found")
     warnings.extend(("price summary not found", "eligibility summary not found"))
     return application_start, application_end, supply_count, tuple(warnings)
+
+
+def _require_public_detail_identity(
+    document: HTMLParser,
+    listed: _ListedNotice,
+) -> None:
+    visible_text = _normalize(document.text(separator=" ")) or ""
+    if (_normalize(listed.title) or "") not in visible_text:
+        raise _ParseFailure("detail title does not match list record")
+    matched_identity = False
+    observed_identity = False
+    for link in document.css("a[href]"):
+        href = _normalize(link.attributes.get("href"))
+        if not href:
+            continue
+        try:
+            parsed = urlsplit(urljoin("https://www.applyhome.co.kr", href))
+            values = parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError:
+            continue
+        if (
+            parsed.path == "/ai/aia/getAtchmnfl.do"
+            and ("houseManageNo" in values or "pblancNo" in values)
+        ):
+            observed_identity = True
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname in {_OFFICIAL_HOST, "static.applyhome.co.kr"}
+            and parsed.path == "/ai/aia/getAtchmnfl.do"
+            and values.get("houseManageNo") == [listed.house_manage_no]
+            and values.get("pblancNo") == [listed.pblanc_no]
+        ):
+            matched_identity = True
+            break
+    if matched_identity:
+        return
+    if observed_identity:
+        raise _ParseFailure("detail identity does not match list record")
+    published = _parse_date(
+        _public_table_label_value(document, ("모집공고일", "공고일")) or ""
+    )
+    if published != listed.published_at.astimezone(_SEOUL).date():
+        raise _ParseFailure("detail publication identity does not match list record")
 
 
 def _public_table_label_value(document: HTMLParser, labels: tuple[str, ...]) -> str | None:

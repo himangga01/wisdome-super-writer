@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from django.core.management.base import CommandError
 
+from apps.local_content.acceptance import AcceptanceExpectations, audit_live_run
 from apps.local_content.bundles import (
     ArticleBundle,
     ArticleBundleWriter,
@@ -223,6 +224,108 @@ def test_same_date_rerun_publishes_immutable_revision_without_touching_prior_run
     assert _tree_bytes(first_root) == before
     assert (tmp_path / second.run_path / "index.md").is_file()
     assert (tmp_path / second.report_path).is_file()
+
+
+def test_workflow_persists_closed_raw_source_observations_and_audit_material(
+    tmp_path: Path,
+) -> None:
+    residential = _notice("raw-residential", title="body must stay out of raw metadata")
+    excluded = _notice(
+        "raw-land",
+        source_key="lh",
+        title="another body that must stay out",
+        category="토지",
+        checksum_digit="b",
+    )
+    workflow = LocalHousingWorkflow(
+        collectors=(
+            _collector("applyhome", residential),
+            _collector("lh", excluded),
+        ),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        mode="fixture",
+    )
+
+    report = _run(workflow)
+
+    run_root = tmp_path / report.run_path
+    raw = json.loads((run_root / "raw-observations.json").read_text("utf-8"))
+    assert set(raw) == {"schema_version", "window", "sources", "observations"}
+    assert raw["window"] == {
+        "start": "2026-08-22T00:00:00+09:00",
+        "end": "2026-08-28T12:00:00+09:00",
+    }
+    assert raw["sources"] == [
+        {
+            "source_key": "applyhome",
+            "collection_code": "OK",
+            "observation_count": 1,
+            "detail_failure_count": 0,
+        },
+        {
+            "source_key": "lh",
+            "collection_code": "OK",
+            "observation_count": 1,
+            "detail_failure_count": 0,
+        },
+    ]
+    assert len(raw["observations"]) == 2
+    assert all(
+        set(row)
+        == {
+            "source_key",
+            "external_id",
+            "category",
+            "published_at",
+            "status",
+            "source_checksum",
+            "detail_code",
+        }
+        for row in raw["observations"]
+    )
+    serialized = json.dumps(raw, ensure_ascii=False)
+    assert "body must stay out" not in serialized
+    assert "https://" not in serialized
+    manifest = json.loads((run_root / "manifest.json").read_text("utf-8"))
+    assert manifest["schema_version"] == 2
+    assert set(manifest["run_files"]) == {"notices.json", "raw-observations.json"}
+    article_root = run_root / report.articles[0].slug
+    assert (article_root / "humanize" / "audit.json").is_file()
+
+    audit = audit_live_run(
+        run_root,
+        window_start=datetime(2026, 8, 22, tzinfo=SEOUL),
+        expectations=AcceptanceExpectations(
+            raw_observations=2,
+            excluded_notices=1,
+            indexed_notices=1,
+            detailed_articles=1,
+        ),
+    )
+    assert audit["overall_passed"] is True
+    assert len(audit["humanizer_job_hashes"]) == 1
+
+    raw["observations"][0]["category"] = "토지"
+    raw_path = run_root / "raw-observations.json"
+    raw_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest["run_files"]["raw-observations.json"] = hashlib.sha256(
+        raw_path.read_bytes()
+    ).hexdigest()
+    (run_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    rejected = audit_live_run(
+        run_root,
+        window_start=datetime(2026, 8, 22, tzinfo=SEOUL),
+        expectations=AcceptanceExpectations(2, 1, 1, 1),
+    )
+    assert rejected["overall_passed"] is False
 
 
 def test_failed_same_date_rerun_keeps_prior_run_byte_identical(tmp_path: Path) -> None:

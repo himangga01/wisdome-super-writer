@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from django.test import override_settings
 
+from apps.local_content.acceptance import preview_headers_match
 from apps.local_content.bundles import (
     ArticleBundle,
     ArticleBundleWriter,
@@ -215,6 +216,36 @@ def test_markdown_renderer_escapes_raw_html() -> None:
 
     assert "<script>" not in rendered
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in rendered
+
+
+@pytest.mark.parametrize(
+    ("header", "replacement"),
+    [
+        ("content-security-policy", "default-src 'self'"),
+        ("referrer-policy", "same-origin"),
+        ("x-content-type-options", "off"),
+        ("x-frame-options", "SAMEORIGIN"),
+        ("cache-control", "max-age=0"),
+    ],
+)
+def test_acceptance_requires_exact_preview_security_headers(
+    header: str,
+    replacement: str,
+) -> None:
+    headers = {
+        "content-security-policy": (
+            "default-src 'self'; base-uri 'none'; form-action 'none'; "
+            "frame-ancestors 'none'; object-src 'none'; img-src 'self'; "
+            "style-src 'self'"
+        ),
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+        "cache-control": "no-store",
+    }
+    assert preview_headers_match(headers, cache_control="no-store") is True
+    headers[header] = replacement
+    assert preview_headers_match(headers, cache_control="no-store") is False
 
 
 @pytest.mark.parametrize("payload", [None, [], "ready", 1])

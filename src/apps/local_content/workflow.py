@@ -39,7 +39,12 @@ from apps.local_content.contracts import (
     _require_timezone_aware,
 )
 from apps.local_content.dates import SEOUL
-from apps.local_content.humanizer import protect_article_prose, verify_humanized_candidate
+from apps.local_content.humanizer import (
+    ProtectedArticleProse,
+    build_humanization_audit,
+    protect_article_prose,
+    verify_humanized_candidate,
+)
 from apps.local_content.images import ImageSet, build_image_set
 from apps.local_content.rendering import (
     RenderedArticle,
@@ -212,7 +217,7 @@ class _ArticleWork:
     errors: list[str] = field(default_factory=list)
     rendered: RenderedArticle | None = None
     images: ImageSet | None = None
-    protected: object | None = None
+    protected: ProtectedArticleProse | None = None
     protected_input: str | None = None
     candidate_output: str | None = None
     final_article: RenderedArticle | None = None
@@ -729,6 +734,7 @@ class LocalHousingWorkflow:
                                 diagnostic,
                                 run_directory=run_lease,
                             )
+                            final_bundles.append(diagnostic)
                             article.draft_path = _relative_path(
                                 lock.output_root,
                                 published,
@@ -762,13 +768,22 @@ class LocalHousingWorkflow:
                         article_work,
                         detail_failures=detail_failure_records,
                     )
+                    notices_document = _notices_document(
+                        collection,
+                        detail_failures=detail_failure_records,
+                    )
+                    raw_observations_document = _raw_observations_document(
+                        source_reports,
+                        window,
+                    )
                     verify_generation()
                     _atomic_write_json(
                         run_root / "notices.json",
-                        _notices_document(
-                            collection,
-                            detail_failures=detail_failure_records,
-                        ),
+                        notices_document,
+                    )
+                    _atomic_write_json(
+                        run_root / "raw-observations.json",
+                        raw_observations_document,
                     )
                     verify_generation()
                     storage_codes = tuple(
@@ -795,6 +810,12 @@ class LocalHousingWorkflow:
                             index,
                             tuple(final_bundles),
                             run_directory=run_lease,
+                            run_files={
+                                "notices.json": _json_text(notices_document),
+                                "raw-observations.json": _json_text(
+                                    raw_observations_document
+                                ),
+                            },
                         )
                         if _relative_path(lock.output_root, run_path) != run_relative:
                             raise BundlePublishError("run lease returned another path")
@@ -971,10 +992,11 @@ def _final_bundle(article: _ArticleWork, run_date) -> ArticleBundle:
     assert article.rendered is not None
     assert article.final_article is not None
     assert article.images is not None
+    source_document = _sources_document(article.rendered)
     files = [
         BundleFile.text("article.draft.md", article.rendered.to_markdown(), "text/markdown"),
         BundleFile.text("article.md", article.final_article.to_markdown(), "text/markdown"),
-        BundleFile.text("sources.json", _sources_document(article.rendered), "application/json"),
+        BundleFile.text("sources.json", source_document, "application/json"),
         BundleFile.text(
             "verification.json",
             _json_text(
@@ -990,6 +1012,19 @@ def _final_bundle(article: _ArticleWork, run_date) -> ArticleBundle:
         ),
     ]
     if article.protected_input is not None and article.candidate_output is not None:
+        assert article.protected is not None
+        image_payloads = {
+            image.bundle_path: image.path.read_bytes()
+            for image in article.images.images
+        }
+        audit = build_humanization_audit(
+            draft_markdown=article.rendered.to_markdown(),
+            final_markdown=article.final_article.to_markdown(),
+            protected=article.protected,
+            candidate=article.candidate_output,
+            sources=source_document.encode("utf-8"),
+            images=image_payloads,
+        )
         files.extend(
             (
                 BundleFile.text("humanize/input.md", article.protected_input, "text/markdown"),
@@ -1010,6 +1045,11 @@ def _final_bundle(article: _ArticleWork, run_date) -> ArticleBundle:
                             "error_codes": [],
                         }
                     ),
+                    "application/json",
+                ),
+                BundleFile.text(
+                    "humanize/audit.json",
+                    _json_text(audit),
                     "application/json",
                 ),
             )
@@ -1189,6 +1229,63 @@ def _sources_document(article: RenderedArticle) -> str:
 
 def _safe_status_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9:._-]", "_", value)[:240]
+
+
+def _raw_observations_document(
+    source_reports: Sequence[SourceRunReport],
+    window: CollectionWindow,
+) -> dict[str, object]:
+    ordered_reports = tuple(
+        sorted(
+            source_reports,
+            key=lambda report: (report.source_key.casefold(), report.source_key),
+        )
+    )
+    observations = sorted(
+        (
+            {
+                "source_key": report.source_key,
+                "external_id": notice.external_id,
+                "category": notice.category,
+                "published_at": notice.published_at.isoformat(),
+                "status": notice.status,
+                "source_checksum": notice.source_checksum,
+                "detail_code": (
+                    "DETAIL_COLLECTION_FAILED" if _has_detail_failure(notice) else "OK"
+                ),
+            }
+            for report in ordered_reports
+            for notice in report.notices
+        ),
+        key=lambda row: (
+            str(row["source_key"]).casefold(),
+            str(row["source_key"]),
+            str(row["external_id"]),
+            str(row["source_checksum"]),
+            str(row["published_at"]),
+        ),
+    )
+    return {
+        "schema_version": 1,
+        "window": {
+            "start": window.start.isoformat(),
+            "end": window.end.isoformat(),
+        },
+        "sources": [
+            {
+                "source_key": report.source_key,
+                "collection_code": (
+                    "SOURCE_COLLECTION_FAILED" if report.errors else "OK"
+                ),
+                "observation_count": len(report.notices),
+                "detail_failure_count": sum(
+                    _has_detail_failure(notice) for notice in report.notices
+                ),
+            }
+            for report in ordered_reports
+        ],
+        "observations": observations,
+    }
 
 
 def _notices_document(

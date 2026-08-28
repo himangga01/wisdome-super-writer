@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -103,13 +104,40 @@ def test_applyhome_parses_sanitized_live_table_shape(
     assert page.records[0].published_at.isoformat() == "2026-08-28T00:00:00+09:00"
 
 
+def test_applyhome_paginates_two_sanitized_official_table_pages() -> None:
+    first = (
+        LIVE_REGRESSIONS / "applyhome-apt-list-two-page-1.html"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"<tr data-pbno[\s\S]*?</tr>", first)
+    assert match is not None
+    rows = "".join(
+        match.group().replace("2026100001", f"{2026100001 + offset}").replace(
+            "공식 표 공고 1", f"공식 표 공고 {offset + 1}"
+        )
+        for offset in range(10)
+    )
+    first = first.replace(match.group(), rows, 1)
+    second = (
+        LIVE_REGRESSIONS / "applyhome-apt-list-two-page-2.html"
+    ).read_text(encoding="utf-8")
+    collector = ApplyHomePublicCollector(
+        FixtureFetcher({APT_PAGE_1: first, APT_PAGE_2: second})
+    )
+
+    records = collector._collect_list_pages("apt", APT_LIST)
+
+    assert len(records) == 11
+    assert records[0].external_id == "applyhome:apt:2026100001:2026100001"
+    assert records[-1].external_id == "applyhome:apt:2026100011:2026100011"
+
+
 def test_applyhome_parses_sanitized_live_detail_shape() -> None:
     body = (LIVE_REGRESSIONS / "applyhome-apt-detail-2026-08-28.html").read_text(
         encoding="utf-8"
     )
 
     application_start, application_end, supply_count, warnings = (
-        ApplyHomePublicCollector._parse_detail(body)
+        ApplyHomePublicCollector._parse_detail(body, listed=_live_record("apt"))
     )
 
     assert application_start.isoformat() == "2026-09-07"
@@ -118,19 +146,57 @@ def test_applyhome_parses_sanitized_live_detail_shape() -> None:
     assert warnings == ("price summary not found", "eligibility summary not found")
 
 
+def test_applyhome_binds_attachmentless_official_detail_by_title_and_publication_date() -> None:
+    body = (
+        LIVE_REGRESSIONS / "applyhome-apt-detail-title-date-2026-08-28.html"
+    ).read_text(encoding="utf-8")
+
+    result = ApplyHomePublicCollector._parse_detail(body, listed=_live_record("apt"))
+
+    assert result[2] == 22
+
+
 def test_applyhome_parses_sanitized_remaining_detail_schedule() -> None:
     body = (
         LIVE_REGRESSIONS / "applyhome-remaining-detail-2026-08-28.html"
     ).read_text(encoding="utf-8")
 
     application_start, application_end, supply_count, warnings = (
-        ApplyHomePublicCollector._parse_detail(body)
+        ApplyHomePublicCollector._parse_detail(body, listed=_live_record("remaining"))
     )
 
     assert application_start.isoformat() == "2026-09-02"
     assert application_end.isoformat() == "2026-09-08"
     assert supply_count == 4
     assert warnings == ("price summary not found", "eligibility summary not found")
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "applyhome-detail-error-2026-08-28.html",
+        "applyhome-detail-sparse-2026-08-28.html",
+        "applyhome-detail-mismatch-2026-08-28.html",
+    ],
+)
+def test_applyhome_public_detail_rejects_unbound_or_incomplete_templates(
+    fixture_name: str,
+) -> None:
+    body = (LIVE_REGRESSIONS / fixture_name).read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="detail"):
+        ApplyHomePublicCollector._parse_detail(body, listed=_live_record("apt"))
+
+
+def _live_record(category: str):  # type: ignore[no-untyped-def]
+    fixture_name = (
+        "applyhome-apt-list-2026-08-28.html"
+        if category == "apt"
+        else "applyhome-remaining-list-2026-08-28.html"
+    )
+    body = (LIVE_REGRESSIONS / fixture_name).read_text(encoding="utf-8")
+    collector = ApplyHomePublicCollector(FixtureFetcher({}))
+    return collector._parse_list(body, category).records[0]
 
 
 def test_applyhome_collector_keeps_only_publication_dates_in_window(

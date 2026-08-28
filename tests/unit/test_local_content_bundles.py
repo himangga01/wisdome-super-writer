@@ -1787,6 +1787,37 @@ def test_run_manifest_is_a_required_verified_commit_marker(tmp_path: Path) -> No
         writer.validate_run(date(2026, 8, 28))
 
 
+def test_schema_two_run_manifest_binds_metadata_and_rejects_extra_inventory(
+    tmp_path: Path,
+) -> None:
+    writer = ArticleBundleWriter(tmp_path / "output")
+    bundle = _bundle(tmp_path)
+    run_files = {
+        "notices.json": b'{"schema_version":1}\n',
+        "raw-observations.json": b'{"schema_version":1}\n',
+    }
+
+    run_path = writer.write_run(
+        date(2026, 8, 28),
+        "# weekly\n",
+        (bundle,),
+        run_files=run_files,
+    )
+
+    manifest = json.loads((run_path / "manifest.json").read_text("utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["run_files"] == {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in sorted(run_files.items())
+    }
+    (run_path / "acceptance-report.json").write_text("{}\n", encoding="utf-8")
+    assert writer.validate_run(date(2026, 8, 28)) == run_path
+    (run_path / "unexpected.txt").write_text("not allowlisted", encoding="utf-8")
+
+    with pytest.raises(BundlePublishError, match="inventory|unmanifested"):
+        writer.validate_run(date(2026, 8, 28))
+
+
 @pytest.mark.parametrize(
     "raw_manifest",
     [

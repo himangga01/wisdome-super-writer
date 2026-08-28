@@ -12,6 +12,7 @@ import secrets
 import stat
 import unicodedata
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -56,6 +57,8 @@ _ALLOWED_IMAGE_PATHS = frozenset(
     {"assets/hero.png", "assets/summary-card.webp", "assets/timeline.webp"}
 )
 _RESERVED_PATHS = frozenset({"manifest.json", "manifest.sha256"})
+_RUN_METADATA_PATHS = frozenset({"notices.json", "raw-observations.json"})
+_RUN_MUTABLE_PATHS = frozenset({"acceptance-report.json"})
 _WINDOWS_DEVICE_NAMES = frozenset(
     {
         "con",
@@ -450,6 +453,7 @@ class ArticleBundleWriter:
         bundles: tuple[ArticleBundle, ...] | list[ArticleBundle] = (),
         *,
         run_directory: RunDirectoryLease | None = None,
+        run_files: Mapping[str, str | bytes] | None = None,
     ) -> Path:
         """Publish article bundles, then atomically replace the run index and manifest."""
 
@@ -486,16 +490,34 @@ class ArticleBundleWriter:
         index_payload = index_markdown.encode("utf-8")
         index_payload.decode("utf-8", errors="strict")
         index_hash = hashlib.sha256(index_payload).hexdigest()
-        run_manifest = {
-            "schema_version": 1,
+        metadata_payloads = _validated_run_metadata(run_files)
+        run_manifest: dict[str, object] = {
+            "schema_version": 2 if metadata_payloads is not None else 1,
             "run_date": run_date.isoformat(),
             "index_sha256": index_hash,
             "articles": dict(sorted(published.items())),
         }
+        if metadata_payloads is not None:
+            run_manifest["run_files"] = {
+                name: hashlib.sha256(payload).hexdigest()
+                for name, payload in metadata_payloads.items()
+            }
         manifest_payload = _json_bytes(run_manifest)
         if lease_state is not None:
             lease_state.commit_started = True
         try:
+            metadata_temps: dict[
+                str, tuple[Path, tuple[object, ...], bytes]
+            ] = {}
+            for name, payload in (metadata_payloads or {}).items():
+                temporary, fingerprint = self._write_owned_run_temp(
+                    run_root,
+                    name,
+                    hashlib.sha256(payload).hexdigest(),
+                    payload,
+                    lease_state,
+                )
+                metadata_temps[name] = (temporary, fingerprint, payload)
             index_tmp, index_fingerprint = self._write_owned_run_temp(
                 run_root,
                 "index.md",
@@ -511,6 +533,13 @@ class ArticleBundleWriter:
                 lease_state,
             )
             _fsync_directory(run_root)
+            for name, (temporary, fingerprint, payload) in metadata_temps.items():
+                self._validate_owned_run_temp(
+                    temporary,
+                    fingerprint,
+                    payload,
+                    f"run metadata temp {name}",
+                )
             self._validate_owned_run_temp(
                 index_tmp,
                 index_fingerprint,
@@ -519,6 +548,18 @@ class ArticleBundleWriter:
             )
             index_target = run_root / "index.md"
             manifest_target = run_root / "manifest.json"
+            for name, (temporary, fingerprint, payload) in metadata_temps.items():
+                target = run_root / name
+                os.replace(temporary, target)
+                lease_state.run_temp_identities.pop(temporary.name, None)
+                lease_state.partial_identities[target.name] = fingerprint
+                self._validate_owned_run_temp(
+                    target,
+                    fingerprint,
+                    payload,
+                    f"published run metadata {name}",
+                )
+                _fsync_directory(run_root)
             os.replace(index_tmp, index_target)
             lease_state.run_temp_identities.pop(index_tmp.name, None)
             lease_state.partial_identities[index_target.name] = index_fingerprint
@@ -641,7 +682,7 @@ class ArticleBundleWriter:
             entries = tuple(os.scandir(run_root))
         except OSError as exc:
             raise BundlePublishError("cannot inspect run lease directory") from exc
-        allowed_files = {"acceptance-report.json", "notices.json"}
+        allowed_files = {*_RUN_MUTABLE_PATHS, *_RUN_METADATA_PATHS}
         if allow_completed and not {"index.md", "manifest.json"}.issubset(
             state.partial_identities
         ):
@@ -726,7 +767,16 @@ class ArticleBundleWriter:
             label="run manifest",
         )
         manifest = _parse_strict_json_object(manifest_payload, "run")
-        if set(manifest) != {"schema_version", "run_date", "index_sha256", "articles"}:
+        schema_version = manifest.get("schema_version")
+        expected_manifest_keys = {
+            "schema_version",
+            "run_date",
+            "index_sha256",
+            "articles",
+        }
+        if schema_version == 2:
+            expected_manifest_keys.add("run_files")
+        if set(manifest) != expected_manifest_keys:
             raise BundlePublishError(f"run JSON manifest violates closed schema: {run_root}")
         index_payload = _read_bound_file(
             index_path,
@@ -739,7 +789,7 @@ class ArticleBundleWriter:
         except UnicodeDecodeError as exc:
             raise BundlePublishError(f"run index is not UTF-8: {run_root}") from exc
         if (
-            manifest.get("schema_version") != 1
+            schema_version not in {1, 2}
             or manifest.get("run_date") != run_date.isoformat()
             or not isinstance(manifest.get("index_sha256"), str)
             or not isinstance(manifest.get("articles"), dict)
@@ -763,6 +813,30 @@ class ArticleBundleWriter:
             article_path = self._safe_child(run_root, article_name)
             if self._existing_hash(article_path).bundle_hash != expected_hash:
                 raise BundlePublishError(f"run article hash does not match: {article_path}")
+        if schema_version == 2:
+            run_files = manifest.get("run_files")
+            if not isinstance(run_files, dict) or set(run_files) != _RUN_METADATA_PATHS:
+                raise BundlePublishError(f"run metadata inventory is invalid: {run_root}")
+            for name, expected_hash in run_files.items():
+                if not isinstance(expected_hash, str) or _SHA256.fullmatch(expected_hash) is None:
+                    raise BundlePublishError(f"run metadata hash is invalid: {name}")
+                metadata_path = self._safe_child(run_root, name)
+                if not _is_regular_file_no_links(metadata_path):
+                    raise BundlePublishError(f"run metadata is missing or unsafe: {name}")
+                metadata_fingerprint = _path_fingerprint(
+                    metadata_path,
+                    f"run metadata {name}",
+                    BundlePublishError,
+                )
+                payload = _read_bound_file(
+                    metadata_path,
+                    metadata_fingerprint,
+                    max_bytes=_MAX_BUNDLE_FILE_BYTES,
+                    label=f"run metadata {name}",
+                )
+                if hashlib.sha256(payload).hexdigest() != expected_hash:
+                    raise BundlePublishError(f"run metadata hash does not match: {name}")
+            _require_closed_run_inventory(run_root, set(articles))
         if _path_fingerprint(run_root, "run directory", BundlePublishError) != run_root_fingerprint:
             raise BundlePublishError(f"run directory changed during validation: {run_root}")
         _require_stable_snapshot(
@@ -2012,6 +2086,62 @@ def _is_regular_file_no_links(path: Path) -> bool:
     except BundlePublishError:
         return False
     return stat.S_ISREG(metadata.st_mode)
+
+
+def _validated_run_metadata(
+    run_files: Mapping[str, str | bytes] | None,
+) -> dict[str, bytes] | None:
+    if run_files is None:
+        return None
+    if not isinstance(run_files, Mapping) or set(run_files) != _RUN_METADATA_PATHS:
+        raise BundleValidationError("run metadata must use the exact allowlisted inventory")
+    result: dict[str, bytes] = {}
+    for name in sorted(_RUN_METADATA_PATHS):
+        value = run_files[name]
+        if isinstance(value, str):
+            try:
+                payload = value.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise BundleValidationError(f"run metadata is not UTF-8: {name}") from exc
+        elif isinstance(value, bytes):
+            payload = value
+            try:
+                payload.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise BundleValidationError(f"run metadata is not UTF-8: {name}") from exc
+        else:
+            raise BundleValidationError(f"run metadata must be text or bytes: {name}")
+        if not payload or len(payload) > _MAX_BUNDLE_FILE_BYTES:
+            raise BundleValidationError(f"run metadata size is invalid: {name}")
+        result[name] = payload
+    return result
+
+
+def _require_closed_run_inventory(run_root: Path, article_names: set[str]) -> None:
+    expected_files = {"index.md", "manifest.json", *_RUN_METADATA_PATHS}
+    try:
+        entries = tuple(os.scandir(run_root))
+    except OSError as exc:
+        raise BundlePublishError(f"cannot inspect run inventory: {run_root}") from exc
+    observed_files: set[str] = set()
+    observed_directories: set[str] = set()
+    for entry in entries:
+        path = Path(entry.path)
+        metadata = _lstat_no_links(path, "run inventory", BundlePublishError)
+        if stat.S_ISREG(metadata.st_mode):
+            observed_files.add(entry.name)
+        elif stat.S_ISDIR(metadata.st_mode):
+            observed_directories.add(entry.name)
+        else:
+            raise BundlePublishError(f"run inventory contains an unsafe entry: {path}")
+    if not observed_files.issubset(expected_files | _RUN_MUTABLE_PATHS):
+        raise BundlePublishError(f"run inventory contains unmanifested files: {run_root}")
+    if not expected_files.issubset(observed_files):
+        raise BundlePublishError(f"run inventory is missing manifest material: {run_root}")
+    if observed_directories != article_names:
+        raise BundlePublishError(
+            f"run inventory contains unmanifested article directories: {run_root}"
+        )
 
 
 def _scan_tree(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -94,6 +95,14 @@ class ProtectedArticleProse:
     link_targets: tuple[str, ...]
     anchors: tuple[str, ...]
     anchor_occurrences: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HumanizationAuditResult:
+    """Body-free proof identifiers for one reverified humanization job."""
+
+    job_hash: str
+    verification_hash: str
 
 
 class HumanizerClient:
@@ -284,6 +293,262 @@ def verify_humanized_candidate(
             "candidate introduced a numeric, date, or currency token"
         )
     return blocks
+
+
+def build_humanization_audit(
+    *,
+    draft_markdown: str,
+    final_markdown: str,
+    protected: ProtectedArticleProse,
+    candidate: str,
+    sources: bytes,
+    images: Mapping[str, bytes],
+) -> dict[str, object]:
+    """Build closed hash material that lets a later audit repeat verification."""
+
+    draft_blocks, draft_skeleton, draft_frontmatter = _article_audit_material(
+        draft_markdown
+    )
+    final_blocks, final_skeleton, final_frontmatter = _article_audit_material(
+        final_markdown
+    )
+    if draft_blocks != protected.original_blocks:
+        raise HumanizationVerificationError(
+            "draft prose does not match protected humanizer input"
+        )
+    if draft_skeleton != final_skeleton or draft_frontmatter != final_frontmatter:
+        raise HumanizationVerificationError(
+            "final article changed frontmatter or factual material"
+        )
+    if protected.document != _require_text(input_value=protected.document):
+        raise HumanizationVerificationError("protected input is invalid")
+    rebuilt = protect_article_prose(draft_blocks, protected.anchors)
+    if rebuilt != protected:
+        raise HumanizationVerificationError("protected humanizer material is inconsistent")
+    verified_blocks = verify_humanized_candidate(protected, candidate)
+    if final_blocks != verified_blocks:
+        raise HumanizationVerificationError(
+            "final article prose does not match verified humanizer output"
+        )
+    hashes = _humanization_audit_hashes(
+        draft_markdown=draft_markdown,
+        final_markdown=final_markdown,
+        frontmatter=draft_frontmatter,
+        factual_skeleton=draft_skeleton,
+        protected=protected,
+        candidate=candidate,
+        verified_blocks=verified_blocks,
+        sources=sources,
+        images=images,
+    )
+    job_material = {
+        "schema_version": 1,
+        "anchors": list(protected.anchors),
+        "hashes": hashes,
+    }
+    return {
+        **job_material,
+        "status": "verified",
+        "job_hash": _canonical_sha256(job_material),
+    }
+
+
+def verify_humanization_audit(
+    audit: Mapping[str, object],
+    *,
+    draft_markdown: str,
+    final_markdown: str,
+    input_document: str,
+    candidate: str,
+    sources: bytes,
+    images: Mapping[str, bytes],
+) -> HumanizationAuditResult:
+    """Rebuild protection and verify every byte/hash bound by a closed audit."""
+
+    if not isinstance(audit, Mapping) or set(audit) != {
+        "schema_version",
+        "status",
+        "anchors",
+        "hashes",
+        "job_hash",
+    }:
+        raise HumanizationVerificationError("humanization audit schema is not closed")
+    if audit.get("schema_version") != 1 or audit.get("status") != "verified":
+        raise HumanizationVerificationError("humanization audit status is invalid")
+    raw_anchors = audit.get("anchors")
+    if not isinstance(raw_anchors, list):
+        raise HumanizationVerificationError("humanization audit anchors are invalid")
+    try:
+        anchors = _validated_anchors(raw_anchors)
+    except ValueError as exc:
+        raise HumanizationVerificationError(
+            "humanization audit anchors are invalid"
+        ) from exc
+    if list(anchors) != raw_anchors:
+        raise HumanizationVerificationError("humanization audit anchors are not canonical")
+    draft_blocks, draft_skeleton, draft_frontmatter = _article_audit_material(
+        draft_markdown
+    )
+    final_blocks, final_skeleton, final_frontmatter = _article_audit_material(
+        final_markdown
+    )
+    if draft_skeleton != final_skeleton or draft_frontmatter != final_frontmatter:
+        raise HumanizationVerificationError(
+            "final article changed frontmatter or factual material"
+        )
+    protected = protect_article_prose(draft_blocks, anchors)
+    if protected.document != input_document:
+        raise HumanizationVerificationError("humanizer input does not match draft protection")
+    verified_blocks = verify_humanized_candidate(protected, candidate)
+    if final_blocks != verified_blocks:
+        raise HumanizationVerificationError(
+            "final article prose does not match verified humanizer output"
+        )
+    expected_hashes = _humanization_audit_hashes(
+        draft_markdown=draft_markdown,
+        final_markdown=final_markdown,
+        frontmatter=draft_frontmatter,
+        factual_skeleton=draft_skeleton,
+        protected=protected,
+        candidate=candidate,
+        verified_blocks=verified_blocks,
+        sources=sources,
+        images=images,
+    )
+    if audit.get("hashes") != expected_hashes:
+        raise HumanizationVerificationError("humanization audit byte hashes changed")
+    job_material = {
+        "schema_version": 1,
+        "anchors": list(anchors),
+        "hashes": expected_hashes,
+    }
+    job_hash = _canonical_sha256(job_material)
+    if audit.get("job_hash") != job_hash:
+        raise HumanizationVerificationError("humanization audit job hash changed")
+    return HumanizationAuditResult(
+        job_hash=job_hash,
+        verification_hash=_canonical_sha256(dict(audit)),
+    )
+
+
+def _humanization_audit_hashes(
+    *,
+    draft_markdown: str,
+    final_markdown: str,
+    frontmatter: str,
+    factual_skeleton: str,
+    protected: ProtectedArticleProse,
+    candidate: str,
+    verified_blocks: tuple[ProseBlock, ...],
+    sources: bytes,
+    images: Mapping[str, bytes],
+) -> dict[str, object]:
+    if not isinstance(sources, bytes):
+        raise HumanizationVerificationError("humanization audit sources must be bytes")
+    image_hashes: dict[str, str] = {}
+    for path, payload in sorted(images.items()):
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(payload, bytes)
+            or path in image_hashes
+        ):
+            raise HumanizationVerificationError("humanization audit images are invalid")
+        image_hashes[path] = _sha256_bytes(payload)
+    if not image_hashes:
+        raise HumanizationVerificationError("humanization audit images are missing")
+    protection_material = {
+        "document_sha256": _sha256_text(protected.document),
+        "blocks": [
+            [block.block_id, _sha256_text(block.markdown)]
+            for block in protected.original_blocks
+        ],
+        "token_values": [
+            [token, _sha256_text(value)] for token, value in protected.token_values
+        ],
+        "token_occurrences": list(protected.token_occurrences),
+        "link_targets": list(protected.link_targets),
+        "anchors": list(protected.anchors),
+        "anchor_occurrences": list(protected.anchor_occurrences),
+    }
+    verified_material = [
+        [block.block_id, _sha256_text(block.markdown)] for block in verified_blocks
+    ]
+    return {
+        "draft_sha256": _sha256_text(draft_markdown),
+        "final_sha256": _sha256_text(final_markdown),
+        "frontmatter_sha256": _sha256_text(frontmatter),
+        "factual_skeleton_sha256": _sha256_text(factual_skeleton),
+        "input_sha256": _sha256_text(protected.document),
+        "output_sha256": _sha256_text(candidate),
+        "protection_sha256": _canonical_sha256(protection_material),
+        "verified_prose_sha256": _canonical_sha256(verified_material),
+        "sources_sha256": _sha256_bytes(sources),
+        "images": image_hashes,
+    }
+
+
+def _article_audit_material(
+    markdown: str,
+) -> tuple[tuple[ProseBlock, ...], str, str]:
+    document = _require_text(input_value=markdown)
+    matches = tuple(_BLOCK_PATTERN.finditer(document))
+    if not matches or document.count("<!-- WSW:block:") != len(matches) or document.count(
+        "<!-- WSW:endblock:"
+    ) != len(matches):
+        raise HumanizationVerificationError("article prose block markers are invalid")
+    blocks = tuple(
+        ProseBlock(match.group("block_id"), match.group("body")) for match in matches
+    )
+    try:
+        _validate_blocks(blocks)
+    except ValueError as exc:
+        raise HumanizationVerificationError("article prose blocks are invalid") from exc
+    pieces: list[str] = []
+    cursor = 0
+    for match in matches:
+        pieces.append(document[cursor : match.start("body")])
+        pieces.append(f"[[WSW:AUDIT-PROSE:{match.group('block_id')}]]")
+        cursor = match.end("body")
+    pieces.append(document[cursor:])
+    frontmatter_end = document.find("\n---\n", 4) if document.startswith("---\n") else -1
+    if frontmatter_end < 0:
+        raise HumanizationVerificationError("article frontmatter is invalid")
+    frontmatter = document[: frontmatter_end + len("\n---\n")]
+    return blocks, "".join(pieces), frontmatter
+
+
+def _require_text(*, input_value: str) -> str:
+    try:
+        payload = _utf8_bytes(input_value, boundary=HumanizationVerificationError)
+    except TypeError:
+        raise HumanizationVerificationError("humanization audit text is invalid") from None
+    if len(payload) > MAX_RESPONSE_BYTES:
+        raise HumanizationVerificationError("humanization audit text exceeded size limit")
+    return input_value
+
+
+def _sha256_text(value: str) -> str:
+    return _sha256_bytes(_utf8_bytes(value, boundary=HumanizationVerificationError))
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
+    except (TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise HumanizationVerificationError(
+            "humanization audit material is not canonical"
+        ) from exc
+    return _sha256_bytes(payload)
 
 
 def _validated_loopback_base_url(value: str) -> str:

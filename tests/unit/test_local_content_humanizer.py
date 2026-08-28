@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import replace
 
 import httpx
@@ -21,6 +22,58 @@ from apps.local_content.humanizer import (
     verify_humanized_candidate,
 )
 from apps.local_content.rendering import ArticleSource, ProseBlock, RenderedArticle
+
+
+def _closed_audit_fixture() -> dict[str, object]:
+    build_audit = humanizer_module.build_humanization_audit
+    verify_audit = humanizer_module.verify_humanization_audit
+    article = RenderedArticle(
+        title="공식 주거 공고",
+        slug="official-housing-notice",
+        frontmatter=(
+            'title: "공식 주거 공고"\n'
+            "source_checksum: " + "a" * 64 + "\n"
+            "external_id: official-1"
+        ),
+        prose_blocks=(
+            ProseBlock("intro", "기존 안내 문장입니다."),
+            ProseBlock("context", "공식 링크에서 확인하세요."),
+        ),
+        factual_markdown="## 공식 사실\n\n- 공급 상태: 접수 중",
+        sources=(),
+        protected_anchors=("공식 링크",),
+    )
+    protected = protect_article_prose(
+        article.prose_blocks,
+        article.protected_anchors,
+    )
+    candidate = protected.document.replace("기존 안내", "다듬은 안내")
+    verified_blocks = verify_humanized_candidate(protected, candidate)
+    final_article = replace(article, prose_blocks=verified_blocks)
+    sources = b'[{"source_key":"applyhome"}]\n'
+    images = {
+        "assets/hero.png": b"hero-image-bytes",
+        "assets/summary-card.webp": b"summary-image-bytes",
+        "assets/timeline.webp": b"timeline-image-bytes",
+    }
+    audit = build_audit(
+        draft_markdown=article.to_markdown(),
+        final_markdown=final_article.to_markdown(),
+        protected=protected,
+        candidate=candidate,
+        sources=sources,
+        images=images,
+    )
+    return {
+        "verify": verify_audit,
+        "audit": audit,
+        "draft": article.to_markdown(),
+        "final": final_article.to_markdown(),
+        "input": protected.document,
+        "output": candidate,
+        "sources": sources,
+        "images": images,
+    }
 
 
 def _event_bytes(events: list[dict[str, object]], *, trailing_newline: bool = True) -> bytes:
@@ -1235,6 +1288,57 @@ def test_client_rejects_escaped_surrogate_result_without_raw_encode_error() -> N
 def test_source_prose_rejects_reserved_wsw_markers(marker: str) -> None:
     with pytest.raises(ValueError, match="reserved WSW marker"):
         protect_article_prose({"intro": f"원문 {marker}"}, anchors=())
+
+
+def test_closed_humanization_audit_reruns_verifier_and_binds_all_material() -> None:
+    material = _closed_audit_fixture()
+
+    result = material["verify"](
+        material["audit"],
+        draft_markdown=material["draft"],
+        final_markdown=material["final"],
+        input_document=material["input"],
+        candidate=material["output"],
+        sources=material["sources"],
+        images=material["images"],
+    )
+
+    assert result.job_hash == material["audit"]["job_hash"]
+    assert len(result.verification_hash) == 64
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["final_fact", "sources", "image", "output", "protection"],
+)
+def test_closed_humanization_audit_rejects_counterexamples(tamper: str) -> None:
+    material = _closed_audit_fixture()
+    audit = deepcopy(material["audit"])
+    final = material["final"]
+    output = material["output"]
+    sources = material["sources"]
+    images = dict(material["images"])
+    if tamper == "final_fact":
+        final = final.replace("공식 사실", "위조 사실")
+    elif tamper == "sources":
+        sources += b"tampered"
+    elif tamper == "image":
+        images["assets/hero.png"] += b"tampered"
+    elif tamper == "output":
+        output = output.replace("다듬은 안내", "변조된 안내")
+    else:
+        audit["anchors"] = ["변조된 앵커"]
+
+    with pytest.raises(HumanizationVerificationError):
+        material["verify"](
+            audit,
+            draft_markdown=material["draft"],
+            final_markdown=final,
+            input_document=material["input"],
+            candidate=output,
+            sources=sources,
+            images=images,
+        )
 
 
 def test_block_ids_must_be_unique_and_safe() -> None:

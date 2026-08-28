@@ -16,8 +16,10 @@ def _restore_migration_leaves(test_case: TransactionTestCase) -> None:
             executor.migrate(leaves)
 
 
-def _suspend_sqlite_triggers(test_case: TransactionTestCase) -> dict[str, tuple[str, ...]]:
-    suspended: dict[str, tuple[str, ...]] = {}
+def _drop_sqlite_triggers(
+    test_case: TransactionTestCase,
+    dropped: list[tuple[object, str]],
+) -> None:
     for alias in test_case._databases_names(include_mirrors=False):
         connection = connections[alias]
         if connection.vendor != "sqlite":
@@ -27,28 +29,58 @@ def _suspend_sqlite_triggers(test_case: TransactionTestCase) -> dict[str, tuple[
                 "SELECT name, sql FROM sqlite_master "
                 "WHERE type = 'trigger' AND sql IS NOT NULL ORDER BY name"
             ).fetchall()
-            for name, _sql in rows:
+            for name, sql in rows:
                 cursor.execute(f"DROP TRIGGER {connection.ops.quote_name(name)}")
-        suspended[alias] = tuple(sql for _name, sql in rows)
-    return suspended
+                dropped.append((connection, sql))
 
 
-def _restore_sqlite_triggers(suspended: dict[str, tuple[str, ...]]) -> None:
-    for alias, statements in suspended.items():
-        with connections[alias].cursor() as cursor:
-            for statement in statements:
+def _restore_sqlite_triggers(
+    dropped: list[tuple[object, str]],
+) -> list[BaseException]:
+    failures: list[BaseException] = []
+    for connection, statement in dropped:
+        try:
+            with connection.cursor() as cursor:
                 cursor.execute(statement)
+        except BaseException as exc:  # noqa: BLE001 - cleanup must preserve every primary failure
+            failures.append(exc)
+    return failures
+
+
+def _raise_with_restore_failures(
+    primary: BaseException | None,
+    restore_failures: list[BaseException],
+) -> None:
+    if primary is not None:
+        for failure in restore_failures:
+            primary.add_note(
+                "SQLite trigger restoration also failed: "
+                f"{failure.__class__.__name__}: {failure}"
+            )
+        raise primary.with_traceback(primary.__traceback__)
+    if restore_failures:
+        first, *remaining = restore_failures
+        for failure in remaining:
+            first.add_note(
+                "Additional SQLite trigger restoration failure: "
+                f"{failure.__class__.__name__}: {failure}"
+            )
+        raise first.with_traceback(first.__traceback__)
 
 
 def _fixture_teardown_with_sqlite_trigger_suspension(
     test_case: TransactionTestCase,
 ) -> None:
     _restore_migration_leaves(test_case)
-    suspended = _suspend_sqlite_triggers(test_case)
+    dropped: list[tuple[object, str]] = []
+    primary: BaseException | None = None
     try:
+        _drop_sqlite_triggers(test_case, dropped)
         _django_fixture_teardown(test_case)
-    finally:
-        _restore_sqlite_triggers(suspended)
+    except BaseException as exc:  # noqa: BLE001 - preserve drop/flush over cleanup failures
+        primary = exc
+    restore_failures = _restore_sqlite_triggers(dropped)
+    _raise_with_restore_failures(primary, restore_failures)
 
 
 TransactionTestCase._fixture_teardown = _fixture_teardown_with_sqlite_trigger_suspension

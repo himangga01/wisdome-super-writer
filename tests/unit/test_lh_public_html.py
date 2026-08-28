@@ -101,6 +101,34 @@ def test_lh_parses_sanitized_live_table_shape() -> None:
     assert notice.deadline.isoformat() == "2026-09-15"
 
 
+def test_lh_paginates_two_sanitized_official_table_pages(
+    window: CollectionWindow,
+) -> None:
+    first = (LIVE_REGRESSIONS / "lh-list-two-page-1.html").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"<tr><td>51</td>[\s\S]*?</tr>", first)
+    assert match is not None
+    rows = "".join(
+        match.group()
+        .replace("<td>51</td>", f"<td>{51 - offset}</td>", 1)
+        .replace("2016122300000001", f"{2016122300000001 + offset}")
+        .replace("공식 표 공고 1", f"공식 표 공고 {offset + 1}")
+        for offset in range(50)
+    )
+    first = first.replace(match.group(), rows, 1)
+    second = (LIVE_REGRESSIONS / "lh-list-two-page-2.html").read_text(
+        encoding="utf-8"
+    )
+    fetcher = FixtureFetcher({"1": first, "2": second}, {})
+
+    records = LhPublicCollector(fetcher)._collect_list_pages(window)
+
+    assert len(records) == 51
+    assert records[0].external_id == "lh:03:2016122300000001:06:08"
+    assert records[-1].external_id == "lh:03:2016122300000051:06:08"
+
+
 def test_lh_parses_sanitized_live_detail_without_attachment_bytes() -> None:
     body = (LIVE_REGRESSIONS / "lh-detail-2026-08-28.html").read_text(encoding="utf-8")
 
@@ -112,7 +140,7 @@ def test_lh_parses_sanitized_live_detail_without_attachment_bytes() -> None:
         eligibility,
         facts,
         warnings,
-    ) = LhPublicCollector._parse_detail(body)
+    ) = LhPublicCollector._parse_detail(body, listed=_live_record())
 
     assert application_start is None
     assert application_end is None
@@ -132,7 +160,7 @@ def test_lh_parses_sanitized_short_supply_header_variant() -> None:
         encoding="utf-8"
     ).replace("금회공급 세대수 (예비자 포함)", "금회공급 세대수")
 
-    result = LhPublicCollector._parse_detail(body)
+    result = LhPublicCollector._parse_detail(body, listed=_live_record())
 
     assert result[2] == 80
 
@@ -142,7 +170,7 @@ def test_lh_accepts_sparse_official_detail_with_explicit_missing_field_warnings(
         encoding="utf-8"
     )
 
-    result = LhPublicCollector._parse_detail(body)
+    result = LhPublicCollector._parse_detail(body, listed=_live_record())
 
     assert result[:6] == (None, None, None, None, (), ())
     assert result[6] == (
@@ -164,9 +192,33 @@ def test_lh_sums_multiple_verified_supply_tables() -> None:
     </table>
     """
 
-    result = LhPublicCollector._parse_detail(body + second_table)
+    result = LhPublicCollector._parse_detail(body + second_table, listed=_live_record())
 
     assert result[2] == 100
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "lh-detail-error-2026-08-28.html",
+        "lh-detail-unbound-sparse-2026-08-28.html",
+        "lh-detail-mismatch-2026-08-28.html",
+    ],
+)
+def test_lh_public_detail_rejects_unbound_or_incomplete_templates(
+    fixture_name: str,
+) -> None:
+    body = (LIVE_REGRESSIONS / fixture_name).read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="detail"):
+        LhPublicCollector._parse_detail(body, listed=_live_record())
+
+
+def _live_record():  # type: ignore[no-untyped-def]
+    body = (LIVE_REGRESSIONS / "lh-list-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+    return LhPublicCollector(FixtureFetcher({}, {}))._parse_list(body).records[0]
 
 
 def _page_with_fifty_records(page: str) -> str:

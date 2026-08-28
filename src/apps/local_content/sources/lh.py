@@ -150,7 +150,7 @@ class LhPublicCollector:
             eligibility_summary,
             facts,
             warnings,
-        ) = self._parse_detail(detail)
+        ) = self._parse_detail(detail, listed=listed)
         fields = {
             "source_key": _SOURCE_KEY,
             "external_id": listed.external_id,
@@ -379,6 +379,8 @@ class LhPublicCollector:
     @staticmethod
     def _parse_detail(
         body: str,
+        *,
+        listed: _ListedNotice | None = None,
     ) -> tuple[
         date | None,
         date | None,
@@ -391,6 +393,9 @@ class LhPublicCollector:
         document = HTMLParser(body)
         root = document.css_first("[data-lh-notice-detail]")
         if root is None:
+            if listed is None:
+                raise _ParseFailure("detail identity is required")
+            _require_public_detail_identity(document, listed)
             return _parse_public_detail(document)
         schedule = _label_value(root, ("청약접수기간", "신청접수기간", "접수기간"))
         application_start, application_end, schedule_warning = _parse_schedule_range(schedule)
@@ -525,6 +530,27 @@ def _parse_public_detail(
         (),
         tuple(warnings),
     )
+
+
+def _require_public_detail_identity(
+    document: HTMLParser,
+    listed: _ListedNotice,
+) -> None:
+    expected = {
+        "panId": listed.pan_id,
+        "ccrCnntSysDsCd": listed.ccr,
+        "uppAisTpCd": listed.upp,
+        "aisTpCd": listed.ais,
+    }
+    for name, value in expected.items():
+        if not any(
+            _normalize(node.attributes.get("value")) == value
+            for node in document.css(f'input[type="hidden"][name="{name}"]')
+        ):
+            raise _ParseFailure("detail identity does not match list record")
+    visible_text = _normalize(document.text(separator=" ")) or ""
+    if (_normalize(listed.title) or "") not in visible_text:
+        raise _ParseFailure("detail title does not match list record")
 
 
 def _is_sparse_public_detail(document: HTMLParser) -> bool:
