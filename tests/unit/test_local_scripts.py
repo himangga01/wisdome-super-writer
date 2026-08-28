@@ -530,28 +530,41 @@ def test_setup_initialization_rejects_local_root_escape_without_creating_outside
 
 
 @WINDOWS_ONLY
-def test_setup_initialization_rejects_reparse_local_root_without_target_write(
+def test_setup_initialization_rejects_reparse_below_configured_article_root_without_write(
     tmp_path: Path,
 ) -> None:
-    """Skipping reparse checks would let root initialization write through a junction."""
+    """Replacing safe root creation would write through this otherwise-valid configured path."""
     repository, humanizer = _script_fixture(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
+    (repository / "output").mkdir()
     junction = subprocess.run(
-        ["cmd.exe", "/d", "/c", "mklink", "/J", str(repository / ".local"), str(outside)],
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(repository / "output" / "link"),
+            str(outside),
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
     if junction.returncode != 0:
         pytest.skip("junction creation is unavailable")
+    (repository / ".env.local").write_text(
+        "WISDOME_ENVIRONMENT=development\nWISDOME_RUNTIME_MODE=local\n"
+        "LOCAL_ARTICLE_ROOT=output\\link\\articles\n",
+        encoding="utf-8",
+    )
 
     result = _initialize_environment(repository, humanizer)
 
     assert result.returncode != 0
     assert "reparse" in (result.stdout + result.stderr).casefold()
-    assert not (outside / "state").exists()
-    assert not (outside / "objects").exists()
+    assert not (outside / "articles").exists()
 
 
 @WINDOWS_ONLY
