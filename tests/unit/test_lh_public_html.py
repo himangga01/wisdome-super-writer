@@ -214,6 +214,16 @@ def test_lh_public_detail_rejects_unbound_or_incomplete_templates(
         LhPublicCollector._parse_detail(body, listed=_live_record())
 
 
+def test_lh_public_detail_rejects_mixed_matching_and_wrong_hidden_identity() -> None:
+    body = (LIVE_REGRESSIONS / "lh-detail-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+    body += '<input type="hidden" name="panId" value="9999999999999999">'
+
+    with pytest.raises(ValueError, match="identity"):
+        LhPublicCollector._parse_detail(body, listed=_live_record())
+
+
 def _live_record():  # type: ignore[no-untyped-def]
     body = (LIVE_REGRESSIONS / "lh-list-2026-08-28.html").read_text(
         encoding="utf-8"

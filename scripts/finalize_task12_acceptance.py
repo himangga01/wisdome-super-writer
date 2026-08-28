@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     report = json.loads(arguments.report.read_text(encoding="utf-8"))
     if not isinstance(report, dict):
         raise ValueError("acceptance report must be a JSON object")
-    section = derive_task12_acceptance(report)
+    section = derive_task12_acceptance(report, project_root=PROJECT_ROOT)
     section["finalized_at"] = datetime.now(UTC).isoformat()
     temporary = arguments.report.with_name(f".{arguments.report.name}.finalize.tmp")
     temporary.write_text(

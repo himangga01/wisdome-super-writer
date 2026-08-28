@@ -306,8 +306,29 @@ def test_workflow_persists_closed_raw_source_observations_and_audit_material(
     assert audit["overall_passed"] is True
     assert len(audit["humanizer_job_hashes"]) == 1
 
-    raw["observations"][0]["category"] = "토지"
     raw_path = run_root / "raw-observations.json"
+    raw["window"]["start"] = "2026-08-21T15:00:00+00:00"
+    raw_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest["run_files"]["raw-observations.json"] = hashlib.sha256(
+        raw_path.read_bytes()
+    ).hexdigest()
+    (run_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    rejected_window = audit_live_run(
+        run_root,
+        window_start=datetime(2026, 8, 22, tzinfo=SEOUL),
+        expectations=AcceptanceExpectations(2, 1, 1, 1),
+    )
+    assert rejected_window["overall_passed"] is False
+
+    raw["window"]["start"] = "2026-08-22T00:00:00+09:00"
+    raw["observations"][0]["category"] = "토지"
     raw_path.write_text(
         json.dumps(raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -326,6 +347,43 @@ def test_workflow_persists_closed_raw_source_observations_and_audit_material(
         expectations=AcceptanceExpectations(2, 1, 1, 1),
     )
     assert rejected["overall_passed"] is False
+
+
+def test_artifact_audit_allows_reused_candidate_prose_but_binds_final_identities(
+    tmp_path: Path,
+) -> None:
+    workflow = LocalHousingWorkflow(
+        collectors=(
+            _collector(
+                "applyhome",
+                _notice("candidate-reuse-one", checksum_digit="1"),
+                _notice("candidate-reuse-two", checksum_digit="2"),
+            ),
+            _collector("lh"),
+        ),
+        humanizer=EchoHumanizer(),
+        output_root=tmp_path,
+        mode="fixture",
+    )
+
+    report = _run(workflow)
+    audit = audit_live_run(
+        tmp_path / report.run_path,
+        window_start=datetime(2026, 8, 22, tzinfo=SEOUL),
+        expectations=AcceptanceExpectations(2, 0, 2, 2),
+    )
+
+    assert audit["overall_passed"] is True
+    identity = audit["humanizer_identity_evidence"]
+    assert identity["binding_counts"] == {
+        "job_hashes": {"count": 2, "unique_count": 2},
+        "bundle_hashes": {"count": 2, "unique_count": 2},
+        "final_article_hashes": {"count": 2, "unique_count": 2},
+        "verification_hashes": {"count": 2, "unique_count": 2},
+    }
+    assert identity["candidate_output_count"] == 2
+    assert identity["unique_candidate_output_count"] == 1
+    assert identity["candidate_output_uniqueness_gate"] is False
 
 
 def test_failed_same_date_rerun_keeps_prior_run_byte_identical(tmp_path: Path) -> None:

@@ -151,9 +151,28 @@ def test_applyhome_binds_attachmentless_official_detail_by_title_and_publication
         LIVE_REGRESSIONS / "applyhome-apt-detail-title-date-2026-08-28.html"
     ).read_text(encoding="utf-8")
 
-    result = ApplyHomePublicCollector._parse_detail(body, listed=_live_record("apt"))
+    listed = _live_record("apt")
+    result = ApplyHomePublicCollector._parse_detail(
+        body,
+        listed=listed,
+        observed_detail_url=listed.canonical_url,
+    )
 
     assert result[2] == 22
+
+
+def test_applyhome_public_detail_rejects_mixed_matching_and_wrong_identity() -> None:
+    body = (LIVE_REGRESSIONS / "applyhome-apt-detail-2026-08-28.html").read_text(
+        encoding="utf-8"
+    )
+    body += (
+        '<a href="https://static.applyhome.co.kr/ai/aia/getAtchmnfl.do?'
+        'houseManageNo=9999999999&amp;pblancNo=9999999999&amp;atchmnflSeqNo=2">'
+        "혼합 식별자</a>"
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        ApplyHomePublicCollector._parse_detail(body, listed=_live_record("apt"))
 
 
 def test_applyhome_parses_sanitized_remaining_detail_schedule() -> None:

@@ -543,10 +543,12 @@ def _require_public_detail_identity(
         "aisTpCd": listed.ais,
     }
     for name, value in expected.items():
-        if not any(
-            _normalize(node.attributes.get("value")) == value
+        observed = {
+            normalized
             for node in document.css(f'input[type="hidden"][name="{name}"]')
-        ):
+            if (normalized := _normalize(node.attributes.get("value")))
+        }
+        if observed != {value}:
             raise _ParseFailure("detail identity does not match list record")
     visible_text = _normalize(document.text(separator=" ")) or ""
     if (_normalize(listed.title) or "") not in visible_text:

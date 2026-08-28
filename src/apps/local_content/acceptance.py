@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import Counter
@@ -11,8 +10,10 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from apps.local_content.acceptance_runner import verify_attempt_selection
 from apps.local_content.bundles import ArticleBundleWriter, BundlePublishError
 from apps.local_content.contracts import HousingNotice
+from apps.local_content.dates import SEOUL
 from apps.local_content.humanizer import (
     HumanizationVerificationError,
     verify_humanization_audit,
@@ -55,19 +56,6 @@ _PREVIEW_CSP = (
     "default-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; "
     "object-src 'none'; img-src 'self'; style-src 'self'"
 )
-_DETERMINISTIC_COMMAND_NAMES = frozenset(
-    {
-        "setup_local",
-        "whole_repository_ruff",
-        "django_check",
-        "migration_check",
-        "focused_pytest",
-        "full_pytest",
-        "changed_file_ruff",
-        "ci_material",
-        "diff_check",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -99,7 +87,107 @@ def preview_headers_match(
     )
 
 
-def derive_task12_acceptance(report: dict[str, object]) -> dict[str, object]:
+def humanizer_identity_evidence(
+    *,
+    job_hashes: tuple[str, ...],
+    bundle_hashes: tuple[str, ...],
+    final_article_hashes: tuple[str, ...],
+    verification_hashes: tuple[str, ...],
+    candidate_output_hashes: tuple[str, ...],
+    expected: int,
+) -> dict[str, object]:
+    """Require unique binding identities while reporting prose reuse non-gating."""
+
+    binding = {
+        "job_hashes": job_hashes,
+        "bundle_hashes": bundle_hashes,
+        "final_article_hashes": final_article_hashes,
+        "verification_hashes": verification_hashes,
+    }
+    binding_counts = {
+        name: {"count": len(values), "unique_count": len(set(values))}
+        for name, values in binding.items()
+    }
+    hashes_valid = all(
+        _SHA256.fullmatch(value) is not None
+        for values in (*binding.values(), candidate_output_hashes)
+        for value in values
+    )
+    passed = (
+        type(expected) is int
+        and expected > 0
+        and hashes_valid
+        and all(
+            counts["count"] == expected and counts["unique_count"] == expected
+            for counts in binding_counts.values()
+        )
+        and len(candidate_output_hashes) == expected
+    )
+    return {
+        "passed": passed,
+        "expected": expected,
+        "binding_counts": binding_counts,
+        "candidate_output_count": len(candidate_output_hashes),
+        "unique_candidate_output_count": len(set(candidate_output_hashes)),
+        "candidate_output_uniqueness_gate": False,
+    }
+
+
+def validate_exact_kst_window(
+    *,
+    start_text: str,
+    end_text: str,
+    expected_start: datetime,
+    run_date: date,
+    executed_at: datetime,
+) -> dict[str, object]:
+    """Validate literal KST representation, run date, and execution bound."""
+
+    try:
+        start = datetime.fromisoformat(start_text)
+        end = datetime.fromisoformat(end_text)
+    except (TypeError, ValueError):
+        start = None
+        end = None
+    exact_start = (
+        isinstance(start_text, str)
+        and start_text == expected_start.isoformat()
+        and start_text.endswith("+09:00")
+    )
+    end_kst = isinstance(end_text, str) and end_text.endswith("+09:00")
+    start_offset = start.utcoffset() if start is not None else None
+    end_offset = end.utcoffset() if end is not None else None
+    passed = (
+        start is not None
+        and end is not None
+        and expected_start.tzinfo is not None
+        and expected_start.utcoffset() is not None
+        and executed_at.tzinfo is not None
+        and executed_at.utcoffset() is not None
+        and exact_start
+        and end_kst
+        and start_offset is not None
+        and end_offset is not None
+        and start_offset.total_seconds() == 9 * 60 * 60
+        and end_offset.total_seconds() == 9 * 60 * 60
+        and end.date() == run_date
+        and start <= end <= executed_at
+    )
+    return {
+        "passed": passed,
+        "start_exact": exact_start,
+        "end_kst": end_kst,
+        "end_run_date": end is not None and end.date() == run_date,
+        "end_not_after_execution": end is not None and end <= executed_at,
+    }
+
+
+def derive_task12_acceptance(
+    report: dict[str, object],
+    *,
+    project_root: Path | None = None,
+    current_changed_python: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     """Recompute final acceptance from workflow, artifact, browser, and command facts."""
 
     section = report.get("task12_acceptance")
@@ -108,7 +196,6 @@ def derive_task12_acceptance(report: dict[str, object]) -> dict[str, object]:
         report["task12_acceptance"] = section
     artifact = section.get("artifact_audit")
     browser = section.get("browser")
-    deterministic = section.get("deterministic_evidence")
     workflow_passed = (
         report.get("live_success") is True
         and report.get("complete") is True
@@ -119,9 +206,21 @@ def derive_task12_acceptance(report: dict[str, object]) -> dict[str, object]:
         isinstance(artifact, dict) and artifact.get("overall_passed") is True
     )
     browser_passed = isinstance(browser, dict) and browser.get("passed") is True
-    deterministic_passed, deterministic_evidence = _derive_deterministic_gate(
-        deterministic
-    )
+    if project_root is None:
+        deterministic_passed = False
+        deterministic_evidence: dict[str, object] = {
+            "failures": ["PROJECT_ROOT_REQUIRED"]
+        }
+    else:
+        selection = verify_attempt_selection(
+            history=section.get("deterministic_attempt_history"),
+            selection=section.get("deterministic_selection"),
+            selected_evidence=section.get("deterministic_evidence"),
+            project_root=project_root,
+            current_changed_python=current_changed_python,
+        )
+        deterministic_passed = selection.passed
+        deterministic_evidence = selection.evidence
     requirements = [
         _verdict("workflow_live_success", workflow_passed, {}),
         _verdict("artifact_audit", artifact_passed, {}),
@@ -139,85 +238,18 @@ def derive_task12_acceptance(report: dict[str, object]) -> dict[str, object]:
     return section
 
 
-def _derive_deterministic_gate(
-    deterministic: object,
-) -> tuple[bool, dict[str, object]]:
-    if not isinstance(deterministic, dict):
-        return False, {"reason": "MISSING_DETERMINISTIC_EVIDENCE"}
-    commands = deterministic.get("commands")
-    ruling = deterministic.get("legacy_ruling")
-    if not isinstance(commands, list) or not isinstance(ruling, dict):
-        return False, {"reason": "INVALID_DETERMINISTIC_SCHEMA"}
-    names: list[str] = []
-    gates_valid = True
-    whole_ruff_valid = False
-    for row in commands:
-        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
-            gates_valid = False
-            continue
-        names.append(row["name"])
-        exit_code = row.get("exit_code")
-        passed = row.get("passed")
-        gate = row.get("gate")
-        if row["name"] == "whole_repository_ruff":
-            if gate is not False or not isinstance(exit_code, int):
-                continue
-            if exit_code == 0:
-                whole_ruff_valid = (
-                    passed is True and row.get("disposition") == "non_gate_clean"
-                )
-            else:
-                text = ruling.get("text")
-                ruling_hash = ruling.get("sha256")
-                whole_ruff_valid = (
-                    passed is False
-                    and row.get("disposition") == "legacy_debt_not_gate"
-                    and ruling.get("applied") is True
-                    and isinstance(ruling.get("id"), str)
-                    and bool(ruling["id"])
-                    and isinstance(text, str)
-                    and bool(text)
-                    and isinstance(ruling_hash, str)
-                    and hashlib.sha256(text.encode("utf-8")).hexdigest()
-                    == ruling_hash
-                )
-        elif (
-            gate is not True
-            or exit_code != 0
-            or passed is not True
-            or row.get("disposition") != "gate_passed"
-        ):
-            gates_valid = False
-    exact_names = (
-        len(names) == len(set(names))
-        and set(names) == _DETERMINISTIC_COMMAND_NAMES
-        and deterministic.get("exact_command_plan_executed") is True
-    )
-    passed = (
-        exact_names
-        and gates_valid
-        and whole_ruff_valid
-        and deterministic.get("failed_gates") == []
-        and deterministic.get("overall_passed") is True
-    )
-    return passed, {
-        "exact_command_count": len(names),
-        "exact_command_names": exact_names,
-        "binding_gates_valid": gates_valid,
-        "whole_repository_ruff_truth_and_ruling_valid": whole_ruff_valid,
-    }
-
-
 def audit_live_run(
     run_root: Path,
     *,
     window_start: datetime,
     expectations: AcceptanceExpectations,
+    executed_at: datetime | None = None,
 ) -> dict[str, object]:
     """Audit one committed run without trusting workflow report booleans."""
 
     root = Path(run_root).resolve()
     run_date = _run_date(root.name)
+    execution = executed_at if executed_at is not None else datetime.now(SEOUL)
     requirements: list[dict[str, object]] = []
 
     try:
@@ -242,7 +274,7 @@ def audit_live_run(
         )
     )
     if not production_validated:
-        return _audit_document(root, requirements, {}, (), ())
+        return _audit_document(root, requirements, {}, {}, (), (), (), (), ())
 
     raw = _read_json_object(root / "raw-observations.json")
     notices = _read_json_object(root / "notices.json")
@@ -253,6 +285,7 @@ def audit_live_run(
         raw,
         window_start=window_start,
         run_date=run_date,
+        executed_at=execution,
         expectations=expectations,
     )
     requirements.append(raw_result["verdict"])
@@ -282,8 +315,12 @@ def audit_live_run(
         root,
         requirements,
         counts,
+        article_result["identity_evidence"],
         article_result["job_hashes"],
+        article_result["bundle_hashes"],
+        article_result["final_article_hashes"],
         article_result["verification_hashes"],
+        article_result["candidate_output_hashes"],
     )
 
 
@@ -315,6 +352,7 @@ def _audit_raw_observations(
     *,
     window_start: datetime,
     run_date: date,
+    executed_at: datetime,
     expectations: AcceptanceExpectations,
 ) -> dict[str, object]:
     schema_valid = set(raw) == {"schema_version", "window", "sources", "observations"}
@@ -330,6 +368,7 @@ def _audit_raw_observations(
         and isinstance(observations, list)
     )
     parsed_end: datetime | None = None
+    window_verdict: dict[str, object] = {"passed": False}
     rows: list[dict[str, object]] = []
     stable_ids: list[tuple[str, str]] = []
     residential_ids: set[tuple[str, str]] = set()
@@ -337,13 +376,20 @@ def _audit_raw_observations(
     dates_valid = False
     if schema_valid:
         try:
-            parsed_start = datetime.fromisoformat(str(window["start"]))
+            start_text = window["start"]
+            end_text = window["end"]
+            if not isinstance(start_text, str) or not isinstance(end_text, str):
+                raise ValueError
+            parsed_start = datetime.fromisoformat(start_text)
             parsed_end = datetime.fromisoformat(str(window["end"]))
-            dates_valid = (
-                parsed_start == window_start
-                and parsed_end.date() == run_date
-                and parsed_end >= parsed_start
+            window_verdict = validate_exact_kst_window(
+                start_text=start_text,
+                end_text=end_text,
+                expected_start=window_start,
+                run_date=run_date,
+                executed_at=executed_at,
             )
+            dates_valid = window_verdict["passed"] is True
             for value in observations:
                 if not isinstance(value, dict) or set(value) != _RAW_OBSERVATION_KEYS:
                     raise ValueError
@@ -415,6 +461,7 @@ def _audit_raw_observations(
                 "source_complete": source_complete,
                 "window_start": window.get("start") if isinstance(window, dict) else None,
                 "window_end": window.get("end") if isinstance(window, dict) else None,
+                "window_representation": window_verdict,
             },
         ),
         "raw_count": len(rows),
@@ -555,7 +602,10 @@ def _audit_articles(
     article_names = sorted(articles) if isinstance(articles, dict) else []
     failures: list[dict[str, str]] = []
     job_hashes: list[str] = []
+    bundle_hashes: list[str] = []
+    final_article_hashes: list[str] = []
     verification_hashes: list[str] = []
+    candidate_output_hashes: list[str] = []
     image_count = 0
     observed_detail_paths: list[str] = []
     for name in article_names:
@@ -585,7 +635,21 @@ def _audit_articles(
             _require_article_status(bundle)
             _require_official_sources(bundle / "sources.json")
             job_hashes.append(result.job_hash)
+            bundle_hash = articles[name]
+            article_file = files["article.md"]
+            audit_hashes = audit.get("hashes")
+            if (
+                not isinstance(bundle_hash, str)
+                or not isinstance(article_file, dict)
+                or not isinstance(article_file.get("sha256"), str)
+                or not isinstance(audit_hashes, dict)
+                or not isinstance(audit_hashes.get("output_sha256"), str)
+            ):
+                raise ValueError("article identity hashes")
+            bundle_hashes.append(bundle_hash)
+            final_article_hashes.append(article_file["sha256"])
             verification_hashes.append(result.verification_hash)
+            candidate_output_hashes.append(audit_hashes["output_sha256"])
         except (
             BundlePublishError,
             HumanizationVerificationError,
@@ -597,14 +661,20 @@ def _audit_articles(
     expected = tuple(
         sorted(path.removeprefix("./") for path in expected_detail_paths)
     )
+    identity_evidence = humanizer_identity_evidence(
+        job_hashes=tuple(job_hashes),
+        bundle_hashes=tuple(bundle_hashes),
+        final_article_hashes=tuple(final_article_hashes),
+        verification_hashes=tuple(verification_hashes),
+        candidate_output_hashes=tuple(candidate_output_hashes),
+        expected=expectations.detailed_articles,
+    )
     passed = (
         manifest.get("schema_version") == 2
         and len(article_names) == expectations.detailed_articles
         and len(observed_detail_paths) == expectations.detailed_articles
         and tuple(sorted(observed_detail_paths)) == expected
-        and len(job_hashes) == expectations.detailed_articles
-        and len(job_hashes) == len(set(job_hashes))
-        and len(verification_hashes) == expectations.detailed_articles
+        and identity_evidence["passed"] is True
         and image_count == expectations.detailed_articles * 3
         and not failures
     )
@@ -616,6 +686,12 @@ def _audit_articles(
                 "article_count": len(article_names),
                 "humanizer_jobs_reverified": len(job_hashes),
                 "unique_job_hashes": len(set(job_hashes)),
+                "unique_bundle_hashes": len(set(bundle_hashes)),
+                "unique_final_article_hashes": len(set(final_article_hashes)),
+                "unique_verification_hashes": len(set(verification_hashes)),
+                "candidate_output_count": len(candidate_output_hashes),
+                "unique_candidate_output_count": len(set(candidate_output_hashes)),
+                "candidate_output_uniqueness_gate": False,
                 "image_count": image_count,
                 "failures": failures,
                 "article_paths": [f"{name}/article.md" for name in article_names],
@@ -623,8 +699,12 @@ def _audit_articles(
         ),
         "article_count": len(article_names),
         "image_count": image_count,
+        "identity_evidence": identity_evidence,
         "job_hashes": tuple(sorted(job_hashes)),
+        "bundle_hashes": tuple(sorted(bundle_hashes)),
+        "final_article_hashes": tuple(sorted(final_article_hashes)),
         "verification_hashes": tuple(sorted(verification_hashes)),
+        "candidate_output_hashes": tuple(sorted(candidate_output_hashes)),
     }
 
 
@@ -737,16 +817,24 @@ def _audit_document(
     root: Path,
     requirements: list[dict[str, object]],
     counts: dict[str, object],
+    identity_evidence: dict[str, object],
     job_hashes: tuple[str, ...],
+    bundle_hashes: tuple[str, ...],
+    final_article_hashes: tuple[str, ...],
     verification_hashes: tuple[str, ...],
+    candidate_output_hashes: tuple[str, ...],
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
         "run_name": root.name,
         "requirements": requirements,
         "counts": counts,
+        "humanizer_identity_evidence": identity_evidence,
         "humanizer_job_hashes": list(job_hashes),
+        "final_bundle_hashes": list(bundle_hashes),
+        "final_article_hashes": list(final_article_hashes),
         "humanizer_verification_hashes": list(verification_hashes),
+        "candidate_output_hashes": list(candidate_output_hashes),
         "overall_passed": bool(requirements)
         and all(row.get("passed") is True for row in requirements),
     }

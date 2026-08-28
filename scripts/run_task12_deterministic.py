@@ -11,20 +11,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from apps.local_content.acceptance_runner import (  # noqa: E402
-    LegacyRuling,
+    TASK12_ATTEMPT_SELECTION_RULE,
+    TASK12_BASE_COMMIT,
+    build_attempt_history_entry,
     build_command_plan,
     build_deterministic_evidence,
     discover_changed_python,
     execute_command,
 )
 
-RULING_ID = "TASK12-RUFF-LEGACY-001"
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
-    parser.add_argument("--base", required=True)
+    parser.add_argument("--base", default=TASK12_BASE_COMMIT)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--history-evidence", action="append", default=[])
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--acceptance-report", type=Path)
@@ -35,16 +37,6 @@ def main(argv: list[str] | None = None) -> int:
         project_root,
         base=arguments.base,
         changed_python=changed_python,
-    )
-    ruling = LegacyRuling(
-        RULING_ID,
-        (
-            f"At base {arguments.base}, whole-repository Ruff findings are ledgered "
-            "legacy debt and a nonzero whole_repository_ruff result is classified only "
-            "as legacy_debt_not_gate. changed_file_ruff, every local_content Python "
-            "file, ci_material, tests, Django, migrations, setup, and diff remain "
-            "binding gates. This ruling never changes a nonzero command to passed=true."
-        ),
     )
     results = []
     environment = {
@@ -62,7 +54,14 @@ def main(argv: list[str] | None = None) -> int:
             environment=environment,
         )
         results.append(result)
-        evidence = build_deterministic_evidence(results, ruling=ruling)
+        evidence = build_deterministic_evidence(
+            results,
+            attempt_id=arguments.attempt_id,
+            project_root=project_root,
+            base=arguments.base,
+            changed_python=changed_python,
+            log_root=arguments.log_dir,
+        )
         _write_json(arguments.evidence, evidence)
         print(
             json.dumps(
@@ -76,9 +75,21 @@ def main(argv: list[str] | None = None) -> int:
             ),
             flush=True,
         )
-    evidence = build_deterministic_evidence(results, ruling=ruling)
+    evidence = build_deterministic_evidence(
+        results,
+        attempt_id=arguments.attempt_id,
+        project_root=project_root,
+        base=arguments.base,
+        changed_python=changed_python,
+        log_root=arguments.log_dir,
+    )
     if arguments.acceptance_report is not None:
-        _merge_report(arguments.acceptance_report, evidence)
+        _merge_report(
+            arguments.acceptance_report,
+            evidence,
+            evidence_path=arguments.evidence,
+            history_specs=arguments.history_evidence,
+        )
     print(
         json.dumps(
             {
@@ -101,7 +112,13 @@ def _write_json(path: Path, value: object) -> None:
     temporary.replace(target)
 
 
-def _merge_report(path: Path, evidence: dict[str, object]) -> None:
+def _merge_report(
+    path: Path,
+    evidence: dict[str, object],
+    *,
+    evidence_path: Path,
+    history_specs: list[str],
+) -> None:
     target = Path(path)
     report = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(report, dict):
@@ -109,8 +126,29 @@ def _merge_report(path: Path, evidence: dict[str, object]) -> None:
     section = report.setdefault("task12_acceptance", {})
     if not isinstance(section, dict):
         raise ValueError("task12 acceptance section must be a JSON object")
+    history = [_history_entry(spec) for spec in history_specs]
+    history.append(
+        build_attempt_history_entry(str(evidence["attempt_id"]), evidence_path)
+    )
+    attempt_ids = [entry["attempt_id"] for entry in history]
+    if len(attempt_ids) != len(set(attempt_ids)):
+        raise ValueError("deterministic attempt history IDs must be unique")
     section["deterministic_evidence"] = evidence
+    section["deterministic_attempt_history"] = history
+    eligible = [str(evidence["attempt_id"])] if evidence["overall_passed"] is True else []
+    section["deterministic_selection"] = {
+        "rule": TASK12_ATTEMPT_SELECTION_RULE,
+        "selected_attempt_id": eligible[-1] if eligible else None,
+        "eligible_attempt_ids": eligible,
+    }
     _write_json(target, report)
+
+
+def _history_entry(specification: str) -> dict[str, object]:
+    attempt_id, separator, raw_path = specification.partition("=")
+    if not separator or not attempt_id or not raw_path:
+        raise ValueError("history evidence must use ATTEMPT_ID=PATH")
+    return build_attempt_history_entry(attempt_id, Path(raw_path))
 
 
 if __name__ == "__main__":
