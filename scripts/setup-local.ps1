@@ -591,6 +591,29 @@ function Import-LocalEnvironment {
     }
 }
 
+function Initialize-LocalRuntimeRoots {
+    param([string]$Root)
+
+    $roots = @(
+        [pscustomobject]@{ Name = 'LOCAL_STATE_ROOT'; Default = '.local\state'; Label = 'Local state root' },
+        [pscustomobject]@{ Name = 'LOCAL_ARTICLE_ROOT'; Default = 'output\housing'; Label = 'Local article root' },
+        [pscustomobject]@{ Name = 'LOCAL_OBJECT_ROOT'; Default = '.local\objects'; Label = 'Local object root' }
+    )
+    foreach ($rootDefinition in $roots) {
+        $configured = [Environment]::GetEnvironmentVariable($rootDefinition.Name, 'Process')
+        $path = if ([string]::IsNullOrWhiteSpace($configured)) {
+            Join-Path $Root $rootDefinition.Default
+        }
+        elseif ([System.IO.Path]::IsPathRooted($configured)) {
+            $configured
+        }
+        else {
+            Join-Path $Root $configured
+        }
+        [void](New-SafeRepositoryDirectory -Root $Root -Path $path -Label $rootDefinition.Label)
+    }
+}
+
 function Invoke-Checked {
     param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory)
 
@@ -655,7 +678,9 @@ if ($ValidateOnly) {
     exit 0
 }
 if ($InitializeEnvironmentOnly) {
-    [void](Initialize-LocalEnvironment -Root $repository -FaultPhase $EnvironmentFaultPhase)
+    $envPath = Initialize-LocalEnvironment -Root $repository -FaultPhase $EnvironmentFaultPhase
+    Import-LocalEnvironment -Root $repository -Path $envPath
+    [void](Initialize-LocalRuntimeRoots -Root $repository)
     Write-Output 'Local environment initialization completed.'
     exit 0
 }
@@ -730,7 +755,7 @@ Import-LocalEnvironment -Root $repository -Path $envPath
 if ($env:WISDOME_ENVIRONMENT -ne 'development' -or $env:WISDOME_RUNTIME_MODE -ne 'local') {
     throw 'Local setup requires development environment and local runtime mode.'
 }
-
+[void](Initialize-LocalRuntimeRoots -Root $repository)
 Invoke-Checked -FilePath $venvPython -Arguments @('src\manage.py', 'migrate', '--noinput') -WorkingDirectory $repository
 Invoke-Checked -FilePath $venvPython -Arguments @('src\manage.py', 'seed_source_registry') -WorkingDirectory $repository
 Invoke-Checked -FilePath $venvPython -Arguments @('src\manage.py', 'verify_source_registry_snapshots') -WorkingDirectory $repository

@@ -369,6 +369,30 @@ def test_setup_initializes_env_atomically_and_preserves_existing_file(tmp_path: 
 
 
 @WINDOWS_ONLY
+def test_setup_initialization_creates_default_local_roots_required_by_sqlite_migrate(
+    tmp_path: Path,
+) -> None:
+    """Removing root initialization would leave fresh SQLite setup unable to open its database."""
+    repository, humanizer = _script_fixture(tmp_path)
+    (repository / ".env.local").unlink()
+
+    result = _powershell(
+        "-File",
+        str(REPOSITORY_ROOT / "scripts" / "setup-local.ps1"),
+        "-RepositoryRoot",
+        str(repository),
+        "-HumanizerRoot",
+        str(humanizer),
+        "-InitializeEnvironmentOnly",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repository / ".local" / "state").is_dir()
+    assert (repository / "output" / "housing").is_dir()
+    assert (repository / ".local" / "objects").is_dir()
+
+
+@WINDOWS_ONLY
 @pytest.mark.parametrize("phase", ["write", "flush", "close"])
 def test_setup_env_post_create_fault_fails_and_removes_only_owned_partial(
     tmp_path: Path,
