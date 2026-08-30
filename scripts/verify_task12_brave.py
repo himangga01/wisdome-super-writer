@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--evidence-root", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:7667")
     parser.add_argument("--requested-date", required=True)
     parser.add_argument("--expected-details", required=True, type=int)
     parser.add_argument("--brave", type=Path, default=DEFAULT_BRAVE)

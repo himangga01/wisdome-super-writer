@@ -310,13 +310,13 @@ def _browser_evidence(root: Path) -> dict[str, object]:
         path.write_bytes(f"png-{name}".encode())
         screenshot_references[name] = build_evidence_reference(path)
     detail = {
-        "url": f"http://127.0.0.1:8000/local-articles/{RUN_NAME}/article-1/",
+        "url": f"http://127.0.0.1:7667/local-articles/{RUN_NAME}/article-1/",
         "status": 200,
         "heading_has_korean": True,
         "horizontal_overflow": False,
         "images": [
             {
-                "src": f"http://127.0.0.1:8000/local-articles/{RUN_NAME}/article-1/assets/{index}",
+                "src": f"http://127.0.0.1:7667/local-articles/{RUN_NAME}/article-1/assets/{index}",
                 "alt_present": True,
                 "complete": True,
                 "width": 1200,
@@ -355,7 +355,7 @@ def _browser_evidence(root: Path) -> dict[str, object]:
         "brave_surviving_owned_pids": [],
         "django_owned_pids": [202],
         "requested_index": {
-            "url": "http://127.0.0.1:8000/local-articles/2026-08-28/",
+            "url": "http://127.0.0.1:7667/local-articles/2026-08-28/",
             "status": 200,
             "heading_has_korean": True,
             "html_lang": "ko",
@@ -365,7 +365,7 @@ def _browser_evidence(root: Path) -> dict[str, object]:
             "passed": True,
         },
         "run_index": {
-            "url": f"http://127.0.0.1:8000/local-articles/{RUN_NAME}/",
+            "url": f"http://127.0.0.1:7667/local-articles/{RUN_NAME}/",
             "status": 200,
             "heading_has_korean": True,
             "html_lang": "ko",

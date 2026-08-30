@@ -1519,7 +1519,7 @@ def _record_url_has_run(value: object, run_name: str) -> bool:
     return (
         parsed.scheme == "http"
         and parsed.hostname == "127.0.0.1"
-        and parsed.port == 8000
+        and parsed.port == 7667
         and f"/local-articles/{run_name}/" in parsed.path
         and not parsed.query
         and not parsed.fragment

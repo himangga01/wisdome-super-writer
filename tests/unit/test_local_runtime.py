@@ -18,6 +18,7 @@ def test_local_runtime_uses_repository_local_paths(settings):
     assert settings.LOCAL_STATE_ROOT == settings.REPOSITORY_ROOT / ".local" / "state"
     assert settings.LOCAL_ARTICLE_ROOT == settings.REPOSITORY_ROOT / "output" / "housing"
     assert settings.LOCAL_OBJECT_ROOT == settings.REPOSITORY_ROOT / ".local" / "objects"
+    assert settings.PUBLIC_BASE_URL == "http://localhost:7667"
     assert Path(settings.DATABASE_URL.removeprefix("sqlite:///")) == (
         settings.LOCAL_STATE_ROOT / "db.sqlite3"
     )

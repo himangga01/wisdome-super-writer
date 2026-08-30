@@ -54,7 +54,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local.ps
 
 시작 스크립트는 `.env.local`을 현재 프로세스에 읽고 production 설정을 거부합니다. 이미 정상인
 서비스는 재시작하지 않으며, 필요한 경우 humanizer를 `127.0.0.1:3210`, Django를
-`127.0.0.1:8000`에 숨김 프로세스로 시작합니다. 정확한 PID와 로그 경로는
+`127.0.0.1:7667`에 숨김 프로세스로 시작합니다. 정확한 PID와 로그 경로는
 `.local/state/start-local/<instance-id>/state.json`과 같은 instance의 `logs/`에 기록됩니다.
 저장소별 mutex는 두 번째 supervisor를 거부하고, `Ctrl+C`로 끝내면 Windows Job Object를 닫아
 이 instance가 시작한 프로세스 트리만 종료합니다.
@@ -76,12 +76,12 @@ humanizer 검증에 실패한 글과 `--no-humanize`로 만든 글은 `article.d
 
 ### 4. 미리보기와 상태 확인
 
-- 실행 목록: <http://127.0.0.1:8000/local-articles/>
-- 특정 실행: `http://127.0.0.1:8000/local-articles/YYYY-MM-DD/`
-- 추가 실행: `http://127.0.0.1:8000/local-articles/YYYY-MM-DD--run-<해시>/`
-- 로컬 상태: <http://127.0.0.1:8000/api/v1/local-articles/status>
-- liveness: <http://127.0.0.1:8000/health/live>
-- readiness: <http://127.0.0.1:8000/health/ready>
+- 실행 목록: <http://127.0.0.1:7667/local-articles/>
+- 특정 실행: `http://127.0.0.1:7667/local-articles/YYYY-MM-DD/`
+- 추가 실행: `http://127.0.0.1:7667/local-articles/YYYY-MM-DD--run-<해시>/`
+- 로컬 상태: <http://127.0.0.1:7667/api/v1/local-articles/status>
+- liveness: <http://127.0.0.1:7667/health/live>
+- readiness: <http://127.0.0.1:7667/health/ready>
 
 미리보기는 로컬 런타임의 loopback 요청에서만 존재합니다. 검증된 실행 매니페스트와 최종
 `article.md`만 읽고, 공식 HTTPS 링크와 체크섬이 일치하는 로컬 이미지만 제공합니다.
@@ -231,10 +231,10 @@ with an ad-hoc migration while workers are running.
 
 접속 주소:
 
-- 관리자 콘솔: `http://localhost:8000/console/`
-- Django Admin: `http://localhost:8000/admin/`
-- liveness: `http://localhost:8000/health/live`
-- readiness: `http://localhost:8000/health/ready`
+- 관리자 콘솔: `http://localhost:7667/console/`
+- Django Admin: `http://localhost:7667/admin/`
+- liveness: `http://localhost:7667/health/live`
+- readiness: `http://localhost:7667/health/ready`
 
 소스 레지스트리와 추출 프로필 import는 불변 draft만 생성합니다. 관리자 검토·재인증·승인 전에는
 자동 수집이나 자동 발행에 사용할 수 없습니다.

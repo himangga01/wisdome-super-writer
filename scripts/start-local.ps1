@@ -11,7 +11,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $humanizerOrigin = 'http://127.0.0.1:3210'
-$djangoOrigin = 'http://127.0.0.1:8000'
+$djangoPort = 7667
+$djangoOrigin = "http://127.0.0.1:$djangoPort"
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
@@ -226,16 +227,16 @@ try {
 
     $djangoLive = Invoke-LocalBoundedStep { Test-Health -Url "$djangoOrigin/health/live" }
     if ($djangoLive) {
-        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 8000 })
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port $djangoPort })
     }
     else {
         [void](Invoke-LocalBoundedStep {
-            Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', '127.0.0.1:8000', '--noreload') -WorkingDirectory $repository
+            Start-LocalOwnedProcess -Context $context -Name 'django' -FilePath $python -Arguments @('src\manage.py', 'runserver', "127.0.0.1:$djangoPort", '--noreload') -WorkingDirectory $repository
         })
         [void](Invoke-LocalBoundedStep {
             Wait-Health -Url "$djangoOrigin/health/live" -TimeoutSeconds $HealthTimeoutSeconds
         })
-        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port 8000 })
+        [void](Invoke-LocalBoundedStep { Assert-LoopbackListener -Port $djangoPort })
     }
     [void](Invoke-LocalBoundedStep {
         Wait-Health -Url "$djangoOrigin/health/ready" -TimeoutSeconds $HealthTimeoutSeconds

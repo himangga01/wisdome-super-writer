@@ -1552,9 +1552,9 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.server.server_port == 3210 and self.path == "/api/health":
             status, body = 200, b'{"status":"ready"}'
-        elif self.server.server_port == 8000 and self.path == "/health/live":
+        elif self.server.server_port == 7667 and self.path == "/health/live":
             status, body = 200, b'{"status":"ok"}'
-        elif self.server.server_port == 8000 and self.path == "/health/ready":
+        elif self.server.server_port == 7667 and self.path == "/health/ready":
             status, body = self.ready_status, b'{"status":"unavailable"}'
         else:
             status, body = 404, b"{}"
@@ -1575,7 +1575,7 @@ def test_start_requires_preexisting_django_readiness_and_never_stops_it(tmp_path
     threads: list[threading.Thread] = []
     _HealthHandler.ready_status = 503
     try:
-        for port in (3210, 8000):
+        for port in (3210, 7667):
             server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _HealthHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             server.daemon_threads = True
@@ -1598,7 +1598,7 @@ def test_start_requires_preexisting_django_readiness_and_never_stops_it(tmp_path
         assert result.returncode != 0
         assert "ready" in (result.stdout + result.stderr).casefold()
         assert urllib.request.urlopen("http://127.0.0.1:3210/api/health").status == 200
-        assert urllib.request.urlopen("http://127.0.0.1:8000/health/live").status == 200
+        assert urllib.request.urlopen("http://127.0.0.1:7667/health/live").status == 200
         states = list((repository / ".local" / "state" / "start-local").glob("*/state.json"))
         assert len(states) == 1
         state = json.loads(states[0].read_text("utf-8-sig"))
@@ -1650,7 +1650,8 @@ def test_start_preflight_reports_exact_loopback_endpoints_without_starting(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "http://127.0.0.1:3210" in result.stdout
-    assert "http://127.0.0.1:8000" in result.stdout
+    assert "http://127.0.0.1:7667" in result.stdout
+    assert "http://127.0.0.1:8000" not in result.stdout
     assert "do-not-print-this-secret" not in result.stdout + result.stderr
     assert not (repository / ".local" / "state" / "start-local-owned.json").exists()
 

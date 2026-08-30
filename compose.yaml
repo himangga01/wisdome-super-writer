@@ -183,7 +183,7 @@ services:
       <<: [*runtime-environment, *blogger-environment]
     command: ["/app/deploy/containers/app/entrypoint.sh"]
     ports:
-      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8000}:8000"
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-7667}:8000"
     networks:
       - web
       - database

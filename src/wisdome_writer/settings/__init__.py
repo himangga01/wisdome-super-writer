@@ -69,7 +69,7 @@ ALLOWED_HOSTS = env_list(
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
 PUBLIC_BASE_URL = env_value(
     "PUBLIC_BASE_URL",
-    "http://localhost:8000" if not IS_PRODUCTION else "",
+    "http://localhost:7667" if not IS_PRODUCTION else "",
 )
 
 DATABASE_URL = env_value(
