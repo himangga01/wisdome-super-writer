@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.request
+import venv
 import warnings
 import zipfile
 from pathlib import Path
@@ -142,7 +143,7 @@ def _initialize_environment(
 
 def _full_setup_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     repository, humanizer = _script_fixture(tmp_path)
-    shutil.copy2(sys.executable, repository / ".venv" / "Scripts" / "python.exe")
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(repository / ".venv")
     marker = tmp_path / "manage-boundary.log"
     (repository / "src" / "manage.py").write_text(
         "import os\n"
@@ -169,7 +170,7 @@ def _full_setup_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     )
     toolchain_end = source.index(venv_line) + len(venv_line)
     (script_root / "setup-local.ps1").write_text(
-        source[:toolchain_start] + venv_line + source[toolchain_end:], encoding="utf-8"
+        source[:toolchain_start] + venv_line + source[toolchain_end:], encoding="utf-8-sig"
     )
     return repository, humanizer, marker, script_root / "setup-local.ps1"
 
@@ -786,11 +787,12 @@ def test_verified_uv_handle_denies_concurrent_write_until_exact_process_exits(
     probe = tmp_path / "verified-uv.ps1"
     probe.write_text(
         f"Import-Module '{module}' -Force\n"
+        "Start-Sleep -Milliseconds 600\n"
         f"$result=Invoke-VerifiedUv -RepositoryRoot '{repository}' -Path '{executable}' "
         f"-ExpectedSha256 '{expected}' -Arguments @('/d','/c','ping 127.0.0.1 -n 3 > nul') "
         f"-WorkingDirectory '{repository}'\n"
         "$result | ConvertTo-Json -Compress\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     process = subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(probe)],
@@ -799,17 +801,30 @@ def test_verified_uv_handle_denies_concurrent_write_until_exact_process_exits(
         stderr=subprocess.PIPE,
         text=True,
     )
-    time.sleep(0.4)
-    assert process.poll() is None
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            assert process.poll() is None, "verified process exited before holding its executable"
+            try:
+                with executable.open("r+b"):
+                    pass
+            except PermissionError:
+                break
+            assert time.monotonic() < deadline, "verified executable never became write-protected"
+            time.sleep(0.02)
 
-    with pytest.raises(PermissionError):
-        executable.write_bytes(b"replacement")
+        with pytest.raises(PermissionError):
+            executable.write_bytes(b"replacement")
 
-    stdout, stderr = process.communicate(timeout=10)
-    assert process.returncode == 0, stdout + stderr
-    payload = json.loads(stdout.strip().splitlines()[-1])
-    assert payload["ExitCode"] == 0
-    assert hashlib.sha256(executable.read_bytes()).hexdigest() == expected
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stdout + stderr
+        payload = json.loads(stdout.strip().splitlines()[-1])
+        assert payload["ExitCode"] == 0
+        assert hashlib.sha256(executable.read_bytes()).hexdigest() == expected
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.communicate(timeout=10)
 
 
 @WINDOWS_ONLY
@@ -905,7 +920,7 @@ def test_job_object_closure_kills_direct_process_and_descendant(tmp_path: Path) 
         "-WindowStyle Hidden -PassThru\n"
         f"Set-Content -LiteralPath '{child_pid_path}' -Value $child.Id\n"
         "Start-Sleep -Seconds 60\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     probe = tmp_path / "probe.ps1"
     module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
@@ -922,13 +937,14 @@ def test_job_object_closure_kills_direct_process_and_descendant(tmp_path: Path) 
         f"$childPid = [int](Get-Content -LiteralPath '{child_pid_path}')\n"
         "$rootPid = $process.Id\n"
         "$closed = Exit-LocalSupervisor -Context $context\n"
-        "$state = Get-Content -Raw -LiteralPath $context.StatePath | ConvertFrom-Json\n"
+        "$state = Get-Content -Raw -Encoding UTF8 -LiteralPath $context.StatePath "
+        "| ConvertFrom-Json\n"
         "[pscustomobject]@{closed=$closed;rootPid=$rootPid;childPid=$childPid;"
         "rootAlive=[bool](Get-Process -Id $rootPid -ErrorAction SilentlyContinue);"
         "childAlive=[bool](Get-Process -Id $childPid -ErrorAction SilentlyContinue);"
         "nativeClosed=$context.NativeProcesses[0].Closed;"
         "state=$state} | ConvertTo-Json -Depth 8 -Compress\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
 
     result = _powershell("-File", str(probe))
@@ -952,7 +968,7 @@ def test_suspended_assignment_failure_terminates_by_handle_before_child_executes
     repository, _humanizer = _script_fixture(tmp_path)
     marker = tmp_path / "must-not-run.txt"
     child = tmp_path / "child.ps1"
-    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8")
+    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8-sig")
     module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
     result = _powershell(
         "-Command",
@@ -1003,7 +1019,7 @@ def test_owned_process_redirects_are_confined_and_created_new(tmp_path: Path) ->
         "  [void](Exit-LocalSupervisor -Context $c)\n"
         "  Write-Output $value\n"
         "}\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     collision = _powershell("-File", str(collision_probe))
     assert collision.returncode != 0
@@ -1021,7 +1037,7 @@ def test_physical_repository_alias_uses_same_global_mutex(tmp_path: Path) -> Non
         "Write-Output ($c.MutexName + '|' + $c.PhysicalRepositoryRoot)\n"
         "Start-Sleep -Seconds 3\n"
         "[void](Exit-LocalSupervisor -Context $c)\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     holder_process = subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(holder)],
@@ -1058,9 +1074,10 @@ def test_stop_signal_latched_before_job_creation_is_cleaned_up_only_by_main(
         f"Import-Module '{module}' -Force; Enable-LocalStopSignal; "
         "[WisdomeConsoleStopSignal]::TriggerForTest(); "
         f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}' -DeferJob; "
-        "$before=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$before=Get-Content -Raw -Encoding UTF8 $c.StatePath | ConvertFrom-Json; "
         "$done=Exit-LocalSupervisor -Context $c; "
-        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; Disable-LocalStopSignal; "
+        "$state=Get-Content -Raw -Encoding UTF8 $c.StatePath | ConvertFrom-Json; "
+        "Disable-LocalStopSignal; "
         "[pscustomobject]@{requested=[WisdomeConsoleStopSignal]::StopRequested;"
         "jobAttempts=$c.JobCloseAttempts;done=$done;before=$before;state=$state} "
         "| ConvertTo-Json -Depth 5 -Compress",
@@ -1109,7 +1126,7 @@ def test_supervisor_mutex_rejects_concurrent_instance_and_preserves_unique_ledge
         "Write-Output ($context.InstanceId + '|' + $context.StatePath)\n"
         "Start-Sleep -Seconds 3\n"
         "[void](Exit-LocalSupervisor -Context $context)\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     process = subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(holder)],
@@ -1155,7 +1172,7 @@ def test_supervisor_close_failure_keeps_instance_ledger_active_error(tmp_path: P
         f"Import-Module '{module}' -Force; "
         f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
         "$closed=Exit-LocalSupervisor -Context $c -CloseHandle { param($handle) $false }; "
-        "$state=Get-Content -Raw -LiteralPath $c.StatePath | ConvertFrom-Json; "
+        "$state=Get-Content -Raw -Encoding UTF8 -LiteralPath $c.StatePath | ConvertFrom-Json; "
         "[pscustomobject]@{closed=$closed;state=$state} | ConvertTo-Json -Depth 6 -Compress",
     )
 
@@ -1230,13 +1247,14 @@ def test_console_handler_only_latches_until_main_closes_and_publishes_state(
         f"$c=Enter-LocalSupervisor -RepositoryRoot '{repository}'; "
         "$p=Start-LocalOwnedProcess -Context $c -Name 'probe' -FilePath 'powershell.exe' "
         "-Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 60'); "
-        "$before=Get-Content -Raw -LiteralPath $c.StatePath | ConvertFrom-Json; "
+        "$before=Get-Content -Raw -Encoding UTF8 -LiteralPath $c.StatePath | ConvertFrom-Json; "
         "[WisdomeConsoleStopSignal]::TriggerForTest(); "
         "$latched=Wait-LocalStopSignal -Milliseconds 1000; "
-        "$afterSignal=Get-Content -Raw -LiteralPath $c.StatePath | ConvertFrom-Json; "
+        "$afterSignal=Get-Content -Raw -Encoding UTF8 -LiteralPath $c.StatePath "
+        "| ConvertFrom-Json; "
         "$aliveBeforeMain=[bool](Get-Process -Id $p.Id -ErrorAction SilentlyContinue); "
         "$closed=Exit-LocalSupervisor -Context $c; "
-        "$state=Get-Content -Raw -LiteralPath $c.StatePath | ConvertFrom-Json; "
+        "$state=Get-Content -Raw -Encoding UTF8 -LiteralPath $c.StatePath | ConvertFrom-Json; "
         "$aliveAfterMain=[bool](Get-Process -Id $p.Id -ErrorAction SilentlyContinue); "
         "Disable-LocalStopSignal; "
         "[pscustomobject]@{latched=$latched;before=$before;afterSignal=$afterSignal;"
@@ -1288,7 +1306,7 @@ def test_main_cleanup_is_idempotent_and_closes_each_resource_exactly_once(
         "$p2=Start-LocalOwnedProcess -Context $c -Name 'two' -FilePath 'powershell.exe' "
         "-Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 60'); "
         "$first=Exit-LocalSupervisor -Context $c; $second=Exit-LocalSupervisor -Context $c; "
-        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$state=Get-Content -Raw -Encoding UTF8 $c.StatePath | ConvertFrom-Json; "
         "$native=@($c.NativeProcesses | ForEach-Object { [pscustomobject]@{"
         "waits=$_.WaitAttemptCount;closes=$_.CloseAttemptCount;closed=$_.Closed} }); "
         "[pscustomobject]@{first=$first;second=$second;jobAttempts=$c.JobCloseAttempts;"
@@ -1326,7 +1344,7 @@ def test_explicit_handle_list_does_not_inherit_unlisted_sentinel(tmp_path: Path)
         "  $value=$stream.ReadByte(); $stream.Dispose()\n"
         "  if ($value -eq 90) { Set-Content -LiteralPath $Marker -Value inherited }\n"
         "} catch { }\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     result = _powershell(
         "-Command",
@@ -1370,7 +1388,7 @@ def test_suspended_launcher_native_faults_are_stable_and_never_run_child(
     repository, _humanizer = _script_fixture(tmp_path)
     marker = tmp_path / "must-not-run.txt"
     child = tmp_path / "fault-child.ps1"
-    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8")
+    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8-sig")
     module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
     result = _powershell(
         "-Command",
@@ -1406,7 +1424,7 @@ def test_suspended_launcher_cleanup_faults_continue_and_retain_failed_metadata(
     repository, _humanizer = _script_fixture(tmp_path)
     marker = tmp_path / "must-not-run-probe.txt"
     child = tmp_path / "cleanup-fault-child.ps1"
-    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8")
+    child.write_text(f"Set-Content -LiteralPath '{marker}' -Value ran\n", encoding="utf-8-sig")
     module = REPOSITORY_ROOT / "scripts" / "local-process-guard.psm1"
     result = _powershell(
         "-Command",
@@ -1467,7 +1485,7 @@ def test_main_cleanup_faults_return_false_and_retain_active_error(
         "while (-not $p1.HasExited() -or -not $p2.HasExited()) { Start-Sleep -Milliseconds 20 }; "
         f"$closed=Exit-LocalSupervisor -Context $c -CleanupFault '{fault}'; "
         "$again=Exit-LocalSupervisor -Context $c -CleanupFault ''; "
-        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$state=Get-Content -Raw -Encoding UTF8 $c.StatePath | ConvertFrom-Json; "
         "$native=@($c.NativeProcesses | ForEach-Object { [pscustomobject]@{"
         "waits=$_.WaitAttemptCount;closes=$_.CloseAttemptCount;closed=$_.Closed;"
         "retained=($_.NativeHandle -ne [IntPtr]::Zero)} }); "
@@ -1523,7 +1541,7 @@ def test_main_cleanup_preserves_first_resource_error_over_close_and_state_errors
         "while (-not $p1.HasExited() -or -not $p2.HasExited()) { Start-Sleep -Milliseconds 20 }; "
         "$closed=Exit-LocalSupervisor -Context $c "
         "-CleanupFault @('process-wait','process-close','state-write'); "
-        "$state=Get-Content -Raw $c.StatePath | ConvertFrom-Json; "
+        "$state=Get-Content -Raw -Encoding UTF8 $c.StatePath | ConvertFrom-Json; "
         "$native=@($c.NativeProcesses | ForEach-Object { [pscustomobject]@{"
         "waits=$_.WaitAttemptCount;closes=$_.CloseAttemptCount;closed=$_.Closed} }); "
         "[pscustomobject]@{closed=$closed;error=$c.CleanupErrorCode;"

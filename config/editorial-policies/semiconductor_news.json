@@ -2,7 +2,7 @@
   "schemaVersion": "editorial-policy-v1",
   "policyKey": "semiconductor-news-editorial",
   "topicCode": "semiconductor_news",
-  "policyVersion": "1.0.0",
+  "policyVersion": "1.1.0",
   "language": "ko-KR",
   "claimTypes": ["fact", "company_claim", "interpretation", "outlook"],
   "requiredBlockTypes": ["fact", "background", "sources"],

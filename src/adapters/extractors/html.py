@@ -28,9 +28,9 @@ class HtmlExtractor:
                 node.decompose()
         records: list[GenericEvidenceRecord] = []
         nodes = tree.css("h1,h2,h3,h4,h5,h6,p,li,blockquote,table,figure,img")
-        for index, node in enumerate(nodes[: self.max_records]):
+        for node in nodes[: self.max_records]:
             tag = node.tag.lower()
-            selector = self._stable_selector(node, index)
+            selector = self._stable_selector(node)
             if tag == "table":
                 rows = []
                 for row in node.css("tr"):
@@ -73,9 +73,17 @@ class HtmlExtractor:
         )
 
     @staticmethod
-    def _stable_selector(node, index: int) -> str:
-        node_id = node.attributes.get("id")
-        if node_id and all(ch.isalnum() or ch in "_-" for ch in node_id):
-            return f"#{node_id}"
-        return f"{node.tag}:nth-of-type({index + 1})"
+    def _stable_selector(node) -> str:
+        parts = []
+        current = node
+        while current is not None and not current.tag.startswith("-"):
+            position = 1
+            sibling = current.prev
+            while sibling is not None:
+                if sibling.tag == current.tag:
+                    position += 1
+                sibling = sibling.prev
+            parts.append(f"{current.tag}:nth-of-type({position})")
+            current = current.parent
+        return " > ".join(reversed(parts))
 

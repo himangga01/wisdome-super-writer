@@ -522,10 +522,21 @@ class WordPressPublisher:
         app_uuid = application.get("uuid")
         if not app_uuid:
             raise PublisherError("wordpress_application_password_identity_missing", category="permanent")
-        self._request(
+        deletion = self._request(
             "DELETE",
             f"/users/{user_id}/application-passwords/{app_uuid}",
             write=True,
+        )
+        try:
+            deleted = deletion.json()
+        except ValueError:
+            deleted = {}
+        previous = deleted.get("previous") if isinstance(deleted, dict) else None
+        deletion_bound = (
+            isinstance(deleted, dict)
+            and deleted.get("deleted") is True
+            and isinstance(previous, dict)
+            and previous.get("uuid") == app_uuid
         )
         verification_path = (
             f"/users/{user_id}/application-passwords/{app_uuid}"
@@ -543,6 +554,13 @@ class WordPressPublisher:
             ) from exc
         if verification.status_code in (404, 410):
             return
+        if deletion_bound and verification.status_code == 401:
+            try:
+                error = verification.json()
+            except ValueError:
+                error = {}
+            if isinstance(error, dict) and error.get("code") == "incorrect_password":
+                return
         if verification.status_code >= 500 or verification.status_code in (408, 429):
             raise PublisherError(
                 "wordpress_revoke_verification_unknown",

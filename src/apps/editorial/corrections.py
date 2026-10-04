@@ -225,7 +225,8 @@ def decide_correction_case(
         reauth_proof_id=normalized_proof_id,
     )
     case = (
-        CorrectionCase.objects.select_for_update()
+        # Retain the mutable article head lock without locking nullable joins.
+        CorrectionCase.objects.select_for_update(of=("self", "article"))
         .select_related(
             "article",
             "source_item",

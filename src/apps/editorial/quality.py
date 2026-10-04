@@ -5,6 +5,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from django.core.exceptions import ValidationError
@@ -32,6 +33,24 @@ _TYPE_SEPARATION = "claim_types_separated_and_attributed"
 _DUPLICATE = "duplicate_or_conflict_resolved"
 _READABILITY = "korean_readability_and_repetition"
 _EXAGGERATION = "no_exaggeration_or_false_experience"
+
+
+def _numeric_quantities(text: str) -> set[tuple[str, Decimal]]:
+    normalized = unicodedata.normalize("NFKC", text)
+    pattern = (
+        r"(?P<number>[+-]?\d+(?:,\d{3})*(?:\.\d+)?)\s*"
+        r"(?P<scale>억|만|천)?\s*"
+        r"(?P<unit>원|달러|퍼센트|%|세대|명|호|년|개월|월|일|시간|시|분|초|m2)?"
+    )
+    factors = {None: 1, "억": 100_000_000, "만": 10_000, "천": 1000}
+    quantities = set()
+    for match in re.finditer(pattern, normalized):
+        value = Decimal(match["number"].replace(",", "")) * factors[match["scale"]]
+        unit = match["unit"] or "number"
+        if unit == "퍼센트":
+            unit = "%"
+        quantities.add((unit, value))
+    return quantities
 
 
 @dataclass(frozen=True)
@@ -375,6 +394,20 @@ def evaluate_editorial_quality(
             ):
                 citation_failures.append(str(claim.get("blockId")))
 
+    unsupported_numeric_claims = []
+    for claim in claims:
+        if claim.get("claimType") not in {"fact", "company_claim"}:
+            continue
+        required = _numeric_quantities(str(claim.get("statement") or ""))
+        witnessed = set()
+        spans = claim.get("sourceSpans") or {}
+        for evidence_id in claim.get("evidenceIds", []):
+            span = spans.get(str(evidence_id))
+            if isinstance(span, str):
+                witnessed.update(_numeric_quantities(span))
+        if not required <= witnessed:
+            unsupported_numeric_claims.append(str(claim.get("claimId") or claim.get("blockId")))
+
     excluded_ids = {
         str(evidence_id)
         for row in exclusions
@@ -428,11 +461,12 @@ def evaluate_editorial_quality(
         _result(
             _GROUNDED,
             policy,
-            bool(claims) and claim_ids_valid,
+            bool(claims) and claim_ids_valid and not unsupported_numeric_claims,
             details={
                 "invalid": not claim_ids_valid,
                 "uncoveredFactAssertions": uncovered_fact_assertions,
                 "titleBindingsValid": title_bindings_valid,
+                "unsupportedNumericClaimIds": sorted(set(unsupported_numeric_claims)),
             },
         ),
         _result(

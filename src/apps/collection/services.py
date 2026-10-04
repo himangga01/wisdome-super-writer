@@ -2124,6 +2124,9 @@ def collect_source_attempt(
                 cause=f"source:{attempt.id}:authority",
             )
             return attempt
+        if resolved_delivery_attempt_no <= attempt.retry_count:
+            return attempt
+        attempt.retry_count = resolved_delivery_attempt_no - 1
         attempt.state = SourceCollectionAttemptState.RUNNING
         attempt.started_at = attempt.started_at or timezone.now()
         attempt.retry_at = None
@@ -2132,6 +2135,7 @@ def collect_source_attempt(
                 "state",
                 "started_at",
                 "retry_at",
+                "retry_count",
             )
         )
 
@@ -2207,6 +2211,11 @@ def collect_source_attempt(
                         "Concurrent collection responses conflict."
                     )
                 return locked_attempt
+            if (
+                locked_attempt.state != SourceCollectionAttemptState.RUNNING
+                or locked_attempt.retry_count != resolved_delivery_attempt_no - 1
+            ):
+                return locked_attempt
             for record in accepted_records:
                 link, changed = _persist_record(
                     locked_run,
@@ -2271,7 +2280,7 @@ def collect_source_attempt(
                         "source_item_id": str(
                             link.source_item_id
                         ),
-                        "change_kind": link.discovery_kind,
+                        "change_kind": str(link.discovery_kind),
                     },
                     correlation_id=locked_run.correlation_id,
                 )
@@ -2309,7 +2318,10 @@ def collect_source_attempt(
                 .select_related("run", "source_snapshot")
                 .get(pk=attempt.pk)
             )
-            if locked_attempt.state in _SOURCE_TERMINAL_STATES:
+            if (
+                locked_attempt.state != SourceCollectionAttemptState.RUNNING
+                or locked_attempt.retry_count != resolved_delivery_attempt_no - 1
+            ):
                 return locked_attempt
             now = timezone.now()
             retryable = bool(exc.retryable)
@@ -2402,7 +2414,10 @@ def collect_source_attempt(
                 SourceCollectionAttempt.objects.select_for_update()
                 .get(pk=attempt.pk)
             )
-            if locked_attempt.state in _SOURCE_TERMINAL_STATES:
+            if (
+                locked_attempt.state != SourceCollectionAttemptState.RUNNING
+                or locked_attempt.retry_count != resolved_delivery_attempt_no - 1
+            ):
                 return locked_attempt
             now = timezone.now()
             locked_attempt.state = (

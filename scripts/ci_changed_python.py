@@ -175,7 +175,7 @@ def main() -> int:
         print("No Python files selected for Ruff.")
         return 0
     return subprocess.run(
-        [sys.executable, "-m", "ruff", "check", *selected],
+        [sys.executable, "-m", "ruff", "check", "--", *selected],
         check=False,
     ).returncode
 

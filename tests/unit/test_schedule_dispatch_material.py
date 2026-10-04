@@ -86,7 +86,8 @@ class ScheduleDispatchMaterialContractTests(SimpleTestCase):
         queryset.filter.return_value.values_list.return_value = [
             ("00000000-0000-0000-0000-000000000001", TICK)
         ]
-        audit_context = SimpleNamespace(database_alias="default")
+        queryset.filter.return_value.order_by.return_value = queryset.filter.return_value
+        audit_context = SimpleNamespace(database_alias="default", actor_type="system")
 
         with (
             patch.object(

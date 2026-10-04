@@ -13,6 +13,11 @@
 > [`T031_WORK_IN_PROGRESS.md`](specs/001-automated-content-publishing/T031_WORK_IN_PROGRESS.md)를
 > 먼저 확인합니다.
 
+현재 코드·서비스 분석은 [코드 분석](docs/code-analysis.md)과
+[서비스 분석](docs/service-analysis.md)에 기록합니다. AI 에이전트는
+[AGENTS.md](AGENTS.md)의 지침에 따라 분석 전에 기존 문서의 기준 커밋과
+현재 코드를 대조하고, 분석 후 같은 문서를 갱신합니다.
+
 ## Windows 로컬 주거 글 빠른 시작
 
 이 경로는 컨테이너 없이 Python 3.12, SQLite, 저장소 내부 파일 시스템만 사용합니다. PowerShell 5.1

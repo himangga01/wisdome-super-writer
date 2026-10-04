@@ -932,6 +932,19 @@ def _read_bounded_regular(path: Path, maximum: int) -> bytes:
 def run_exact_cli(arguments: argparse.Namespace) -> int:
     output = Path(arguments.output)
     report = Path(arguments.report)
+    if os.path.lexists(output) or os.path.lexists(report):
+        return EXIT_INVALID_INPUT
+    owned: dict[Path, tuple[int, int]] = {}
+
+    def cleanup() -> None:
+        for path, identity in owned.items():
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) == identity:
+                path.unlink(missing_ok=True)
+
     try:
         input_path = Path(arguments.input)
         if arguments.network != "none" or not input_path.is_absolute() or not output.is_absolute() or not report.is_absolute():
@@ -949,14 +962,21 @@ def run_exact_cli(arguments: argparse.Namespace) -> int:
         max_pages = int(os.environ.get("HWP_MAX_PAGES", "2000"))
         limits = _limits_from_environment(max_output_bytes, timeout_seconds)
         environment = _sanitized_environment(output.parent)
-        return_code, stdout, stderr = _run_bounded(
-            ["/usr/local/bin/rhwp", "export-pdf", str(input_path), "-o", str(output)],
-            cwd=output.parent,
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-            limits=limits,
-            process_group=False,
-        )
+        try:
+            return_code, stdout, stderr = _run_bounded(
+                ["/usr/local/bin/rhwp", "export-pdf", str(input_path), "-o", str(output)],
+                cwd=output.parent,
+                environment=environment,
+                timeout_seconds=timeout_seconds,
+                limits=limits,
+                process_group=False,
+            )
+        finally:
+            try:
+                current = output.lstat()
+                owned[output] = (current.st_dev, current.st_ino)
+            except FileNotFoundError:
+                pass
         if _was_resource_signal(return_code):
             raise SandboxResourceLimit("rhwp was terminated by a resource limit")
         if return_code != 0 or _contains_warning(stdout, stderr):
@@ -990,19 +1010,19 @@ def run_exact_cli(arguments: argparse.Namespace) -> int:
             "font_substitutions": [],
             "fallback_used": False,
         }
-        report.write_bytes(canonical_json(child_report))
+        with report.open("xb") as result_file:
+            current = os.fstat(result_file.fileno())
+            owned[report] = (current.st_dev, current.st_ino)
+            result_file.write(canonical_json(child_report))
         return 0
     except SandboxInvalidInput:
-        output.unlink(missing_ok=True)
-        report.unlink(missing_ok=True)
+        cleanup()
         return EXIT_INVALID_INPUT
     except SandboxResourceLimit:
-        output.unlink(missing_ok=True)
-        report.unlink(missing_ok=True)
+        cleanup()
         return EXIT_RESOURCE_LIMIT
     except (SandboxConverterFailure, OSError, ValueError):
-        output.unlink(missing_ok=True)
-        report.unlink(missing_ok=True)
+        cleanup()
         return EXIT_CONVERTER_FAILURE
 
 

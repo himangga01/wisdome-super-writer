@@ -994,9 +994,16 @@ def _create_raw_evidence(
     fanout_fence: Mapping[str, Any],
 ) -> EvidenceAsset:
     item = run_source_item.source_item
+    source_record = {
+        "source_record": {
+            "source_item_id": str(item.id),
+            "body_text": item.body_text,
+            "metadata": item.metadata,
+        },
+    }
     content_hash = evidence_content_hash(
         text=item.body_text,
-        structured_data=item.metadata,
+        structured_data=source_record,
         checksum=None,
     )
     fingerprint = _raw_input_fingerprint(
@@ -1018,13 +1025,13 @@ def _create_raw_evidence(
                 "locator_type": LocatorType.STRUCTURED_PATH,
                 "locator": {
                     "locator_type": "structured_path",
-                    "path_type": "record_key",
-                    "path": "body_text",
+                    "path_type": "json_pointer",
+                    "path": "/source_record/body_text",
                 },
                 "extracted_text": item.body_text,
-                "structured_data": item.metadata,
+                "structured_data": source_record,
                 "extraction_method": "source_record",
-                "extractor_version": "v1",
+                "extractor_version": "v2",
                 "evidence_content_hash": content_hash,
                 "review_subject_hash": "0" * 64,
                 "review_state": ReviewState.PASSED,
@@ -1695,10 +1702,27 @@ def _expected_document_evidence_material(
     return canonical_hash(entries), len(entries)
 
 
+def _derived_input_rights(run_source_item, input_asset, *, manual: bool) -> dict[str, Any]:
+    if input_asset is None:
+        rights = _rights(run_source_item)
+    else:
+        rights = {
+            "rights_status": input_asset.rights_status,
+            "rights_basis_url": input_asset.rights_basis_url,
+            "attribution_text": input_asset.attribution_text,
+            "manual_review_required": input_asset.manual_review_required,
+        }
+    return {
+        **rights,
+        "manual_review_required": manual or bool(rights.get("manual_review_required")),
+    }
+
+
 def _make_document_evidence(document, run, output, run_source_item) -> list[EvidenceAsset]:
-    rights = _rights(run_source_item)
     reasons = normalize_low_confidence_reasons(output.low_confidence_reasons)
     manual = run.state == ExtractionState.LOW_CONFIDENCE
+    rights = _derived_input_rights(run_source_item, document.input_asset, manual=manual)
+    manual = rights["manual_review_required"]
     created: list[EvidenceAsset] = []
     for page in output.pages:
         for block in page.blocks:
@@ -1747,7 +1771,6 @@ def _make_document_evidence(document, run, output, run_source_item) -> list[Evid
                 evidence_content_hash=content_hash,
                 review_subject_hash="0" * 64,
                 review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
-                manual_review_required=manual,
                 publishable=False,
                 alt_text=(f"{document.source_item.title} {block.block_type} 영역" if kind in (
                     EvidenceKind.IMAGE, EvidenceKind.CHART
@@ -2609,7 +2632,10 @@ def _run_generic_extraction(
                 f"evidence.other_ready:{attempt.id}:{attempt.result_checksum}"
             )
             manual = bool(reasons)
-            rights = _rights(attempt.run_source_item)
+            rights = _derived_input_rights(
+                attempt.run_source_item, attempt.input_asset, manual=manual,
+            )
+            manual = rights["manual_review_required"]
             evidence_assets: list[EvidenceAsset] = []
             for record_index, record in enumerate(output.records):
                 record_material = record.as_dict()
@@ -2661,7 +2687,6 @@ def _run_generic_extraction(
                     ),
                     review_subject_hash="0" * 64,
                     review_state=ReviewState.MANUAL_REQUIRED if manual else ReviewState.PASSED,
-                    manual_review_required=manual,
                     alt_text=record.alt_text,
                     **storage_fields,
                     **rights,
@@ -3462,7 +3487,7 @@ def consume_other_ready(
     with transaction.atomic():
         run = CollectionRun.objects.select_for_update().get(pk=run_id)
         attempt = (
-            GenericExtractionAttempt.objects.select_for_update()
+            GenericExtractionAttempt.objects.select_for_update(of=("self",))
             .select_related(
                 "run_source_item",
                 "evidence_asset",
@@ -3472,7 +3497,7 @@ def consume_other_ready(
             .get(pk=generic_extraction_attempt_id)
         )
         evidence_assets = list(
-            EvidenceAsset.objects.select_for_update()
+            EvidenceAsset.objects.select_for_update(of=("self",))
             .filter(generic_extraction_attempt=attempt)
             .select_related(
                 "origin_run_source_item__source_snapshot",
@@ -3708,7 +3733,7 @@ def finalize_run_evidence(run_id: str):
                 "fanoutComplete": False,
             }
         documents = list(
-            DocumentExtraction.objects.select_for_update()
+            DocumentExtraction.objects.select_for_update(of=("self",))
             .filter(run_source_item__run=run)
             .select_related(
                 "input_asset__generic_extraction_attempt__input_asset__parent_asset",
@@ -3718,7 +3743,7 @@ def finalize_run_evidence(run_id: str):
             .order_by("id")
         )
         attempts = list(
-            GenericExtractionAttempt.objects.select_for_update()
+            GenericExtractionAttempt.objects.select_for_update(of=("self",))
             .filter(run_source_item__run=run)
             .select_related(
                 "input_asset__parent_asset",
@@ -3733,7 +3758,7 @@ def finalize_run_evidence(run_id: str):
             .order_by("document_extraction_id", "id")
         )
         locked_evidence = list(
-            EvidenceAsset.objects.select_for_update()
+            EvidenceAsset.objects.select_for_update(of=("self",))
             .filter(origin_run_source_item__run=run)
             .select_related(
                 "origin_run_source_item__source_snapshot",

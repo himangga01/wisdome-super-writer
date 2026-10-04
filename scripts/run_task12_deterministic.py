@@ -18,6 +18,7 @@ from apps.local_content.acceptance_runner import (  # noqa: E402
     build_deterministic_evidence,
     discover_changed_python,
     execute_command,
+    verify_deterministic_evidence,
 )
 
 
@@ -133,9 +134,20 @@ def _merge_report(
     attempt_ids = [entry["attempt_id"] for entry in history]
     if len(attempt_ids) != len(set(attempt_ids)):
         raise ValueError("deterministic attempt history IDs must be unique")
-    section["deterministic_evidence"] = evidence
     section["deterministic_attempt_history"] = history
-    eligible = [str(evidence["attempt_id"])] if evidence["overall_passed"] is True else []
+    eligible = []
+    documents = {}
+    root = Path(str(evidence["project_root"])).resolve()
+    targets = tuple(evidence["changed_python"])
+    for entry in history:
+        document = json.loads(Path(entry["evidence_path"]).read_text(encoding="utf-8"))
+        documents[entry["attempt_id"]] = document
+        verified = verify_deterministic_evidence(
+            document, project_root=root, current_changed_python=targets
+        )
+        if verified.passed and document.get("plan_sha256") == evidence.get("plan_sha256"):
+            eligible.append(entry["attempt_id"])
+    section["deterministic_evidence"] = documents[eligible[-1]] if eligible else evidence
     section["deterministic_selection"] = {
         "rule": TASK12_ATTEMPT_SELECTION_RULE,
         "selected_attempt_id": eligible[-1] if eligible else None,

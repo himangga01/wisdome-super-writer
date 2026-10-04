@@ -1407,7 +1407,8 @@ def aggregate_document_extraction(
         ).first()
         document = (
             DocumentExtraction.objects.using(using)
-            .select_for_update()
+            # Joined input lineage is immutable; run/step own the mutable fence.
+            .select_for_update(of=("self",))
             .select_related(
                 "input_asset__generic_extraction_attempt__input_asset",
                 "input_asset__producing_generic_attempt__input_asset",
@@ -1469,7 +1470,7 @@ def aggregate_document_extraction(
         selected_run_ids = {run.id for run in selected.values()}
         evidence = list(
             EvidenceAsset.objects.using(using)
-            .select_for_update()
+            .select_for_update(of=("self",))
             .filter(
                 document_extraction=document,
                 extraction_run_id__in=selected_run_ids,

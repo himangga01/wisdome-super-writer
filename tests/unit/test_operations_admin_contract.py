@@ -80,6 +80,31 @@ def _schedule_row(*, version: int = 4):
 class OperationsOpenApiContractTests(SimpleTestCase):
     maxDiff = None
 
+    def test_schedule_contract_accepts_real_five_field_cron_for_create_and_update(self):
+        body = {
+            "name": "Official housing check",
+            "topic": "housing_subscription",
+            "cronExpression": "0 */2 * * *",
+            "timezone": "Asia/Seoul",
+            "windowMinutes": 1440,
+            "targetIds": [TARGET_ID],
+            "approvalMode": "manual",
+            "autoPublishValidationRefs": [],
+            "autoPublishActivationRefs": [],
+            "overlapPolicy": "skip",
+            "enabled": True,
+            "requestKey": "schedule-cron-review-001",
+            "reason": "Check official housing notices",
+        }
+        patch_body = {key: value for key, value in body.items() if key != "topic"}
+        patch_body["expectedVersion"] = 4
+        for name, value in (("ScheduleInput", body), ("SchedulePatch", patch_body)):
+            with self.subTest(schema=name):
+                _validator(name).validate(value)
+                for invalid in ("0 * * *", "0 * * * * *"):
+                    with self.assertRaises(ValidationError):
+                        _validator(name).validate({**value, "cronExpression": invalid})
+
     def test_every_operations_endpoint_has_an_exact_operation_id_and_route(self):
         contract = load_openapi_contract()
         expected = {

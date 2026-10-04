@@ -99,10 +99,10 @@
         `${evidence.publisher || "publisher 미상"} · rights ${evidence.rightsStatus || "unknown"}`,
         "muted",
       ));
-      const locator = safeHttpUrl(evidence.locator);
-      if (locator) {
+      const sourceUrl = safeHttpUrl(evidence.sourceUrl);
+      if (sourceUrl) {
         const anchor = element("a", "근거 원문 열기");
-        anchor.href = locator;
+        anchor.href = sourceUrl;
         anchor.target = "_blank";
         anchor.rel = "noopener noreferrer";
         summary.appendChild(anchor);

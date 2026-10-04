@@ -61,9 +61,10 @@
   async function reauthenticate(actionScope) {
     const currentPassword = window.prompt("현재 비밀번호를 입력하세요.");
     if (!currentPassword) throw new Error("재인증이 취소되었습니다.");
+    const mfaCode = window.prompt("MFA 코드가 설정된 경우 입력하세요. 없으면 비워 두세요.");
     const proof = await api("/api/v1/auth/reauth", {
       method: "POST",
-      body: JSON.stringify({currentPassword, actionScopes: [actionScope]}),
+      body: JSON.stringify({currentPassword, actionScopes: [actionScope], mfaCode: mfaCode?.trim() || null}),
     });
     return proof.id;
   }
@@ -122,6 +123,7 @@
 
   function resetScheduleForm() {
     state.schedule = null;
+    byId("schedule-topic").disabled = false;
     byId("schedule-form").reset();
     byId("schedule-id").value = "";
     byId("schedule-version").value = "";
@@ -140,6 +142,7 @@
     byId("schedule-version").value = String(row.version);
     byId("schedule-name").value = row.name;
     byId("schedule-topic").value = row.topic;
+    byId("schedule-topic").disabled = true;
     byId("schedule-cron").value = row.cronExpression;
     byId("schedule-timezone").value = row.timezone;
     byId("schedule-window").value = String(row.windowMinutes || 1440);
@@ -174,9 +177,8 @@
   }
 
   function scheduleBody() {
-    return {
+    const body = {
       name: byId("schedule-name").value.trim(),
-      topic: byId("schedule-topic").value,
       cronExpression: byId("schedule-cron").value.trim(),
       timezone: byId("schedule-timezone").value.trim(),
       windowMinutes: Number(byId("schedule-window").value),
@@ -189,6 +191,8 @@
       requestKey: requestKey("schedule"),
       reason: byId("schedule-reason").value.trim(),
     };
+    if (!state.schedule) body.topic = byId("schedule-topic").value;
+    return body;
   }
 
   async function saveSchedule(event) {

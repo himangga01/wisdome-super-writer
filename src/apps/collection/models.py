@@ -532,7 +532,7 @@ class SourceItem(models.Model):
     )
     body_text = models.TextField(blank=True)
     metadata = models.JSONField(default=dict)
-    attachments = models.JSONField(default=list)
+    attachments = models.JSONField(default=list, blank=True)
     retention_tombstoned_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=20,

@@ -1233,7 +1233,7 @@ paths:
             application/json:
               schema:
                 allOf:
-                  - $ref: '#/components/schemas/VerificationReport'
+                  - $ref: '#/components/schemas/AutoPublishValidationReport'
                   - type: object
                     properties:
                       subjectType: { const: auto_publish_validation }
@@ -2463,6 +2463,26 @@ components:
         code: { type: string, pattern: '^[a-z][a-z0-9_.-]{1,99}$' }
         result: { type: string, enum: [passed, failed, skipped] }
         detailRedacted: { type: [string, 'null'], maxLength: 1000 }
+    AutoPublishValidationReport:
+      type: object
+      additionalProperties: false
+      description: Available immutable canary/pilot evidence; its result is separate from the validation approval state. Empty metric/sample arrays mean no such evidence was recorded.
+      required: [subjectType, subjectId, subjectMaterialHash, validationState, reportObjectKey, reportObjectVersion, reportHash, samples, metrics, thresholds, stageResults, overallResult, verifiedAt, validationCreatedAt]
+      properties:
+        subjectType: { const: auto_publish_validation }
+        subjectId: { type: string, format: uuid }
+        subjectMaterialHash: { type: string }
+        validationState: { type: string, enum: [draft, passed, revoked, stale] }
+        reportObjectKey: { type: string }
+        reportObjectVersion: { type: string }
+        reportHash: { type: string }
+        samples: { type: array, items: { type: object } }
+        metrics: { type: array, items: { type: object } }
+        thresholds: { type: array, items: { type: object } }
+        stageResults: { type: array, items: { type: object } }
+        overallResult: { type: string, enum: [passed, failed, pending] }
+        verifiedAt: { type: [string, 'null'], format: date-time }
+        validationCreatedAt: { type: string, format: date-time }
     VerificationReport:
       type: object
       additionalProperties: false
@@ -4576,7 +4596,7 @@ components:
       properties:
         name: { type: string, minLength: 1, maxLength: 200 }
         topic: { $ref: '#/components/schemas/TopicCode' }
-        cronExpression: { type: string, pattern: '^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$' }
+        cronExpression: { type: string, pattern: '^\S+\s+\S+\s+\S+\s+\S+\s+\S+$' }
         timezone: { type: string, default: Asia/Seoul }
         windowMinutes: { type: integer, minimum: 1, maximum: 10080 }
         targetIds:
@@ -4626,7 +4646,7 @@ components:
         requestKey: { type: string, minLength: 8, maxLength: 200 }
         reason: { type: string, minLength: 3, maxLength: 500 }
         name: { type: string, minLength: 1, maxLength: 200 }
-        cronExpression: { type: string, pattern: '^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+$' }
+        cronExpression: { type: string, pattern: '^\S+\s+\S+\s+\S+\s+\S+\s+\S+$' }
         timezone: { type: string }
         windowMinutes: { type: integer, minimum: 1, maximum: 10080 }
         targetIds:

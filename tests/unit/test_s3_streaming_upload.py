@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
 
 os.environ.setdefault("WISDOME_ENVIRONMENT", "development")
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "wisdome_writer.settings")
@@ -47,6 +48,80 @@ class _StreamingClient:
 
 
 class S3StreamingUploadTests(unittest.TestCase):
+    def test_failed_download_preserves_an_existing_destination(self) -> None:
+        for response_version, response_size, exception in (
+            ("frozen-v1", 5, FileExistsError),
+            ("wrong-v2", 5, ValueError),
+            ("frozen-v1", 99, ValueError),
+        ):
+            with self.subTest(version=response_version, size=response_size):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    destination = Path(temporary_directory) / "input.bin"
+                    destination.write_bytes(b"caller-owned")
+                    body = BytesIO(b"value")
+                    client = Mock()
+                    client.get_object.return_value = {
+                        "Body": body,
+                        "VersionId": response_version,
+                        "ContentLength": response_size,
+                    }
+                    with self.assertRaises(exception):
+                        S3ObjectStorage(bucket="test", client=client).get_file(
+                            key="evidence/raw/input.bin",
+                            version_id="frozen-v1",
+                            destination=destination,
+                            expected_checksum_sha256=hashlib.sha256(b"value").hexdigest(),
+                            expected_size=5,
+                        )
+                    self.assertTrue(destination.exists())
+                    self.assertEqual(destination.read_bytes(), b"caller-owned")
+                    self.assertTrue(body.closed)
+
+    def test_download_rejects_a_substituted_destination_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "input.bin"
+            moved = Path(temporary_directory) / "download.bin"
+
+            class ReplacingBody(BytesIO):
+                def close(self):
+                    if not self.closed:
+                        destination.replace(moved)
+                        destination.write_bytes(b"replacement-owned-by-another-writer")
+                    super().close()
+
+            body = ReplacingBody(b"value")
+            client = Mock()
+            client.get_object.return_value = {
+                "Body": body,
+                "VersionId": "frozen-v1",
+                "ContentLength": 5,
+            }
+            with self.assertRaisesRegex(ValueError, "destination.*changed"):
+                S3ObjectStorage(bucket="test", client=client).get_file(
+                    key="evidence/raw/input.bin",
+                    version_id="frozen-v1",
+                    destination=destination,
+                    expected_checksum_sha256=hashlib.sha256(b"value").hexdigest(),
+                    expected_size=5,
+                )
+            self.assertEqual(destination.read_bytes(), b"replacement-owned-by-another-writer")
+            self.assertEqual(moved.read_bytes(), b"value")
+
+    def test_checksum_failure_removes_only_the_new_download(self) -> None:
+        client = _StreamingClient()
+        client.uploaded = b"value"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "input.bin"
+            with self.assertRaisesRegex(ValueError, "identity"):
+                S3ObjectStorage(bucket="test", client=client).get_file(
+                    key="evidence/raw/input.bin",
+                    version_id="stream-version",
+                    destination=destination,
+                    expected_checksum_sha256="0" * 64,
+                    expected_size=5,
+                )
+            self.assertFalse(destination.exists())
+
     def test_put_file_hashes_and_uploads_from_a_bounded_file_stream(self) -> None:
         client = _StreamingClient()
         data = b"%PDF-1.7\n" + b"x" * 4096

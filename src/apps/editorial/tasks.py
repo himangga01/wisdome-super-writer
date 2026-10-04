@@ -534,7 +534,7 @@ def revalidate_manual_revision(
         )
         revision = (
             ArticleRevision.objects.using(alias)
-            .select_for_update()
+            .select_for_update(of=("self",))
             .select_related(
                 "editorial_policy_snapshot",
                 "origin_run",
@@ -611,7 +611,7 @@ def finalize_manual_revalidation_delivery_failure(
         )
         revision = (
             ArticleRevision.objects.using(alias)
-            .select_for_update()
+            .select_for_update(of=("self",))
             .select_related(
                 "editorial_policy_snapshot",
                 "origin_run",

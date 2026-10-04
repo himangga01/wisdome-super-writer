@@ -1066,6 +1066,7 @@ class PublicationDispatchCreateTests(SimpleTestCase):
         attempt_query = MagicMock()
         attempt_query.first.return_value = None
         trace: list[str] = []
+        publication.save = MagicMock(side_effect=lambda **kwargs: trace.append("schedule"))
 
         with (
             patch.object(services, "_require_publication_targets_exist"),
@@ -1131,7 +1132,9 @@ class PublicationDispatchCreateTests(SimpleTestCase):
         self.assertTrue(created)
         self.assertIs(observed.dispatch, dispatch)
         self.assertEqual(observed.attempts, (attempt,))
-        self.assertEqual(trace, ["attempt", "media", "ledger", "queue"])
+        self.assertEqual(trace, ["attempt", "schedule", "media", "ledger", "queue"])
+        self.assertIsNone(publication.scheduled_for)
+        publication.save.assert_called_once_with(update_fields=("scheduled_for", "updated_at"))
         ledger_kwargs = create_dispatch.call_args.kwargs
         self.assertEqual(ledger_kwargs["request_hash_version"], "publication-dispatch-request-v1")
         self.assertEqual(ledger_kwargs["attempt_count"], 1)

@@ -323,7 +323,14 @@ def revoke_target_credentials(decision_id: str):
         decision = TargetDisconnectDecision.objects.get(id=decision_id)
         return {"decisionId": decision_id, "state": decision.state}
     decision, target, fence = prepared
-    adapter = publisher_for_target(target, refresh_blogger=False)
+    from .services import authorize_target_credential_revoke_external_write
+
+    adapter = publisher_for_target(
+        target, refresh_blogger=False,
+        write_guard=lambda: authorize_target_credential_revoke_external_write(
+            fence, audit_context=audit_context,
+        ),
+    )
     try:
         adapter.revoke_credentials()
         outcome_hash = sha256_hex({"targetId": str(target.id), "result": "revoked"})

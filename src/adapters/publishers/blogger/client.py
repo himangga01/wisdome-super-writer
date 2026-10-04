@@ -368,6 +368,7 @@ class BloggerPublisher:
         token = self.revocation_token
         if not token:
             raise PublisherError("blogger_token_missing", category="permanent")
+        self.write_guard()
         try:
             response = self.client.post(
                 "https://oauth2.googleapis.com/revoke",

@@ -4,7 +4,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 from django.contrib.auth import get_user_model
@@ -45,6 +45,10 @@ _SCHEDULE_ID_NAMESPACE = uuid.UUID("af919249-fd4b-4d1d-8e7e-d6943171cfcb")
 _SCHEDULE_DISPATCH_ID_NAMESPACE = uuid.UUID(
     "4975ad31-f714-4d8d-a67e-406675c46146"
 )
+
+
+class ScheduleMaterialIneligible(ValueError):
+    pass
 
 
 def _request_hash(material) -> str:
@@ -820,7 +824,10 @@ def disable_schedule(
 
 def calculate_next_run(schedule: Schedule, after: datetime | None = None) -> datetime:
     after = after or timezone.now()
-    local = after.astimezone(ZoneInfo(schedule.timezone))
+    try:
+        local = after.astimezone(ZoneInfo(schedule.timezone))
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("schedule timezone is invalid") from exc
     value = croniter(schedule.cron_expression, local).get_next(datetime)
     return value.astimezone(UTC)
 
@@ -926,12 +933,12 @@ def _dispatch_schedule_atomic(
             _SCHEDULE_DISPATCH_ID_NAMESPACE,
             tick_key,
         )
-        frozen = build_schedule_dispatch_material(
-            schedule,
-            dispatch_id=dispatch_id,
-            scheduled_for=scheduled_for,
-            using=alias,
-        )
+        try:
+            frozen = build_schedule_dispatch_material(
+                schedule, dispatch_id=dispatch_id, scheduled_for=scheduled_for, using=alias,
+            )
+        except ValueError as exc:
+            raise ScheduleMaterialIneligible("schedule material is ineligible") from exc
         frozen["tickKey"] = tick_key
         tick_ref = _tick_ref_from_material(frozen)
         tick_refs, union_start, union_end, tick_manifest_hash = (
@@ -1089,6 +1096,37 @@ def _dispatch_schedule_atomic(
         return dispatch
 
 
+def _record_ineligible_schedule_tick(schedule_id, scheduled_for, *, now, audit_context):
+    alias = audit_context.database_alias
+    with transaction.atomic(using=alias):
+        schedule = Schedule.objects.using(alias).select_for_update().get(pk=schedule_id)
+        if not schedule.enabled or schedule.next_run_at != scheduled_for:
+            return
+        tick_key = f"{schedule.id}:{scheduled_for.astimezone(UTC).isoformat()}"
+        action = "schedule_dispatch.skipped"
+        identity = audit_event_id(action=action, entity=schedule, identity_key=tick_key)
+        if AuditEvent.objects.using(alias).filter(pk=identity).exists():
+            require_audit_replay(
+                context=audit_context, action=action, entity=schedule, identity_key=tick_key
+            )
+            return
+        before = _schedule_material(schedule)
+        schedule.next_run_at = calculate_next_run(schedule, after=now)
+        schedule.save(update_fields=("next_run_at", "updated_at"), using=alias)
+        record_audit_event(
+            context=audit_context, action=action, entity=schedule, identity_key=tick_key,
+            material_schema_version="schedule-held-tick-audit-v1",
+            before_material={"schedule": before},
+            after_material={"schedule": _schedule_material(schedule)},
+            metadata={
+                "schedule_id": str(schedule.id), "schedule_version": schedule.version,
+                "tick_key": tick_key, "result": "skipped", "state": "skipped",
+                "reason_code": "schedule_material_ineligible",
+                "error_code": "schedule_material_ineligible",
+            },
+        )
+
+
 def dispatch_due_schedules(
     now: datetime | None = None,
     *,
@@ -1096,19 +1134,27 @@ def dispatch_due_schedules(
 ):
     now = now or timezone.now()
     alias = audit_context.database_alias
+    if audit_context.actor_type != AuditEvent.ActorType.SYSTEM:
+        raise ValueError("scheduled dispatch requires explicit system provenance")
     due_ticks = list(
         Schedule.objects.using(alias)
         .filter(enabled=True, next_run_at__lte=now)
+        .order_by("next_run_at", "id")
         .values_list("id", "next_run_at")
     )
-    return [
-        dispatch_schedule(
-            schedule_id,
-            scheduled_for=scheduled_for,
-            audit_context=audit_context,
-        )
-        for schedule_id, scheduled_for in due_ticks
-    ]
+    results = []
+    for schedule_id, scheduled_for in due_ticks:
+        try:
+            result = dispatch_schedule(
+                schedule_id, scheduled_for=scheduled_for, audit_context=audit_context
+            )
+        except ScheduleMaterialIneligible:
+            _record_ineligible_schedule_tick(
+                schedule_id, scheduled_for, now=now, audit_context=audit_context
+            )
+            result = None
+        results.append(result)
+    return results
 
 
 def release_queued_dispatch(

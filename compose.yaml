@@ -2,6 +2,7 @@ name: wisdome-super-writer
 
 x-runtime-environment: &runtime-environment
   WISDOME_ENVIRONMENT: ${WISDOME_ENVIRONMENT:?set development or production}
+  WISDOME_RUNTIME_MODE: distributed
   DJANGO_SETTINGS_MODULE: wisdome_writer.settings
   DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY}
   DJANGO_DEBUG: ${DJANGO_DEBUG:-false}

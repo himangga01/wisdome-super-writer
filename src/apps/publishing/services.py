@@ -1428,6 +1428,34 @@ def _latest_approvals_allow_dispatch(
     )
 
 
+def _preview_material_hashes(
+    *,
+    channel: str,
+    title: str,
+    body: str,
+    revision_id: Any,
+    input_evidence_manifest_hash: str,
+    source_links: list[str],
+    correction_history: list[dict[str, Any]],
+    include_empty_history: bool = False,
+) -> tuple[str, str]:
+    template = {
+        "channel": channel,
+        "title": title,
+        "body": body,
+        "revision": str(revision_id),
+    }
+    sources = {
+        "inputEvidenceManifestHash": input_evidence_manifest_hash,
+        "sourceLinks": source_links,
+    }
+    # Empty histories retain the original immutable preview hash contract.
+    if correction_history or include_empty_history:
+        template["correctionHistory"] = correction_history
+        sources["correctionHistory"] = correction_history
+    return sha256_hex(template), sha256_hex(sources)
+
+
 def _render_approval_material(
     render: ArticleChannelRender,
     *,
@@ -1437,24 +1465,30 @@ def _render_approval_material(
     expected_content_hash = sha256_hex(
         {"title": render.title, "body": render.body_html}
     )
-    expected_template_hash = sha256_hex(
-        {
-            "channel": target.channel,
-            "title": render.title,
-            "body": render.body_html,
-            "revision": str(intent.article_revision_id),
-        }
+    expected_template_hash, expected_source_manifest_hash = _preview_material_hashes(
+        channel=target.channel,
+        title=render.title,
+        body=render.body_html,
+        revision_id=intent.article_revision_id,
+        input_evidence_manifest_hash=intent.input_evidence_manifest_hash,
+        source_links=render.source_links,
+        correction_history=getattr(render, "correction_history", []),
     )
-    expected_source_manifest_hash = sha256_hex(
-        {
-            "inputEvidenceManifestHash": intent.input_evidence_manifest_hash,
-            "sourceLinks": render.source_links,
-        }
-    )
+    hash_pairs = {(expected_template_hash, expected_source_manifest_hash)}
+    if getattr(render, "correction_history", []) == []:
+        hash_pairs.add(_preview_material_hashes(
+            channel=target.channel,
+            title=render.title,
+            body=render.body_html,
+            revision_id=intent.article_revision_id,
+            input_evidence_manifest_hash=intent.input_evidence_manifest_hash,
+            source_links=render.source_links,
+            correction_history=[],
+            include_empty_history=True,
+        ))
     if (
         render.content_hash != expected_content_hash
-        or render.template_hash != expected_template_hash
-        or render.source_manifest_hash != expected_source_manifest_hash
+        or (render.template_hash, render.source_manifest_hash) not in hash_pairs
     ):
         raise Conflict("approval render material is stale")
     return {
@@ -2183,6 +2217,7 @@ def _stale_locked_intents(
 
 
 def _assert_target_has_no_active_external_write(target_id) -> None:
+    _assert_target_has_no_pending_credential_revoke(target_id)
     active = (
         PublicationAttempt.objects.select_for_update()
         .filter(
@@ -2205,6 +2240,16 @@ def _assert_target_has_no_active_external_write(target_id) -> None:
         raise Conflict(
             "publication target cannot change during an active external write"
         )
+
+
+def _assert_target_has_no_pending_credential_revoke(target_id) -> None:
+    if TargetDisconnectDecision.objects.filter(
+        target_id=target_id,
+        state__in=(TargetDisconnectDecision.State.ACCEPTED,
+                   TargetDisconnectDecision.State.REVOKING,
+                   TargetDisconnectDecision.State.RECONCILING),
+    ).exists():
+        raise Conflict("publication target cannot change during credential revocation")
 
 
 def _lock_article_external_write_fence(article_id):
@@ -3283,6 +3328,7 @@ def resolve_blogger_token_bundle_for_target(
     ) <= observed_at.astimezone(dt_timezone.utc) + timedelta(seconds=60)
     if not refresh_required:
         return bundle
+    _assert_target_has_no_pending_credential_revoke(target.id)
     before_material = _audit_state(target)
     next_version = _next_credential_version(bundle["version"])
     owns_client = oauth_client is None
@@ -3353,6 +3399,7 @@ def start_blogger_oauth(
     target = PublicationTarget.objects.using(
         audit_context.database_alias
     ).get(id=target_id, channel=ChannelCode.BLOGGER)
+    _assert_target_has_no_pending_credential_revoke(target.id)
     session_hash = _oauth_session_hash(request)
     nonce = sha256_hex(
         {
@@ -3484,6 +3531,7 @@ def complete_blogger_oauth(
                 request_hash=expected_request_hash,
             )
             return target
+        _assert_target_has_no_pending_credential_revoke(target.id)
         if (
             _id(target.current_snapshot_id)
             != state_data.get("targetSnapshotId")
@@ -3918,7 +3966,7 @@ def request_target_preflight(
     )
     dedupe_key = (
         f"publication.preflight_requested:{target.id}:"
-        f"{target.current_snapshot_version}"
+        f"{target.current_snapshot_version}:{sha256_hex(audit_context.request_key)}"
     )
     if _has_request_audit(
         audit_context=audit_context,
@@ -5152,7 +5200,7 @@ def decide_auto_publish_validation(
     consume_reauthentication_proof(
         request=request,
         proof_id=data["reauthProofId"],
-        action_scope="auto_publish_change",
+        action_scope="validation_decision",
         entity_type="auto_publish_validation",
         entity_id=validation.id,
     )
@@ -5225,6 +5273,7 @@ def decide_auto_publish_validation(
             "target_id": str(validation.target_id),
             "validation_id": str(validation.id),
             "decision_id": str(decision.id),
+            "request_hash": request_hash,
             "decision": decision.decision,
             "decision_hash": decision_hash,
             "state": validation.status,
@@ -7009,6 +7058,34 @@ def enqueue_media_delivery_operation_locked(
     return operation, created
 
 
+def _activate_available_media_binding(binding, mapping) -> bool:
+    if binding.binding_state == PublicationMedia.BindingState.ACTIVE and binding.remote_verified_at:
+        return True
+    if binding.binding_state != PublicationMedia.BindingState.PREPARED:
+        raise Conflict("removed publication media binding cannot be implicitly restored")
+    if mapping.last_reconciled_at is None:
+        return False
+    snapshot = binding.published_evidence_snapshot or binding.published_visualization_snapshot
+    material = _snapshot_delivery_material(snapshot)
+    if (
+        mapping.asset_checksum != material["asset_checksum"]
+        or mapping.presentation_hash != material["presentation_hash"]
+        or (
+            binding.remote_media_id
+            and (not mapping.remote_media_id or not mapping.remote_source_url)
+        )
+        or (
+            binding.public_delivery_asset_id
+            and (not mapping.delivery_object_version or not mapping.public_url)
+        )
+    ):
+        raise Conflict("available media proof differs from the bound snapshot")
+    binding.binding_state = PublicationMedia.BindingState.ACTIVE
+    binding.remote_verified_at = mapping.last_reconciled_at
+    binding.save(update_fields=("binding_state", "remote_verified_at"))
+    return True
+
+
 def ensure_publication_media_delivery_operations_locked(
     *,
     attempt: PublicationAttempt,
@@ -7017,11 +7094,14 @@ def ensure_publication_media_delivery_operations_locked(
     for binding in prepare_publication_media_bindings_locked(attempt=attempt):
         if binding.remote_media_id:
             mapping = binding.remote_media
-            if mapping.state == RemoteMedia.State.AVAILABLE:
+            if (
+                mapping.state == RemoteMedia.State.AVAILABLE
+                and _activate_available_media_binding(binding, mapping)
+            ):
                 continue
             action = (
                 MediaDeliveryOperation.Action.RECONCILE
-                if mapping.state == RemoteMedia.State.RECONCILING
+                if mapping.state in {RemoteMedia.State.RECONCILING, RemoteMedia.State.AVAILABLE}
                 else MediaDeliveryOperation.Action.UPLOAD
             )
             operation, _created = enqueue_media_delivery_operation_locked(
@@ -7031,7 +7111,10 @@ def ensure_publication_media_delivery_operations_locked(
             )
         else:
             mapping = binding.public_delivery_asset
-            if mapping.state == PublicDeliveryAsset.State.AVAILABLE:
+            if (
+                mapping.state == PublicDeliveryAsset.State.AVAILABLE
+                and _activate_available_media_binding(binding, mapping)
+            ):
                 continue
             action = (
                 MediaDeliveryOperation.Action.RECONCILE
@@ -7502,7 +7585,10 @@ def persist_media_delivery_operation_result(
             "state": operation.state,
         },
     )
-    if operation.state == MediaDeliveryOperation.State.UNKNOWN_OUTCOME:
+    if (
+        operation.state == MediaDeliveryOperation.State.UNKNOWN_OUTCOME
+        and operation.action != MediaDeliveryOperation.Action.DELETE
+    ):
         enqueue_media_delivery_operation_locked(
             remote_media=(mapping if operation.remote_media_id else None),
             public_delivery_asset=(
@@ -7687,20 +7773,14 @@ def _create_preview_render(intent, revision, target) -> ArticleChannelRender:
     if target.channel == ChannelCode.BLOGGER:
         canonical_state = ArticleChannelRender.CanonicalState.PENDING
         body += '\n<p class="canonical-source">원문: {{CANONICAL_WORDPRESS_URL}}</p>'
-    template_material = {
-        "channel": target.channel,
-        "title": revision.title,
-        "body": body,
-        "revision": str(revision.id),
-        "correctionHistory": correction_history,
-    }
-    template_hash = sha256_hex(template_material)
-    source_manifest_hash = sha256_hex(
-        {
-            "inputEvidenceManifestHash": intent.input_evidence_manifest_hash,
-            "sourceLinks": source_links,
-            "correctionHistory": correction_history,
-        }
+    template_hash, source_manifest_hash = _preview_material_hashes(
+        channel=target.channel,
+        title=revision.title,
+        body=body,
+        revision_id=revision.id,
+        input_evidence_manifest_hash=intent.input_evidence_manifest_hash,
+        source_links=source_links,
+        correction_history=correction_history,
     )
     return ArticleChannelRender.objects.create(
         publication_intent=intent,
@@ -8577,6 +8657,12 @@ def _dispatch_publication_atomic(
             dependency_subject_hash=dependency_subject_hash,
             request_fingerprint=request_fingerprint,
         )
+        publish_at = data.get("publishAt")
+        publication.scheduled_for = (
+            timezone.datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
+            if publish_at else None
+        )
+        publication.save(update_fields=("scheduled_for", "updated_at"))
         media_operations = ensure_publication_media_delivery_operations_locked(
             attempt=attempt
         )
@@ -8656,11 +8742,12 @@ def _dispatch_publication_atomic(
 
 
 def _queue_attempt_on_commit(attempt: PublicationAttempt, *, publish_at: str | None = None) -> None:
-    eta = None
+    eta = getattr(attempt.publication, "scheduled_for", None)
     if publish_at:
         eta = timezone.datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
         if timezone.is_naive(eta):
             eta = timezone.make_aware(eta, dt_timezone.utc)
+    if eta is not None:
         attempt.publication.state = Publication.State.SCHEDULED
         attempt.publication.scheduled_for = eta
         attempt.publication.save(update_fields=["state", "scheduled_for", "updated_at"])
@@ -12816,6 +12903,42 @@ class TargetCredentialRevokeFence:
 
 
 @transaction.atomic
+def _assert_credential_revoke_subject(decision, target) -> None:
+    snapshot = PublicationTargetSnapshot.objects.get(
+        id=decision.expected_target_snapshot_id,
+        target_id=target.id,
+        config_hash=decision.expected_target_config_hash,
+    )
+    current = _target_material(target)
+    expected = (
+        snapshot.channel, snapshot.base_url.rstrip("/"), snapshot.remote_blog_id,
+        snapshot.username_ref_identity_hash, snapshot.credential_ref_identity_hash,
+        snapshot.credential_version,
+    )
+    observed = (
+        current["channel"], current["baseUrl"], current["remoteBlogId"],
+        current["usernameRefIdentityHash"], current["credentialRefIdentityHash"],
+        current["credentialVersion"],
+    )
+    if observed != expected:
+        raise Conflict("credential revocation subject changed after the accepted decision")
+
+
+@transaction.atomic
+def authorize_target_credential_revoke_external_write(fence, *, audit_context) -> None:
+    _require_audit_actor(audit_context, "worker")
+    target = PublicationTarget.objects.select_for_update().get(pk=fence.target_id)
+    decision = TargetDisconnectDecision.objects.select_for_update().get(pk=fence.decision_id)
+    if (
+        decision.state != TargetDisconnectDecision.State.REVOKING
+        or target.current_snapshot_id != fence.target_snapshot_id
+        or target.current_config_hash != fence.target_config_hash
+    ):
+        raise Conflict("credential revocation write fence is stale")
+    _assert_credential_revoke_subject(decision, target)
+
+
+@transaction.atomic
 def begin_target_credential_revoke(
     decision_id: str,
     *,
@@ -12919,6 +13042,7 @@ def begin_target_credential_revoke(
         raise Conflict(
             "credential revocation state has no matching terminal audit event"
         )
+    _assert_credential_revoke_subject(decision, target)
     if not started_recorded:
         before_material = _audit_state(decision)
         decision.state = TargetDisconnectDecision.State.REVOKING

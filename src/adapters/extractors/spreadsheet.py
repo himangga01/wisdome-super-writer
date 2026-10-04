@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -45,6 +46,10 @@ class SpreadsheetExtractor:
                         if cells_seen > self.max_cells:
                             raise ExtractorError("spreadsheet_limit_exceeded", "Spreadsheet has too many cells")
                         value = cell.value
+                        if isinstance(value, (datetime, date, time)):
+                            value = value.isoformat()
+                        elif isinstance(value, timedelta):
+                            value = str(value)
                         values.append(value)
                         if value is not None:
                             nonempty.append((cell.coordinate, value, cell.data_type))
@@ -58,7 +63,6 @@ class SpreadsheetExtractor:
                             "locator_type": "spreadsheet_cell",
                             "sheet_name": worksheet.title,
                             "cell_range": f"{first}:{last}",
-                            "table_name": None,
                         },
                         text=" | ".join("" if value is None else str(value) for value in values),
                         structured_data={
@@ -81,10 +85,14 @@ class SpreadsheetExtractor:
     def _extract_delimited(self, path: Path) -> GenericExtractionOutput:
         delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
         records: list[GenericEvidenceRecord] = []
+        cells_seen = 0
         with path.open("r", encoding="utf-8-sig", newline="") as source:
             reader = csv.reader(source, delimiter=delimiter)
             for row_index, row in enumerate(reader, start=1):
-                if row_index * max(1, len(row)) > self.max_cells:
+                if not row:
+                    continue
+                cells_seen += len(row)
+                if cells_seen > self.max_cells:
                     raise ExtractorError("spreadsheet_limit_exceeded", "Delimited data has too many cells")
                 records.append(GenericEvidenceRecord(
                     kind="spreadsheet",
@@ -93,7 +101,6 @@ class SpreadsheetExtractor:
                         "locator_type": "spreadsheet_cell",
                         "sheet_name": "Sheet1",
                         "cell_range": f"A{row_index}:{self._column_name(max(1, len(row)))}{row_index}",
-                        "table_name": None,
                     },
                     text=" | ".join(row),
                     structured_data={"row_index": row_index, "values": row},

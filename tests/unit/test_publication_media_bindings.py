@@ -170,6 +170,98 @@ class PublicationMediaBindingServiceTests(DjangoTestCase):
             resolved_action=publishing_models.PublicationAction.CREATE,
         )
 
+    def test_available_verified_wordpress_mapping_activates_a_new_binding(self):
+        self._assert_available_verified_mapping("wordpress")
+
+    def test_available_verified_blogger_mapping_activates_a_new_binding(self):
+        self._assert_available_verified_mapping("blogger")
+
+    def _assert_available_verified_mapping(self, channel):
+        attempt = self._attempt() if channel == "wordpress" else self._blogger_attempt()
+        binding = services.prepare_publication_media_bindings_locked(attempt=attempt)[0]
+        mapping = binding.remote_media if channel == "wordpress" else binding.public_delivery_asset
+        verified_at = timezone.now()
+        mapping.state = "available"
+        mapping.last_reconciled_at = verified_at
+        if channel == "wordpress":
+            mapping.remote_media_id = "verified-media"
+            mapping.remote_source_url = "https://example.com/verified.png"
+            mapping.save(
+                update_fields=(
+                    "state", "last_reconciled_at",
+                    "remote_media_id", "remote_source_url",
+                )
+            )
+        else:
+            mapping.delivery_object_version = "verified-version"
+            mapping.public_url = "https://example.com/verified.png"
+            mapping.save(
+                update_fields=(
+                    "state", "last_reconciled_at",
+                    "delivery_object_version", "public_url",
+                )
+            )
+        self.assertEqual(
+            services.ensure_publication_media_delivery_operations_locked(attempt=attempt), ()
+        )
+        binding.refresh_from_db()
+        self.assertEqual(binding.binding_state, "active")
+        self.assertEqual(binding.remote_verified_at, verified_at)
+        services.require_publication_media_ready_locked(attempt=attempt)
+
+    def test_uncertain_delete_records_its_outcome_without_invalid_publication_reconcile(self):
+        from unittest.mock import patch
+
+        from apps.audit.models import AuditEvent
+        from apps.audit.services import AuditContext
+        from wisdome_writer.infrastructure.models import OutboxConsumerReceipt
+
+        attempt = self._attempt()
+        binding = services.prepare_publication_media_bindings_locked(attempt=attempt)[0]
+        binding.binding_state = "removed"
+        binding.removed_at = timezone.now()
+        binding.save(update_fields=("binding_state", "removed_at"))
+        operation, _ = services.enqueue_media_delivery_operation_locked(
+            remote_media=binding.remote_media,
+            action=publishing_models.MediaDeliveryOperation.Action.DELETE,
+        )
+        token = uuid.uuid4()
+        receipt = OutboxConsumerReceipt.objects.create(
+            event=operation.source_event, consumer_name="media-delete-v2", state="processing",
+            attempts=1, claimed_at=timezone.now(),
+            claimed_until=timezone.now() + timezone.timedelta(minutes=1),
+            lease_token=token, lease_generation=1,
+        )
+        context = AuditContext.for_worker(
+            correlation_id=operation.source_event.correlation_id,
+            event_key=str(operation.source_event_id),
+            consumer_name=receipt.consumer_name, lease_token=token, lease_generation=1,
+        )
+        _, fence = services.begin_media_delivery_operation(
+            operation.id, expected_generation=1, audit_context=context
+        )
+        with patch.object(services, "_kill_switch_enabled", return_value=False):
+            services.authorize_media_delivery_external_write(fence, audit_context=context)
+        services.persist_media_delivery_operation_result(
+            fence,
+            result={"status": "unknown_outcome", "error_code": "remote_media_delete_unproven"},
+            audit_context=context,
+        )
+        operation.refresh_from_db()
+        binding.remote_media.refresh_from_db()
+        self.assertEqual(operation.state, "unknown_outcome")
+        self.assertNotEqual(binding.remote_media.state, "deleted")
+        self.assertEqual(
+            publishing_models.MediaDeliveryOperation.objects.filter(
+                remote_media=binding.remote_media
+            ).count(), 1
+        )
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action="media_delivery_operation.finished", entity_id=operation.id
+            ).exists()
+        )
+
     def test_prepare_replays_exact_wordpress_mapping_and_binding(self):
         attempt = self._attempt()
 

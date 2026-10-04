@@ -1145,7 +1145,7 @@ def build_source_grounded_draft(
         )
         event_revision = (
             ArticleRevision.objects.using(alias)
-            .select_for_update()
+            .select_for_update(of=("self",))
             .select_related("generation_attempt")
             .filter(pk=revision_id, article=article)
             .first()
@@ -2188,7 +2188,8 @@ def validate_publishable_projection_material(
 
 
 def _maybe_lock(queryset, *, lock: bool):
-    return queryset.select_for_update() if lock else queryset
+    # Callers lock mutable run/article/evidence owners explicitly in order.
+    return queryset.select_for_update(of=("self",)) if lock else queryset
 
 
 def _validate_revision_publishable_by_id(

@@ -214,8 +214,14 @@ class ApplyHomeApiObserver:
                 },
             )
             values = payload.get("data")
-            total = payload.get("totalCount", 0)
-            if not isinstance(values, list) or type(total) is not int or total < 0:
+            unfiltered_total = payload.get("totalCount", 0)
+            total = payload.get("matchCount", unfiltered_total)
+            if (
+                not isinstance(values, list)
+                or type(unfiltered_total) is not int
+                or type(total) is not int
+                or not 0 <= total <= unfiltered_total
+            ):
                 raise OfficialApiError("OFFICIAL_API_SCHEMA_FAILED")
             if expected_total is None:
                 expected_total = total
@@ -249,6 +255,8 @@ class ApplyHomeApiObserver:
                     )
                 )
             received += len(values)
+            if received > total:
+                raise OfficialApiError("OFFICIAL_API_PAGINATION_FAILED")
             if received >= total:
                 break
             if not values or page == _MAX_PAGES:

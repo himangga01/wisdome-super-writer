@@ -182,14 +182,21 @@ def target_json(row: PublicationTarget) -> dict[str, Any]:
         "canaryState": row.canary_state,
         "pilotState": row.pilot_state,
         "canaryPolicyVersion": row.canary_policy_version,
-        "capabilities": row.capabilities,
+        "capabilities": {
+            public_name: bool(row.capabilities.get(internal_name, False))
+            for public_name, internal_name in (
+                ("create", "create"), ("update", "update"), ("unpublish", "unpublish"),
+                ("markWithdrawn", "mark_withdrawn"), ("draft", "draft"),
+                ("schedule", "schedule"), ("mediaUpload", "media_upload"),
+            )
+        },
         "autoPublishEnabled": row.auto_publish_enabled,
         "autoPublishActivationId": (
             str(row.latest_auto_publish_activation_id)
             if row.latest_auto_publish_activation_id
             else None
         ),
-        "autoPublishActivationVersion": row.auto_publish_activation_version,
+        "autoPublishActivationVersion": row.auto_publish_activation_version or None,
         "lastPreflightAt": row.last_preflight_at.isoformat() if row.last_preflight_at else None,
         "lastCanaryAt": row.last_canary_at.isoformat() if row.last_canary_at else None,
         "lastPilotAt": row.last_pilot_at.isoformat() if row.last_pilot_at else None,
@@ -616,14 +623,17 @@ def auto_publish_validation_report(
         "subjectType": "auto_publish_validation",
         "subjectId": str(row.id),
         "subjectMaterialHash": row.material_hash,
+        "validationState": row.status,
+        "reportObjectKey": row.test_report_object_key,
         "reportObjectVersion": row.test_report_object_version,
         "reportHash": row.test_report_hash,
         "samples": [],
-        "metrics": {},
-        "thresholds": {},
+        "metrics": [],
+        "thresholds": [],
         "stageResults": [],
-        "overallResult": "passed" if row.status == AutoPublishValidation.State.PASSED else "failed",
-        "verifiedAt": row.created_at.isoformat(),
+        "overallResult": "pending",
+        "verifiedAt": None,
+        "validationCreatedAt": row.created_at.isoformat(),
     }
     if row.test_report_object_key.startswith("db://publishing/"):
         evidence = row.material_document.get("validationEvidence", {})
@@ -640,25 +650,33 @@ def auto_publish_validation_report(
                 }
                 for item in evidence.get("stageResults", [])
             ]
+        stages = normalized["stageResults"]
         normalized["overallResult"] = (
-            "passed"
-            if row.status == AutoPublishValidation.State.PASSED
-            else "failed"
+            "passed" if stages and all(stage["result"] == "passed" for stage in stages)
+            else "failed" if stages else "pending"
         )
     else:
         try:
-            raw = S3ObjectStorage().get_bytes(
+            raw = S3ObjectStorage().get_bounded_bytes(
                 key=row.test_report_object_key,
                 version_id=row.test_report_object_version,
+                max_bytes=8 * 1024 * 1024,
             )
-            if sha256_hex(raw) == row.test_report_hash:
-                report = json.loads(raw.decode("utf-8"))
-                for key in (
-                    "samples", "metrics", "thresholds", "stageResults",
-                    "overallResult", "verifiedAt",
-                ):
-                    if key in report:
-                        normalized[key] = report[key]
+            if sha256_hex(raw) != row.test_report_hash:
+                raise ValueError("immutable report digest differs")
+            report = json.loads(raw.decode("utf-8"))
+            if not isinstance(report, dict):
+                raise ValueError("immutable report schema differs")
+            if report.get("overallResult") not in {"passed", "failed"}:
+                raise ValueError("immutable report verdict is missing")
+            for key in ("samples", "metrics", "thresholds", "stageResults"):
+                if key in report:
+                    if not isinstance(report[key], list):
+                        raise ValueError("immutable report schema differs")
+                    normalized[key] = report[key]
+            for key in ("overallResult", "verifiedAt"):
+                if key in report:
+                    normalized[key] = report[key]
         except Exception:
             normalized["stageResults"] = [
                 {

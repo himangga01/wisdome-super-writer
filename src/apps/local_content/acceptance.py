@@ -217,6 +217,15 @@ def derive_task12_acceptance(
             section.get("artifact_evidence"),
             project_root=project_root,
         )
+        if artifact_evidence.get("run_name") != report.get("run_path"):
+            artifact_passed = False
+            artifact_evidence = {
+                **artifact_evidence,
+                "failures": [
+                    *artifact_evidence.get("failures", []),
+                    "ARTIFACT_RUN_IDENTITY_MISMATCH",
+                ],
+            }
         browser_passed, browser_evidence = verify_brave_evidence(
             section.get("browser_evidence"),
             project_root=project_root,

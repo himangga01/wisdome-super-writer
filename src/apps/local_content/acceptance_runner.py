@@ -169,7 +169,7 @@ def build_command_plan(
         ),
         CommandSpec(
             "changed_file_ruff",
-            (python, "-m", "ruff", "check", *changed_python),
+            (python, "-m", "ruff", "check", "--", *changed_python),
             True,
             (0,),
             "ruff",
@@ -248,21 +248,19 @@ def discover_changed_python(project_root: Path, *, base: str) -> tuple[str, ...]
         if path.is_file()
     }
     for argv in (
-        ("git", "diff", "--name-only", "--diff-filter=ACMR", merge_base, "HEAD"),
-        ("git", "diff", "--name-only", "--diff-filter=ACMR"),
-        ("git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"),
-        ("git", "ls-files", "--others", "--exclude-standard"),
+        ("git", "diff", "--name-only", "-z", "--diff-filter=ACMRT", merge_base, "HEAD"),
+        ("git", "diff", "--name-only", "-z", "--diff-filter=ACMRT"),
+        ("git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT"),
+        ("git", "ls-files", "-z", "--others", "--exclude-standard"),
     ):
         completed = subprocess.run(
             argv,
             cwd=root,
             check=True,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
         )
-        for line in completed.stdout.splitlines():
-            relative = line.strip().replace("\\", "/")
+        for line in completed.stdout.split(b"\0"):
+            relative = line.decode("utf-8", errors="surrogateescape")
             if relative.endswith(".py") and (root / relative).is_file():
                 candidates.add(relative)
     if not candidates:

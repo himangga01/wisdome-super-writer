@@ -21,6 +21,21 @@ def _validate_key(key: str) -> str:
     return str(path)
 
 
+def _download_file_matches(destination: Path, identity: tuple[int, int] | None) -> bool:
+    if identity is None:
+        return False
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity
+
+
+def _remove_owned_download(destination: Path, identity: tuple[int, int] | None) -> None:
+    if _download_file_matches(destination, identity):
+        destination.unlink(missing_ok=True)
+
+
 class S3ObjectStorage:
     def __init__(
         self,
@@ -236,6 +251,7 @@ class S3ObjectStorage:
         body = response["Body"]
         digest = hashlib.sha256()
         size = 0
+        created_identity = None
         try:
             content_length = response.get("ContentLength")
             if type(content_length) is not int or content_length < 0:
@@ -245,6 +261,8 @@ class S3ObjectStorage:
             if response.get("VersionId") != version_id:
                 raise ValueError("object version differs from frozen provenance")
             with destination.open("xb") as output:
+                metadata = os.fstat(output.fileno())
+                created_identity = (metadata.st_dev, metadata.st_ino)
                 while True:
                     chunk = body.read(1024 * 1024)
                     if not chunk:
@@ -257,19 +275,21 @@ class S3ObjectStorage:
                 output.flush()
                 os.fsync(output.fileno())
         except BaseException:
-            destination.unlink(missing_ok=True)
+            _remove_owned_download(destination, created_identity)
             raise
         finally:
             close = getattr(body, "close", None)
             if close is not None:
                 close()
         observed_checksum = digest.hexdigest()
+        if not _download_file_matches(destination, created_identity):
+            raise ValueError("download destination changed while it was streamed")
         if (
             size != expected_size
             or observed_checksum != expected_checksum_sha256
             or response["ContentLength"] != size
         ):
-            destination.unlink(missing_ok=True)
+            _remove_owned_download(destination, created_identity)
             raise ValueError("downloaded object identity differs from provenance")
         destination.chmod(0o400)
         return ObjectInfo(
