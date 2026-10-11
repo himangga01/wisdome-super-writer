@@ -1,0 +1,148 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: POLICY FUNDING WORKSPACE
+  - heading "정책자금, 이해하고 준비하세요." [level=1]
+  - paragraph: 중앙정부와 지역의 지원 공고를 찾고, 조건과 신청 순서를 쉽게 알아보세요.
+  - link "처음 배우기 ↗":
+    - /url: /policy-funding/guide/
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월" [selected]
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월"
+      - option "11월"
+      - option "12월"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /policy-funding/?q=QA-no-match-20261009&region=&kind=&mode=live&year=2026&month=10&basis=published
+    - link "전체 기간":
+      - /url: /policy-funding/?q=QA-no-match-20261009&region=&kind=&mode=live&basis=published
+  - strong: 2026년 전체
+  - text: · 공고 게시·등록일 기준
+  - link "← 이전":
+    - /url: /policy-funding/?q=QA-no-match-20261009&region=&kind=&mode=live&year=2025&basis=published
+  - link "다음 →":
+    - /url: /policy-funding/?q=QA-no-match-20261009&region=&kind=&mode=live&year=2027&basis=published
+  - article:
+    - text: 검색 조건에 맞는 공고
+    - strong: 0개
+    - paragraph: 최근 검증된 실행 범위
+  - article:
+    - text: 수집 설정된 출처
+    - strong: 3개
+    - paragraph: 설정 범위 내 수집
+  - article:
+    - text: 쉬운 용어 설명
+    - strong: 32개
+    - paragraph:
+      - link "용어 사전 보기 ↗":
+        - /url: /policy-funding/glossary/
+  - complementary:
+    - strong: 확인서는 대출 승인이 아닙니다.
+    - generic: 최대 한도도 내게 확정된 금액이 아닙니다. 보증기관·은행 심사와 약정이 남아 있을 수 있어요.
+  - region "내 사업에 맞는 공고 찾기":
+    - heading "내 사업에 맞는 공고 찾기" [level=2]
+    - text: 검색어
+    - textbox "검색어":
+      - /placeholder: 지역·기관·자금 이름
+      - text: QA-no-match-20261009
+    - text: 사업장 지역
+    - combobox "사업장 지역":
+      - option "모든 지역" [selected]
+      - option "서울"
+      - option "부산"
+      - option "대구"
+      - option "인천"
+      - option "광주"
+      - option "대전"
+      - option "울산"
+      - option "세종"
+      - option "경기"
+      - option "강원"
+      - option "충북"
+      - option "충남"
+      - option "전북"
+      - option "전남"
+      - option "경북"
+      - option "경남"
+      - option "제주"
+    - text: 지원 방식
+    - combobox "지원 방식":
+      - option "모든 방식" [selected]
+      - option "직접대출"
+      - option "대리대출"
+      - option "신용보증"
+      - option "이자 지원"
+      - option "보증료 지원"
+      - option "지원금"
+      - option "정책자금"
+    - text: 자료 구분
+    - combobox "자료 구분":
+      - option "실제 수집" [selected]
+      - option "검증용 예시"
+    - button "찾아보기"
+    - paragraph: 0개 결과 · 전국 단위기관 공고도 함께 표시합니다. 실제 지원대상 지역은 원문에서 확인하세요. 최대 100개 표시, 최근 5개 검증된 실행 범위입니다.
+    - heading "표시할 수집 공고가 없습니다." [level=3]
+    - paragraph: 검색 조건을 바꾸거나 공식 출처를 확인하세요. 기본 용어와 신청 순서는 공고가 없어도 볼 수 있습니다.
+    - link "쉬운 안내 보기":
+      - /url: /policy-funding/guide/
+  - heading "최근 수집 상태" [level=2]
+  - link "모든 수집 기록 ↗":
+    - /url: /policy-funding/history/
+  - paragraph: 정해진 출처·페이지 범위의 결과입니다. 일부 출처가 실패하면 이전 자료가 남을 수 있으니 각 공고의 수집 시각을 확인하세요.
+  - link "2026-10-08--run-fd18f61df3fc 실제 수집 · 93개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-08--run-fd18f61df3fc/
+    - strong: 2026-10-08--run-fd18f61df3fc
+    - generic: 실제 수집 · 93개 · 결과·변경사항 보기
+  - link "2026-10-06 실제 수집 · 40개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-06/
+    - strong: 2026-10-06
+    - generic: 실제 수집 · 40개 · 결과·변경사항 보기
+  - link "2026-10-05--run-6b4ba832282a 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05--run-6b4ba832282a/
+    - strong: 2026-10-05--run-6b4ba832282a
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+  - link "2026-10-05--run-a0555b8f14f0 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05--run-a0555b8f14f0/
+    - strong: 2026-10-05--run-a0555b8f14f0
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+  - link "2026-10-05 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05/
+    - strong: 2026-10-05
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

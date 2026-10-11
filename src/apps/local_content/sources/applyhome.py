@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -75,7 +76,7 @@ class _ParsedListPage:
 class ApplyHomePublicCollector:
     """Collect public ApplyHome notice pages through the bounded HTML fetcher."""
 
-    parser_version = "applyhome-public-html-v1"
+    parser_version = "applyhome-public-html-v2"
 
     def __init__(self, fetcher: HtmlFetcher) -> None:
         self._fetcher = fetcher
@@ -153,6 +154,8 @@ class ApplyHomePublicCollector:
             listed=listed,
             observed_detail_url=response.validated_logical_url(),
         )
+        # Detail identity has already been validated by _parse_detail above.
+        facts = _subscription_schedule_facts(HTMLParser(response.body))
         fields = {
             "source_key": _SOURCE_KEY,
             "external_id": listed.external_id,
@@ -171,7 +174,7 @@ class ApplyHomePublicCollector:
             "price_summary": None,
             "eligibility_summary": (),
             "restriction_summary": (),
-            "facts": (),
+            "facts": facts,
             "parser_version": self.parser_version,
             "warnings": warnings,
         }
@@ -188,6 +191,7 @@ class ApplyHomePublicCollector:
             application_start=application_start,
             application_end=application_end,
             supply_count=supply_count,
+            facts=facts,
             source_checksum=_checksum(fields),
             parser_version=self.parser_version,
             warnings=warnings,
@@ -283,9 +287,7 @@ class ApplyHomePublicCollector:
         if current_page < last_page and len(rows) != _PUBLIC_PAGE_SIZE:
             raise _ParseFailure("invalid list page cardinality")
         total_count = (
-            (last_page - 1) * _PUBLIC_PAGE_SIZE + len(rows)
-            if current_page == last_page
-            else None
+            (last_page - 1) * _PUBLIC_PAGE_SIZE + len(rows) if current_page == last_page else None
         )
         return _ParsedListPage(
             records=tuple(self._parse_public_table_row(row, category) for row in rows),
@@ -311,9 +313,7 @@ class ApplyHomePublicCollector:
         if not published:
             raise _ParseFailure("missing publication date")
         detail_path = _PUBLIC_DETAIL_PATHS[category]
-        detail_query = urlencode(
-            (("houseManageNo", house_manage_no), ("pblancNo", pblanc_no))
-        )
+        detail_query = urlencode((("houseManageNo", house_manage_no), ("pblancNo", pblanc_no)))
         canonical_url = _canonical_detail_url(
             f"{detail_path}?{detail_query}",
             category=category,
@@ -414,12 +414,8 @@ def _parse_public_detail(
 ) -> tuple[date | None, date | None, int | None, tuple[str, ...]]:
     if not document.css("table.tbl_st"):
         raise _ParseFailure("detail parser drift")
-    application_start = _parse_date(
-        _table_cell_text(document.css_first("#rnk1CrsRceptPd")) or ""
-    )
-    application_end = _parse_date(
-        _table_cell_text(document.css_first("#rnk2CrsRceptPd")) or ""
-    )
+    application_start = _parse_date(_table_cell_text(document.css_first("#rnk1CrsRceptPd")) or "")
+    application_end = _parse_date(_table_cell_text(document.css_first("#rnk2CrsRceptPd")) or "")
     if application_start is None:
         schedule = _public_table_label_value(document, ("청약접수", "청약기간"))
         dates = tuple(
@@ -440,6 +436,123 @@ def _parse_public_detail(
         warnings.append("supply count not found")
     warnings.extend(("price summary not found", "eligibility summary not found"))
     return application_start, application_end, supply_count, tuple(warnings)
+
+
+def _subscription_kind(label: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", label).strip()
+    match = re.fullmatch(
+        r"(?P<stage>특별\s*공급|(?:일반\s*공급\s*)?(?:제\s*)?1\s*순위)(?P<region>.*)",
+        normalized,
+    )
+    if match is None:
+        return None
+    region = match["region"]
+    if region.strip() and not re.fullmatch(
+        r"[\s·:/,()\[\]-]*(?:(?:해당지역|당해지역|기타지역|기타경기|서울|인천|경기|전국|"
+        r"거주자|거주|지역)[\s·:/,()\[\]-]*)+",
+        region,
+    ):
+        return None
+    return "special" if match["stage"].startswith("특별") else "first"
+
+
+def _subscription_schedule_facts(document: HTMLParser) -> tuple[tuple[str, str], ...]:
+    """Keep explicitly labelled stages; generic application dates are not stages."""
+    facts: list[tuple[str, str]] = []
+
+    def record(label: str, text: str) -> None:
+        if len(label) > 256 or len(text) > 2048 or len(facts) >= 64:
+            raise _ParseFailure("subscription schedule exceeds detail limits")
+        pair = (label, text)
+        if pair not in facts:
+            facts.append(pair)
+
+    for table in document.css("table.tbl_st"):
+        region_headers: dict[int, str] = {}
+        spanning: dict[int, tuple[Node, int]] = {}
+        for row in table.css("tr"):
+            grid = {column: node for column, (node, _remaining) in spanning.items()}
+            next_spanning = {
+                column: (node, remaining - 1)
+                for column, (node, remaining) in spanning.items()
+                if remaining > 1
+            }
+            column = 0
+            for cell in row.css("th, td"):
+                while column in grid:
+                    column += 1
+                try:
+                    colspan = int(cell.attributes.get("colspan", "1"))
+                    rowspan = int(cell.attributes.get("rowspan", "1"))
+                except ValueError:
+                    raise _ParseFailure("invalid schedule table span") from None
+                if not 1 <= colspan <= 16 or not 1 <= rowspan <= 32 or column > 64:
+                    raise _ParseFailure("invalid schedule table span")
+                for position in range(column, column + colspan):
+                    if position in grid:
+                        raise _ParseFailure("overlapping schedule table span")
+                    grid[position] = cell
+                    if rowspan > 1:
+                        next_spanning[position] = (cell, rowspan - 1)
+                column += colspan
+            spanning = next_spanning
+            cells = [
+                (index, node, _table_cell_text(node) or "") for index, node in sorted(grid.items())
+            ]
+            row_regions: dict[int, str] = {}
+            for index, _node, text in cells:
+                if (
+                    re.search(r"해당지역|기타지역|기타경기", text)
+                    and not _DATE_PATTERN.search(text)
+                    and _subscription_kind(text) is None
+                ):
+                    region_headers[index] = text
+                    row_regions[index] = text
+            stages = {
+                id(node): (index, text)
+                for index, node, text in cells
+                if _subscription_kind(text) is not None and not _DATE_PATTERN.search(text)
+            }
+            if len(stages) == 1:
+                stage_column, stage_label = next(iter(stages.values()))
+                values = [item for item in cells if item[0] > stage_column]
+                dated = any(_DATE_PATTERN.search(text) for _index, _node, text in values)
+                for index, _node, text in values:
+                    if index in row_regions:
+                        continue
+                    preceding = [
+                        region
+                        for position, region in row_regions.items()
+                        if stage_column < position < index
+                    ]
+                    region = preceding[-1] if preceding else region_headers.get(index)
+                    if not text or (
+                        not _DATE_PATTERN.search(text)
+                        and region is None
+                        and (dated or index != stage_column + 1)
+                    ):
+                        continue
+                    label = stage_label
+                    if region is not None:
+                        label += f" · {region}"
+                    record(label, text)
+            elif not stages:
+                for index, node, text in cells:
+                    if node.attributes.get("id") == "rnk1CrsRceptPd":
+                        label = "1순위"
+                        preceding = [
+                            region for position, region in row_regions.items() if position < index
+                        ]
+                        region = preceding[-1] if preceding else region_headers.get(index)
+                        if region is not None:
+                            label += f" · {region}"
+                        record(label, text)
+    for term in document.css("[data-notice-detail] dl dt"):
+        label = _table_cell_text(term) or ""
+        description = term.next
+        if _subscription_kind(label) and description is not None and description.tag == "dd":
+            record(label, _table_cell_text(description) or "")
+    return tuple(facts)
 
 
 def _require_public_detail_identity(
@@ -468,9 +581,7 @@ def _require_public_detail_identity(
         except ValueError:
             continue
         if "houseManageNo" in values or "pblancNo" in values:
-            observed.add(
-                _detail_identity_pair(urljoin("https://www.applyhome.co.kr", href))
-            )
+            observed.add(_detail_identity_pair(urljoin("https://www.applyhome.co.kr", href)))
     if observed != {(listed.house_manage_no, listed.pblanc_no)}:
         raise _ParseFailure("detail identity does not match list record")
 
@@ -592,27 +703,21 @@ def _canonical_detail_url(
     except ValueError:
         raise _ParseFailure("detail URL query is not approved") from None
     observed_keys = set(values)
-    if (
-        parsed.path == _PUBLIC_DETAIL_PATHS[category]
-        and observed_keys == set(_PUBLIC_DETAIL_QUERY_KEYS)
+    if parsed.path == _PUBLIC_DETAIL_PATHS[category] and observed_keys == set(
+        _PUBLIC_DETAIL_QUERY_KEYS
     ):
         query_keys = _PUBLIC_DETAIL_QUERY_KEYS
-    elif (
-        parsed.path == _LEGACY_DETAIL_PATHS[category]
-        and observed_keys == set(_LEGACY_DETAIL_QUERY_KEYS)
+    elif parsed.path == _LEGACY_DETAIL_PATHS[category] and observed_keys == set(
+        _LEGACY_DETAIL_QUERY_KEYS
     ):
         query_keys = _LEGACY_DETAIL_QUERY_KEYS
     else:
         raise _ParseFailure("detail URL query is not approved")
-    if any(
-        len(values[key]) != 1 for key in query_keys
-    ):
+    if any(len(values[key]) != 1 for key in query_keys):
         raise _ParseFailure("detail URL query is not approved")
     if values["houseManageNo"][0] != house_manage_no or values["pblancNo"][0] != pblanc_no:
         raise _ParseFailure("detail URL identity does not match list record")
-    if "houseSecd" in values and not re.fullmatch(
-        r"[A-Za-z0-9_-]+", values["houseSecd"][0]
-    ):
+    if "houseSecd" in values and not re.fullmatch(r"[A-Za-z0-9_-]+", values["houseSecd"][0]):
         raise _ParseFailure("detail URL query is not approved")
     return urlunsplit(
         (

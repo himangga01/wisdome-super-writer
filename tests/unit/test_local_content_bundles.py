@@ -1692,6 +1692,165 @@ def test_article_publish_rejects_owned_stage_substitution_during_replace(
     assert backup.is_dir()
 
 
+def test_article_publish_accepts_owned_stage_archive_metadata_change_portably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = ArticleBundle(
+        date(2026, 10, 8),
+        "archive-fixture",
+        (BundleFile.text("article.md", "# Fixture\n", "text/markdown"),),
+    )
+    writer = ArticleBundleWriter(tmp_path / "output")
+    real_create = writer._create_owned_staging
+    real_lstat = bundle_module.os.lstat
+    changed_stage: Path | None = None
+
+    def change_archive_after_creation(*args, **kwargs):
+        nonlocal changed_stage
+        staging, fingerprint = real_create(*args, **kwargs)
+        changed_stage = staging
+        return staging, fingerprint
+
+    def archive_lstat(path, *args, **kwargs):
+        metadata = real_lstat(path, *args, **kwargs)
+        if changed_stage is None or Path(path) != changed_stage:
+            return metadata
+        values = {name: getattr(metadata, name) for name in dir(metadata) if name.startswith("st_")}
+        values["st_file_attributes"] = getattr(metadata, "st_file_attributes", 0) ^ 0x20
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(writer, "_create_owned_staging", change_archive_after_creation)
+    monkeypatch.setattr(bundle_module.os, "lstat", archive_lstat)
+    published = writer.write(bundle)
+
+    assert (published / "article.md").read_text(encoding="utf-8") == "# Fixture\n"
+    assert changed_stage is not None and not changed_stage.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows archive attributes")
+def test_article_publish_accepts_real_windows_owned_stage_archive_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    bundle = ArticleBundle(
+        date(2026, 10, 8),
+        "archive-fixture",
+        (BundleFile.text("article.md", "# Fixture\n", "text/markdown"),),
+    )
+    writer = ArticleBundleWriter(tmp_path / "output")
+    real_create = writer._create_owned_staging
+    observed_changes: list[tuple[int, int]] = []
+
+    def change_archive_after_creation(*args, **kwargs):
+        staging, fingerprint = real_create(*args, **kwargs)
+        before = os.lstat(staging)
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+        setter.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong]
+        setter.restype = ctypes.c_int
+        assert setter(str(staging), before.st_file_attributes ^ 0x20), ctypes.get_last_error()
+        after = os.lstat(staging)
+        assert (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) == (
+            after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)
+        )
+        observed_changes.append((before.st_file_attributes, after.st_file_attributes))
+        return staging, fingerprint
+
+    monkeypatch.setattr(writer, "_create_owned_staging", change_archive_after_creation)
+    published = writer.write(bundle)
+
+    assert (published / "article.md").read_text(encoding="utf-8") == "# Fixture\n"
+    assert len(observed_changes) == 1
+    before_attributes, after_attributes = observed_changes[0]
+    assert before_attributes ^ after_attributes == 0x20
+    assert os.lstat(published).st_file_attributes == after_attributes
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["inode", "device", "type", "readonly", "hidden", "reparse"]
+)
+def test_article_owned_stage_still_rejects_security_metadata_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_field: str
+) -> None:
+    bundle = ArticleBundle(
+        date(2026, 10, 8),
+        "guard-fixture",
+        (BundleFile.text("article.md", "# Fixture\n", "text/markdown"),),
+    )
+    writer = ArticleBundleWriter(tmp_path / "output")
+    real_validate = writer._validate_owned_article_stage
+    real_lstat = bundle_module.os.lstat
+
+    def substitute_metadata_before_validation(staging, fingerprint, current_bundle):
+        def substituted_lstat(path, *args, **kwargs):
+            metadata = real_lstat(path, *args, **kwargs)
+            if Path(path) != staging:
+                return metadata
+            values = {
+                name: getattr(metadata, name) for name in dir(metadata) if name.startswith("st_")
+            }
+            if changed_field == "inode":
+                values["st_ino"] += 1
+            elif changed_field == "device":
+                values["st_dev"] += 1
+            elif changed_field == "type":
+                values["st_mode"] = stat.S_IFREG | stat.S_IMODE(metadata.st_mode)
+            else:
+                values["st_file_attributes"] = getattr(metadata, "st_file_attributes", 0) ^ {
+                    "readonly": 0x1, "hidden": 0x2, "reparse": 0x400
+                }[changed_field]
+            return SimpleNamespace(**values)
+
+        monkeypatch.setattr(bundle_module.os, "lstat", substituted_lstat)
+        real_validate(staging, fingerprint, current_bundle)
+
+    monkeypatch.setattr(
+        writer, "_validate_owned_article_stage", substitute_metadata_before_validation
+    )
+    with pytest.raises(BundlePublishError, match="owned|identity|reparse") as raised:
+        writer.write(bundle)
+    if changed_field != "reparse":
+        assert "expected=" in str(raised.value)
+        assert "observed=" in str(raised.value)
+    assert not (tmp_path / "output" / "2026-10-08" / "guard-fixture").exists()
+
+
+@pytest.mark.parametrize("changed_boundary", ["path_snapshot", "opened_handle"])
+def test_bound_read_still_rejects_archive_metadata_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_boundary: str
+) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("fixture", encoding="utf-8")
+    before = os.lstat(path)
+    fingerprint = bundle_module._path_fingerprint(path, "fixture", BundlePublishError)
+    real_lstat = bundle_module.os.lstat
+    real_fstat = bundle_module.os.fstat
+
+    def changed_archive(metadata):
+        values = {
+            name: getattr(metadata, name) for name in dir(metadata) if name.startswith("st_")
+        }
+        values["st_file_attributes"] = getattr(metadata, "st_file_attributes", 0) ^ 0x20
+        return SimpleNamespace(**values)
+
+    def archive_lstat(candidate, *args, **kwargs):
+        metadata = real_lstat(candidate, *args, **kwargs)
+        return changed_archive(metadata) if Path(candidate) == path else metadata
+
+    def archive_fstat(descriptor):
+        metadata = real_fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == (before.st_dev, before.st_ino):
+            return changed_archive(metadata)
+        return metadata
+
+    if changed_boundary == "path_snapshot":
+        monkeypatch.setattr(bundle_module.os, "lstat", archive_lstat)
+    else:
+        monkeypatch.setattr(bundle_module.os, "fstat", archive_fstat)
+    with pytest.raises(BundlePublishError, match="identity changed|opened identity differs"):
+        bundle_module._read_bound_file(path, fingerprint, max_bytes=7, label="fixture")
+
+
 def test_article_publish_rechecks_owned_target_after_complete_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

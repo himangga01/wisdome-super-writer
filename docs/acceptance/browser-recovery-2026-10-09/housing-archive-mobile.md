@@ -1,0 +1,39 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "주택 청약 메뉴":
+  - strong: 주택 청약
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: HOUSING CONTENT LIBRARY
+  - heading "작성된 주택 콘텐츠" [level=1]
+  - paragraph: 검증된 수집 기록을 열어 정리된 글과 원문을 확인하세요.
+  - link "청약 공고 보기 ↗":
+    - /url: /housing/notices/
+  - strong: 전체 기간
+  - text: · 실행 날짜 기준
+  - link "이번 달":
+    - /url: /local-articles/?year=2026&month=10&basis=collected
+  - link "전체 기간":
+    - /url: /local-articles/?basis=collected
+  - generic "연도·월 선택"
+  - heading "콘텐츠 기록" [level=2]
+  - generic: 검증된 실행 결과
+  - list:
+    - link "2026-10-08--run-4a05683f2944 0개 최종 글 · 추가 실행 ↗":
+      - /url: /local-articles/2026-10-08--run-4a05683f2944/
+      - strong: 2026-10-08--run-4a05683f2944
+      - generic: 0개 최종 글 · 추가 실행 ↗
+    - link "2026-10-08 0개 최종 글 ↗":
+      - /url: /local-articles/2026-10-08/
+      - strong: 2026-10-08
+      - generic: 0개 최종 글 ↗
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

@@ -1,8 +1,10 @@
 # Wisdome Super Writer
 
-관리자 한 명이 대한민국 부동산 청약정보와 국내·글로벌 반도체 뉴스를 수집하고,
-근거가 연결된 글을 만든 뒤 WordPress와 Google Blogger에 발행하는 Django/Celery 서비스입니다.
-스캔 PDF와 복합 레이아웃 PDF는 로컬 PaddleOCR 3.7.0 `PP-StructureV3`로 처리합니다.
+Wisdome Super Writer는 **주택 청약정보, 국내·글로벌 반도체 뉴스, 대한민국 정책자금 정보**를
+수집하고, 출처와 함께 정리해 이해하기 쉬운 콘텐츠 작성을 돕는 서비스입니다.
+정책자금은 공고와 함께 대출·보증·지원금의 차이, 신청 순서와 준비사항을 쉬운 말로 설명합니다.
+현재는 관리자용 개발 버전이며, 로컬 수집·문서 생성·미리보기를 제공합니다.
+WordPress·Google Blogger 발행 연동은 실제 운영을 위한 별도 검증이 필요합니다.
 
 > **개발 상태:** 핵심 MVP 파이프라인과 관리자 콘솔이 구현된 개발 버전입니다. 실제 운영 전에는
 > 출처별 수집기 고도화, PaddleOCR 모델 checksum 확정, 자동발행 안전 게이트 및 Phase 7 테스트를
@@ -17,6 +19,118 @@
 [서비스 분석](docs/service-analysis.md)에 기록합니다. AI 에이전트는
 [AGENTS.md](AGENTS.md)의 지침에 따라 분석 전에 기존 문서의 기준 커밋과
 현재 코드를 대조하고, 분석 후 같은 문서를 갱신합니다.
+
+## Three-topic content portal
+
+The main entry at `/` now opens a topic portal. Each workspace has independent
+pages and navigation:
+
+| Workspace | Entry | Topic menu |
+| --- | --- | --- |
+| Housing | `/housing/` | Overview, saved notices, written-content archive, official sources |
+| Semiconductor | `/semiconductor/` | Overview, saved news versions, current article drafts, source directory |
+| Policy funding | `/policy-funding/` | Notices, beginner guide, glossary, official institutions, collection history |
+
+The shared light-gray/white layout uses black selected controls and lime accents
+from the user-supplied reference images. Small screens use a native expandable
+topic menu and visible workspace links. The operations console remains at
+`/console/`; local housing data stays local-only. Pages display actual saved data
+or explicit empty/unavailable states, not sample metrics.
+
+Reference screenshots are saved in `docs/reference/topic-portal/`. Direct Chrome
+desktop/mobile acceptance is still pending because the browser tool rejects
+navigation despite the visible permission settings. Server-side tests do not
+substitute for that acceptance. See the [portal progress record](docs/analysis/2026-10-08-topic-portal-progress.md)
+and [design](docs/superpowers/specs/2026-10-08-topic-portal-design.md).
+
+## Year/month browsing and October collection
+
+Choose a year and month in each workspace, or use the current-month, previous,
+next and all-period shortcuts. Search and topic filters preserve the selection.
+
+| Page | Month means |
+| --- | --- |
+| Housing notices | Actual special-supply or first-priority reception dates, with regional stage labels; choose both, special only or first only |
+| Funding notices | Official posting/registration date, rather than application dates |
+| Semiconductor news | Original publication date; a separately labelled capture-date choice is also available |
+| Article/collection history | Saved execution/capture or draft modification date, as labelled on the page |
+
+Unknown source dates remain unknown and are excluded from a selected dated
+result with an explanation. Monthly housing/funding history is selected before
+deduplication and display limits. Funding detail links preserve the selected
+saved version and return filters. Later bounded scans do not establish that an
+older notice has closed.
+
+For the requested October 2026 refresh, run these explicit local commands with
+the development/local environment shown below. Housing looks back into September
+so a September announcement with an October reception can be included:
+
+```powershell
+.venv/Scripts/python.exe src/manage.py collect_recent_housing --since 2026-09-01 --no-humanize --no-write-articles
+.venv/Scripts/python.exe src/manage.py collect_policy_funding --pages 3 --max-notices 40 --seconds 180
+.venv/Scripts/python.exe src/manage.py collect_semiconductor_news --year 2026 --month 10 --max-items 60 --seconds 180
+```
+
+The semiconductor command saves local official title/link/date metadata under
+`SEMICONDUCTOR_ARCHIVE_ROOT` (default `output/semiconductor`). It does not create
+distributed source approvals or article bodies. Local automatic selection prefers
+a validated available local archive; the news page also offers explicit local or
+database inventory selection. A failed update retains earlier valid observations
+and reports the failure separately from a successful empty source result.
+Configured robots, access/rights rules and persisted polling/rate limits apply.
+KRX is currently unsupported by this local archive and SK hynix remains disabled.
+
+See the [monthly progress and actual source outcomes](docs/analysis/2026-10-08-monthly-data-update.md),
+[design](docs/superpowers/specs/2026-10-08-monthly-update-design.md), and
+[implementation plan](docs/superpowers/plans/2026-10-08-monthly-update.md).
+
+## Policy funding: official notices and a beginner guide
+
+The new `/policy-funding/` experience collects official Korean funding notices and
+explains loans, guarantees, subsidies, costs and application steps in plain Korean.
+It includes a 48-entry source directory across central institutions and 17 requested
+regional discovery buckets. Three configurations are connected: OLS agency loans,
+OLS direct loans and Bizinfo's finance category (open and ended lists separately).
+Directory entries are not a promise of exhaustive live regional coverage.
+
+From the repository root, using the existing Python 3.12 environment:
+
+```powershell
+$env:WISDOME_ENVIRONMENT = "development"
+$env:WISDOME_RUNTIME_MODE = "local"
+$env:PYTHONUTF8 = "1"
+.venv/Scripts/python.exe src/manage.py collect_policy_funding --pages 1 --max-notices 20
+.venv/Scripts/python.exe src/manage.py collectstatic --noinput
+.venv/Scripts/python.exe src/manage.py runserver 127.0.0.1:7667 --noreload
+```
+
+Open [policy funding](http://127.0.0.1:7667/policy-funding/),
+[beginner education](http://127.0.0.1:7667/policy-funding/guide/), or
+[official sources](http://127.0.0.1:7667/policy-funding/sources/).
+This module uses Python and official public reads independently of the housing
+humanizer. Local pages require loopback; nonlocal mode requires an active staff session.
+
+Useful collection options:
+
+- `--sources semas_agency bizinfo_finance`: select supported source configurations.
+- `--region gyeongnam`: filter collected notices to that regional bucket plus national
+  institution notices; actual eligibility remains in the original notice.
+- `--pages 1 --max-notices 4 --seconds 90`: bounded pages, detail count and time per source.
+- `--fixture --as-of 2026-10-05`: offline parser/reference data, explicitly labeled
+  fixture. Default fixture sources are agency loans and Bizinfo, not live acceptance.
+- `--output <directory>`: override the output root; the UI uses `POLICY_FUNDING_ROOT`
+  (default `output/policy-funding`). Use the same root to view a custom output.
+
+Runs contain immutable Markdown, source/observation JSON and integrity manifests.
+Failed or incomplete sources remain recorded; the CLI returns failure after saving
+such a run. Missing bounded-scan records are not called closed. Source registration,
+capture time, list status, application period and personal approval are distinct.
+The supplied October 6 sample remains untrusted input with dated field-level evidence.
+
+Read the [acceptance record](docs/acceptance/2026-10-05-policy-funding-acceptance.md),
+[design](docs/superpowers/specs/2026-10-05-policy-funding-design.md),
+[implementation plan](docs/superpowers/plans/2026-10-05-policy-funding-implementation.md),
+and [restart ledger](docs/analysis/2026-10-05-policy-funding-progress.md).
 
 ## Windows 로컬 주거 글 빠른 시작
 

@@ -13,6 +13,16 @@
   [English modification plan](../superpowers/plans/2026-10-03-critical-review-remediation.md).
 - No commit, push, task-checkbox change or real publisher write.
 
+**Later correction (2026-10-05):** This ledger preserves the October 3 adjudication.
+The repairs were committed as db5edec on October 4. The
+[resumed follow-up](2026-10-05-documentation-and-code-review.md) narrows the current
+meaning of several repaired dispositions: E7's 13 lock expressions leave 16 other
+incompatible queries (R9); B2 handles temporal values but not array formulas (R10);
+C3/D5 isolation misses ordinary domain conflicts (R7). R1/R13 expose credential and
+canary recovery gaps; R12/R15/R16 limit raw attachment, report and HWP claims.
+Use the refreshed canonical reports and plan for current status; do not read this
+historical table as closure of every related path.
+
 The service is a Django modular monolith for evidence-bound Korean housing and
 semiconductor articles, with a separate Windows local housing writer. Reviews cover
 collection, extraction, editorial, publishing, schedules, security, storage, local
@@ -167,3 +177,4 @@ Product questions remain in the [service report](../service-analysis.md#open-pro
 | Date | Update |
 | --- | --- |
 | 2026-10-03 | Two rounds of three reviewers completed; main reproduced, adjudicated and repaired defects; conditional features, rejected hypothesis and external release gates preserved |
+| 2026-10-05 | Repairs confirmed committed as `db5edec`; suite reproduced. Undispositioned reviewer observations and new findings R1–R8 are recorded in [the follow-up report](2026-10-05-documentation-and-code-review.md); this ledger's dispositions are unchanged |

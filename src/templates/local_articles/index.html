@@ -1,31 +1,9 @@
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>로컬 주거 공고</title>
-  <link rel="stylesheet" href="/static/local_articles/preview.css">
-  <link rel="icon" href="/static/local_articles/generic-housing-hero.png" type="image/png">
-</head>
-<body>
-  <main>
-    <header>
-      <p class="eyebrow">Wisdome Super Writer</p>
-      <h1>로컬 주거 공고</h1>
-      <p>검증이 끝난 로컬 실행 결과만 표시합니다.</p>
-    </header>
-    {% if runs %}
-      <ol class="run-list">
-        {% for run in runs %}
-          <li>
-            <a href="{{ run.url }}"><strong>{{ run.name }}</strong></a>
-            <span>{{ run.article_count }}개 최종 글{% if run.generation %} · 추가 실행{% endif %}</span>
-          </li>
-        {% endfor %}
-      </ol>
-    {% else %}
-      <p class="empty">아직 검증된 실행 결과가 없습니다.</p>
-    {% endif %}
-  </main>
-</body>
-</html>
+{% extends 'portal/base.html' %}
+{% block title %}작성된 주택 콘텐츠{% endblock %}
+{% block portal_css %}<link rel="stylesheet" href="/static/portal/app.css">{% endblock %}
+{% block extra_css %}<link rel="icon" href="/static/local_articles/generic-housing-hero.png" type="image/png">{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="small-kicker">HOUSING CONTENT LIBRARY</p><h1>작성된 주택 콘텐츠</h1><p>검증된 수집 기록을 열어 정리된 글과 원문을 확인하세요.</p></div><a class="black-button" href="/housing/notices/">청약 공고 보기 ↗</a></div>
+{% include "portal/period_archive.html" %}
+<section class="panel"><div class="panel-heading"><h2>콘텐츠 기록</h2><span class="muted">검증된 실행 결과</span></div>{% if runs %}<ol class="archive-list">{% for run in runs %}<li><a class="history-link" href="{{ run.url }}"><strong>{{ run.name }}</strong><span>{{ run.article_count }}개 최종 글{% if run.generation %} · 추가 실행{% endif %} ↗</span></a></li>{% endfor %}</ol>{% else %}<div class="empty-state"><span class="empty-icon" aria-hidden="true">⌂</span><h3>아직 검증된 실행 결과가 없습니다.</h3><p>청약 공고와 공식 출처를 먼저 살펴보세요.</p><a class="black-button" href="/housing/sources/">공식 출처 보기</a></div>{% endif %}</section>
+{% endblock %}

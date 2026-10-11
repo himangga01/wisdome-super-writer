@@ -1,0 +1,450 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- complementary "작업 공간 탐색":
+  - link "Wisdome 포털 홈":
+    - /url: /
+    - text: Wisdome
+    - generic: 콘텐츠 워크스페이스
+  - navigation "데스크톱 주제 선택":
+    - paragraph: 작업 공간
+    - link "01 주택 청약 집을 찾는 정보":
+      - /url: /housing/
+      - generic: "01"
+      - text: 주택 청약
+      - generic: 집을 찾는 정보
+      - generic: ›
+    - link "02 반도체 뉴스 산업의 흐름을 읽는 정보":
+      - /url: /semiconductor/
+      - generic: "02"
+      - text: 반도체 뉴스
+      - generic: 산업의 흐름을 읽는 정보
+      - generic: ›
+    - link "03 정책자금 사업을 준비하는 정보":
+      - /url: /policy-funding/
+      - generic: "03"
+      - text: 정책자금
+      - generic: 사업을 준비하는 정보
+      - generic: ›
+  - navigation "데스크톱 정책자금 메뉴":
+    - paragraph: 정책자금
+    - link "지원 공고":
+      - /url: /policy-funding/
+      - text: 지원 공고
+    - link "처음 배우기":
+      - /url: /policy-funding/guide/
+      - text: 처음 배우기
+    - link "쉬운 용어 사전":
+      - /url: /policy-funding/glossary/
+      - text: 쉬운 용어 사전
+    - link "공식 기관·출처":
+      - /url: /policy-funding/sources/
+      - text: 공식 기관·출처
+    - link "수집 기록":
+      - /url: /policy-funding/history/
+      - text: 수집 기록
+  - text: YOUR WORKSPACE
+  - strong:
+    - text: 정보를 모으고,
+    - text: 이해를 더하세요.
+  - link "전체 주제 보기":
+    - /url: /
+    - text: 전체 주제 보기
+    - generic: ↗
+  - link "운영 콘솔":
+    - /url: /console/
+    - text: 운영 콘솔
+    - generic: ↗
+- banner:
+  - link "Wisdome":
+    - /url: /
+  - generic: /
+  - strong: 정책자금
+  - generic: / 지원 공고
+  - generic: 로컬 작업 공간
+- main:
+  - paragraph: POLICY FUNDING WORKSPACE
+  - heading "정책자금, 이해하고 준비하세요." [level=1]
+  - paragraph: 중앙정부와 지역의 지원 공고를 찾고, 조건과 신청 순서를 쉽게 알아보세요.
+  - link "처음 배우기 ↗":
+    - /url: /policy-funding/guide/
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월"
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월" [selected]
+      - option "11월"
+      - option "12월"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /policy-funding/?year=2026&month=10&basis=published
+    - link "전체 기간":
+      - /url: /policy-funding/?basis=published
+  - strong: 2026년 10월
+  - text: · 공고 게시·등록일 기준
+  - link "← 이전":
+    - /url: /policy-funding/?year=2026&month=9&basis=published
+  - link "다음 →":
+    - /url: /policy-funding/?year=2026&month=11&basis=published
+  - article:
+    - text: 검색 조건에 맞는 공고
+    - strong: 17개
+    - paragraph: 최근 검증된 실행 범위
+  - article:
+    - text: 수집 설정된 출처
+    - strong: 3개
+    - paragraph: 설정 범위 내 수집
+  - article:
+    - text: 쉬운 용어 설명
+    - strong: 32개
+    - paragraph:
+      - link "용어 사전 보기 ↗":
+        - /url: /policy-funding/glossary/
+  - complementary:
+    - strong: 확인서는 대출 승인이 아닙니다.
+    - generic: 최대 한도도 내게 확정된 금액이 아닙니다. 보증기관·은행 심사와 약정이 남아 있을 수 있어요.
+  - region "내 사업에 맞는 공고 찾기":
+    - heading "내 사업에 맞는 공고 찾기" [level=2]
+    - text: 검색어
+    - textbox "검색어":
+      - /placeholder: 지역·기관·자금 이름
+    - text: 사업장 지역
+    - combobox "사업장 지역":
+      - option "모든 지역" [selected]
+      - option "서울"
+      - option "부산"
+      - option "대구"
+      - option "인천"
+      - option "광주"
+      - option "대전"
+      - option "울산"
+      - option "세종"
+      - option "경기"
+      - option "강원"
+      - option "충북"
+      - option "충남"
+      - option "전북"
+      - option "전남"
+      - option "경북"
+      - option "경남"
+      - option "제주"
+    - text: 지원 방식
+    - combobox "지원 방식":
+      - option "모든 방식" [selected]
+      - option "직접대출"
+      - option "대리대출"
+      - option "신용보증"
+      - option "이자 지원"
+      - option "보증료 지원"
+      - option "지원금"
+      - option "정책자금"
+    - text: 자료 구분
+    - combobox "자료 구분":
+      - option "실제 수집" [selected]
+      - option "검증용 예시"
+    - button "찾아보기"
+    - paragraph: 17개 결과 · 전국 단위기관 공고도 함께 표시합니다. 실제 지원대상 지역은 원문에서 확인하세요. 최대 100개 표시, 최근 5개 검증된 실행 범위입니다.
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장·상환유예 안내" [level=3]:
+        - link "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장·상환유예 안내":
+          - /url: /policy-funding/notices/edaf634df282b0f7ef40b51733a6206fbb5d6b0e65fc420d2551660dd5d740a2/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 대출의 만기나 상환 일정을 조정하는 안내입니다. 신규 대출이나 빚 면제와는 다릅니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: 2026년 10월 12일(화) 14:00 ~ 2026년 12월 31일(목) 18:00
+      - paragraph: 소진공 등록일 2026년 10월 8일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/edaf634df282b0f7ef40b51733a6206fbb5d6b0e65fc420d2551660dd5d740a2/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 대리대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(대리대출) 만기연장·상환유예 안내" [level=3]:
+        - link "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(대리대출) 만기연장·상환유예 안내":
+          - /url: /policy-funding/notices/851cfd7948d82a76b9d76d6753a465b4c964297b5493cb29e4e22af89a99f03d/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 대출의 만기나 상환 일정을 조정하는 안내입니다. 신규 대출이나 빚 면제와는 다릅니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: 2026년 10월 12일(화) 14:00 ~ 2026년 12월 31일(목) 18:00
+      - paragraph: 소진공 등록일 2026년 10월 8일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/851cfd7948d82a76b9d76d6753a465b4c964297b5493cb29e4e22af89a99f03d/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 서울
+      - generic: 정책자금
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[서울] 은평구 2026년 4분기 중소기업육성기금 융자지원 계획 수정 공고" [level=3]:
+        - link "[서울] 은평구 2026년 4분기 중소기업육성기금 융자지원 계획 수정 공고":
+          - /url: /policy-funding/notices/46f6aa192942d660ca8c52e7d4b42dddcee486290d987fff8a816393394a4563/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 지원사업의 조건을 바꾸는 공고입니다. 바뀐 항목과 적용일을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 서울특별시
+      - term: 신청기간
+      - definition: 2026.10.12 ~ 2026.10.23
+      - paragraph: 기업마당 등록일 2026년 10월 7일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/46f6aa192942d660ca8c52e7d4b42dddcee486290d987fff8a816393394a4563/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 세종
+      - generic: 정책자금
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[세종] 2026년 중소기업 제조물배상책임(PL)보험 지원사업 참가기업 모집 공고(상시)" [level=3]:
+        - link "[세종] 2026년 중소기업 제조물배상책임(PL)보험 지원사업 참가기업 모집 공고(상시)":
+          - /url: /policy-funding/notices/680ff79552b5feadfafb1f1242be83fa2905bdc5acd90416b5eeeed3071a7254/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 이 공고는 사업에 필요한 자금이나 보증·비용 지원을 안내합니다. 지원 방식을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 세종특별자치시
+      - term: 신청기간
+      - definition: 모집 완료시
+      - paragraph: 기업마당 등록일 2026년 10월 6일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/680ff79552b5feadfafb1f1242be83fa2905bdc5acd90416b5eeeed3071a7254/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 강원
+      - generic: 정책자금
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[강원] 2026년 하반기 농어촌진흥기금 지원계획 공고" [level=3]:
+        - link "[강원] 2026년 하반기 농어촌진흥기금 지원계획 공고":
+          - /url: /policy-funding/notices/86c988070277ca934abbc9ee59caea84f47dc13506916080a21aad45c8ecc523/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책자금 이용과 관련된 안내입니다. 새로 신청하는 공고인지, 기존 이용자를 위한 내용인지 확인하세요.
+      - term: 기관
+      - definition: 강원특별자치도
+      - term: 신청기간
+      - definition: 2026.10.02 ~ 2026.10.30
+      - paragraph: 기업마당 등록일 2026년 10월 6일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/86c988070277ca934abbc9ee59caea84f47dc13506916080a21aad45c8ecc523/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "홈플러스 피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장‧상환유예 안내" [level=3]:
+        - link "홈플러스 피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장‧상환유예 안내":
+          - /url: /policy-funding/notices/5ecaee55e011668c1ff6c6534d1b47cfe68995da52f185e061f2fda640063586/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 대출의 만기나 상환 일정을 조정하는 안내입니다. 신규 대출이나 빚 면제와는 다릅니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: 2026년 10월 6일(화) 14:00 ~ 2026년 12월 31일(목) 18:00
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/5ecaee55e011668c1ff6c6534d1b47cfe68995da52f185e061f2fda640063586/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 대리대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "홈플러스 피해 소상공인을 위한 소상공인정책자금(대리대출) 만기연장·상환유예 안내" [level=3]:
+        - link "홈플러스 피해 소상공인을 위한 소상공인정책자금(대리대출) 만기연장·상환유예 안내":
+          - /url: /policy-funding/notices/900b6e494bb66db6e90f2e7d10d620ee100d54c7e62cf48819490d55880c9af2/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 대출의 만기나 상환 일정을 조정하는 안내입니다. 신규 대출이나 빚 면제와는 다릅니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: 2026년 10월 6일(화) 14:00 ~ 2026년 12월 31일(목) 18:00
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/900b6e494bb66db6e90f2e7d10d620ee100d54c7e62cf48819490d55880c9af2/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 정책자금
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "2026년 중소벤처기업부 소상공인 정책자금 융자사업 5차 변경 공고" [level=3]:
+        - link "2026년 중소벤처기업부 소상공인 정책자금 융자사업 5차 변경 공고":
+          - /url: /policy-funding/notices/9bcab60a1cba052c795337fa3ee2401b401a73e548719658c52692cd12164723/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 지원사업의 조건을 바꾸는 공고입니다. 바뀐 항목과 적용일을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 중소벤처기업부
+      - term: 신청기간
+      - definition: 예산 소진시까지
+      - paragraph: 기업마당 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/9bcab60a1cba052c795337fa3ee2401b401a73e548719658c52692cd12164723/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 4분기 혁신성장촉진자금 신청안내" [level=3]:
+        - link "2026년 4분기 혁신성장촉진자금 신청안내":
+          - /url: /policy-funding/notices/fb3ac21fbce33fbf6cd7f837f09bcedc6d3a212043b3242e7005fed9d4f66ea5/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책기관이 직접 심사하고 빌려주는 직접대출 공고입니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: ‘26. 10. 12.(월) ~ 10. 13.(화), 10:00 ~ 18:00
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/fb3ac21fbce33fbf6cd7f837f09bcedc6d3a212043b3242e7005fed9d4f66ea5/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 4분기 재도전특별자금 신청안내" [level=3]:
+        - link "2026년 4분기 재도전특별자금 신청안내":
+          - /url: /policy-funding/notices/18eeea373443500387100157d320fa6ac8189255115c880624c12990c589bf8b/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책기관이 직접 심사하고 빌려주는 직접대출 공고입니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: ‘26년 10월 26일(월) 10:00 ~ 예산 소진 시까지
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/18eeea373443500387100157d320fa6ac8189255115c880624c12990c589bf8b/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 10월 일시적경영애로자금(직접대출) 신청안내" [level=3]:
+        - link "2026년 10월 일시적경영애로자금(직접대출) 신청안내":
+          - /url: /policy-funding/notices/2090aa8f085511c592ea414af884d332ff455f424fba3ba71da5dae3109c3c8b/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책기관이 직접 심사하고 빌려주는 직접대출 공고입니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: ‘26년 10월 26일(월) 10:00 ~ 예산 소진 시까지
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/2090aa8f085511c592ea414af884d332ff455f424fba3ba71da5dae3109c3c8b/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "2026년 10월 신용취약소상공인자금 신청안내" [level=3]:
+        - link "2026년 10월 신용취약소상공인자금 신청안내":
+          - /url: /policy-funding/notices/debf433a09b8c846f4685546f588d6b8b26eb04c74e55989f47aa5b97abc5bce/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책기관이 직접 심사하고 빌려주는 직접대출 공고입니다.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: ‘26. 10. 12.(월) ~ 10. 13.(화), 10:00 ~ 18:00
+      - paragraph: 소진공 등록일 2026년 10월 2일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/debf433a09b8c846f4685546f588d6b8b26eb04c74e55989f47aa5b97abc5bce/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 직접대출
+      - paragraph: 목록 접수 상태 미확인
+      - heading "소식이의 안심상담소 3편 부정수급이란?(목적 외 사용편)" [level=3]:
+        - link "소식이의 안심상담소 3편 부정수급이란?(목적 외 사용편)":
+          - /url: /policy-funding/notices/ce47fb657a4841bd643f8d01d41150504d8765a7b7a8cccdd6dcff13e9f5aa92/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 정책자금 이용과 관련된 안내입니다. 새로 신청하는 공고인지, 기존 이용자를 위한 내용인지 확인하세요.
+      - term: 기관
+      - definition: 소상공인시장진흥공단
+      - term: 신청기간
+      - definition: 원 공고에서 확인하세요
+      - paragraph: 소진공 등록일 2026년 10월 1일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/ce47fb657a4841bd643f8d01d41150504d8765a7b7a8cccdd6dcff13e9f5aa92/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 지역 확인 필요
+      - generic: 정책자금
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[전남광주] 2026년 전라남도 중소기업 육성자금 지원계획 3차 변경 공고" [level=3]:
+        - link "[전남광주] 2026년 전라남도 중소기업 육성자금 지원계획 3차 변경 공고":
+          - /url: /policy-funding/notices/126781bcf5cbb46e15b6b273a704fa7ad2dee7470e1885955564fced3afccab9/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 지원사업의 조건을 바꾸는 공고입니다. 바뀐 항목과 적용일을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 전남광주통합특별시
+      - term: 신청기간
+      - definition: 예산 소진시까지
+      - paragraph: 기업마당 등록일 2026년 10월 1일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/126781bcf5cbb46e15b6b273a704fa7ad2dee7470e1885955564fced3afccab9/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 경기
+      - generic: 신용보증
+      - generic: 이자 지원
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[경기] 평택시 청년창업 특례보증 및 이차보전 지원 수정 공고" [level=3]:
+        - link "[경기] 평택시 청년창업 특례보증 및 이차보전 지원 수정 공고":
+          - /url: /policy-funding/notices/1936b14f91746f81f839330df3cf6392840c8a26593dc14b1e9bbb05c3a97f97/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 지원사업의 조건을 바꾸는 공고입니다. 바뀐 항목과 적용일을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 경기도
+      - term: 신청기간
+      - definition: 상시 접수
+      - paragraph: 기업마당 등록일 2026년 10월 1일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/1936b14f91746f81f839330df3cf6392840c8a26593dc14b1e9bbb05c3a97f97/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 경기
+      - generic: 신용보증
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "[경기] 안산시 2026년 소상공인 특례보증 추가 지원 계획 공고" [level=3]:
+        - link "[경기] 안산시 2026년 소상공인 특례보증 추가 지원 계획 공고":
+          - /url: /policy-funding/notices/15a5ec50041b1fff0eb7ff3d1a9b8f5c2abd4f1ea97546a006298c64df881d9d/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 이 공고는 사업에 필요한 자금이나 보증·비용 지원을 안내합니다. 지원 방식을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 경기도
+      - term: 신청기간
+      - definition: 예산 소진시까지
+      - paragraph: 기업마당 등록일 2026년 10월 1일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/15a5ec50041b1fff0eb7ff3d1a9b8f5c2abd4f1ea97546a006298c64df881d9d/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+    - article:
+      - generic: 전국 기관
+      - generic: 이자 지원
+      - paragraph: 공식 접수중 목록에서 확인
+      - heading "2026년 중소기업 정책자금 융자계획 변경 공고" [level=3]:
+        - link "2026년 중소기업 정책자금 융자계획 변경 공고":
+          - /url: /policy-funding/notices/2ea5ccf43304a12e916efb70408e9eef36acc4cda37bbd7f67c4eda13198b471/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+      - paragraph: 기존 지원사업의 조건을 바꾸는 공고입니다. 바뀐 항목과 적용일을 원문에서 확인하세요.
+      - term: 기관
+      - definition: 중소벤처기업부
+      - term: 신청기간
+      - definition: 예산 소진시까지
+      - paragraph: 기업마당 등록일 2026년 10월 1일 · 수집 2026-10-08 22:49
+      - link "조건과 진행 순서 보기 →":
+        - /url: /policy-funding/notices/2ea5ccf43304a12e916efb70408e9eef36acc4cda37bbd7f67c4eda13198b471/?mode=live&year=2026&month=10&basis=published&run=2026-10-08--run-fd18f61df3fc
+  - heading "최근 수집 상태" [level=2]
+  - link "모든 수집 기록 ↗":
+    - /url: /policy-funding/history/
+  - paragraph: 정해진 출처·페이지 범위의 결과입니다. 일부 출처가 실패하면 이전 자료가 남을 수 있으니 각 공고의 수집 시각을 확인하세요.
+  - link "2026-10-08--run-fd18f61df3fc 실제 수집 · 93개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-08--run-fd18f61df3fc/
+    - strong: 2026-10-08--run-fd18f61df3fc
+    - generic: 실제 수집 · 93개 · 결과·변경사항 보기
+  - link "2026-10-06 실제 수집 · 40개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-06/
+    - strong: 2026-10-06
+    - generic: 실제 수집 · 40개 · 결과·변경사항 보기
+  - link "2026-10-05--run-6b4ba832282a 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05--run-6b4ba832282a/
+    - strong: 2026-10-05--run-6b4ba832282a
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+  - link "2026-10-05--run-a0555b8f14f0 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05--run-a0555b8f14f0/
+    - strong: 2026-10-05--run-a0555b8f14f0
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+  - link "2026-10-05 실제 수집 · 12개 · 결과·변경사항 보기":
+    - /url: /policy-funding/runs/2026-10-05/
+    - strong: 2026-10-05
+    - generic: 실제 수집 · 12개 · 결과·변경사항 보기
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

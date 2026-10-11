@@ -1,8 +1,9 @@
 # Critical Review Remediation and Code Modification Plan
 
-**Date:** 2026-10-03, Asia/Seoul.
-**Source:** main at 7eb33310665dfffafa15561d66d6d1a2d4b48e6b plus this session's
-uncommitted repairs. Dependencies and task checkboxes unchanged.
+**Written:** 2026-10-03, Asia/Seoul. **Revalidated:** 2026-10-05 after reboot.
+**Source:** main at db5edec35aad39ae85e3aca7b6f9e1b9f2e3a0dc. Product source is
+unchanged in the follow-up; only documentation/instructions and ignored diagnostics
+were updated. The October 3 repairs are committed. Dependencies/task checkboxes unchanged.
 
 **Goal:** Preserve the verified repairs from two review rounds, complete the remaining
 publication features, and obtain actual backend/channel/corpus acceptance before
@@ -48,14 +49,14 @@ boundaries; duplicate reviewer IDs do not represent additional independent defec
 | File and CLI ownership | A1, A7/A8, A9/F2 | S3 storage; CI/acceptance filename discovery; HWP wrapper. Collision/substitution, Unicode and option-boundary tests, owned cleanup. |
 | Windows and runtime | A2/A5/A11, A3 | Local-script fixture venv/UTF-8/lock synchronization; Compose distributed mode. Default-root Unicode fixture checks. |
 | Collection input and settlement | A6/F1, B6/B7, E1 | Local API count validation; SourceItem optional attachments/migration 0012; plain-string change event; current-delivery start/result/failure fence. |
-| Actual extractor output | B1/B2/B3/B8, E9 | HTML structural locators; deterministic XLSX types; closed locators; cumulative CSV cells and skipped blank records. Real adapter output tests. |
+| Actual extractor output | B1/B2/B3/B8, E9 | Structural HTML locators, XLSX temporal values, closed spreadsheet locators and delimited budgets repaired; array-formula serialization remains R10. |
 | Frozen evidence and quality | B4/B5/B9, E2–E5 | Raw source_record pointer; unit-aware numeric citation checks; one derived rights envelope preserving input restrictions. Real fanout/snapshot and materializer tests. |
 | Console and public contracts | C1/C2/C4/C10, D7/F3/F7 | Cron escaping, edit/create topic boundary, optional MFA, target casing/nullability, evidence sourceUrl links. Production JS harness and compiled response schema. |
 | Approval and validation | C5/C6/C11, D1/F4/F5 | Correct proof scope/audit replay; shared and narrowly compatible preview hashes; truthful stage/result reports with bounded version/digest verification. |
-| Dispatch and recovery | C3/C7/C8/C13, D3–D6/D8 | Isolated audited held schedule ticks, future-time persistence, proof-required mapping reuse, request-bound preflight, persisted uncertain delete result. |
+| Dispatch and recovery | C3/C7/C8/C13, D3–D6/D8 | ValueError-derived held ticks, future-time persistence, proof-required reuse, preflight dedupe and uncertain DELETE persistence repaired. Domain-conflict schedule isolation (R7) and actual uncertain recovery remain open. |
 | Credential revocation | A4/C9, D2/D9 | Exact WordPress deletion identity/Core response; pending mutation and original-subject fence; guards immediately before WordPress/Blogger writes. |
 | Acceptance composition | A10/F8 | Current-run artifact binding and all eligible same-plan history documents; latest eligible passing report selection. |
-| PostgreSQL compatibility | E6/E7 | Forward migration 0013 retains INSERT lineage and one-way retention UPDATE/DELETE guards. Qualified locks in evidence/editorial/corrections; mutable article head retained. Thirteen real compiler checks, no PostgreSQL execution. |
+| PostgreSQL compatibility | E6/E7, R9 | Migration 0013 preserves lineage/retention guards; thirteen explicit lock expressions repaired. Sixteen additional bad nullable-join expressions compiled on resume; compatibility remains incomplete and PostgreSQL unexecuted. |
 | Release candidates | E8 | Separate HTML/spreadsheet/HWP 1.2.0 draft candidates; editorial policies 1.1.0. No old profile JSON/approval mutation or new approval. |
 
 New regression modules are tests/unit/test_review_*.py, console behavior modules
@@ -63,18 +64,27 @@ and tests/js/*.cjs. Existing S3, local script, operation contract, media binding
 schedule material and dispatch idempotency tests were extended. Exact evidence and
 counts remain in the [review report](../../analysis/2026-10-03-two-round-review.md).
 
-## Task 1 — P0 for distributed release: execute PostgreSQL invariants
+## Task 1 — P0 for distributed release: repair remaining locks and execute PostgreSQL invariants
 
-**Code already repaired:** evidence/services.py and tasks.py, editorial/services.py,
-tasks.py and corrections.py, and collection migration 0013.
+**Partial repairs present:** thirteen expressions in evidence/editorial modules and
+collection migration 0013. R9 still affects publishing/services.py, automation.py,
+corrections.py, scheduling/services.py and evidence/tasks.py.
+**Modify:** these remaining query owners and .github/workflows/quality.yml.
 **Create:** tests/integration/test_postgresql_lock_contracts.py.
 **Extend:** existing extraction-generation, editorial-publication-eligibility,
 correction and retention regressions; use their existing frozen fixture builders.
 
 - [x] Compile thirteen production query expressions with the real PostgreSQL backend,
   forbidding connections. Optional joins remain, locks qualify owned tables.
-- [x] Preserve explicit run → step → aggregate → child/evidence ordering; correction
-  locks both case and article because current_revision_id is mutable.
+- [x] Preserve the repaired callers' explicit run → step → aggregate → child/evidence
+  ordering; correction locks case and article because current_revision_id is mutable.
+- [ ] R9: inventory every remaining lock expression, including related managers and
+  helper-built querysets. Derive each caller's mutable related-row requirements before
+  choosing OF or separate locks. Do not apply a blanket self-only manager default.
+  Resolve all 16 documented cases and fail discovery when an expression is unresolved.
+- [ ] Add a PostgreSQL CI job that executes representative real transaction paths with
+  nullable relations absent/present. The existing Windows/Linux job remains SQLite
+  coverage and cannot close the PostgreSQL gate.
 - [ ] Execute aggregation, generic ready/finalization, manual validation and failure,
   generation replay, publishability/visual checks and correction decisions in actual
   PostgreSQL transactions with optional relations both absent and present.
@@ -244,10 +254,118 @@ limits. Unchecked T031/T032 and prerequisite task acceptance govern completion.
 - [ ] Retain per-file sampling limits. Fully read affected unread DDL/test bodies during
   implementation; inventory/AST is not a fresh exhaustive semantic audit.
 
+## Task 8 — 2026-10-05 follow-up findings and implementation order
+
+Evidence: [completed verification/synthesis](../../analysis/2026-10-05-documentation-and-code-review.md).
+The report records R1–R16 and conditional candidate dispositions. Diagnostic probes
+reproduce failures; no product fix was made during this follow-up. The plan is
+complete as an authored document, while the unchecked implementation tasks remain.
+
+### 8.1 R9 — first priority, distributed lock compatibility
+
+- [ ] Repair the 16 expressions listed in the report: nine in publishing/services.py,
+  one in scheduling/services.py, two in publishing/automation.py, one in
+  publishing/corrections.py and three in evidence/tasks.py.
+- [ ] For each, list the rows whose mutable state is read/written, preceding locks
+  and canonical acquisition order. Keep intended publication/target/approval/
+  dependency/media/registry/article locks using explicit non-null reads where needed.
+  A nullable join cannot be solved by silently dropping a necessary related lock.
+- [ ] Extend test_review_postgresql_lock_queries.py from its fixed 13-case list with
+  source discovery and resolved related-manager expressions; preserve actual filters.
+  Unresolved cases must be visible failures or explicitly reviewed exclusions.
+- [ ] Implement Task 1's PostgreSQL execution/CI with publication begin, media
+  claim/authorize/settle, schedule material, automation and correction paths.
+  Assert the real backend and use actual transactions, not SQLite-only mocks.
+
+### 8.2 R1/R13 — credential recovery and durable external outcome evidence
+
+**Owners:** publishing/services.py/tasks.py, event_routes.py and recovery API/schema.
+**Extend:** test_review_publishing_regressions.py and publisher credential tests;
+add real canary/preflight state/recovery tests with supported fixtures.
+
+- [ ] Give TargetDisconnectDecision in reconciling an audited, reauthenticated
+  resolution: independently prove absence then complete, or explicitly abandon with
+  truthful remote state. Add dead-letter handling for accepted/revoking work.
+- [ ] Distinguish adapter construction and pre-I/O guard failures from writes that may
+  have occurred. A retry must not claim remote uncertainty merely because the start
+  audit exists; preserve the original credential-subject/per-write fence.
+- [ ] Persist bounded, immutable preflight/canary result and cleanup IDs even when
+  current target state may no longer be updated. Separate stale-result recording from
+  permission to project a current target. Do not remove C9/D2's replacement guard.
+- [ ] Regress a canary create, accepted disconnect, blocked update/cleanup, failed result
+  persistence and redelivery. The observed current behavior is running/empty refs,
+  then failed target_snapshot_stale/empty refs; every known remote ID must survive
+  the repaired flow for audited cleanup.
+- [ ] Cover exact replay, snapshot rotation, unknown DELETE, worker reclaim and errors
+  before/after the external-call boundary. Use no actual production credential writes.
+
+### 8.3 R7/R11 — schedule isolation and timezone validation
+
+**Owners:** scheduling/services.py and its API; topic-policy/registry callers.
+**Extend:** test_review_schedule_regressions.py and schedule contract/dispatch tests.
+
+- [ ] Define explicit ordinary ineligibility from inactive/unverifiable policy and
+  registry material. Contain StateConflict/Conflict per tick, audit the hold/failure
+  and preserve healthy schedule dispatch. Do not suppress arbitrary programming faults.
+- [ ] Use a real inactive-policy/registry fixture, then a healthy later tick, including
+  repeat scans and restoration. A test injecting only ValueError is insufficient.
+- [ ] Bound timezone input and normalize directory-like/overlong invalid ZoneInfo
+  errors to the API's validation response. Test Asia, a 300-character key, invalid
+  identifier and a valid Asia/Seoul create/update on supported operating systems.
+
+### 8.4 Remaining behavior and boundary fixes
+
+- [ ] R2/P1: implement selected source/document/publication retry through the owning
+  service with idempotent decision execution, or narrow API/console wording until it
+  exists. T028/T031 remain open.
+- [ ] R3/P1: execute Task 4's staged Blogger cohort before modifying release order.
+  For withdrawal, include PREPARED/unproven versus ACTIVE/proven existing media:
+  the planner currently queues reconcile only in the first case. Define whether
+  media preparation belongs on a non-content action; preserve current withdrawal guards.
+- [ ] R4: reproduce the consumer infrastructure double fault; distinguish replay of
+  settled work from a same-number retry_scheduled delivery that still needs work.
+- [ ] R5: compound Korean scale parser and unit-bound support tests, including
+  5천만원 and 3억 5,000만원 versus equivalent won values and contradictory controls.
+- [ ] R6: precompute HTML sibling ordinals without changing exact locators; benchmark
+  representative large trees and preserve evidence lookup/duplicate-ID behavior.
+- [ ] R8: bounded exact absence-proof media DELETE recovery with retention convergence;
+  unknown outcome must not become an invented deletion or indefinite silent hold.
+- [ ] R10: define array/data-table formula material, preserve formula/range provenance,
+  and canonically serialize or emit a classified unsupported-input result. Test actual
+  saved XLSX files, ordinary formulas and temporal values through hash/persistence.
+- [ ] R12: unify raw text/downloaded-attachment/metadata-only locator construction;
+  every RAW producer must pass the shared validator and resolve its frozen evidence.
+- [ ] R14: decide kill-switch revocation semantics and model a truthful paused/terminal
+  outcome; never equate local disconnected state with proven provider revocation.
+- [ ] R15: validate the entire temporary report schema, verdict and verifiedAt type/
+  format before copying fields; failure projection must not retain partial samples.
+  Keep exact version/digest checks and do not fabricate missing evidence.
+- [ ] R16: retain original resource/converter errors when output metadata/cleanup fails.
+  Establish private output directory ownership before conversion; cover late-writer
+  interference as a conditional case. Preserve early collision controls and hard-false
+  HWP admission until actual Linux/signed acceptance is available.
+
+### 8.5 Documentation and lower-priority candidates
+
+- [x] Refresh canonical code/service findings, repair limits, plan and AGENTS status;
+  correct LOCAL_ARTICLE_ROOT and preserve the old report-link anchor.
+- [ ] Correct README/quickstart/event/model drift D1–D21 after behavior decisions.
+  Preserve historical plans and acceptance records rather than rewriting their dates.
+- [ ] Decide supported CSV encodings; CP949 currently fails and UTF-8 passes, already
+  true before db5edec. Classify unsupported encodings even if support stays UTF-8 only.
+- [ ] Consider duplicated parsing/hashing/predicates and stored material size only
+  after invariant and release-versioning regressions exist. These observations are
+  not independently demonstrated correctness bugs.
+- [ ] Promote useful ignored diagnostic reproductions into tracked owning tests with
+  negative-before/positive-after behavior when implementing fixes. Keep synthetic
+  I/O/provenance limits explicit and add real backend acceptance separately.
+
 ## Verification and handoff contract
 
-- Local commands use development/local, PYTHONUTF8=1 and removed inherited root
-  overrides; empty LOCAL_* values are not equivalent to absence.
+- Local commands use development/local and PYTHONUTF8=1. Remove LOCAL_STATE_ROOT,
+  LOCAL_OBJECT_ROOT and LOCAL_ARTICLE_ROOT rather than assigning empty values.
+  Older guidance misnamed LOCAL_OUTPUT_ROOT; clear that obsolete name too when
+  inheriting a historical shell. Settings consumes LOCAL_ARTICLE_ROOT.
 - Run Django check and makemigrations --check --dry-run; migrate only disposable
   state. Run pytest -q tests/unit tests/integration with default local roots.
 - Check local-content and new-test/migration Ruff, whole Ruff with actual findings,
@@ -269,3 +387,13 @@ See [service questions](../../service-analysis.md#open-product-questions) for su
 runtime, local attachment facts, required factual/semantic assurance, withdrawal UX,
 acceptance-signing ownership, scale and retention. Tasks above define engineering
 continuation without claiming those product decisions were made.
+## 2026-10-05 resumed verification
+
+- 9 saved diagnostics reproduced; all 16 remaining actual query expressions compiled
+  invalid lock shapes without connecting to PostgreSQL.
+- 11 candidate tests and a separate CP949/UTF-8 control passed as defect/control
+  assertions. Canary cleanup-reference loss is confirmed with mocked publisher I/O;
+  its stale redelivery result is recorded accurately. HWP faults are injected.
+- 19 existing repaired-query/WordPress/HWP collision regressions still pass.
+- Product files, dependencies and tracked tests are unchanged. The earlier full suite
+  of 1,363 passing tests is historical to this resumption, not rerun or release proof.

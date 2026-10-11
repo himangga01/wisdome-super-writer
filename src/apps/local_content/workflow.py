@@ -282,6 +282,8 @@ class LocalHousingWorkflow:
         humanize: bool = True,
         write_articles: bool = True,
         selected_ids: Collection[str] = (),
+        *,
+        collection_start: datetime | None = None,
     ) -> WorkflowReport:
         _require_timezone_aware(now, "now")
         if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 31:
@@ -290,12 +292,23 @@ class LocalHousingWorkflow:
             raise ValueError("selected IDs must be non-empty strings")
         selected = tuple(dict.fromkeys(selected_ids))
         observed = now.astimezone(SEOUL)
+        start = datetime.combine(
+            observed.date() - timedelta(days=days - 1),
+            time.min,
+            tzinfo=SEOUL,
+        )
+        if collection_start is not None:
+            if not isinstance(collection_start, datetime):
+                raise ValueError("collection_start must be a timezone-aware datetime")
+            _require_timezone_aware(collection_start, "collection_start")
+            try:
+                start = collection_start.astimezone(SEOUL)
+            except OverflowError:
+                raise ValueError("collection_start is outside the supported date range") from None
+            if start > observed or observed - start > timedelta(days=365):
+                raise ValueError("collection_start must be within the past 365 days and not future")
         window = CollectionWindow(
-            start=datetime.combine(
-                observed.date() - timedelta(days=days - 1),
-                time.min,
-                tzinfo=SEOUL,
-            ),
+            start=start,
             end=observed,
         )
         workflow_id = uuid.uuid4().hex

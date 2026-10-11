@@ -1,0 +1,166 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- complementary "작업 공간 탐색":
+  - link "Wisdome 포털 홈":
+    - /url: /
+    - text: Wisdome
+    - generic: 콘텐츠 워크스페이스
+  - navigation "데스크톱 주제 선택":
+    - paragraph: 작업 공간
+    - link "01 주택 청약 집을 찾는 정보":
+      - /url: /housing/
+      - generic: "01"
+      - text: 주택 청약
+      - generic: 집을 찾는 정보
+      - generic: ›
+    - link "02 반도체 뉴스 산업의 흐름을 읽는 정보":
+      - /url: /semiconductor/
+      - generic: "02"
+      - text: 반도체 뉴스
+      - generic: 산업의 흐름을 읽는 정보
+      - generic: ›
+    - link "03 정책자금 사업을 준비하는 정보":
+      - /url: /policy-funding/
+      - generic: "03"
+      - text: 정책자금
+      - generic: 사업을 준비하는 정보
+      - generic: ›
+  - navigation "데스크톱 반도체 뉴스 메뉴":
+    - paragraph: 반도체 뉴스
+    - link "대시보드":
+      - /url: /semiconductor/
+      - text: 대시보드
+    - link "수집한 뉴스":
+      - /url: /semiconductor/news/
+      - text: 수집한 뉴스
+    - link "콘텐츠 초안":
+      - /url: /semiconductor/articles/
+      - text: 콘텐츠 초안
+    - link "출처 디렉터리":
+      - /url: /semiconductor/sources/
+      - text: 출처 디렉터리
+  - text: YOUR WORKSPACE
+  - strong:
+    - text: 정보를 모으고,
+    - text: 이해를 더하세요.
+  - link "전체 주제 보기":
+    - /url: /
+    - text: 전체 주제 보기
+    - generic: ↗
+  - link "운영 콘솔":
+    - /url: /console/
+    - text: 운영 콘솔
+    - generic: ↗
+- banner:
+  - link "Wisdome":
+    - /url: /
+  - generic: /
+  - strong: 반도체 뉴스
+  - generic: / 대시보드
+  - generic: 로컬 작업 공간
+- main:
+  - paragraph: SEMICONDUCTOR WORKSPACE
+  - heading "반도체 산업의 흐름을 읽으세요." [level=1]
+  - paragraph: 기업과 기관의 발표를 출처와 함께 읽고, 콘텐츠 작업으로 이어가세요.
+  - generic: 반도체 뉴스
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월"
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월" [selected]
+      - option "11월"
+      - option "12월"
+    - text: 날짜 기준
+    - combobox "날짜 기준":
+      - option "기사 발표일" [selected]
+      - option "수집 날짜"
+    - text: 자료원
+    - combobox "자료원":
+      - option "최근 수집자료 자동 선택" [selected]
+      - option "공식 페이지 수집자료"
+      - option "운영 수집기록"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /semiconductor/?inventory=auto&year=2026&month=10&basis=published
+    - link "전체 기간":
+      - /url: /semiconductor/?inventory=auto&basis=published
+  - strong: 2026년 10월
+  - text: · 기사 발표일 기준
+  - link "← 이전":
+    - /url: /semiconductor/?inventory=auto&year=2026&month=9&basis=published
+  - link "다음 →":
+    - /url: /semiconductor/?inventory=auto&year=2026&month=11&basis=published
+  - article:
+    - text: 로컬 원문 메타데이터
+    - strong: 2개
+    - paragraph: 공식 페이지 제목·날짜·링크
+  - article:
+    - text: 표시된 출처 설정
+    - strong: 5개
+    - paragraph: 실제 수집 연결 상태와 다름
+  - article:
+    - text: 최근 저장된 수집 시각
+    - strong: 2026.10.09 00:32
+    - paragraph: 기사 발표일과 구분해 표시
+  - generic "마지막 수집 결과 · 2026.10.09 00:32"
+  - paragraph: 로컬 수집의 원문 제목·출처 메타데이터입니다. 첫 페이지 범위이며 월 전체 수집을 뜻하지 않습니다.
+  - heading "로컬 원문 메타데이터" [level=2]
+  - paragraph: 발표일과 수집일을 함께 확인하세요.
+  - link "모두 보기 ↗":
+    - /url: /semiconductor/news/
+  - article:
+    - generic: Semiconductor Industry Association
+    - generic: 저장된 메타데이터
+    - heading "Year-to-Date Global Semiconductor Sales Top $1 Trillion Through August ↗" [level=3]:
+      - link "Year-to-Date Global Semiconductor Sales Top $1 Trillion Through August ↗":
+        - /url: https://www.semiconductors.org/year-to-date-global-semiconductor-sales-top-1-trillion-through-august/
+    - paragraph: 발표 2026.10.05 · 수집 2026.10.09 00:32
+    - paragraph: 내부 분석 전용
+  - article:
+    - generic: 대한민국 산업통상부
+    - generic: 저장된 메타데이터
+    - heading "(설명자료)K-온디바이스 AI반도체 기술개발 사업은 정상 추진 중이며, 현재(9.30일 기준) 54%(1305억원 중 706억원) 실집행 중입니다 ↗" [level=3]:
+      - link "(설명자료)K-온디바이스 AI반도체 기술개발 사업은 정상 추진 중이며, 현재(9.30일 기준) 54%(1305억원 중 706억원) 실집행 중입니다 ↗":
+        - /url: https://www.motir.go.kr/kor/article/ATCLe0854704d/172261/view
+    - paragraph: 발표 2026.10.02 · 수집 2026.10.09 00:31
+    - paragraph: 출처 표시 필요
+  - complementary:
+    - generic: ✦ 소식을 읽는 기준
+    - heading "누가 발표했는지, 언제 바뀌었는지." [level=2]:
+      - text: 누가 발표했는지,
+      - text: 언제 바뀌었는지.
+    - paragraph: 기업의 발표와 확인된 사실을 구분해 읽으세요. 변경·철회 표시와 출처별 이용 조건도 함께 확인합니다.
+    - link "출처 디렉터리 ↗":
+      - /url: /semiconductor/sources/
+  - heading "다음 작업" [level=2]
+  - generic: ↗
+  - link "콘텐츠 초안 살펴보기 ↗":
+    - /url: /semiconductor/articles/
+    - strong: 콘텐츠 초안
+    - generic: 살펴보기 ↗
+  - paragraph: 반도체 주제의 현재 초안을 별도 화면에서 확인합니다.
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

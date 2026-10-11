@@ -1,0 +1,72 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "반도체 뉴스 메뉴":
+  - strong: 반도체 뉴스
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: SEMICONDUCTOR WORKSPACE
+  - heading "반도체 콘텐츠 초안" [level=1]
+  - paragraph: 기업과 기관의 발표를 출처와 함께 읽고, 콘텐츠 작업으로 이어가세요.
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도" [selected]
+      - option "2027년"
+      - option "2026년"
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월" [selected]
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월"
+      - option "11월"
+      - option "12월"
+    - text: 날짜 기준
+    - combobox "날짜 기준":
+      - option "초안 수정일" [selected]
+      - option "초안 수정일"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /semiconductor/articles/?year=2026&month=10&basis=published
+    - link "전체 기간":
+      - /url: /semiconductor/articles/?basis=published
+  - strong: 전체 기간
+  - text: · 초안 수정일 기준
+  - generic "마지막 수집 결과 · 2026.10.09 00:32"
+  - paragraph: 콘텐츠 초안 저장소를 불러올 수 없습니다.
+  - text: 초안 검색
+  - textbox "초안 검색":
+    - /placeholder: 제목·요약으로 검색
+  - button "검색"
+  - heading "반도체 주제의 초안" [level=2]
+  - generic: 현재 버전 기준
+  - generic: ▤
+  - heading "초안 데이터를 불러올 수 없어요" [level=3]
+  - paragraph: 수집된 소식과 출처를 먼저 살펴보세요.
+  - link "수집한 뉴스 보기":
+    - /url: /semiconductor/news/
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

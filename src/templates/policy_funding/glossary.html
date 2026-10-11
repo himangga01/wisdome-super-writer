@@ -1,0 +1,8 @@
+{% extends 'policy_funding/base.html' %}
+{% block title %}정책자금 쉬운 용어 사전{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="small-kicker">FUNDING DICTIONARY</p><h1>어려운 이름을, 쉬운 말로.</h1><p>공고에서 만나는 {{ guide.glossary|length }}개의 용어를 뜻과 예시로 살펴보세요.</p></div><span class="topic-badge">정책자금</span></div>
+<aside class="principle"><strong>확인서는 대출 승인이 아닙니다.</strong><span>용어의 뜻과 실제 자금별 조건은 구분해서 확인하세요.</span></aside>
+<section id="glossary"><div class="glossary">{% for term in guide.glossary %}<details id="{{ term.id }}"><summary>{{ term.term }}</summary><p>{{ term.plain }}</p><p class="example">{{ term.example }}</p><a href="{{ term.reference }}" target="_blank" rel="noopener noreferrer">관련 공식 안내 ↗</a></details>{% endfor %}</div></section>
+<a class="black-button" href="/policy-funding/guide/">대출 진행 순서도 알아보기 ↗</a>
+{% endblock %}

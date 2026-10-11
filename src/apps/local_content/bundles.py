@@ -81,7 +81,9 @@ _MAX_IMAGE_EDGE = 4096
 _MAX_IMAGE_PIXELS = 16_000_000
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 10_000
+_FILE_ATTRIBUTE_ARCHIVE = 0x20
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_FLAG_RANDOM_ACCESS = 0x10000000
 _ALLOWED_WSW_COMMENT = re.compile(
     r"<!-- WSW:(?:block|endblock|slot):[a-z0-9_-]+ -->"
 )
@@ -845,6 +847,31 @@ class ArticleBundleWriter:
             "run ancestor",
         )
         return run_root
+
+    def read_validated_run_file(
+        self,
+        run_date: date,
+        filename: str,
+        *,
+        run_directory: str | None = None,
+    ) -> bytes:
+        """Read declared run metadata with inventory and file-identity checks."""
+        if filename not in _RUN_METADATA_PATHS | {"index.md"}:
+            raise BundleValidationError("unsupported run metadata file")
+        run_root = self.validate_run(run_date, run_directory=run_directory)
+        manifest_path = run_root / "manifest.json"
+        manifest_identity = _path_fingerprint(
+            manifest_path, "run manifest", BundleValidationError
+        )
+        path = run_root / filename
+        identity = _path_fingerprint(path, "run metadata", BundleValidationError)
+        payload = _read_bound_file(
+            path, identity, max_bytes=_MAX_BUNDLE_FILE_BYTES, label="run metadata"
+        )
+        self.validate_run(run_date, run_directory=run_directory)
+        _require_unchanged_fingerprint(manifest_path, manifest_identity, BundleValidationError)
+        _require_unchanged_fingerprint(path, identity, BundleValidationError)
+        return payload
 
     def validated_run_article_metadata(
         self,
@@ -1898,7 +1925,8 @@ def _identity_fingerprint_metadata(metadata: os.stat_result) -> tuple[object, ..
         stat.S_IFMT(metadata.st_mode),
         metadata.st_dev,
         metadata.st_ino,
-        getattr(metadata, "st_file_attributes", 0),
+        # Archive state is mutable metadata, not the identity of the owned object.
+        getattr(metadata, "st_file_attributes", 0) & ~_FILE_ATTRIBUTE_ARCHIVE,
     )
 
 
@@ -1906,7 +1934,7 @@ def _identity_from_fingerprint(
     fingerprint: tuple[object, ...],
 ) -> tuple[object, ...]:
     file_type, device, inode, _size, _mtime, _ctime, attributes = fingerprint
-    return (file_type, device, inode, attributes)
+    return (file_type, device, inode, attributes & ~_FILE_ATTRIBUTE_ARCHIVE)
 
 
 def _path_fingerprint(
@@ -1917,12 +1945,72 @@ def _path_fingerprint(
     return _fingerprint_metadata(_lstat_no_links(path, label, error_type))
 
 
+def _windows_file_attributes(path: Path) -> int | None:
+    """Read native attributes without translating unknown bits into safe metadata."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    absolute = os.path.abspath(path)
+    if not absolute.startswith("\\\\?\\"):
+        absolute = (
+            "\\\\?\\UNC\\" + absolute[2:]
+            if absolute.startswith("\\\\")
+            else "\\\\?\\" + absolute
+        )
+    getter = ctypes.WinDLL("kernel32", use_last_error=True).GetFileAttributesW
+    getter.argtypes = [ctypes.c_wchar_p]
+    getter.restype = ctypes.c_ulong
+    attributes = getter(absolute)
+    if attributes == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return attributes
+
+
 def _path_identity_fingerprint(
     path: Path,
     label: str,
     error_type: type[BundleValidationError],
 ) -> tuple[object, ...]:
-    return _identity_from_fingerprint(_path_fingerprint(path, label, error_type))
+    fingerprint = _path_fingerprint(path, label, error_type)
+    attributes = fingerprint[-1]
+    if attributes & _FILE_FLAG_RANDOM_ACCESS:
+        # Windows lstat has returned this CreateFile hint transiently as an
+        # attribute. Reconcile only the demonstrated native disagreement,
+        # binding every other field to a second no-link snapshot.
+        try:
+            native_attributes = _windows_file_attributes(path)
+        except OSError as exc:
+            raise error_type(f"{label} native attributes cannot be inspected: {path}") from exc
+        if native_attributes is not None and native_attributes != attributes:
+            if native_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise error_type(f"{label} native attributes contain a reparse point: {path}")
+            rechecked = _path_fingerprint(path, label, error_type)
+            try:
+                confirmed_native_attributes = _windows_file_attributes(path)
+            except OSError as exc:
+                raise error_type(
+                    f"{label} native attributes cannot be inspected: {path}"
+                ) from exc
+            if (
+                confirmed_native_attributes is not None
+                and confirmed_native_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise error_type(f"{label} native attributes contain a reparse point: {path}")
+            if (
+                attributes ^ native_attributes != _FILE_FLAG_RANDOM_ACCESS
+                or rechecked[-1] ^ native_attributes not in (0, _FILE_FLAG_RANDOM_ACCESS)
+                or rechecked[:-1] != fingerprint[:-1]
+                or confirmed_native_attributes != native_attributes
+            ):
+                raise error_type(
+                    f"{label} native/lstat metadata disagree or changed: {path}; "
+                    f"initial={fingerprint!r}; native_attributes={native_attributes!r}; "
+                    f"confirmed_native_attributes={confirmed_native_attributes!r}; "
+                    f"rechecked={rechecked!r}"
+                )
+            fingerprint = (*rechecked[:-1], native_attributes)
+    return _identity_from_fingerprint(fingerprint)
 
 
 def _require_owned_identity(
@@ -1933,7 +2021,8 @@ def _require_owned_identity(
     observed = _path_identity_fingerprint(path, label, BundlePublishError)
     if observed != expected:
         raise BundlePublishError(
-            f"{label} owned identity, type, or reparse state was substituted: {path}"
+            f"{label} owned identity, type, or reparse state was substituted: {path}; "
+            f"expected={expected!r}; observed={observed!r}"
         )
 
 

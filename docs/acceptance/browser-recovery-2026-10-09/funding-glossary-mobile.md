@@ -1,0 +1,56 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: FUNDING DICTIONARY
+  - heading "어려운 이름을, 쉬운 말로." [level=1]
+  - paragraph: 공고에서 만나는 32개의 용어를 뜻과 예시로 살펴보세요.
+  - complementary:
+    - strong: 확인서는 대출 승인이 아닙니다.
+    - generic: 용어의 뜻과 실제 자금별 조건은 구분해서 확인하세요.
+  - generic "정책자금 대출"
+  - generic "지원금·보조금"
+  - generic "직접대출"
+  - generic "대리대출"
+  - generic "지원대상 확인서"
+  - generic "한도"
+  - generic "원금"
+  - generic "이자"
+  - generic "금리"
+  - generic "고정금리"
+  - generic "변동금리"
+  - generic "신용보증"
+  - generic "특례보증"
+  - generic "보증료"
+  - generic "이차보전"
+  - generic "거치기간"
+  - generic "만기"
+  - generic "만기일시상환"
+  - generic "원금균등분할상환"
+  - generic "원리금균등분할상환"
+  - generic "운전자금"
+  - generic "시설자금"
+  - generic "창업자금"
+  - generic "긴급경영안정자금"
+  - generic "대환대출"
+  - generic "보증잔액"
+  - generic "보증여력"
+  - generic "신용상태"
+  - generic "연체"
+  - generic "약정"
+  - generic "대출 실행"
+  - generic "예산 소진"
+  - link "대출 진행 순서도 알아보기 ↗":
+    - /url: /policy-funding/guide/
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

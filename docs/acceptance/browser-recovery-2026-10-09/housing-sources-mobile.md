@@ -1,0 +1,34 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "주택 청약 메뉴":
+  - strong: 주택 청약
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: HOUSING WORKSPACE
+  - heading "청약 정보, 공식 출처부터." [level=1]
+  - paragraph: 저장된 공고의 일정과 조건을 읽고, 자세한 내용은 원문에서 확인하세요.
+  - article:
+    - generic: ⌂
+    - heading "청약홈" [level=2]
+    - paragraph: 한국부동산원 청약홈의 주택 공고와 청약 일정을 확인합니다.
+    - generic: 공식 출처
+    - link "청약홈 방문 ↗":
+      - /url: https://www.applyhome.co.kr/
+  - article:
+    - generic: ⌂
+    - heading "LH 청약플러스" [level=2]
+    - paragraph: LH가 안내하는 공급 공고와 신청 관련 정보를 확인합니다.
+    - generic: 공식 출처
+    - link "LH 청약플러스 방문 ↗":
+      - /url: https://apply.lh.or.kr/
+  - paragraph: 출처 링크는 전체 공고의 수집 완료나 현재 접수 가능 여부를 뜻하지 않습니다.
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

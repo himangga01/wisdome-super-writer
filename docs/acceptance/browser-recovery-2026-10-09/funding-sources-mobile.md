@@ -1,0 +1,454 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: 출처부터 확인하세요
+  - heading "중앙정부·지역의 공식 창구" [level=1]
+  - paragraph: 공고를 가져오는 경로와 직접 찾아볼 기관을 구분합니다. 출처 목록에 있다는 이유만으로 모든 공고가 수집된 것은 아닙니다.
+  - complementary:
+    - strong: 17개 지역은 탐색을 위한 분류입니다.
+    - generic: 정부 페이지의 명칭·통합·이동과 개별 자금의 지원 자격은 다릅니다. 사업장 소재지와 원 공고의 대상을 확인하세요.
+  - article:
+    - generic: 자동 수집 연결
+    - heading "기업마당 금융 지원사업" [level=2]
+    - paragraph: 금융 분야 접수중·마감 목록을 각각 제한된 페이지까지 수집합니다. 원 공고와 등록일을 구분합니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.bizinfo.go.kr/sii/siia/selectSIIA200View.do
+    - link "기관 확인 근거":
+      - /url: https://www.bizinfo.go.kr/sii/siia/selectSIIA200View.do
+  - article:
+    - generic: 자동 수집 연결
+    - heading "소진공 대리대출" [level=2]
+    - paragraph: 소상공인정책자금 공개 조회와 본문을 수집합니다. 로그인·대출신청은 하지 않습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://ols.semas.or.kr/ols/man/SMAN051M/page.do
+    - link "기관 확인 근거":
+      - /url: https://ols.semas.or.kr/ols/man/SMAN051M/page.do
+  - article:
+    - generic: 자동 수집 연결
+    - heading "소진공 직접대출" [level=2]
+    - paragraph: 소상공인정책자금 공개 조회와 본문을 수집합니다. 로그인·대출신청은 하지 않습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://ols.semas.or.kr/ols/man/SMAN051M/page.do
+    - link "기관 확인 근거":
+      - /url: https://ols.semas.or.kr/ols/man/SMAN051M/page.do
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "중소벤처기업부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.mss.go.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.mss.go.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "소상공인시장진흥공단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.semas.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.semas.or.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "중소벤처기업진흥공단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.kosmes.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.kosmes.or.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "신용보증기금" [level=2]
+    - paragraph: 기관 안내 링크입니다. 공고 자동 수집은 robots 제한으로 연결하지 않았습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.kodit.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.kodit.or.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "기술보증기금" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.kibo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.kibo.or.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "신용보증재단중앙회" [level=2]
+    - paragraph: 재단 공식 목록·교육 출처입니다. 수집이 제한된 보증상품 검색 경로는 자동으로 조회하지 않습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.koreg.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "정부24 보조금24" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gov.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.gov.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "공공데이터포털" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.data.go.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.data.go.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "서울 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 이번 직접 연결 점검에서 인증서 확인 오류가 있었습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.seoulshinbo.co.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "부산 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.busansinbo.or.kr/portal/intro.do
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "대구 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 이번 직접 연결 점검에서 인증서 확인 오류가 있었습니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.ttg.co.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "인천 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.icsinbo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "광주 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gjsinbo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "대전 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.sinbo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "울산 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.ulsanshinbo.co.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "세종 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://sjsinbo.or.kr/main
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경기 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gcgf.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "강원 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gwsinbo.or.kr/main/intro.php
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "충북 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.cbsinbo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "충남 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.cnsinbo.co.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "전북 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.jbcredit.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "전남 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.jnsinbo.or.kr/jnsinbo/intro.do
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경북 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://gbsinbo.co.kr/main.tc
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경남 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gnsinbo.or.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "제주 신용보증재단" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://jcgf.or.kr/index2.php
+    - link "기관 확인 근거":
+      - /url: https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "서울 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://news.seoul.go.kr/economy/rearing-funds
+    - link "기관 확인 근거":
+      - /url: https://news.seoul.go.kr/economy/rearing-funds
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "부산 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.busan.go.kr/minsaeng100/sub0201
+    - link "기관 확인 근거":
+      - /url: https://www.busan.go.kr/minsaeng100/sub0201
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "대구 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://onestop119.daegu.go.kr/index.do?menu_id=00000121&menu_link=%2Fonestop%2FadvisInfoFrontView.do%3Fsector_id%3D181298&page_type=normal&sector_type=COMM_00011
+    - link "기관 확인 근거":
+      - /url: https://onestop119.daegu.go.kr/index.do?menu_id=00000121&menu_link=%2Fonestop%2FadvisInfoFrontView.do%3Fsector_id%3D181298&page_type=normal&sector_type=COMM_00011
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "인천 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://bizok.incheon.go.kr/open_content/support.do?cate=01
+    - link "기관 확인 근거":
+      - /url: https://bizok.incheon.go.kr/open_content/support.do?cate=01
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "광주 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 정부 페이지의 명칭·통합·이동과 지원 자격을 구분하고 원 공고의 대상 지역을 확인하세요.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gwangju.go.kr/main.do
+    - link "기관 확인 근거":
+      - /url: https://www.gwangju.go.kr/main.do
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "대전 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.daejeon.go.kr/drh/MediaList.do?notiType=NOTI_06&menuSeq=2564
+    - link "기관 확인 근거":
+      - /url: https://www.daejeon.go.kr/drh/MediaList.do?notiType=NOTI_06&menuSeq=2564
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "울산 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.ulsan.go.kr/u/rep/transfer/notice/47059.ulsan?gosiGbn=A&mId=001004002000000000
+    - link "기관 확인 근거":
+      - /url: https://www.ulsan.go.kr/u/rep/transfer/notice/47059.ulsan?gosiGbn=A&mId=001004002000000000
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "세종 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.sejong.go.kr/prog/publicNotice/kor/sub02_0303/C1/view.do?not_ancmt_mgt_no=67834&pageIndex=2
+    - link "기관 확인 근거":
+      - /url: https://www.sejong.go.kr/prog/publicNotice/kor/sub02_0303/C1/view.do?not_ancmt_mgt_no=67834&pageIndex=2
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경기 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gg.go.kr/bbs/board.do?bsIdx=469&menuId=1547
+    - link "기관 확인 근거":
+      - /url: https://www.gg.go.kr/bbs/board.do?bsIdx=469&menuId=1547
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "강원 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://state.gwd.go.kr/portal/bulletin/notification
+    - link "기관 확인 근거":
+      - /url: https://state.gwd.go.kr/portal/bulletin/notification
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "충북 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://ebizcb.chungbuk.go.kr/index.do
+    - link "기관 확인 근거":
+      - /url: https://ebizcb.chungbuk.go.kr/index.do
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "충남 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.chungnam.go.kr/cnportal/province/province/view.do?nttId=2170718&menuNo=500487
+    - link "기관 확인 근거":
+      - /url: https://www.chungnam.go.kr/cnportal/province/province/view.do?nttId=2170718&menuNo=500487
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "전북 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.jeonbuk.go.kr/board/list.jeonbuk?boardId=BBS_0000129&menuCd=DOM_000000102002005000&paging=ok
+    - link "기관 확인 근거":
+      - /url: https://www.jeonbuk.go.kr/board/list.jeonbuk?boardId=BBS_0000129&menuCd=DOM_000000102002005000&paging=ok
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "전남 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 정부 페이지의 명칭·통합·이동과 지원 자격을 구분하고 원 공고의 대상 지역을 확인하세요.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.jeonnam.go.kr/J0203/boardView.do?boardId=J0203&menuId=jeonnam0203000000&seq=23529
+    - link "기관 확인 근거":
+      - /url: https://www.jeonnam.go.kr/J0203/boardView.do?boardId=J0203&menuId=jeonnam0203000000&seq=23529
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경북 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gb.go.kr/page/link.do?mn=10109&pageNo=67
+    - link "기관 확인 근거":
+      - /url: https://www.gb.go.kr/page/link.do?mn=10109&pageNo=67
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "경남 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.gyeongnam.go.kr/giup/index.gyeong
+    - link "기관 확인 근거":
+      - /url: https://www.gyeongnam.go.kr/giup/index.gyeong
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "제주 지역정부" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.jeju.go.kr/news/news/law/jeju2.htm
+    - link "기관 확인 근거":
+      - /url: https://www.jeju.go.kr/news/news/law/jeju2.htm
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "포항시" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.pohang.go.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.pohang.go.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "양산시" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.yangsan.go.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.yangsan.go.kr/
+  - article:
+    - generic: 공식 출처 찾기
+    - heading "영천시" [level=2]
+    - paragraph: 공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.
+    - paragraph: 출처 확인일 2026-10-05
+    - link "공식 사이트":
+      - /url: https://www.yc.go.kr/
+    - link "기관 확인 근거":
+      - /url: https://www.yc.go.kr/
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

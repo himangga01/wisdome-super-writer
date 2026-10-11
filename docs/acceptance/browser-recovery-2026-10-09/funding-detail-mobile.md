@@ -1,0 +1,65 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - link "← 공고 목록":
+    - /url: /policy-funding/?mode=live&year=2026&month=10&basis=published&q=&region=&kind=
+  - paragraph: 소상공인시장진흥공단
+  - heading "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장·상환유예 안내" [level=1]
+  - paragraph: 기존 대출의 만기나 상환 일정을 조정하는 안내입니다. 신규 대출이나 빚 면제와는 다릅니다.
+  - paragraph: 소진공 등록일 2026년 10월 8일 · 수집 2026-10-08 22:49
+  - complementary:
+    - strong: 지원대상 확인서는 대출 승인이 아닙니다. 공고의 최대 한도도 내게 확정된 금액이 아닙니다.
+    - generic: 개인별 승인금액·실제 금리·보증여력은 이 화면에서 판단하지 않습니다. 자금별 원 공고와 보증기관·은행 심사로 확인하세요.
+  - heading "먼저 확인할 조건" [level=2]
+  - paragraph: 목록 접수 상태 미확인 · 수집 당시 기준
+  - term: 신청기간 원문
+  - definition: 2026년 10월 12일(화) 14:00 ~ 2026년 12월 31일(목) 18:00
+  - term: 지원 방식
+  - definition: 직접대출
+  - term: 개인별 금액·금리
+  - definition: 기관·은행 심사와 약정에서 확인
+  - paragraph: 수집 당시 공식 목록과 공고의 표시입니다. 예산 잔액이나 지금 신청 가능한지는 공식 접수 화면에서 다시 확인하세요.
+  - link "공식 공고 확인":
+    - /url: https://ols.semas.or.kr/ols/man/SMAN052M/page.do?bltwtrSeq=417&bbsTypeCd=01
+  - link "공식 신청 경로":
+    - /url: https://ols.semas.or.kr/ols/man/SMAN010M/page.do
+  - heading "미리 준비할 자료" [level=2]
+  - list:
+    - listitem: 사업자등록증과 사업장 주소
+    - listitem: 업종과 사업을 시작한 날짜
+    - listitem: 최근 매출과 증빙
+    - listitem: 현재 사업자대출과 매달 갚는 금액
+    - listitem: 기존 소진공·중진공 정책자금
+    - listitem: 지역재단·신보·기보 보증잔액
+    - listitem: 대표자 신용·연체 상태
+    - listitem: 직원 수
+    - listitem: 필요한 금액과 구체적인 사용 용도
+    - listitem: 은행·보증기관에 확인할 질문
+  - heading "같은 금액이어도 비교하세요" [level=2]
+  - list:
+    - listitem: 지원대상과 제외 업종
+    - listitem: 은행 대출금리와 변동 여부
+    - listitem: 이차보전 비율·기간·종료 후 금리
+    - listitem: 보증료와 지원 조건
+    - listitem: 거치기간·만기·상환 방식
+    - listitem: 중도상환 비용과 연장 조건
+    - listitem: 기존 대출·보증과 함께 이용 가능한지
+    - listitem: 선정·승인·실행 순서와 접수 마감 조건
+  - link "용어가 어렵다면 쉬운 뜻 보기 →":
+    - /url: /policy-funding/guide/
+  - heading "공고에서 확인한 내용" [level=2]
+  - paragraph: 아래는 공식 페이지에서 추출한 내용입니다. 복잡한 조건과 첨부문서는 원 공고를 함께 확인하세요.
+  - generic: "2026년 특별재난지역 호우피해 소상공인을 위한 소상공인정책자금(직접대출) 만기연장‧상환유예 안내자료를 게시하오니, 만기연장‧상환유예 신청 전 (붙임1)신청안내자료를 반드시 확인해주시기 바랍니다. ※ 법인기업의 경우 (붙임2) 기업(신용)정보 수집·이용·제공·조회 동의서를 필수로 작성하여 신청 시 제출 - 신청서식 작성 예시는 ＜2026년 소상공인정책자금(직접대출) 공통 신청서식 게시(수정)＞ 게시글 내 (별첨)을 참고해 주시기 바랍니다. □ 신청기간 : 2026년 10월 12일(화) 14:00 ~ 2026년 12월 31일(목) 18:00 □ 지원대상 소상공인 정책자금 대출보유(직접대출) 중이며 호우 피해를 입은 아래의 요건에 모두 해당하는 소상공인 ① ‘26년 특별재난지역 호우 피해*로 재해 중소기업(소상공인) 확인증을 발급 * 호우피해 특별재난지역 총 2곳(경남 거제시·통영시) ② 현재 소상공인정책자금 원금상환중이거나 ’26년 내 원금상환 도래(예정) 소상공인"
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

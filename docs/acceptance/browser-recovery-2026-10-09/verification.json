@@ -1,0 +1,36 @@
+{
+  "checks": 35,
+  "unique_states": 35,
+  "horizontal_overflow_failures": 0,
+  "utf8_files": 7,
+  "local_links": 126,
+  "fences": "balanced",
+  "usable_images": {
+    "portal-desktop.jpg": [
+      1613,
+      760
+    ],
+    "reference-desktop.jpg": [
+      1613,
+      760
+    ],
+    "portal-mobile-full.jpg": [
+      375,
+      2116
+    ],
+    "housing-october-mobile.jpg": [
+      375,
+      844
+    ],
+    "funding-october-mobile.jpg": [
+      375,
+      811
+    ],
+    "semiconductor-october-mobile-full.jpg": [
+      375,
+      2226
+    ]
+  },
+  "source_files": 447,
+  "source_aggregate_sha256": "2214241f51746f57cc6918dd67c54665f67e7634a0983450df1200fc63c9ff61"
+}

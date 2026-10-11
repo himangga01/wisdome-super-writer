@@ -29,9 +29,7 @@ from apps.local_content.bundles import (
 from apps.local_content.status import local_runtime_status
 
 _RUN_NAME = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})(?:--run-[0-9a-f]{12})?")
-_ARTICLE_NAME = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]{0,118}[a-z0-9])?(?:--rev-[0-9a-f]{12})?"
-)
+_ARTICLE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,118}[a-z0-9])?(?:--rev-[0-9a-f]{12})?")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _LOCAL_ARTICLE_LINK = re.compile(
     r"\./(?P<article>[a-z0-9](?:[a-z0-9-]{0,118}[a-z0-9])?"
@@ -57,9 +55,30 @@ _CSP = (
 
 def local_article_index(request: HttpRequest) -> HttpResponse:
     _require_local_request(request)
+    from wisdome_writer.portal.periods import period_context, selection_from_query
+
+    try:
+        period = selection_from_query(
+            request.GET, default_basis="collected", allowed_bases=("collected",)
+        )
+    except ValueError as exc:
+        from django.http import HttpResponseBadRequest
+
+        return HttpResponseBadRequest(str(exc))
     runs = _list_validated_runs()
+    runs = [run for run in runs if period.matches(run["date"])]
     return _page_response(
-        render(request, "local_articles/index.html", {"runs": runs}),
+        render(
+            request,
+            "local_articles/index.html",
+            {
+                "runs": runs,
+                "period_selection": period,
+                "period_ui": period_context(
+                    request, period, basis_labels={"collected": "실행 날짜"}
+                ),
+            },
+        ),
     )
 
 
@@ -266,7 +285,7 @@ def render_markdown_preview(
             while index < len(lines) and "|" in lines[index] and lines[index].strip():
                 rows.append(_table_cells(lines[index].strip()))
                 index += 1
-            output.append("<div class=\"table-scroll\"><table><thead><tr>")
+            output.append('<div class="table-scroll"><table><thead><tr>')
             for cell in headers:
                 rendered_cell = _render_inline(
                     cell, run_name, article_name, article_files, final_articles

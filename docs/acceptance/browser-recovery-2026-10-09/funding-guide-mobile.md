@@ -1,0 +1,177 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: 처음이라도 괜찮아요
+  - heading "돈의 이름보다, 어떻게 쓰고 갚는지부터." [level=1]:
+    - text: 돈의 이름보다,
+    - text: 어떻게 쓰고 갚는지부터.
+  - paragraph:
+    - text: 정책자금 대출, 보증, 지원금은 서로 다릅니다.
+    - text: 뜻과 순서를 알면 공고를 훨씬 쉽게 읽을 수 있어요.
+  - complementary:
+    - strong: 확인서 ≠ 대출 승인 · 최대 한도 ≠ 내 승인금액
+    - generic: 신청 → 지원대상 확인 → 심사 → 약정 → 실제 지급을 구분하세요.
+  - heading "대표님, 헷갈리는 부분부터 같이 볼까요?" [level=2]
+  - paragraph: 어려운 이름보다 내게 필요한 뜻과 다음 순서를 먼저 알아봐요. 아래 숫자는 이해를 돕는 가정 예시예요.
+  - generic "대표님, 확인서를 받으면 돈이 들어오나요?"
+  - generic "소상공인이면 확인서를 무조건 받나요?"
+  - generic "대리대출은 반드시 재단 보증서가 필요한가요?"
+  - generic "매출이 3천만원이면 3천만원을 번 건가요?"
+  - generic "매출이 늘었다면 내년 초에 신청하는 게 좋을까요?"
+  - generic "안내문에 연말까지 나온다는데 기다려도 되나요?"
+  - heading "세 가지 길을 구분해요" [level=2]
+  - article:
+    - heading "직접대출" [level=3]
+    - paragraph: 정책기관이 심사하고 직접 빌려줍니다. 원금과 이자를 약정에 따라 갚습니다.
+  - article:
+    - heading "대리대출" [level=3]
+    - paragraph: 정책 조건에 따라 은행에서 빌립니다. 보증이 필요하면 보증기관 심사도 거칩니다.
+  - article:
+    - heading "지원금·보조금" [level=3]
+    - paragraph: 정해진 사업·비용을 돕습니다. 일반 대출과 다르지만 용도와 정산 의무가 있고, 잘못 쓰면 돌려줄 수 있습니다.
+  - heading "대리대출 진행 순서" [level=2]
+  - list:
+    - strong: 내게 맞는 자금 찾기
+    - paragraph: 소재지·업종·사업 기간·필요한 용도를 공고와 비교합니다.
+    - strong: 지원대상 확인 신청
+    - paragraph: 소진공 정책자금 사이트에서 해당 자금의 신청 절차를 확인합니다.
+    - strong: 확인서 받기
+    - paragraph: 정책상 지원대상 확인입니다. 대출 승인이나 지급이 아닙니다.
+    - strong: 보증기관 심사 · 필요한 경우
+    - paragraph: 보증서가 필요한 경우 재단 등이 심사합니다. 신용·담보 방식은 경로가 다를 수 있습니다.
+    - strong: 은행 대출심사
+    - paragraph: 은행이 사업 상황과 상환 능력 등을 보고 금액과 조건을 결정합니다.
+    - strong: 약정 후 실제 지급
+    - paragraph: 필요한 계약과 절차를 마쳐야 대출금이 지급됩니다.
+    - strong: 용도 지키고 갚기
+    - paragraph: 허용된 용도로 쓰고 증빙과 상환 일정을 관리합니다.
+  - heading "직접대출 진행 순서" [level=2]
+  - list:
+    - strong: 직접대출 공고 확인
+    - paragraph: 기관과 자금별 대상·서류·접수 방식을 확인합니다.
+    - strong: 기관에 신청
+    - paragraph: 소진공·중진공 등 해당 기관의 공식 경로로 신청합니다.
+    - strong: 평가와 심사
+    - paragraph: 사업 내용과 상환 능력 등을 확인하며 현장 확인이 포함될 수 있습니다.
+    - strong: 약정·지급
+    - paragraph: 승인된 조건으로 계약하고 지급 절차를 진행합니다.
+    - strong: 사후관리·상환
+    - paragraph: 사용 용도와 보고 의무를 지키고 원금·이자를 갚습니다.
+  - heading "지원금 진행 순서" [level=2]
+  - list:
+    - strong: 지원사업 찾기
+    - paragraph: 지원받을 사업·비용과 내 사업의 대상 여부를 확인합니다.
+    - strong: 신청·선정
+    - paragraph: 계획과 증빙을 제출하고 선정 심사를 받습니다.
+    - strong: 협약·사업 진행
+    - paragraph: 허용된 기간과 용도, 자부담 조건을 지킵니다.
+    - strong: 증빙·정산
+    - paragraph: 영수증과 결과를 제출합니다. 부정 수급이나 조건 위반은 반환 대상이 될 수 있습니다.
+  - heading "숫자는 이렇게 읽어요" [level=2]
+  - article:
+    - generic: 실제 상품 조건 아님
+    - 'heading "가정 예시: 확인서와 실제 금액" [level=3]'
+    - paragraph: 확인서에 최대 금액이 적혀 있어도 그 금액이 승인된 것은 아닙니다. 실제 금액은 심사 뒤 줄거나 0원이 될 수 있습니다.
+  - article:
+    - generic: 실제 상품 조건 아님
+    - 'heading "가정 예시: 이자와 이차보전" [level=3]'
+    - paragraph: 은행 금리가 연 5%이고 3%포인트를 지원한다고 가정하면 지원 기간의 단순 차이는 2%입니다. 실제 조건·보증료·지원 한도는 별도로 확인합니다.
+  - article:
+    - generic: 실제 상품 조건 아님
+    - 'heading "가정 예시: 원금을 갚지 않는 기간" [level=3]'
+    - paragraph: 거치기간에 원금 납부를 미루더라도 이자는 낼 수 있습니다. 만기에 몰아서 갚을 원금을 미리 준비해야 합니다.
+  - heading "쉬운 용어 사전 · 32개" [level=2]
+  - generic "정책자금 대출"
+  - generic "지원금·보조금"
+  - generic "직접대출"
+  - generic "대리대출"
+  - generic "지원대상 확인서"
+  - generic "한도"
+  - generic "원금"
+  - generic "이자"
+  - generic "금리"
+  - generic "고정금리"
+  - generic "변동금리"
+  - generic "신용보증"
+  - generic "특례보증"
+  - generic "보증료"
+  - generic "이차보전"
+  - generic "거치기간"
+  - generic "만기"
+  - generic "만기일시상환"
+  - generic "원금균등분할상환"
+  - generic "원리금균등분할상환"
+  - generic "운전자금"
+  - generic "시설자금"
+  - generic "창업자금"
+  - generic "긴급경영안정자금"
+  - generic "대환대출"
+  - generic "보증잔액"
+  - generic "보증여력"
+  - generic "신용상태"
+  - generic "연체"
+  - generic "약정"
+  - generic "대출 실행"
+  - generic "예산 소진"
+  - article:
+    - heading "내 사업 준비표" [level=2]
+    - list:
+      - listitem: 사업자등록증과 사업장 주소
+      - listitem: 업종과 사업을 시작한 날짜
+      - listitem: 최근 매출과 증빙
+      - listitem: 현재 사업자대출과 매달 갚는 금액
+      - listitem: 기존 소진공·중진공 정책자금
+      - listitem: 지역재단·신보·기보 보증잔액
+      - listitem: 대표자 신용·연체 상태
+      - listitem: 직원 수
+      - listitem: 필요한 금액과 구체적인 사용 용도
+      - listitem: 은행·보증기관에 확인할 질문
+  - article:
+    - heading "중앙정부 + 지역 자금" [level=2]
+    - paragraph: 중앙정부 자금과 사업장 소재지의 특례보증·육성자금·이자·보증료 지원을 함께 살펴보세요. 지역이나 프로그램이 다르면 조건도 다릅니다.
+    - paragraph: 제조·성장·수출·기술·시설투자 기업은 중진공, 신보, 기보와 지자체 자금도 함께 확인합니다.
+    - link "기관과 지역별 출처 보기 →":
+      - /url: /policy-funding/sources/
+    - heading "안전하게 신청하기" [level=3]
+    - paragraph: 공식 사이트와 공고에 적힌 연락처로 확인하세요. 승인 보장, 선입금 요구, 인증서·비밀번호 전달 요구를 경계하세요. OLS는 본인 신청이 원칙이라고 안내합니다.
+  - heading "받아본 안내문, 이렇게 검증해요" [level=2]
+  - paragraph: 2026-10-05 조사 사례입니다. 날짜가 지난 뒤 최신 조건으로 사용하지 마세요. 첨부문서는 표의 적용 범위를 검토한 기록이며 자동 파서의 정확도 보장이 아닙니다.
+  - paragraph: 아래는 사용자가 제공한 2026년 10월 6일 안내자료의 항목별 조사 기록입니다. 승인 결과가 아닙니다.
+  - generic "2026년 4분기 대리대출 10월 6일 10시 접수"
+  - generic "확인서와 표시 한도는 대출 승인이 아님"
+  - generic "포항 300억원 추가·연간 1500억원"
+  - generic "일반 5천만원·청년/다자녀 1억원·2년간 3% 이자지원"
+  - generic "양산 일반자금 10월 6일 시작"
+  - generic "경영안정 7천만원·창업 5천만원·최대 4년 2.5% 지원"
+  - generic "양산 청년특별자금도 동일한 10월 6일 신규 접수로 해석"
+  - generic "청년 5천만원·최대 4년 3%·첫해 보증료 지원"
+  - generic "영천 10억원 추가·연간 약128억원"
+  - generic "일반3천만원·청년5천만원·최대5년·2년간3%지원"
+  - heading "공유받은 상담 안내, 사실과 의견을 구분해요" [level=2]
+  - paragraph: 같은 문단이 두 번 등장해 한 번만 검토했어요. 공식 공고로 확인한 사실, 조건이 필요한 설명, 상담자의 의견과 전망을 나눠 읽어보세요.
+  - paragraph: 검토일 2026-10-06 · 전달된 문구에는 연도가 없습니다. 아래 일정은 2026년 공식 공고와 대조했으며, 원문 작성연도를 확인한 것은 아닙니다. 현재 접수·예산 상태는 별도로 확인하세요.
+  - generic "확인서와 확인서의 금액은 대출 승인이 아니다"
+  - generic "소상공인이면 별도의 심사 없이 확인서가 나온다"
+  - generic "지역신용보증재단 보증서가 있어야만 대리대출을 받는다"
+  - generic "10월 6일 대리대출 접수"
+  - generic "10월 12일 혁신성장·신용취약 자금 접수"
+  - generic "10월 12일 중진공 직접대출 접수"
+  - generic "10월 26일 재도전·일시적경영애로 접수"
+  - generic "매출은 비용을 뺀 실제 남는 돈과 다르다"
+  - generic "연매출 3천만원이면 부채는 3천만원을 넘으면 안 된다"
+  - generic "매출이 올랐다면 내년 1월 말·2월 초에 신청하는 것이 좋다"
+  - generic "비인기 자금은 연말·12월까지 계속 나올 것이다"
+  - generic "직원 3명 이상·매출 기준의 30%면 졸업후보 검토 가능"
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

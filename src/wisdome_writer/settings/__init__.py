@@ -56,6 +56,9 @@ LOCAL_ARTICLE_ROOT = Path(
 LOCAL_OBJECT_ROOT = Path(
     env_value("LOCAL_OBJECT_ROOT", str(REPOSITORY_ROOT / ".local" / "objects"))
 ).resolve()
+POLICY_FUNDING_ROOT = Path(
+    env_value("POLICY_FUNDING_ROOT", str(REPOSITORY_ROOT / "output" / "policy-funding"))
+).absolute()
 HUMANIZER_BASE_URL = env_value("HUMANIZER_BASE_URL", "http://127.0.0.1:3210")
 SECRET_KEY = env_value(
     "DJANGO_SECRET_KEY",
@@ -276,6 +279,7 @@ INSTALLED_APPS = [
     "apps.publishing.apps.PublishingConfig",
     "apps.scheduling.apps.SchedulingConfig",
     "apps.local_content.apps.LocalContentConfig",
+    "apps.policy_funding.apps.PolicyFundingConfig",
 ]
 
 MIDDLEWARE = [
@@ -307,6 +311,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "wisdome_writer.portal.navigation.portal_navigation",
             ],
         },
     }
@@ -337,6 +342,9 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "/static/"
+SEMICONDUCTOR_ARCHIVE_ROOT = Path(
+    env_value("SEMICONDUCTOR_ARCHIVE_ROOT", str(REPOSITORY_ROOT / "output" / "semiconductor"))
+)
 STATIC_ROOT = REPOSITORY_ROOT / "staticfiles"
 STATICFILES_DIRS = [SRC_ROOT / "static"]
 STORAGES = {

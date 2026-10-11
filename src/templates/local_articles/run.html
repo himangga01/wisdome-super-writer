@@ -1,16 +1,8 @@
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ run_name }} · 로컬 주거 공고</title>
-  <link rel="stylesheet" href="/static/local_articles/preview.css">
-  <link rel="icon" href="/static/local_articles/generic-housing-hero.png" type="image/png">
-</head>
-<body>
-  <main>
-    <nav><a href="{% url 'local-article-index' %}">모든 실행 결과</a></nav>
-    <article>{{ article_html|safe }}</article>
-  </main>
-</body>
-</html>
+{% extends 'portal/base.html' %}
+{% block title %}{{ run_name }} · 주택 콘텐츠{% endblock %}
+{% block portal_css %}<link rel="stylesheet" href="/static/portal/app.css">{% endblock %}
+{% block extra_css %}<link rel="icon" href="/static/local_articles/generic-housing-hero.png" type="image/png">{% endblock %}
+{% block content %}
+<nav class="archive-breadcrumbs" aria-label="주택 콘텐츠 경로"><a href="/housing/">주택 청약</a><span aria-hidden="true">/</span><a href="{% url 'local-article-index' %}">모든 실행 결과</a></nav>
+<article class="archive-article">{{ article_html|safe }}</article>
+{% endblock %}

@@ -1,0 +1,973 @@
+{
+  "schema_version": 1,
+  "region_note": "17개 지역은 요청된 탐색 분류입니다. 현재 법정 행정구역 수나 통합 지역의 지원 자격을 뜻하지 않습니다.",
+  "sources": [
+    {
+      "source_id": "bizinfo_finance",
+      "name": "기업마당 금융 지원사업",
+      "authority": "government",
+      "authority_url": "https://www.bizinfo.go.kr/sii/siia/selectSIIA200View.do",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.bizinfo.go.kr/sii/siia/selectSIIA200View.do",
+      "allowed_hosts": [
+        "www.bizinfo.go.kr"
+      ],
+      "allowed_paths": [
+        "/sii/siia/"
+      ],
+      "adapter": "bizinfo",
+      "enabled": true,
+      "access_note": "금융 분야 접수중·마감 목록을 각각 제한된 페이지까지 수집합니다. 원 공고와 등록일을 구분합니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "semas_agency",
+      "name": "소진공 대리대출",
+      "authority": "government",
+      "authority_url": "https://ols.semas.or.kr/ols/man/SMAN051M/page.do",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://ols.semas.or.kr/ols/man/SMAN051M/page.do",
+      "allowed_hosts": [
+        "ols.semas.or.kr"
+      ],
+      "allowed_paths": [
+        "/ols/man/"
+      ],
+      "adapter": "ols",
+      "enabled": true,
+      "access_note": "소상공인정책자금 공개 조회와 본문을 수집합니다. 로그인·대출신청은 하지 않습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "semas_direct",
+      "name": "소진공 직접대출",
+      "authority": "government",
+      "authority_url": "https://ols.semas.or.kr/ols/man/SMAN051M/page.do",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://ols.semas.or.kr/ols/man/SMAN051M/page.do",
+      "allowed_hosts": [
+        "ols.semas.or.kr"
+      ],
+      "allowed_paths": [
+        "/ols/man/"
+      ],
+      "adapter": "ols",
+      "enabled": true,
+      "access_note": "소상공인정책자금 공개 조회와 본문을 수집합니다. 로그인·대출신청은 하지 않습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "mss",
+      "name": "중소벤처기업부",
+      "authority": "government",
+      "authority_url": "https://www.mss.go.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.mss.go.kr/",
+      "allowed_hosts": [
+        "www.mss.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "semas",
+      "name": "소상공인시장진흥공단",
+      "authority": "government",
+      "authority_url": "https://www.semas.or.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.semas.or.kr/",
+      "allowed_hosts": [
+        "www.semas.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "kosmes",
+      "name": "중소벤처기업진흥공단",
+      "authority": "government",
+      "authority_url": "https://www.kosmes.or.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.kosmes.or.kr/",
+      "allowed_hosts": [
+        "www.kosmes.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "kodit",
+      "name": "신용보증기금",
+      "authority": "government",
+      "authority_url": "https://www.kodit.or.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.kodit.or.kr/",
+      "allowed_hosts": [
+        "www.kodit.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "기관 안내 링크입니다. 공고 자동 수집은 robots 제한으로 연결하지 않았습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "kibo",
+      "name": "기술보증기금",
+      "authority": "government",
+      "authority_url": "https://www.kibo.or.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.kibo.or.kr/",
+      "allowed_hosts": [
+        "www.kibo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "koreg",
+      "name": "신용보증재단중앙회",
+      "authority": "government",
+      "authority_url": "https://www.koreg.or.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.koreg.or.kr/",
+      "allowed_hosts": [
+        "www.koreg.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "재단 공식 목록·교육 출처입니다. 수집이 제한된 보증상품 검색 경로는 자동으로 조회하지 않습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "gov24",
+      "name": "정부24 보조금24",
+      "authority": "government",
+      "authority_url": "https://www.gov.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.gov.kr/",
+      "allowed_hosts": [
+        "www.gov.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "data_go_kr",
+      "name": "공공데이터포털",
+      "authority": "government",
+      "authority_url": "https://www.data.go.kr/",
+      "regions": [
+        "national"
+      ],
+      "entry_url": "https://www.data.go.kr/",
+      "allowed_hosts": [
+        "www.data.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_seoul",
+      "name": "서울 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "seoul"
+      ],
+      "entry_url": "https://www.seoulshinbo.co.kr/",
+      "allowed_hosts": [
+        "www.seoulshinbo.co.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 이번 직접 연결 점검에서 인증서 확인 오류가 있었습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_busan",
+      "name": "부산 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "busan"
+      ],
+      "entry_url": "https://www.busansinbo.or.kr/portal/intro.do",
+      "allowed_hosts": [
+        "www.busansinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_daegu",
+      "name": "대구 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "daegu"
+      ],
+      "entry_url": "https://www.ttg.co.kr/",
+      "allowed_hosts": [
+        "www.ttg.co.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 이번 직접 연결 점검에서 인증서 확인 오류가 있었습니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_incheon",
+      "name": "인천 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "incheon"
+      ],
+      "entry_url": "https://www.icsinbo.or.kr/",
+      "allowed_hosts": [
+        "www.icsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_gwangju",
+      "name": "광주 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "gwangju"
+      ],
+      "entry_url": "https://www.gjsinbo.or.kr/",
+      "allowed_hosts": [
+        "www.gjsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_daejeon",
+      "name": "대전 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "daejeon"
+      ],
+      "entry_url": "https://www.sinbo.or.kr/",
+      "allowed_hosts": [
+        "www.sinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_ulsan",
+      "name": "울산 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "ulsan"
+      ],
+      "entry_url": "https://www.ulsanshinbo.co.kr/",
+      "allowed_hosts": [
+        "www.ulsanshinbo.co.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_sejong",
+      "name": "세종 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "sejong"
+      ],
+      "entry_url": "https://sjsinbo.or.kr/main",
+      "allowed_hosts": [
+        "sjsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_gyeonggi",
+      "name": "경기 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "gyeonggi"
+      ],
+      "entry_url": "https://www.gcgf.or.kr/",
+      "allowed_hosts": [
+        "www.gcgf.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_gangwon",
+      "name": "강원 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "gangwon"
+      ],
+      "entry_url": "https://www.gwsinbo.or.kr/main/intro.php",
+      "allowed_hosts": [
+        "www.gwsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_chungbuk",
+      "name": "충북 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "chungbuk"
+      ],
+      "entry_url": "https://www.cbsinbo.or.kr/",
+      "allowed_hosts": [
+        "www.cbsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_chungnam",
+      "name": "충남 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "chungnam"
+      ],
+      "entry_url": "https://www.cnsinbo.co.kr/",
+      "allowed_hosts": [
+        "www.cnsinbo.co.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_jeonbuk",
+      "name": "전북 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "jeonbuk"
+      ],
+      "entry_url": "https://www.jbcredit.or.kr/",
+      "allowed_hosts": [
+        "www.jbcredit.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_jeonnam",
+      "name": "전남 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "jeonnam"
+      ],
+      "entry_url": "https://www.jnsinbo.or.kr/jnsinbo/intro.do",
+      "allowed_hosts": [
+        "www.jnsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_gyeongbuk",
+      "name": "경북 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "gyeongbuk"
+      ],
+      "entry_url": "https://gbsinbo.co.kr/main.tc",
+      "allowed_hosts": [
+        "gbsinbo.co.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_gyeongnam",
+      "name": "경남 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "gyeongnam"
+      ],
+      "entry_url": "https://www.gnsinbo.or.kr/",
+      "allowed_hosts": [
+        "www.gnsinbo.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "foundation_jeju",
+      "name": "제주 신용보증재단",
+      "authority": "foundation",
+      "authority_url": "https://www.koreg.or.kr/haedream/cm/cntnts/cntntsView.do?cntntsId=1077&mi=1136",
+      "regions": [
+        "jeju"
+      ],
+      "entry_url": "https://jcgf.or.kr/index2.php",
+      "allowed_hosts": [
+        "jcgf.or.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_seoul",
+      "name": "서울 지역정부",
+      "authority": "government",
+      "authority_url": "https://news.seoul.go.kr/economy/rearing-funds",
+      "regions": [
+        "seoul"
+      ],
+      "entry_url": "https://news.seoul.go.kr/economy/rearing-funds",
+      "allowed_hosts": [
+        "news.seoul.go.kr",
+        "www.seoul.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_busan",
+      "name": "부산 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.busan.go.kr/minsaeng100/sub0201",
+      "regions": [
+        "busan"
+      ],
+      "entry_url": "https://www.busan.go.kr/minsaeng100/sub0201",
+      "allowed_hosts": [
+        "www.busan.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_daegu",
+      "name": "대구 지역정부",
+      "authority": "government",
+      "authority_url": "https://onestop119.daegu.go.kr/index.do?menu_id=00000121&menu_link=%2Fonestop%2FadvisInfoFrontView.do%3Fsector_id%3D181298&page_type=normal&sector_type=COMM_00011",
+      "regions": [
+        "daegu"
+      ],
+      "entry_url": "https://onestop119.daegu.go.kr/index.do?menu_id=00000121&menu_link=%2Fonestop%2FadvisInfoFrontView.do%3Fsector_id%3D181298&page_type=normal&sector_type=COMM_00011",
+      "allowed_hosts": [
+        "onestop119.daegu.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_incheon",
+      "name": "인천 지역정부",
+      "authority": "government",
+      "authority_url": "https://bizok.incheon.go.kr/open_content/support.do?cate=01",
+      "regions": [
+        "incheon"
+      ],
+      "entry_url": "https://bizok.incheon.go.kr/open_content/support.do?cate=01",
+      "allowed_hosts": [
+        "bizok.incheon.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_gwangju",
+      "name": "광주 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.gwangju.go.kr/main.do",
+      "regions": [
+        "gwangju"
+      ],
+      "entry_url": "https://www.gwangju.go.kr/main.do",
+      "allowed_hosts": [
+        "www.gwangju.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 정부 페이지의 명칭·통합·이동과 지원 자격을 구분하고 원 공고의 대상 지역을 확인하세요.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_daejeon",
+      "name": "대전 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.daejeon.go.kr/drh/MediaList.do?notiType=NOTI_06&menuSeq=2564",
+      "regions": [
+        "daejeon"
+      ],
+      "entry_url": "https://www.daejeon.go.kr/drh/MediaList.do?notiType=NOTI_06&menuSeq=2564",
+      "allowed_hosts": [
+        "www.daejeon.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_ulsan",
+      "name": "울산 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.ulsan.go.kr/u/rep/transfer/notice/47059.ulsan?gosiGbn=A&mId=001004002000000000",
+      "regions": [
+        "ulsan"
+      ],
+      "entry_url": "https://www.ulsan.go.kr/u/rep/transfer/notice/47059.ulsan?gosiGbn=A&mId=001004002000000000",
+      "allowed_hosts": [
+        "www.ulsan.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_sejong",
+      "name": "세종 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.sejong.go.kr/prog/publicNotice/kor/sub02_0303/C1/view.do?not_ancmt_mgt_no=67834&pageIndex=2",
+      "regions": [
+        "sejong"
+      ],
+      "entry_url": "https://www.sejong.go.kr/prog/publicNotice/kor/sub02_0303/C1/view.do?not_ancmt_mgt_no=67834&pageIndex=2",
+      "allowed_hosts": [
+        "www.bizinfo.go.kr",
+        "www.sejong.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_gyeonggi",
+      "name": "경기 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.gg.go.kr/bbs/board.do?bsIdx=469&menuId=1547",
+      "regions": [
+        "gyeonggi"
+      ],
+      "entry_url": "https://www.gg.go.kr/bbs/board.do?bsIdx=469&menuId=1547",
+      "allowed_hosts": [
+        "g-money.gg.go.kr",
+        "gnews.gg.go.kr",
+        "www.gg.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_gangwon",
+      "name": "강원 지역정부",
+      "authority": "government",
+      "authority_url": "https://state.gwd.go.kr/portal/bulletin/notification",
+      "regions": [
+        "gangwon"
+      ],
+      "entry_url": "https://state.gwd.go.kr/portal/bulletin/notification",
+      "allowed_hosts": [
+        "state.gwd.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_chungbuk",
+      "name": "충북 지역정부",
+      "authority": "government",
+      "authority_url": "https://ebizcb.chungbuk.go.kr/index.do",
+      "regions": [
+        "chungbuk"
+      ],
+      "entry_url": "https://ebizcb.chungbuk.go.kr/index.do",
+      "allowed_hosts": [
+        "ebizcb.chungbuk.go.kr",
+        "www.chungbuk.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_chungnam",
+      "name": "충남 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.chungnam.go.kr/cnportal/province/province/view.do?nttId=2170718&menuNo=500487",
+      "regions": [
+        "chungnam"
+      ],
+      "entry_url": "https://www.chungnam.go.kr/cnportal/province/province/view.do?nttId=2170718&menuNo=500487",
+      "allowed_hosts": [
+        "www.bizinfo.go.kr",
+        "www.chungnam.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_jeonbuk",
+      "name": "전북 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.jeonbuk.go.kr/board/list.jeonbuk?boardId=BBS_0000129&menuCd=DOM_000000102002005000&paging=ok",
+      "regions": [
+        "jeonbuk"
+      ],
+      "entry_url": "https://www.jeonbuk.go.kr/board/list.jeonbuk?boardId=BBS_0000129&menuCd=DOM_000000102002005000&paging=ok",
+      "allowed_hosts": [
+        "www.jeonbuk.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_jeonnam",
+      "name": "전남 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.jeonnam.go.kr/J0203/boardView.do?boardId=J0203&menuId=jeonnam0203000000&seq=23529",
+      "regions": [
+        "jeonnam"
+      ],
+      "entry_url": "https://www.jeonnam.go.kr/J0203/boardView.do?boardId=J0203&menuId=jeonnam0203000000&seq=23529",
+      "allowed_hosts": [
+        "www.jeonnam.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다. 정부 페이지의 명칭·통합·이동과 지원 자격을 구분하고 원 공고의 대상 지역을 확인하세요.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_gyeongbuk",
+      "name": "경북 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.gb.go.kr/page/link.do?mn=10109&pageNo=67",
+      "regions": [
+        "gyeongbuk"
+      ],
+      "entry_url": "https://www.gb.go.kr/page/link.do?mn=10109&pageNo=67",
+      "allowed_hosts": [
+        "gb.go.kr",
+        "www.gb.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_gyeongnam",
+      "name": "경남 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.gyeongnam.go.kr/giup/index.gyeong",
+      "regions": [
+        "gyeongnam"
+      ],
+      "entry_url": "https://www.gyeongnam.go.kr/giup/index.gyeong",
+      "allowed_hosts": [
+        "www.gyeongnam.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "government_jeju",
+      "name": "제주 지역정부",
+      "authority": "government",
+      "authority_url": "https://www.jeju.go.kr/news/news/law/jeju2.htm",
+      "regions": [
+        "jeju"
+      ],
+      "entry_url": "https://www.jeju.go.kr/news/news/law/jeju2.htm",
+      "allowed_hosts": [
+        "www.jeju.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "pohang",
+      "name": "포항시",
+      "authority": "government",
+      "authority_url": "https://www.pohang.go.kr/",
+      "regions": [
+        "gyeongbuk"
+      ],
+      "entry_url": "https://www.pohang.go.kr/",
+      "allowed_hosts": [
+        "www.pohang.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "yangsan",
+      "name": "양산시",
+      "authority": "government",
+      "authority_url": "https://www.yangsan.go.kr/",
+      "regions": [
+        "gyeongnam"
+      ],
+      "entry_url": "https://www.yangsan.go.kr/",
+      "allowed_hosts": [
+        "www.yangsan.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    },
+    {
+      "source_id": "yeongcheon",
+      "name": "영천시",
+      "authority": "government",
+      "authority_url": "https://www.yc.go.kr/",
+      "regions": [
+        "gyeongbuk"
+      ],
+      "entry_url": "https://www.yc.go.kr/",
+      "allowed_hosts": [
+        "www.yc.go.kr"
+      ],
+      "allowed_paths": [
+        "/"
+      ],
+      "adapter": null,
+      "enabled": false,
+      "access_note": "공식 출처 탐색용입니다. 이 기관의 모든 공고를 자동 수집했다는 뜻은 아닙니다.",
+      "verified_on": "2026-10-05"
+    }
+  ]
+}

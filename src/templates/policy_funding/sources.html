@@ -1,0 +1,21 @@
+{% extends 'policy_funding/base.html' %}
+{% block title %}공식 출처 찾기{% endblock %}
+{% block content %}<section class="article-heading">
+<p class="eyebrow">출처부터 확인하세요</p>
+<h1>중앙정부·지역의 공식 창구</h1>
+<p>공고를 가져오는 경로와 직접 찾아볼 기관을 구분합니다. 출처 목록에 있다는 이유만으로 모든 공고가 수집된 것은 아닙니다.</p>
+</section>
+<aside class="principle">
+<strong>17개 지역은 탐색을 위한 분류입니다.</strong>
+<span>정부 페이지의 명칭·통합·이동과 개별 자금의 지원 자격은 다릅니다. 사업장 소재지와 원 공고의 대상을 확인하세요.</span>
+</aside>
+<div class="cards">{% for source in sources %}<article class="card">
+<span class="tag">{% if source.enabled %}자동 수집 연결{% else %}공식 출처 찾기{% endif %}</span>
+<h2>{{ source.name }}</h2>
+<p>{{ source.access_note }}</p>
+<p class="muted">출처 확인일 {{ source.verified_on }}</p>
+<div class="actions">
+<a href="{{ source.entry_url }}" target="_blank" rel="noopener noreferrer">공식 사이트</a>
+<a href="{{ source.authority_url }}" target="_blank" rel="noopener noreferrer">기관 확인 근거</a>
+</div>
+</article>{% endfor %}</div>{% endblock %}

@@ -1,0 +1,8 @@
+<nav class="workspace-topics" aria-label="{{ nav_variant }} 주제 선택">
+<p class="nav-caption">작업 공간</p>
+{% for topic in portal.topics %}{% if topic.available %}<a class="workspace-topic{% if topic.active %} current{% endif %}" href="{{ topic.href }}"{% if topic.active %} aria-current="true"{% endif %}><span class="topic-number">{{ topic.number }}</span><span>{{ topic.name }}<small>{{ topic.caption }}</small></span><span class="topic-chevron" aria-hidden="true">›</span></a>{% else %}<span class="workspace-topic unavailable"><span class="topic-number">{{ topic.number }}</span><span>{{ topic.name }}<small>로컬 환경에서 이용</small></span></span>{% endif %}{% endfor %}
+</nav>
+<nav class="workspace-menu" aria-label="{{ nav_variant }} {{ portal.topic_title }} 메뉴">
+<p class="nav-caption">{{ portal.topic_title }}</p>
+{% for item in portal.menu %}<a href="{{ item.href }}" class="menu-item{% if item.active %} current{% endif %}"{% if item.active %} aria-current="page"{% endif %}><span class="nav-dot icon-{{ item.key }}" aria-hidden="true"></span>{{ item.label }}{% if item.active %}<span class="active-dot" aria-hidden="true"></span>{% endif %}</a>{% endfor %}
+</nav>

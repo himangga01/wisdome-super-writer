@@ -1,0 +1,1097 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "주택 청약 메뉴":
+  - strong: 주택 청약
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: HOUSING WORKSPACE
+  - heading "내가 살펴볼 청약 공고" [level=1]
+  - paragraph: 저장된 공고의 일정과 조건을 읽고, 자세한 내용은 원문에서 확인하세요.
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월" [selected]
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월"
+      - option "11월"
+      - option "12월"
+    - text: 청약 단계
+    - combobox "청약 단계":
+      - option "특공·1순위 전체" [selected]
+      - option "특별공급"
+      - option "1순위"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /housing/notices/?stage=all&year=2026&month=10&basis=schedule
+    - link "전체 기간":
+      - /url: /housing/notices/?stage=all&basis=schedule
+  - strong: 2026년 전체
+  - text: · 특별공급·1순위 접수 일정 기준
+  - link "← 이전":
+    - /url: /housing/notices/?stage=all&year=2025&basis=schedule
+  - link "다음 →":
+    - /url: /housing/notices/?stage=all&year=2027&basis=schedule
+  - paragraph: 해당 청약 단계가 없거나 일정을 확인할 수 없는 124개 공고는 월별 결과에서 제외했습니다.
+  - article:
+    - text: 조건에 맞는 청약 공고
+    - strong: 51개
+    - paragraph: 검증된 저장 자료 기준
+  - article:
+    - text: 확인 가능한 수집 기록
+    - strong: 2개
+    - paragraph: 표시 범위 내 검증된 기록
+  - article:
+    - text: 자료 기준 시점
+    - strong: 2026.10.08 22:40
+    - paragraph: 저장된 수집 기간의 기준 시각
+  - paragraph: "검증된 저장 이력의 특별공급·1순위 청약일 기준입니다. 청약일이 확인되지 않은 공고는 월별 결과에 포함하지 않습니다. 이전 게시 공고의 수집 범위 밖 일정은 누락될 수 있습니다. 선택한 청약 단계의 날짜 미확인 공고: 124개. 이 실행은 일부 수집 결과가 누락되었을 수 있습니다."
+  - text: 공고 검색
+  - textbox "공고 검색":
+    - /placeholder: 공고명·기관·지역으로 검색
+  - button "검색"
+  - heading "청약 공고 목록" [level=2]
+  - paragraph: 확인된 특별공급·1순위 일정 · 최대 100개 공고
+  - article:
+    - generic: 대전
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "대전 경남아너스빌 센텀스카이" [level=3]:
+      - link "대전 경남아너스빌 센텀스카이":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000202&pblancNo=2026000202
+        - text: 대전 경남아너스빌 센텀스카이 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-08
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-08
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-09
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-09
+    - generic: 2026-09-03
+  - article:
+    - generic: 울산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "그랑라크 에일린의 뜰" [level=3]:
+      - link "그랑라크 에일린의 뜰":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000403&pblancNo=2026000403
+        - text: 그랑라크 에일린의 뜰 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-02
+  - article:
+    - generic: 울산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "남울산 노르웨이숲(조합원 취소분)(2회차)" [level=3]:
+      - link "남울산 노르웨이숲(조합원 취소분)(2회차)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000420&pblancNo=2026000420
+        - text: 남울산 노르웨이숲(조합원 취소분)(2회차) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-04
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 여주역더퍼스트" [level=3]:
+      - link "더샵 여주역더퍼스트":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000394&pblancNo=2026000394
+        - text: 더샵 여주역더퍼스트 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-03
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "두정역 푸르지오 그랑피크" [level=3]:
+      - link "두정역 푸르지오 그랑피크":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000423&pblancNo=2026000423
+        - text: 두정역 푸르지오 그랑피크 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-04
+  - article:
+    - generic: 광주
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "올 뉴 챔피언스시티 1차" [level=3]:
+      - link "올 뉴 챔피언스시티 1차":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000419&pblancNo=2026000419
+        - text: 올 뉴 챔피언스시티 1차 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-02
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "천안 아이파크 시티 3단지" [level=3]:
+      - link "천안 아이파크 시티 3단지":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000422&pblancNo=2026000422
+        - text: 천안 아이파크 시티 3단지 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-04
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "천안 아이파크 시티 4단지" [level=3]:
+      - link "천안 아이파크 시티 4단지":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000426&pblancNo=2026000426
+        - text: 천안 아이파크 시티 4단지 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-14
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-15
+    - generic: 2026-09-04
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "시흥 은계 에피트(조합원 취소분)" [level=3]:
+      - link "시흥 은계 에피트(조합원 취소분)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000393&pblancNo=2026000393
+        - text: 시흥 은계 에피트(조합원 취소분) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-15
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-16
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-16
+    - generic: 2026-09-04
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 분당하이스트" [level=3]:
+      - link "더샵 분당하이스트":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000103&pblancNo=2026000103
+        - text: 더샵 분당하이스트 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-23
+    - generic: 2026-09-11
+  - article:
+    - generic: 울산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "문수로 비스타 더파크" [level=3]:
+      - link "문수로 비스타 더파크":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000441&pblancNo=2026000441
+        - text: 문수로 비스타 더파크 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-11
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "오남역 서희스타힐스 여의재 3단지 (조합원 취소분)" [level=3]:
+      - link "오남역 서희스타힐스 여의재 3단지 (조합원 취소분)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000431&pblancNo=2026000431
+        - text: 오남역 서희스타힐스 여의재 3단지 (조합원 취소분) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-09
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "중동역 다채로움 더원" [level=3]:
+      - link "중동역 다채로움 더원":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000314&pblancNo=2026000314
+        - text: 중동역 다채로움 더원 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-10
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "화서역 호수공원 아너스빌" [level=3]:
+      - link "화서역 호수공원 아너스빌":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000449&pblancNo=2026000449
+        - text: 화서역 호수공원 아너스빌 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-11
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "힐스테이트 고덕엘리스트 A12BL 공공분양주택" [level=3]:
+      - link "힐스테이트 고덕엘리스트 A12BL 공공분양주택":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000437&pblancNo=2026000437
+        - text: 힐스테이트 고덕엘리스트 A12BL 공공분양주택 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타경기
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타경기
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-11
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "힐스테이트 고덕엘리스트 A65BL 공공분양주택" [level=3]:
+      - link "힐스테이트 고덕엘리스트 A65BL 공공분양주택":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000438&pblancNo=2026000438
+        - text: 힐스테이트 고덕엘리스트 A65BL 공공분양주택 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타경기
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-21
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타경기
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-22
+    - generic: 2026-09-11
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "철산자이 브리에르" [level=3]:
+      - link "철산자이 브리에르":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930031&pblancNo=2026930031
+        - text: 철산자이 브리에르 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-09-22
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-09-23
+    - generic: 2026-09-17
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "과천 푸르지오 라비엔오" [level=3]:
+      - link "과천 푸르지오 라비엔오":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930036&pblancNo=2026930036
+        - text: 과천 푸르지오 라비엔오 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위
+      - generic: "-"
+    - generic: 2026-09-23
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "과천 푸르지오 벨라르테" [level=3]:
+      - link "과천 푸르지오 벨라르테":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930037&pblancNo=2026930037
+        - text: 과천 푸르지오 벨라르테 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: "-"
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-09-28
+    - generic: 2026-09-23
+  - article:
+    - generic: 울산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 시에르네(조합원취소분)(2회차)" [level=3]:
+      - link "더샵 시에르네(조합원취소분)(2회차)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000436&pblancNo=2026000436
+        - text: 더샵 시에르네(조합원취소분)(2회차) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 충북
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 청주그리니티" [level=3]:
+      - link "더샵 청주그리니티":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930035&pblancNo=2026930035
+        - text: 더샵 청주그리니티 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위
+      - generic: "-"
+    - generic: 2026-09-21
+  - article:
+    - generic: 전북
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "삼천 하늘채 라비엘" [level=3]:
+      - link "삼천 하늘채 라비엘":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000445&pblancNo=2026000445
+        - text: 삼천 하늘채 라비엘 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 인천
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "숭의역 노르웨이숲 더 스카이" [level=3]:
+      - link "숭의역 노르웨이숲 더 스카이":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000448&pblancNo=2026000448
+        - text: 숭의역 노르웨이숲 더 스카이 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 부산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "쌍용 더 플래티넘 센텀" [level=3]:
+      - link "쌍용 더 플래티넘 센텀":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000424&pblancNo=2026000424
+        - text: 쌍용 더 플래티넘 센텀 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 부산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "에코델타시티 금강펜테리움 에코리버" [level=3]:
+      - link "에코델타시티 금강펜테리움 에코리버":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000443&pblancNo=2026000443
+        - text: 에코델타시티 금강펜테리움 에코리버 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 경남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "진주 판문지구 레이크써밋 웰가" [level=3]:
+      - link "진주 판문지구 레이크써밋 웰가":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000446&pblancNo=2026000446
+        - text: 진주 판문지구 레이크써밋 웰가 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-29
+    - generic: 2026-09-18
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "천안 용곡 두산위브(조합원 취소분)" [level=3]:
+      - link "천안 용곡 두산위브(조합원 취소분)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000454&pblancNo=2026000454
+        - text: 천안 용곡 두산위브(조합원 취소분) ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-28
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-09-28
+    - generic: 2026-09-17
+  - article:
+    - generic: 울산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "태화강 에피트" [level=3]:
+      - link "태화강 에피트":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930032&pblancNo=2026930032
+        - text: 태화강 에피트 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: "-"
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-09-28
+    - generic: 2026-09-15
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "광명 시티프라디움 에듀하임" [level=3]:
+      - link "광명 시티프라디움 에듀하임":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000453&pblancNo=2026000453
+        - text: 광명 시티프라디움 에듀하임 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-09-29
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-30
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-01
+    - generic: 2026-09-18
+  - article:
+    - generic: 서울
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "강변역 센트럴 아이파크" [level=3]:
+      - link "강변역 센트럴 아이파크":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930040&pblancNo=2026930040
+        - text: 강변역 센트럴 아이파크 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: "-"
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-06
+    - generic: 2026-09-23
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "고양 장항 아테라" [level=3]:
+      - link "고양 장항 아테라":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930038&pblancNo=2026930038
+        - text: 고양 장항 아테라 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-10-07
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-08
+    - generic: 2026-10-02
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "탕정 푸르지오 리버파크" [level=3]:
+      - link "탕정 푸르지오 리버파크":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930039&pblancNo=2026930039
+        - text: 탕정 푸르지오 리버파크 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-10-07
+    - paragraph:
+      - strong: 1순위
+      - generic: "-"
+    - generic: 2026-10-02
+  - article:
+    - generic: 대구
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 동인센트리체" [level=3]:
+      - link "더샵 동인센트리체":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000494&pblancNo=2026000494
+        - text: 더샵 동인센트리체 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 대전
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "도안 푸르지오 디아델 29블록" [level=3]:
+      - link "도안 푸르지오 디아델 29블록":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930033&pblancNo=2026930033
+        - text: 도안 푸르지오 디아델 29블록 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-13
+    - generic: 2026-10-06
+  - article:
+    - generic: 대전
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "도안 푸르지오 디아델 31블록" [level=3]:
+      - link "도안 푸르지오 디아델 31블록":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930034&pblancNo=2026930034
+        - text: 도안 푸르지오 디아델 31블록 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-13
+    - generic: 2026-10-06
+  - article:
+    - generic: 세종
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "세종 리더스포레 나릿재마을 1단지" [level=3]:
+      - link "세종 리더스포레 나릿재마을 1단지":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930041&pblancNo=2026930041
+        - text: 세종 리더스포레 나릿재마을 1단지 ↗
+    - paragraph:
+      - strong: 특별공급
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위
+      - generic: "-"
+    - generic: 2026-10-07
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "쌍용 더 플래티넘 한강" [level=3]:
+      - link "쌍용 더 플래티넘 한강":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000468&pblancNo=2026000468
+        - text: 쌍용 더 플래티넘 한강 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "용인 양지 서희스타힐스 하이뷰 (조합원 취소분)" [level=3]:
+      - link "용인 양지 서희스타힐스 하이뷰 (조합원 취소분)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000386&pblancNo=2026000386
+        - text: 용인 양지 서희스타힐스 하이뷰 (조합원 취소분) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 제주
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "제주시 이도이동 아이린8차 아파트" [level=3]:
+      - link "제주시 이도이동 아이린8차 아파트":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000444&pblancNo=2026000444
+        - text: 제주시 이도이동 아이린8차 아파트 ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-12
+    - generic: 2026-10-02
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "천안 아이파크 시티 2단지(2회차)" [level=3]:
+      - link "천안 아이파크 시티 2단지(2회차)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000498&pblancNo=2026000498
+        - text: 천안 아이파크 시티 2단지(2회차) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "향남역 그로브 스위첸" [level=3]:
+      - link "향남역 그로브 스위첸":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000463&pblancNo=2026000463
+        - text: 향남역 그로브 스위첸 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 전남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "진도 승원팰리체 더 테라스" [level=3]:
+      - link "진도 승원팰리체 더 테라스":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000466&pblancNo=2026000466
+        - text: 진도 승원팰리체 더 테라스 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-14
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-14
+    - generic: 2026-10-08
+  - article:
+    - generic: 인천
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "산곡역자이힐스테이트앤하늘채" [level=3]:
+      - link "산곡역자이힐스테이트앤하늘채":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000458&pblancNo=2026000458
+        - text: 산곡역자이힐스테이트앤하늘채 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 충남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "아산 그랑시티필하우스" [level=3]:
+      - link "아산 그랑시티필하우스":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000267&pblancNo=2026000267
+        - text: 아산 그랑시티필하우스 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 부산
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "연제갤러리자이" [level=3]:
+      - link "연제갤러리자이":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000469&pblancNo=2026000469
+        - text: 연제갤러리자이 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 인천
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "인천계양 A17블록 신혼희망타운(공공분양)(본청약)" [level=3]:
+      - link "인천계양 A17블록 신혼희망타운(공공분양)(본청약)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026820010&pblancNo=2026820010
+        - text: 인천계양 A17블록 신혼희망타운(공공분양)(본청약) ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-19~2026-10-22
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-19~2026-10-22
+    - generic: 2026-09-30
+  - article:
+    - generic: 충북
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "청주 가경 아이파크 7단지" [level=3]:
+      - link "청주 가경 아이파크 7단지":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000491&pblancNo=2026000491
+        - text: 청주 가경 아이파크 7단지 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 충북
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "청주 가경 아이파크 8단지" [level=3]:
+      - link "청주 가경 아이파크 8단지":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000492&pblancNo=2026000492
+        - text: 청주 가경 아이파크 8단지 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 광주
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "한양립스 에듀포레(조합원 취소분)" [level=3]:
+      - link "한양립스 에듀포레(조합원 취소분)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000471&pblancNo=2026000471
+        - text: 한양립스 에듀포레(조합원 취소분) ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-19
+    - generic: 2026-10-08
+  - article:
+    - generic: 경남
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "힐스테이트 거제시그니처(1회차)" [level=3]:
+      - link "힐스테이트 거제시그니처(1회차)":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000464&pblancNo=2026000464
+        - text: 힐스테이트 거제시그니처(1회차) ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-19
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-20
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-20
+    - generic: 2026-10-08
+  - article:
+    - generic: 전북
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "익산 부송에코르 10년 공공임대주택" [level=3]:
+      - link "익산 부송에코르 10년 공공임대주택":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000402&pblancNo=2026000402
+        - text: 익산 부송에코르 10년 공공임대주택 ↗
+    - paragraph:
+      - strong: 특별공급 · 해당지역
+      - generic: 2026-10-22
+    - paragraph:
+      - strong: 특별공급 · 기타지역
+      - generic: 2026-10-22
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-23
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-23
+    - generic: 2026-10-08
+  - complementary:
+    - generic: ✦ 청약 체크포인트
+    - heading "날짜와 조건, 함께 확인하세요." [level=2]:
+      - text: 날짜와 조건,
+      - text: 함께 확인하세요.
+    - paragraph: 특별공급과 1순위 접수일, 해당지역·기타지역 구분을 원 공고에서 살펴보세요. 저장된 공고는 현재 접수 상태와 다를 수 있어요.
+    - link "공식 공고 확인 ↗":
+      - /url: /housing/sources/
+  - heading "콘텐츠 기록" [level=2]
+  - link "모든 주택 콘텐츠 기록":
+    - /url: /local-articles/
+    - text: ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08--run-4a05683f2944/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

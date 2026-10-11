@@ -1,0 +1,61 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "반도체 뉴스 메뉴":
+  - strong: 반도체 뉴스
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: SEMICONDUCTOR WORKSPACE
+  - heading "산업 소식의 출처를 살펴보세요." [level=1]
+  - paragraph: 기업과 기관의 발표를 출처와 함께 읽고, 콘텐츠 작업으로 이어가세요.
+  - generic "마지막 수집 결과 · 2026.10.09 00:32"
+  - paragraph: 출처 설정을 보여줍니다. 등록 여부와 실제 수집·재사용 가능 여부는 다릅니다.
+  - article:
+    - generic: ▦
+    - generic: 사용 설정
+    - heading "산업통상부" [level=2]
+    - paragraph: 대한민국 산업통상부
+    - paragraph: 출처 표시 필요
+    - link "공식 출처 확인 ↗":
+      - /url: https://www.motir.go.kr/
+  - article:
+    - generic: ▦
+    - generic: 사용 설정
+    - heading "KRX KIND" [level=2]
+    - paragraph: 한국거래소
+    - paragraph: 내부 분석 전용
+    - link "공식 출처 확인 ↗":
+      - /url: https://kind.krx.co.kr/
+  - article:
+    - generic: ▦
+    - generic: 사용 설정
+    - heading "Samsung Global Newsroom Semiconductor" [level=2]
+    - paragraph: Samsung Electronics
+    - paragraph: 내부 분석 전용
+    - link "공식 출처 확인 ↗":
+      - /url: https://news.samsung.com/
+  - article:
+    - generic: ▦
+    - generic: 사용 중지 설정
+    - heading "SK hynix Newsroom" [level=2]
+    - paragraph: SK hynix
+    - paragraph: 금지
+    - link "공식 출처 확인 ↗":
+      - /url: https://news.skhynix.com/
+  - article:
+    - generic: ▦
+    - generic: 사용 설정
+    - heading "Semiconductor Industry Association" [level=2]
+    - paragraph: Semiconductor Industry Association
+    - paragraph: 내부 분석 전용
+    - link "공식 출처 확인 ↗":
+      - /url: https://www.semiconductors.org/
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

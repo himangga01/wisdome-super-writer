@@ -1,0 +1,33 @@
+{% load static %}
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}{{ portal.topic_title }}{% endblock %} · Wisdome</title>
+  {% block portal_css %}<link rel="stylesheet" href="{% static 'portal/app.css' %}">{% endblock %}
+  {% block extra_css %}{% endblock %}
+</head>
+<body class="workspace topic-{{ portal.topic_key }}">
+<a class="workspace-skip" href="#main">본문 바로가기</a>
+<div class="workspace-frame">
+  <aside class="workspace-sidebar" aria-label="작업 공간 탐색">
+    <a class="workspace-brand" href="/" aria-label="Wisdome 포털 홈"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i><i></i></span>Wisdome<span class="brand-caption">콘텐츠 워크스페이스</span></a>
+    {% include 'portal/navigation.html' with nav_variant='데스크톱' %}
+    <div class="sidebar-bottom"><div class="sidebar-note"><span class="small-kicker">YOUR WORKSPACE</span><strong>정보를 모으고,<br>이해를 더하세요.</strong><a href="/">전체 주제 보기 <span aria-hidden="true">↗</span></a></div><a class="admin-entry" href="/console/">운영 콘솔 <span aria-hidden="true">↗</span></a></div>
+  </aside>
+  <div class="workspace-body">
+    <header class="workspace-topbar">
+      <div class="workspace-breadcrumb"><a href="/">Wisdome</a><span aria-hidden="true">/</span><strong>{{ portal.topic_title }}</strong>{% if portal.topic_key != 'home' %}<span class="breadcrumb-section">/ {{ portal.section_title }}</span>{% endif %}</div>
+      <span class="workspace-mode"><span class="status-dot" aria-hidden="true"></span>{% if portal.local_runtime %}로컬 작업 공간{% else %}관리자 작업 공간{% endif %}</span>
+    </header>
+    <div class="workspace-mobile">
+      <details class="mobile-menu"><summary><span class="brand-symbol mini" aria-hidden="true"><i></i><i></i><i></i><i></i></span><strong>{{ portal.topic_title }}</strong><span class="menu-label">메뉴 <span aria-hidden="true">☰</span></span></summary>{% include 'portal/navigation.html' with nav_variant='모바일' %}<a class="admin-entry" href="/console/">운영 콘솔 ↗</a></details>
+      <nav class="mobile-topics" aria-label="빠른 주제 전환">{% for topic in portal.topics %}{% if topic.available %}<a href="{{ topic.href }}" {% if topic.active %}aria-current="true" class="current"{% endif %}>{{ topic.name }}</a>{% else %}<span title="로컬 환경에서 이용할 수 있습니다">{{ topic.name }} · 로컬 전용</span>{% endif %}{% endfor %}</nav>
+    </div>
+    <main id="main" class="workspace-main" tabindex="-1">{% block content %}{% endblock %}</main>
+    <footer class="workspace-footer">{% block footer %}출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.{% endblock %}<span>WISDOME SUPER WRITER</span></footer>
+  </div>
+</div>
+</body>
+</html>

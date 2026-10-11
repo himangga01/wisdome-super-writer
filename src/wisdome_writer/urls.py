@@ -3,7 +3,6 @@ from importlib import import_module
 from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path
-from django.views.generic import RedirectView
 
 from wisdome_writer import console
 from wisdome_writer.api.health import live, ready
@@ -12,7 +11,7 @@ admin.site.site_header = "Wisdome Super Writer"
 admin.site.site_title = "Wisdome Super Writer Admin"
 
 urlpatterns = [
-    path("", RedirectView.as_view(pattern_name="console-home", permanent=False)),
+    path("", include("wisdome_writer.portal.urls")),
     path("admin/", admin.site.urls),
     path("console/", console.home, name="console-home"),
     path("console/runs/", console.runs, name="console-runs"),
@@ -22,6 +21,7 @@ urlpatterns = [
     path("console/publishing/", console.publishing, name="console-publishing"),
     path("console/publishing/", include("apps.publishing.console_urls")),
     path("console/operations/", console.operations, name="console-operations"),
+    path("policy-funding/", include("apps.policy_funding.urls")),
     path("health/live", live, name="health-live"),
     path("health/ready", ready, name="health-ready"),
     path("api/v1/", include("wisdome_writer.api.urls")),

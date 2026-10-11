@@ -1,0 +1,90 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "콘텐츠 포털 메뉴":
+  - strong: 콘텐츠 포털
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: YOUR INFORMATION, CONNECTED
+  - heading "오늘은 어떤 정보를 살펴볼까요?" [level=1]
+  - paragraph: 주택 청약부터 산업 소식, 사업 자금까지. 필요한 주제로 바로 들어가세요.
+  - article:
+    - generic: ⌂
+    - generic: WORKSPACE / 01
+    - paragraph: 집을 찾는 정보
+    - heading "주택 청약" [level=2]
+    - paragraph: 청약 일정과 주요 조건을 살펴보고, 정리된 공고와 콘텐츠를 확인하세요.
+    - generic: 청약홈·LH
+    - generic: 공고·콘텐츠
+    - link "주택 청약 살펴보기":
+      - /url: /housing/
+      - text: 주택 청약 살펴보기
+      - generic: ↗
+  - article:
+    - generic: ▦
+    - generic: WORKSPACE / 02
+    - paragraph: 산업의 흐름을 읽는 정보
+    - heading "반도체 뉴스" [level=2]
+    - paragraph: 국내외 기업·기관의 소식을 모아, 출처와 함께 산업의 흐름을 읽으세요.
+    - generic: 기업·산업 소식
+    - generic: 뉴스·초안
+    - link "반도체 뉴스 살펴보기":
+      - /url: /semiconductor/
+      - text: 반도체 뉴스 살펴보기
+      - generic: ↗
+  - article:
+    - generic: ₩
+    - generic: WORKSPACE / 03
+    - paragraph: 사업을 준비하는 정보
+    - heading "정책자금" [level=2]
+    - paragraph: 중앙정부와 지역의 지원을 찾고, 어려운 용어와 신청 순서를 배워보세요.
+    - generic: 정부·지역 지원
+    - generic: 쉬운 설명
+    - link "정책자금 살펴보기":
+      - /url: /policy-funding/
+      - text: 정책자금 살펴보기
+      - generic: ↗
+  - paragraph: HOW IT WORKS
+  - heading "흩어진 정보에, 읽기 쉬운 순서를." [level=2]
+  - generic: ↗
+  - generic: "01"
+  - strong: 모으고
+  - paragraph:
+    - text: 주제에 맞는 출처의
+    - text: 공고와 소식을 수집해요.
+  - generic: "02"
+  - strong: 살펴보고
+  - paragraph:
+    - text: 내용과 출처를 함께 읽고
+    - text: 확인할 조건을 정리해요.
+  - generic: "03"
+  - strong: 이해하고
+  - paragraph:
+    - text: 용어와 진행 순서를
+    - text: 쉬운 설명으로 알아봐요.
+  - generic: "04"
+  - strong: 콘텐츠로
+  - paragraph:
+    - text: 정리된 글을 읽고
+    - text: 다음 작업을 준비해요.
+  - complementary:
+    - generic: ✦ WISDOME GUIDE
+    - heading "처음 만나는 정책자금, 이름부터 어렵다면." [level=2]:
+      - text: 처음 만나는 정책자금,
+      - text: 이름부터 어렵다면.
+    - paragraph:
+      - text: 대출, 보증, 지원금의 차이부터
+      - text: 내가 준비할 자료까지 차근차근.
+    - link "쉬운 안내 읽기":
+      - /url: /policy-funding/guide/
+      - text: 쉬운 안내 읽기
+      - generic: ↗
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

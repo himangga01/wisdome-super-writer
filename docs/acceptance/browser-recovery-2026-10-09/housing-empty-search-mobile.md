@@ -1,0 +1,110 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "주택 청약 메뉴":
+  - strong: 주택 청약
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: HOUSING WORKSPACE
+  - heading "내가 살펴볼 청약 공고" [level=1]
+  - paragraph: 저장된 공고의 일정과 조건을 읽고, 자세한 내용은 원문에서 확인하세요.
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월"
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월" [selected]
+      - option "11월"
+      - option "12월"
+    - text: 청약 단계
+    - combobox "청약 단계":
+      - option "특공·1순위 전체" [selected]
+      - option "특별공급"
+      - option "1순위"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /housing/notices/?stage=all&q=QA-no-match-20261009&year=2026&month=10&basis=schedule
+    - link "전체 기간":
+      - /url: /housing/notices/?stage=all&q=QA-no-match-20261009&basis=schedule
+  - strong: 2026년 10월
+  - text: · 특별공급·1순위 접수 일정 기준
+  - link "← 이전":
+    - /url: /housing/notices/?stage=all&q=QA-no-match-20261009&year=2026&month=9&basis=schedule
+  - link "다음 →":
+    - /url: /housing/notices/?stage=all&q=QA-no-match-20261009&year=2026&month=11&basis=schedule
+  - paragraph: 해당 청약 단계가 없거나 일정을 확인할 수 없는 124개 공고는 월별 결과에서 제외했습니다.
+  - article:
+    - text: 조건에 맞는 청약 공고
+    - strong: 0개
+    - paragraph: 검증된 저장 자료 기준
+  - article:
+    - text: 확인 가능한 수집 기록
+    - strong: 2개
+    - paragraph: 표시 범위 내 검증된 기록
+  - article:
+    - text: 자료 기준 시점
+    - strong: 2026.10.08 22:40
+    - paragraph: 저장된 수집 기간의 기준 시각
+  - paragraph: "검증된 저장 이력의 특별공급·1순위 청약일 기준입니다. 청약일이 확인되지 않은 공고는 월별 결과에 포함하지 않습니다. 이전 게시 공고의 수집 범위 밖 일정은 누락될 수 있습니다. 선택한 청약 단계의 날짜 미확인 공고: 124개. 이 실행은 일부 수집 결과가 누락되었을 수 있습니다."
+  - text: 공고 검색
+  - textbox "공고 검색":
+    - /placeholder: 공고명·기관·지역으로 검색
+    - text: QA-no-match-20261009
+  - button "검색"
+  - heading "청약 공고 목록" [level=2]
+  - paragraph: 확인된 특별공급·1순위 일정 · 최대 100개 공고
+  - generic: ⌂
+  - heading "검색 조건에 맞는 공고가 없어요" [level=3]
+  - paragraph: 공식 출처를 살펴보거나 기존 콘텐츠 기록을 확인해 보세요.
+  - link "공식 출처 보기":
+    - /url: /housing/sources/
+  - complementary:
+    - generic: ✦ 청약 체크포인트
+    - heading "날짜와 조건, 함께 확인하세요." [level=2]:
+      - text: 날짜와 조건,
+      - text: 함께 확인하세요.
+    - paragraph: 특별공급과 1순위 접수일, 해당지역·기타지역 구분을 원 공고에서 살펴보세요. 저장된 공고는 현재 접수 상태와 다를 수 있어요.
+    - link "공식 공고 확인 ↗":
+      - /url: /housing/sources/
+  - heading "콘텐츠 기록" [level=2]
+  - link "모든 주택 콘텐츠 기록":
+    - /url: /local-articles/
+    - text: ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08--run-4a05683f2944/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

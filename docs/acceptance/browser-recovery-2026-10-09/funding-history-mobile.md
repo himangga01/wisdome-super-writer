@@ -1,0 +1,83 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- generic "정책자금 메뉴":
+  - strong: 정책자금
+  - generic: 메뉴 ☰
+- navigation "빠른 주제 전환":
+  - link "주택 청약":
+    - /url: /housing/
+  - link "반도체 뉴스":
+    - /url: /semiconductor/
+  - link "정책자금":
+    - /url: /policy-funding/
+- main:
+  - paragraph: COLLECTION HISTORY
+  - heading "언제, 무엇을 확인했는지." [level=1]
+  - paragraph: 최근 검증된 수집 기록과 출처별 결과·변경사항을 확인하세요.
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도" [selected]
+      - option "2027년"
+      - option "2026년"
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월" [selected]
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월"
+      - option "11월"
+      - option "12월"
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /policy-funding/history/?year=2026&month=10&basis=collected
+    - link "전체 기간":
+      - /url: /policy-funding/history/?basis=collected
+  - strong: 전체 기간
+  - text: · 수집 날짜 기준
+  - heading "정책자금 수집 기록" [level=2]
+  - generic: 최근 최대 30개 실행
+  - link "2026-10-08--run-fd18f61df3fc 공식 페이지 수집 93개 공고 · 결과 보기 ↗":
+    - /url: /policy-funding/runs/2026-10-08--run-fd18f61df3fc/
+    - strong: 2026-10-08--run-fd18f61df3fc
+    - paragraph: 공식 페이지 수집
+    - generic: 93개 공고 · 결과 보기 ↗
+  - link "2026-10-06 공식 페이지 수집 40개 공고 · 결과 보기 ↗":
+    - /url: /policy-funding/runs/2026-10-06/
+    - strong: 2026-10-06
+    - paragraph: 공식 페이지 수집
+    - generic: 40개 공고 · 결과 보기 ↗
+  - link "2026-10-05--run-6b4ba832282a 공식 페이지 수집 12개 공고 · 결과 보기 ↗":
+    - /url: /policy-funding/runs/2026-10-05--run-6b4ba832282a/
+    - strong: 2026-10-05--run-6b4ba832282a
+    - paragraph: 공식 페이지 수집
+    - generic: 12개 공고 · 결과 보기 ↗
+  - link "2026-10-05--run-a0555b8f14f0 공식 페이지 수집 12개 공고 · 결과 보기 ↗":
+    - /url: /policy-funding/runs/2026-10-05--run-a0555b8f14f0/
+    - strong: 2026-10-05--run-a0555b8f14f0
+    - paragraph: 공식 페이지 수집
+    - generic: 12개 공고 · 결과 보기 ↗
+  - link "2026-10-05 공식 페이지 수집 12개 공고 · 결과 보기 ↗":
+    - /url: /policy-funding/runs/2026-10-05/
+    - strong: 2026-10-05
+    - paragraph: 공식 페이지 수집
+    - generic: 12개 공고 · 결과 보기 ↗
+  - paragraph: 각 실행은 정해진 출처·페이지 범위의 결과입니다. 일부 출처의 확인 실패나 현재 접수 여부는 상세 결과와 원문을 함께 확인하세요.
+- contentinfo:
+  - text: 지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.
+  - generic: WISDOME SUPER WRITER

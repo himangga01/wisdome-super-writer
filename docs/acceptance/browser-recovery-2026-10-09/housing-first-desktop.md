@@ -1,0 +1,232 @@
+- link "본문 바로가기":
+  - /url: "#main"
+- complementary "작업 공간 탐색":
+  - link "Wisdome 포털 홈":
+    - /url: /
+    - text: Wisdome
+    - generic: 콘텐츠 워크스페이스
+  - navigation "데스크톱 주제 선택":
+    - paragraph: 작업 공간
+    - link "01 주택 청약 집을 찾는 정보":
+      - /url: /housing/
+      - generic: "01"
+      - text: 주택 청약
+      - generic: 집을 찾는 정보
+      - generic: ›
+    - link "02 반도체 뉴스 산업의 흐름을 읽는 정보":
+      - /url: /semiconductor/
+      - generic: "02"
+      - text: 반도체 뉴스
+      - generic: 산업의 흐름을 읽는 정보
+      - generic: ›
+    - link "03 정책자금 사업을 준비하는 정보":
+      - /url: /policy-funding/
+      - generic: "03"
+      - text: 정책자금
+      - generic: 사업을 준비하는 정보
+      - generic: ›
+  - navigation "데스크톱 주택 청약 메뉴":
+    - paragraph: 주택 청약
+    - link "대시보드":
+      - /url: /housing/
+      - text: 대시보드
+    - link "청약 공고":
+      - /url: /housing/notices/
+      - text: 청약 공고
+    - link "작성된 콘텐츠":
+      - /url: /local-articles/
+      - text: 작성된 콘텐츠
+    - link "공식 출처":
+      - /url: /housing/sources/
+      - text: 공식 출처
+  - text: YOUR WORKSPACE
+  - strong:
+    - text: 정보를 모으고,
+    - text: 이해를 더하세요.
+  - link "전체 주제 보기":
+    - /url: /
+    - text: 전체 주제 보기
+    - generic: ↗
+  - link "운영 콘솔":
+    - /url: /console/
+    - text: 운영 콘솔
+    - generic: ↗
+- banner:
+  - link "Wisdome":
+    - /url: /
+  - generic: /
+  - strong: 주택 청약
+  - generic: / 대시보드
+  - generic: 로컬 작업 공간
+- main:
+  - paragraph: HOUSING WORKSPACE
+  - heading "주택 청약, 한눈에 살펴보세요." [level=1]
+  - paragraph: 저장된 공고의 일정과 조건을 읽고, 자세한 내용은 원문에서 확인하세요.
+  - generic: 주택 청약
+  - form "연도·월 조회":
+    - text: 연도
+    - combobox "연도":
+      - option "전체 연도"
+      - option "2027년"
+      - option "2026년" [selected]
+      - option "2025년"
+      - option "2024년"
+      - option "2023년"
+      - option "2022년"
+      - option "2021년"
+      - option "2020년"
+      - option "2019년"
+      - option "2018년"
+    - text: 월
+    - combobox "월":
+      - option "전체 월"
+      - option "1월"
+      - option "2월"
+      - option "3월"
+      - option "4월"
+      - option "5월"
+      - option "6월"
+      - option "7월"
+      - option "8월"
+      - option "9월"
+      - option "10월" [selected]
+      - option "11월"
+      - option "12월"
+    - text: 청약 단계
+    - combobox "청약 단계":
+      - option "특공·1순위 전체"
+      - option "특별공급"
+      - option "1순위" [selected]
+    - button "기간 적용"
+    - link "이번 달":
+      - /url: /housing/?stage=first&year=2026&month=10&basis=schedule
+    - link "전체 기간":
+      - /url: /housing/?stage=first&basis=schedule
+  - strong: 2026년 10월
+  - text: · 특별공급·1순위 접수 일정 기준
+  - link "← 이전":
+    - /url: /housing/?stage=first&year=2026&month=9&basis=schedule
+  - link "다음 →":
+    - /url: /housing/?stage=first&year=2026&month=11&basis=schedule
+  - paragraph: 해당 청약 단계가 없거나 일정을 확인할 수 없는 128개 공고는 월별 결과에서 제외했습니다.
+  - article:
+    - text: 조건에 맞는 청약 공고
+    - strong: 21개
+    - paragraph: 검증된 저장 자료 기준
+  - article:
+    - text: 확인 가능한 수집 기록
+    - strong: 2개
+    - paragraph: 표시 범위 내 검증된 기록
+  - article:
+    - text: 자료 기준 시점
+    - strong: 2026.10.08 22:40
+    - paragraph: 저장된 수집 기간의 기준 시각
+  - paragraph: "검증된 저장 이력의 특별공급·1순위 청약일 기준입니다. 청약일이 확인되지 않은 공고는 월별 결과에 포함하지 않습니다. 이전 게시 공고의 수집 범위 밖 일정은 누락될 수 있습니다. 선택한 청약 단계의 날짜 미확인 공고: 128개. 이 실행은 일부 수집 결과가 누락되었을 수 있습니다."
+  - heading "저장된 청약 공고" [level=2]
+  - paragraph: 확인된 특별공급·1순위 일정 · 최대 100개 공고
+  - link "모두 보기 ↗":
+    - /url: /housing/notices/
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "광명 시티프라디움 에듀하임" [level=3]:
+      - link "광명 시티프라디움 에듀하임":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000453&pblancNo=2026000453
+        - text: 광명 시티프라디움 에듀하임 ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-09-30
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-01
+    - generic: 2026-09-18
+  - article:
+    - generic: 서울
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "강변역 센트럴 아이파크" [level=3]:
+      - link "강변역 센트럴 아이파크":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930040&pblancNo=2026930040
+        - text: 강변역 센트럴 아이파크 ↗
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-06
+    - generic: 2026-09-23
+  - article:
+    - generic: 경기
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "고양 장항 아테라" [level=3]:
+      - link "고양 장항 아테라":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930038&pblancNo=2026930038
+        - text: 고양 장항 아테라 ↗
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-08
+    - generic: 2026-10-02
+  - article:
+    - generic: 제주
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "제주시 이도이동 아이린8차 아파트" [level=3]:
+      - link "제주시 이도이동 아이린8차 아파트":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000444&pblancNo=2026000444
+        - text: 제주시 이도이동 아이린8차 아파트 ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-12
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-12
+    - generic: 2026-10-02
+  - article:
+    - generic: 대구
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "더샵 동인센트리체" [level=3]:
+      - link "더샵 동인센트리체":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTLttotPblancDetail.do?houseManageNo=2026000494&pblancNo=2026000494
+        - text: 더샵 동인센트리체 ↗
+    - paragraph:
+      - strong: 1순위 · 해당지역
+      - generic: 2026-10-13
+    - paragraph:
+      - strong: 1순위 · 기타지역
+      - generic: 2026-10-13
+    - generic: 2026-10-02
+  - article:
+    - generic: 대전
+    - generic: ApplyHome
+    - generic: "저장 당시 표시: published"
+    - heading "도안 푸르지오 디아델 29블록" [level=3]:
+      - link "도안 푸르지오 디아델 29블록":
+        - /url: https://www.applyhome.co.kr/ai/aia/selectAPTRemndrLttotPblancDetailView.do?houseManageNo=2026930033&pblancNo=2026930033
+        - text: 도안 푸르지오 디아델 29블록 ↗
+    - paragraph:
+      - strong: 1순위
+      - generic: 2026-10-13
+    - generic: 2026-10-06
+  - complementary:
+    - generic: ✦ 청약 체크포인트
+    - heading "날짜와 조건, 함께 확인하세요." [level=2]:
+      - text: 날짜와 조건,
+      - text: 함께 확인하세요.
+    - paragraph: 특별공급과 1순위 접수일, 해당지역·기타지역 구분을 원 공고에서 살펴보세요. 저장된 공고는 현재 접수 상태와 다를 수 있어요.
+    - link "공식 공고 확인 ↗":
+      - /url: /housing/sources/
+  - heading "콘텐츠 기록" [level=2]
+  - link "모든 주택 콘텐츠 기록":
+    - /url: /local-articles/
+    - text: ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08--run-4a05683f2944/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+  - link "2026-10-08 0개 글":
+    - /url: /local-articles/2026-10-08/
+    - strong: 2026-10-08
+    - generic: 0개 글 ↗
+- contentinfo:
+  - text: 출처와 함께 읽는 정보. 저장된 자료의 기준 시점을 확인하고 최신 조건은 원문에서 살펴보세요.
+  - generic: WISDOME SUPER WRITER

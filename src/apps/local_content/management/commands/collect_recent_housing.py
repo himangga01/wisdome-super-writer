@@ -9,7 +9,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit
@@ -54,6 +54,11 @@ class Command(BaseCommand):
     def add_arguments(self, parser) -> None:
         parser.add_argument("--days", type=int, default=7, choices=range(1, 32))
         parser.add_argument(
+            "--since",
+            type=_since_date,
+            help="Publication start date (YYYY-MM-DD, midnight KST), within the past 365 days.",
+        )
+        parser.add_argument(
             "--humanize",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -83,9 +88,18 @@ class Command(BaseCommand):
                 humanize=options["humanize"],
                 write_articles=options["write_articles"],
                 selected_ids=tuple(options["selected_id"]),
+                collection_start=(
+                    datetime.combine(options["since"], time.min, tzinfo=SEOUL)
+                    if options.get("since") is not None
+                    else None
+                ),
             )
         except WorkflowError as exc:
             raise CommandError(f"local housing workflow failed: {exc.code}") from None
+        except ValueError:
+            raise CommandError(
+                "local housing configuration or collection window is invalid"
+            ) from None
         metadata = {
             "workflow_id": report.workflow_id,
             "mode": report.mode,
@@ -108,6 +122,15 @@ class Command(BaseCommand):
             codes = ",".join(report.error_codes) or "WORKFLOW_INCOMPLETE"
             raise CommandError(f"local housing workflow incomplete: {codes}")
         return None
+
+
+def _since_date(value: str) -> date:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise argparse.ArgumentTypeError("--since requires YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--since requires a valid calendar date") from None
 
 
 def _build_workflow(*, fixture_root: Path | None, dry_run: bool) -> LocalHousingWorkflow:
@@ -186,14 +209,10 @@ def _verify_fixture_manifest(
     expected_sets = {
         root: {"README.md", "manifest.json"},
         root.parent / "applyhome": {
-            Path(relative).name
-            for relative in _FIXTURE_FILES
-            if relative.startswith("applyhome/")
+            Path(relative).name for relative in _FIXTURE_FILES if relative.startswith("applyhome/")
         },
         root.parent / "lh": {
-            Path(relative).name
-            for relative in _FIXTURE_FILES
-            if relative.startswith("lh/")
+            Path(relative).name for relative in _FIXTURE_FILES if relative.startswith("lh/")
         },
     }
     fixture_parent_path = root.parent
@@ -266,10 +285,7 @@ def _fixture_directory_fingerprint(path: Path) -> tuple[object, ...]:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
-        or bool(
-            getattr(metadata, "st_file_attributes", 0)
-            & _FILE_ATTRIBUTE_REPARSE_POINT
-        )
+        or bool(getattr(metadata, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
     ):
         raise WorkflowError("FIXTURE_DIRECTORY_CHANGED")
     return (
@@ -294,10 +310,7 @@ def _closed_fixture_names(directory: Path) -> set[str]:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
-            or bool(
-                getattr(metadata, "st_file_attributes", 0)
-                & _FILE_ATTRIBUTE_REPARSE_POINT
-            )
+            or bool(getattr(metadata, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
         ):
             raise WorkflowError("FIXTURE_EXTRA_FILE")
         result.add(entry.name)
@@ -322,10 +335,7 @@ def _read_fixture_file(path: Path) -> bytes:
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
-            or bool(
-                getattr(before, "st_file_attributes", 0)
-                & _FILE_ATTRIBUTE_REPARSE_POINT
-            )
+            or bool(getattr(before, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
         ):
             raise WorkflowError("FIXTURE_MANIFEST_INVALID")
         observed = 0
@@ -410,9 +420,7 @@ class _FixtureFetcher:
         if url.startswith(APT_LIST):
             page = query.get("pageIndex", ["1"])[0]
             relative = (
-                "applyhome/apt-list.html"
-                if page == "1"
-                else "applyhome/apt-list-page-2.html"
+                "applyhome/apt-list.html" if page == "1" else "applyhome/apt-list-page-2.html"
             )
         elif url.startswith(REMAINING_LIST):
             relative = "applyhome/remaining-list.html"
@@ -423,11 +431,7 @@ class _FixtureFetcher:
                 else None
             )
         elif split.hostname == "apply.lh.or.kr":
-            relative = (
-                "lh/notice-detail.html"
-                if query.get("panId") == ["0000061158"]
-                else None
-            )
+            relative = "lh/notice-detail.html" if query.get("panId") == ["0000061158"] else None
         else:
             raise KeyError(url)
         body = (
@@ -471,7 +475,6 @@ def _assembled_lh_page(body: str, page: str) -> str:
     if row is None:
         return body
     copies = [
-        row.group().replace("0000061158", f"{61158 + offset:010d}", 1)
-        for offset in range(1, 50)
+        row.group().replace("0000061158", f"{61158 + offset:010d}", 1) for offset in range(1, 50)
     ]
     return body.replace("</main>", f"{''.join(copies)}</main>", 1)

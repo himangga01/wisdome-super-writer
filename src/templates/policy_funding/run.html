@@ -1,0 +1,17 @@
+{% extends 'policy_funding/base.html' %}
+{% block title %}수집 결과{% endblock %}
+{% block content %}<a href="/policy-funding/">← 공고 목록</a>
+<section class="article-heading">
+<h1>수집 결과</h1>
+<p>{{ run.run_name }} · {% if run.mode == 'fixture' %}검증용 자료{% else %}실제 공식 페이지 수집{% endif %}</p>
+<p>수집된 공고 {{ run.notices|length }}개. 제한된 페이지 범위이며, 목록에서 안 보인 공고를 폐지·마감으로 처리하지 않습니다.</p>
+</section>
+<section>
+<h2>출처별 상태</h2>{% for source in run.source_outcomes %}<article class="card">
+<h3>{{ source.source_id }}</h3>
+<p>{% if source.status == 'completed' %}설정한 범위 수집 완료{% elif source.status == 'partial' %}일부 확인 실패{% elif source.status == 'failed' %}출처 확인 실패{% else %}탐색용 출처{% endif %} · {{ source.count }}개</p>{% if source.errors %}<p class="warning">{{ source.errors|length }}건을 확인하지 못했습니다. 해당 출처의 최신 정보는 원문에서 다시 확인하세요.</p>{% endif %}</article>{% endfor %}</section>
+<section>
+<h2>새 소식과 변경</h2>{% for change in run.changes %}<div class="run-row">
+<a href="/policy-funding/notices/{{ change.notice_id }}/?mode={{ run.mode }}&amp;run={{ run.run_name }}">{% if change.status == 'added' %}새로 확인{% elif change.status == 'changed' %}내용 변경{% else %}이전과 동일{% endif %}</a>
+<span>{% if change.fields %}변경 항목 {{ change.fields|length }}개{% endif %}</span>
+</div>{% empty %}<p>이번 실행에서 확인된 공고가 없습니다.</p>{% endfor %}</section>{% endblock %}

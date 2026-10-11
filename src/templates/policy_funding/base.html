@@ -1,0 +1,5 @@
+{% extends 'portal/base.html' %}
+{% load static %}
+{% block title %}정책자금 · {{ portal.section_title }}{% endblock %}
+{% block extra_css %}<link rel="stylesheet" href="{% static 'policy_funding/app.css' %}">{% endblock %}
+{% block footer %}지원대상 확인·대출 승인·실제 지급은 서로 다른 단계입니다. 최신 조건은 해당 기관의 공고에서 확인하세요.{% endblock %}
